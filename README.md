@@ -9,10 +9,9 @@ snapshots through an epoch-based reconfiguration subsystem.
 > sequence-defined DATA/CUT/ACK protocol, exact worker ownership
 > accounting, owner-worker activation, and quiescence-gated reclamation. The
 > control plane exposes durable Prepare/Activate convergence, commit-confirmed
-> updates, and evidence-gated guardrails. Final release qualification and the
-> physical CloudLab/TRex campaign remain required before publishing a
-> throughput or physical-conformance claim. Kinetum 0.1.0 has no physical
-> TRex packet-latency measurement contract.
+> updates, and evidence-gated guardrails. Physical results apply to the tested
+> hardware and configurations; broader qualification remains incomplete.
+> Kinetum 0.1.0 has no physical TRex packet-latency measurement contract.
 
 ## Status
 
