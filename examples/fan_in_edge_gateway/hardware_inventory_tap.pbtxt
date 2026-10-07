@@ -1,0 +1,15 @@
+# Hardware Inventory - Fan-In Edge Gateway TAP Validation
+#
+# The five explicit CPU rows provide exactly three packet workers, one
+# transition coordinator, and one lifecycle executor. Match these CPU/NUMA
+# facts to the validation host. TAP device identity belongs to the bindings.
+
+node {
+  cpu {
+    core_topology { core_id: 0 numa_node: 0 is_hyperthread: false }
+    core_topology { core_id: 2 numa_node: 0 is_hyperthread: false }
+    core_topology { core_id: 4 numa_node: 0 is_hyperthread: false }
+    core_topology { core_id: 6 numa_node: 0 is_hyperthread: false }
+    core_topology { core_id: 16 numa_node: 0 is_hyperthread: true }
+  }
+}

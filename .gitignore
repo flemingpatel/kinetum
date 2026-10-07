@@ -1,0 +1,29 @@
+# Build outputs
+build*/
+cmake-build-*/
+dist/
+out/
+.cache/
+
+# IDEs
+.vscode/
+.idea/
+
+# Generated
+gen/
+*.pb.cc
+*.pb.h
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# OS files
+.DS_Store
+._*
+
+# AI tools
+.claude/
+.codex/

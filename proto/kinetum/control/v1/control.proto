@@ -1,0 +1,513 @@
+// Copyright (c) 2026 Fleming Patel. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Control Plane API: Configuration Management and Orchestration
+//
+// The Control Plane API provides atomic configuration updates with:
+//   - Snapshot revisions for rollback safety
+//   - Epoch-consistent updates via CP/DP two-phase apply
+//   - Guardrails for automatic regression detection
+//   - Exact statistics and readiness observation
+//
+// The platform owns epoch transitions, opaque-blob routing, and lifecycle
+// ordering. Each module owns its configuration schema and interpretation; the
+// Control Plane stores and routes exact module bytes without becoming another
+// module-policy authority.
+//
+// Design principles:
+//   1. Every configuration change is a durable snapshot
+//   2. Rollback re-applies retained content through the validated transition path
+//   3. Updates commit through the sequence-defined DATA/CUT/ACK protocol
+//   4. Commit-confirmed rollback is live; telemetry guardrails require coherent evidence
+//   5. Modules own their config schemas (platform is schema-agnostic)
+
+syntax = "proto3";
+
+package kinetum.control.v1;
+
+import "kinetum/common/v1/common.proto";
+import "kinetum/telemetry/v1/telemetry.proto";
+
+option cc_enable_arenas = true;
+
+// =============================================================================
+// Guardrails: Automatic Regression Detection
+// =============================================================================
+
+// Exact threshold detector. Every value is required when this detector is
+// selected; zero is a policy value, never a request for a runtime default.
+message GuardrailsThresholdPolicy {
+  // Maximum admitted dropped / (accepted TX + dropped) interval ratio.
+  double max_drop_ratio = 1;
+  // Minimum accepted-TX rate relative to the frozen previous baseline.
+  double min_tx_ratio = 2;
+  // Minimum accepted-TX-plus-drop interval population required to evaluate.
+  uint64 min_packets_per_window = 3;
+}
+
+// Exact multi-signal detector. At least one base weight is positive, and the
+// complete base-plus-CONFIG_ISSUE contribution cannot exceed one.
+message GuardrailsCorrelationPolicy {
+  // Contribution of normalized drop ratio.
+  double drop_ratio_weight = 1;
+  // Contribution of normalized accepted-TX throughput.
+  double throughput_ratio_weight = 2;
+  // Contribution of complete current module-health observations.
+  double module_health_weight = 3;
+  // Additive contribution from contexts reporting CONFIG_ISSUE.
+  double config_issue_boost = 4;
+  // Exact EWMA smoothing factor in (0, 1].
+  double ewma_alpha = 5;
+  // Hysteresis entry threshold in (0, 1].
+  double degradation_threshold = 6;
+  // Hysteresis band in [0, 0.5], strictly below the threshold.
+  double hysteresis_band = 7;
+  // Valid post-change samples required before a detector decision.
+  uint32 min_samples = 8;
+  // Drop ratio mapped to complete normalized degradation.
+  double normalization_max_drop_ratio = 9;
+  // Throughput ratio mapped to complete normalized degradation.
+  double normalization_min_tx_ratio = 10;
+}
+
+// Exact attribution policy applied only after one detector identifies a
+// degradation. Missing baseline evidence is inconclusive, never neutral.
+message GuardrailsAttributionPolicy {
+  // Minimum complete attribution confidence for automatic rollback.
+  double auto_rollback_threshold = 1;
+  // Minimum confidence requiring an operator decision.
+  double defer_threshold = 2;
+  // Valid stable samples required before a configuration can be armed.
+  uint32 baseline_samples = 3;
+  // Minimum magnitude treated as a significant configuration regression.
+  double degradation_threshold = 4;
+}
+
+// Optional ordered-boundary safety policy. Presence enables the observation;
+// absence disables it without a parallel boolean.
+message GuardrailsBoundaryPolicy {
+  // Exact generation-local CUT-to-current-observation ACK wait bound.
+  uint64 ack_timeout_ms = 1;
+}
+
+// GuardrailsPolicy is one complete durable evaluation contract. Disabled
+// policy is represented by enabled=false with every other field absent/zero.
+// Enabled policy requires one detector, attribution, cadence, and history.
+message GuardrailsPolicy {
+  // False is valid only when every remaining policy field is absent or zero.
+  bool enabled = 1;
+  // Control Plane observation cadence in monotonic milliseconds.
+  uint64 poll_interval_ms = 2;
+  // Valid-observation time allowed for one post-change evaluation window.
+  uint64 evaluation_window_ms = 3;
+  // Bounded retained interval-sample capacity.
+  uint32 telemetry_history_capacity = 4;
+
+  oneof detector {
+    GuardrailsThresholdPolicy threshold = 5;
+    GuardrailsCorrelationPolicy correlation = 6;
+  }
+
+  // Required attribution contract for either detector.
+  GuardrailsAttributionPolicy attribution = 7;
+  // Optional ordered-boundary observation contract.
+  GuardrailsBoundaryPolicy boundary = 8;
+}
+
+// =============================================================================
+// Module Configuration
+// =============================================================================
+//
+// Each module owns its config schema. The control plane serializes module-
+// specific policy into config_blob. The platform validates the complete
+// snapshot identity and routes each opaque blob to its exact module context.
+
+// ModuleConfig provides module-specific configuration.
+// Applied at epoch transitions for consistency.
+message ModuleConfig {
+  // Module identifier (matches Stage.module_id in pipeline definition)
+  string module_id = 1;
+
+  // Module-policy revision carried by this snapshot.
+  int64 revision = 2;
+
+  // Opaque configuration blob (interpretation is module-defined)
+  // Platform routes this through the module PREPARE lifecycle without parsing.
+  // The module interprets these bytes according to its own exact schema.
+  bytes config_blob = 3;
+
+  // Content type hint (e.g., "application/protobuf", "application/json")
+  // Informational only - platform does not parse based on this.
+  string content_type = 4;
+
+  // SHA-256 hash of config_blob for integrity verification
+  string content_hash = 5;
+
+  // Optional: Schema identifier for tooling (e.g., "kinetum.module.acl.v1.AclRuleset")
+  // Informational only - platform does not validate against this.
+  string schema_id = 6;
+}
+
+// =============================================================================
+// Configuration Snapshot
+// =============================================================================
+
+// ConfigSnapshot is the atomic unit of configuration update.
+// All module configurations within a snapshot are applied together atomically.
+//
+// The platform routes opaque blobs to modules without interpretation.
+// Each module owns its config schema.
+//
+// Example:
+//   snapshot {
+//     modules: [
+//       { module_id: "kinetum.acl", config_blob: <serialized AclRuleset> },
+//       { module_id: "kinetum.nat44", config_blob: <serialized NatPools> },
+//       { module_id: "kinetum.qos", config_blob: <serialized QosProfiles> },
+//       { module_id: "my_satcom_acm", config_blob: <user-defined bytes> }
+//     ]
+//   }
+//
+message ConfigSnapshot {
+  // Unique snapshot identifier
+  string snapshot_id = 1;
+
+  // Snapshot content revision. Generated selective rollback mutations advance
+  // the current revision; full rollback retains the exact
+  // target snapshot revision while activation advances to a new DP epoch.
+  int64 revision = 2;
+
+  // Creation timestamp (Unix milliseconds)
+  int64 created_unix_ms = 3;
+
+  // =========================================================================
+  // Module Configurations
+  // =========================================================================
+  // Platform routes these blobs to modules without interpretation.
+  // Each module deserializes config_blob according to its own schema.
+  repeated ModuleConfig modules = 4;
+
+  // =========================================================================
+  // Metadata
+  // =========================================================================
+
+  // Description/change notes
+  string description = 7;
+
+  // Author/operator who created this snapshot
+  string author = 8;
+
+  // Parent snapshot (for diff computation)
+  string parent_snapshot_id = 9;
+
+  // Arbitrary labels
+  map<string, string> labels = 10;
+
+  // Content hash for integrity verification
+  string content_hash = 11;
+}
+
+// SnapshotInfo provides summary information for listing.
+message SnapshotInfo {
+  string snapshot_id = 1;
+  int64 revision = 2;
+  int64 created_unix_ms = 3;
+  bool is_active = 4;
+  string description = 6;
+  string author = 7;
+}
+
+// =============================================================================
+// Control Plane RPC Messages
+// =============================================================================
+
+message ListSnapshotsRequest {
+  // Required positive maximum snapshots returned by one bounded response.
+  uint32 page_size = 1;
+
+  // Empty for the first page; otherwise the exact opaque token returned by
+  // the immediately preceding page of the same immutable listing identity.
+  string page_token = 2;
+}
+
+message ListSnapshotsResponse {
+  repeated SnapshotInfo snapshots = 1;
+  kinetum.common.v1.Status status = 2;
+  string next_page_token = 3;
+  uint64 total_count = 4;
+}
+
+message SetConfigSnapshotRequest {
+  ConfigSnapshot snapshot = 1;
+
+  // Required 1..256-byte printable-ASCII identity for durable exact retry.
+  string idempotency_key = 3;
+
+  // Commit-confirmed timeout in milliseconds.
+  // If > 0, the configuration will auto-rollback unless ConfirmConfig is called
+  // within this duration. Set to 0 (default) to disable commit-confirmed mode.
+  // The CP requires an existing active snapshot when this is non-zero because
+  // that snapshot is the rollback target.
+  //
+  // Example: confirm_timeout_ms = 300000 (5 minutes)
+  //   - Config is applied immediately
+  //   - Operator has 5 minutes to call ConfirmConfig
+  //   - If not confirmed, auto-rollback to previous snapshot
+  //
+  uint64 confirm_timeout_ms = 4;
+
+  // Optional CAS (Compare-And-Swap) revision enforced by the CP control loop.
+  // Presence, including an exact value of zero, requires equality with the
+  // current revision and prevents concurrent overwrites.
+  //
+  // Example: expected_revision = 5
+  //   - If current_revision == 5: proceed with mutation
+  //   - If current_revision != 5: fail with revision_mismatch
+  //
+  optional int64 expected_revision = 5;
+}
+
+message SetConfigSnapshotResponse {
+  kinetum.common.v1.Status status = 1;
+  string snapshot_id = 2;
+  int64 revision = 3;
+  uint64 epoch = 4;  // Exact CP-allocated epoch completed by the Data Plane
+}
+
+message GetActiveSnapshotRequest {}
+
+message GetActiveSnapshotResponse {
+  kinetum.common.v1.Status status = 1;
+  ConfigSnapshot snapshot = 2;
+}
+
+message RollbackRequest {
+  // Target snapshot to roll back to
+  string snapshot_id = 1;
+
+  // Selective rollback: only rollback these modules.
+  // If empty, rollback all modules.
+  // If specified, create a hybrid snapshot:
+  //   - Listed modules: use config from target snapshot
+  //   - Other modules: keep current config
+  //
+  // CONSTRAINT: current and target snapshots must have the same module ID set.
+  // ConfigSnapshot carries module config, not the full Gluon plan graph, so the
+  // CP enforces this concrete compatibility check before building the hybrid.
+  repeated string module_ids = 3;
+
+  // Required 1..256-byte printable-ASCII identity. Exact retries resolve from
+  // canonical durable transition state, never a key-only cache.
+  string idempotency_key = 4;
+
+  // Optional exact CAS revision. Presence, including zero, requires equality
+  // with the current active revision.
+  optional int64 expected_revision = 5;
+}
+
+message RollbackResponse {
+  kinetum.common.v1.Status status = 1;
+  string new_snapshot_id = 2;
+  int64 new_revision = 3;
+  uint64 epoch = 4;  // Exact CP-allocated epoch completed by the Data Plane
+}
+
+// =============================================================================
+// Commit-Confirmed Pattern
+// =============================================================================
+
+// ConfirmConfigRequest confirms that a pending configuration is operating correctly.
+// This records one exact terminal confirmation and prevents auto-rollback.
+//
+// The commit-confirmed pattern allows operators to safely apply configurations
+// with automatic rollback protection:
+//   1. Establish an active baseline snapshot
+//   2. Apply config with confirm_timeout_ms set (e.g., 5 minutes)
+//   3. Verify the configuration is working as expected
+//   4. Call ConfirmConfig to make the configuration permanent
+//   5. If ConfirmConfig is not called before timeout, auto-rollback occurs
+message ConfirmConfigRequest {
+  // Exact snapshot ID awaiting confirmation.
+  string snapshot_id = 1;
+
+  // Exact CP-allocated completed epoch.
+  uint64 epoch = 2;
+
+  // Exact active snapshot revision. Presence is required because zero is a
+  // valid revision and must not be confused with omission.
+  optional int64 revision = 3;
+
+  // Required 1..256-byte printable-ASCII retry identity. One accepted
+  // confirmation retains its digest until the next successful allocation.
+  string idempotency_key = 4;
+}
+
+message ConfirmConfigResponse {
+  kinetum.common.v1.Status status = 1;
+
+  // Confirmed snapshot ID
+  string snapshot_id = 2;
+
+  // Positive time remaining captured by the first durable success (ms).
+  // Exact retries return the same value.
+  uint64 time_remaining_ms = 3;
+
+  // Exact confirmed CP-allocated epoch.
+  uint64 epoch = 4;
+
+  // Exact confirmed active snapshot revision. Presence is retained even when
+  // the exact value is zero.
+  optional int64 revision = 5;
+}
+
+// PendingConfirm represents a configuration awaiting operator confirmation.
+// This is persisted to disk to survive CP restarts.
+//
+// CRITICAL: Uses absolute wall-clock deadline (deadline_unix_ms) instead of
+// monotonic time to ensure correct behavior across CP restarts. Monotonic
+// time is process-relative and becomes invalid after restart.
+// While unconfirmed, only a zero-confirmation-timeout transition to the exact
+// rollback target is admissible; a safety rollback cannot arm another timer.
+message PendingConfirm {
+  // Snapshot ID awaiting confirmation
+  string snapshot_id = 1;
+
+  // Exact CP-allocated epoch completed when this snapshot was applied
+  uint64 epoch = 2;
+
+  // Absolute wall-clock deadline for confirmation (Unix milliseconds).
+  // After this deadline, auto-rollback occurs.
+  // Computed as: created_unix_ms + original_timeout_ms
+  //
+  // Wall time survives CP restart. Current time at/after the deadline, or a
+  // backward sample before created_unix_ms, starts the same rollback intent.
+  int64 deadline_unix_ms = 3;
+
+  // Previous snapshot ID to rollback to if not confirmed
+  string rollback_snapshot_id = 4;
+
+  // When this pending confirm was created (Unix milliseconds)
+  int64 created_unix_ms = 5;
+
+  // Original timeout value requested (for logging/audit)
+  uint64 original_timeout_ms = 6;
+
+  // Revision of the snapshot being confirmed
+  // Used for validation in ConfirmConfig to prevent confirming wrong version.
+  int64 revision = 7;
+
+  // Whether this record is the retained terminal confirmation result.
+  bool confirmed = 8;
+
+  // Empty before confirmation and exactly SHA-256 width afterward. The full
+  // caller key never becomes a second durable mutation authority.
+  bytes confirmation_key_digest = 9;
+
+  // Time remaining captured by the first durable confirmation success and
+  // replayed byte-for-byte after an ambiguous response loss.
+  uint64 confirmed_time_remaining_ms = 10;
+}
+
+message ConfigureGuardrailsRequest {
+  // Complete explicit policy; presence distinguishes unconfigured from disabled.
+  GuardrailsPolicy policy = 1;
+  // Required bounded printable retry identity, retained as a durable digest.
+  string idempotency_key = 2;
+  // Exact current durable policy generation, including zero before first
+  // write. Presence is required so omission cannot act as generation zero.
+  optional uint64 expected_policy_generation = 3;
+}
+
+message ConfigureGuardrailsResponse {
+  kinetum.common.v1.Status status = 1;
+  // New or retained exact generation on success; zero on failure.
+  uint64 policy_generation = 2;
+  // Raw SHA-256 of deterministic validated policy bytes on success.
+  bytes policy_hash = 3;
+}
+
+message GetGuardrailsRequest {}
+
+message GetGuardrailsResponse {
+  kinetum.common.v1.Status status = 1;
+  // Present for both enabled and explicitly disabled durable policy.
+  GuardrailsPolicy policy = 2;
+  // Exact durable generation, or zero when policy is unconfigured.
+  uint64 policy_generation = 3;
+  // Raw SHA-256 paired with nonzero generation; absent when unconfigured.
+  bytes policy_hash = 4;
+}
+
+// =============================================================================
+// Statistics and Observability
+// =============================================================================
+
+// StatsRequest selects optional row families from the one shared telemetry
+// contract. Runtime, engine, transition, and protocol-fault summaries are
+// present in every successful response. The selection message itself must be
+// explicitly present; missing or stale unknown-wire input rejects.
+message StatsRequest {
+  kinetum.telemetry.v1.TelemetrySelection selection = 1;
+}
+
+// Exact CP-owned active configuration attached to one successful runtime
+// observation.
+message ActiveStatsConfiguration {
+  int64 revision = 1;
+  string snapshot_id = 2;
+}
+
+// A non-OK status makes both payload messages unavailable. CP validates and
+// forwards the shared RuntimeTelemetry message without rebuilding its fields.
+message StatsResponse {
+  kinetum.common.v1.Status status = 1;
+  ActiveStatsConfiguration active_config = 2;
+  kinetum.telemetry.v1.RuntimeTelemetry telemetry = 3;
+}
+
+// =============================================================================
+// Health and Readiness
+// =============================================================================
+
+message HealthCheckRequest {}
+
+message HealthCheckResponse {
+  enum Status {
+    STATUS_UNSPECIFIED = 0;
+    STATUS_SERVING = 1;
+    STATUS_NOT_SERVING = 2;
+  }
+  Status status = 1;
+  string version = 2;
+  int64 uptime_seconds = 3;
+  // Required diagnostic state, independent of Control Plane serving status.
+  kinetum.common.v1.LoggingStatus logging = 4;
+}
+
+// =============================================================================
+// Control Service Definition
+// =============================================================================
+
+// ControlService is the primary API for control plane operations.
+service ControlService {
+  // Snapshot management
+  rpc SetConfigSnapshot(SetConfigSnapshotRequest) returns (SetConfigSnapshotResponse);
+  rpc ListSnapshots(ListSnapshotsRequest) returns (ListSnapshotsResponse);
+  rpc GetActiveSnapshot(GetActiveSnapshotRequest) returns (GetActiveSnapshotResponse);
+  rpc Rollback(RollbackRequest) returns (RollbackResponse);
+
+  // Commit-confirmed pattern
+  // Confirms a pending configuration, preventing auto-rollback.
+  // Only valid when a config was applied with confirm_timeout_ms > 0.
+  rpc ConfirmConfig(ConfirmConfigRequest) returns (ConfirmConfigResponse);
+
+  // Guardrails
+  rpc ConfigureGuardrails(ConfigureGuardrailsRequest) returns (ConfigureGuardrailsResponse);
+  rpc GetGuardrails(GetGuardrailsRequest) returns (GetGuardrailsResponse);
+
+  // Observability
+  rpc GetStats(StatsRequest) returns (StatsResponse);
+
+  // Health
+  rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
+}

@@ -1,0 +1,15 @@
+// Copyright (c) 2026 Fleming Patel. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Pure configuration contract for storage-domain sharing transitions.
+
+syntax = "proto3";
+
+package kinetum.transition.core.v1;
+
+option cc_enable_arenas = true;
+
+// ZeroCopyShareConfig selects exact zero-copy sharing of one storage domain.
+// Empty is complete policy, not permission to infer access agents or staging;
+// both sides must satisfy the catalog's declared compatibility facts.
+message ZeroCopyShareConfig {}

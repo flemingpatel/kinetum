@@ -1,0 +1,507 @@
+// Copyright (c) 2026 Fleming Patel. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Gluon: Deployment Planning and Region Partitioning
+//
+// The plan contract separates three deterministic planning products:
+//   1. Logical region partitioning
+//   2. Executable stage, worker, and I/O ownership
+//   3. Explicit boundary, runtime-service, and transition-policy ownership
+//
+// Gluon emits logical regions, executable workers/I/O,
+// deterministic cross-worker boundaries, runtime-service placement, and one
+// complete transition policy. Source-worker future-input capacity and every
+// worker's health cadence/budget are explicit plan facts. Runtime capability
+// still depends on complete provider compilation and materialization; schema
+// presence alone never authorizes packet work.
+//
+// The DeploymentPlan is the contract between Gluon (planner) and the
+// dataplane runtime. It encapsulates all placement decisions.
+
+syntax = "proto3";
+
+package kinetum.gluon.v1;
+
+import "kinetum/axiom/v1/axiom.proto";
+import "google/protobuf/any.proto";
+
+option cc_enable_arenas = true;
+
+// PortDirection specifies whether a port is used for RX, TX, or both.
+// Enables asymmetric port configurations (e.g., RX-only ingress port).
+enum PortDirection {
+  PORT_DIRECTION_UNSPECIFIED = 0;
+  PORT_DIRECTION_RX_ONLY = 1;       // Receive only
+  PORT_DIRECTION_TX_ONLY = 2;       // Transmit only
+  PORT_DIRECTION_BIDIRECTIONAL = 3; // Both RX and TX
+}
+
+// IoStreamDirection identifies the executable direction of one stream.
+// Streams are queue/work-ownership facts, so each stream is exactly RX or TX.
+enum IoStreamDirection {
+  IO_STREAM_DIRECTION_UNSPECIFIED = 0;
+  IO_STREAM_DIRECTION_RX = 1;
+  IO_STREAM_DIRECTION_TX = 2;
+}
+
+// TrafficSteeringKind describes how I/O-driver streams receive traffic.
+//
+// Every RX stream references one exact profile. A single-stream port uses an
+// explicit NONE profile; a multi-stream port uses RSS. Profiles are plan facts
+// and must be materialized and live-validated by the exact I/O-driver contract
+// before workers start. Adding another kind requires a complete driver
+// contract and an atomic schema/consumer update.
+enum TrafficSteeringKind {
+  TRAFFIC_STEERING_KIND_UNSPECIFIED = 0;
+  TRAFFIC_STEERING_KIND_NONE = 1;
+  TRAFFIC_STEERING_KIND_RSS = 2;
+}
+
+// ProcessFacilityInstance owns one exact process- or device-scoped native
+// facility configuration. The Any type URL is the provider contract identity.
+message ProcessFacilityInstance {
+  string facility_instance_id = 1;
+  google.protobuf.Any configuration = 2;
+}
+
+// IoDriverInstance owns one exact packet-I/O implementation instance.
+message IoDriverInstance {
+  string io_driver_instance_id = 1;
+  repeated string facility_instance_ids = 2;
+  google.protobuf.Any configuration = 3;
+}
+
+// PacketStorageDomain owns one bounded packet-record and payload population.
+message PacketStorageDomain {
+  string storage_domain_id = 1;
+  repeated string facility_instance_ids = 2;
+  google.protobuf.Any configuration = 3;
+  uint32 buffer_count = 4;
+  uint32 data_room_bytes = 5;
+  uint32 headroom_bytes = 6;
+  uint32 alignment_bytes = 7;
+  optional int32 host_numa_node = 8;
+}
+
+// ExecutionProviderInstance owns one exact stage-execution implementation.
+message ExecutionProviderInstance {
+  string execution_provider_instance_id = 1;
+  repeated string facility_instance_ids = 2;
+  google.protobuf.Any configuration = 3;
+}
+
+// PacketPathEndpoint names one exact endpoint namespace. Stream and stage
+// identities never share an untyped string namespace.
+message PacketPathEndpoint {
+  oneof endpoint {
+    string io_stream_id = 1;
+    string stage_instance_id = 2;
+  }
+}
+
+// StorageTransition owns one exact storage/access change between two directed
+// packet-path endpoints.
+message StorageTransition {
+  string transition_id = 1;
+  PacketPathEndpoint from_endpoint = 2;
+  PacketPathEndpoint to_endpoint = 3;
+  string from_storage_domain_id = 4;
+  string to_storage_domain_id = 5;
+  repeated string facility_instance_ids = 6;
+  google.protobuf.Any configuration = 7;
+  uint32 staging_capacity = 8;
+  optional int32 staging_numa_node = 9;
+}
+
+// PortConfig binds one logical platform port to one exact driver-local port.
+// Provider-specific attachment syntax lives only in the selected driver's
+// typed configuration.
+message PortConfig {
+  // Logical port ID visible to pipeline stages and modules.
+  // This is what packet metadata and kinetum_batch_t input_port/output_port
+  // arrays carry at runtime.
+  // Range: 0 to MAX_LOGICAL_PORTS-1 (typically 0-63).
+  uint32 logical_port_id = 1;
+
+  // Logical port name for human readability and stage configuration.
+  // Must match the typed IoStageConfig.interface on STAGE_KIND_RX/TX.
+  // Examples: "wan0", "lan0"
+  string logical_name = 2;
+
+  // Exact I/O-driver instance that owns the driver-local port.
+  string io_driver_instance_id = 3;
+
+  // Exact driver-local port identity interpreted by that driver's contract.
+  string driver_port_id = 4;
+
+  // Direction constrains which operations are allowed on this port.
+  PortDirection direction = 5;
+
+  // Resolved host NUMA ownership when the fact is known and applicable.
+  // Absence remains unknown/irrelevant and never means node zero.
+  optional int32 host_numa_node = 6;
+
+  // Exact nonzero Maximum Transmission Unit.
+  uint32 mtu = 7;
+
+  // Resolved six-byte MAC address when hardware resolution supplies one.
+  // Empty denotes absence; textual spelling is never plan identity.
+  bytes resolved_mac_address = 8;
+}
+
+// ExecutionLane is a resolved execution grouping for stage instances and I/O
+// streams. A lane is not a region and not a backend queue; it is the plan-level
+// grouping used to keep replicated stages and streams aligned.
+message ExecutionLane {
+  // Stable lane identity. Generated IDs must be deterministic and injective.
+  string lane_id = 1;
+
+  // Compact lane index used by validation and diagnostics.
+  uint32 lane_index = 2;
+
+  // Stage instances assigned to this lane in deterministic order.
+  repeated string stage_instance_ids = 3;
+
+  // I/O streams assigned to this lane in deterministic order.
+  repeated string io_stream_ids = 4;
+}
+
+// WorkerPlacement binds one schedulable runtime worker to an execution lane
+// slice inside a region. CPU affinity belongs here rather than on Region
+// because one region may contain multiple worker lanes.
+message WorkerPlacement {
+  // Stable runtime worker identity.
+  string worker_id = 1;
+
+  // Runtime region containing this worker's lane-local slice.
+  int32 region_id = 2;
+
+  // Execution lane owned by this worker inside the region.
+  string lane_id = 3;
+
+  // Compact worker index used by launch, telemetry, and epoch retirement.
+  uint32 worker_index = 4;
+
+  // Dedicated CPU ownership for this worker. Gluon emits exactly one core;
+  // empty ownership fails runtime host admission.
+  repeated int32 cpu_core_ids = 5;
+
+  // Power-of-two capacity, at least two, of each active/future queue in this
+  // source worker's swappable epoch-staging pair, applied independently to
+  // every exact source storage domain. Non-source workers carry zero and
+  // allocate no future queue. Without epoch_transition_plan, every worker
+  // carries zero and source domains remain active-only.
+  uint32 source_epoch_staging_capacity = 6;
+
+  // Policy-independent monotonic owner-worker observation cadence. Telemetry
+  // publication and the exact owner-worker module-health sweep consume the
+  // same cadence.
+  uint64 module_health_poll_interval_ms = 7;
+
+  // Policy-independent maximum duration of one owner-worker health callback.
+  // It is required with field 7 and enforced from the platform's post-return
+  // monotonic sample; telemetry cadence never reinterprets it as a work budget.
+  uint64 module_health_callback_budget_ns = 8;
+}
+
+// StageInstance binds one logical stage to executable ownership facts.
+message StageInstance {
+  // Stable executable stage-instance identity.
+  string stage_instance_id = 1;
+
+  // Logical stage ID from the authored Axiom pipeline.
+  string logical_stage_id = 2;
+
+  // Execution lane containing this instance.
+  string lane_id = 3;
+
+  // Runtime region that owns this executable instance.
+  int32 region_id = 4;
+
+  // Replica index within the logical stage.
+  uint32 replica_index = 5;
+
+  // Module-manager context identity for mutable per-stage-instance state.
+  string context_instance_id = 6;
+
+  // Exact execution-provider instance for this stage instance.
+  string execution_provider_instance_id = 8;
+
+  // Exact packet-storage domain used for active packet origination. Required
+  // for active stages and empty for passive stages; no default is inferred.
+  string active_origin_storage_domain_id = 9;
+
+  // Exact aggregate capacity for allocations retained for this module
+  // context's lifetime. Required and nonzero for module stages; zero for
+  // platform stages.
+  uint64 context_memory_capacity_bytes = 10;
+
+  // Exact capacity of each epoch arena owned by this module context. Required
+  // and nonzero for module stages; zero for platform stages.
+  uint64 epoch_arena_capacity_bytes = 11;
+}
+
+// TxStorageBinding declares the complete storage set one TX queue may accept.
+// Members are nonempty, unique domain identities, canonically sorted before
+// plan identity is computed. An empty set never means unrestricted storage.
+message TxStorageBinding {
+  repeated string storage_domain_ids = 1;
+}
+
+// IoStream binds one logical port direction to one exact driver queue, owner
+// worker, direction-specific storage contract, and attached stage instance.
+message IoStream {
+  // Stable executable stream identity.
+  string io_stream_id = 1;
+
+  // Logical port ID referenced in plan.ports[].
+  uint32 logical_port_id = 2;
+
+  // Execution lane containing this stream.
+  string lane_id = 3;
+
+  // Executable stream direction.
+  IoStreamDirection direction = 4;
+
+  // Stage instance attached to this stream.
+  string stage_instance_id = 5;
+
+  // Exact traffic-steering profile for RX; empty for TX.
+  string steering_profile_id = 6;
+
+  // Exact queue identity within the owning I/O-driver port.
+  uint32 driver_queue_id = 7;
+
+  // Exact runtime worker identity that owns this stream.
+  string owning_worker_id = 8;
+
+  // Exact descriptor count for this queue and direction.
+  uint32 descriptor_count = 10;
+
+  // The selected arm must match direction. RX allocates from one domain;
+  // TX accepts original records from its complete declared storage set.
+  oneof storage {
+    string rx_storage_domain_id = 11;
+    TxStorageBinding tx_storage = 12;
+  }
+}
+
+// TrafficSteeringProfile is the plan-owned stream steering contract. The
+// selected I/O-driver instance must materialize the exact NONE or RSS profile
+// through its admitted contract or reject the plan.
+message TrafficSteeringProfile {
+  // Stable steering profile identity referenced by IoStream.steering_profile_id
+  // and the selected I/O driver's materialized steering operations.
+  string steering_profile_id = 1;
+
+  // Steering mechanism requested by the plan.
+  TrafficSteeringKind kind = 2;
+
+  // Whether reversing an unchanged flow tuple preserves its RSS selection.
+  // This hardware property does not prove context ownership after a module
+  // changes the tuple. The selected driver must prove the requested property.
+  bool symmetric = 3;
+
+  // Hash or match fields requested by the profile. Field names are exact
+  // steering vocabulary validated by the selected I/O-driver contract.
+  repeated string hash_fields = 4;
+
+  // Exact hash key bytes. RSS profiles require a nonempty authored key; no
+  // driver default or entropy source may complete the plan after lowering.
+  bytes hash_key = 5;
+
+  // Streams governed by this profile in deterministic order.
+  repeated string stream_ids = 6;
+}
+
+// ModuleContextDomain fixes the complete context population sharing one
+// module configuration. The position in the sorted context list is the
+// module-scoped ordinal; its count and every ordinal remain generation-fixed.
+message ModuleContextDomain {
+  string module_id = 1;
+  repeated string context_instance_ids = 2;
+}
+
+// PlanMetadata contains planning context and provenance.
+message PlanMetadata {
+  // Planner version that generated this plan
+  string planner_version = 1;
+
+  // Planning timestamp (Unix milliseconds)
+  int64 planned_unix_ms = 2;
+
+  // Exact planning algorithm used.
+  string algorithm = 3;
+
+  // Planning duration in milliseconds
+  int64 planning_duration_ms = 4;
+}
+
+// Region represents a logical partition assigned to one execution unit. The
+// executable graph is StageInstance; logical_stage_ids is partition provenance
+// used by lowering and admission.
+message Region {
+  // Unique region identifier (0-based, contiguous)
+  int32 region_id = 1;
+
+  // Logical stages assigned to this region in canonical Axiom topological order.
+  repeated string logical_stage_ids = 2;
+
+  // Derived provenance: union of worker_placements[] cores in this region.
+  // Runtime affinity truth lives in WorkerPlacement.cpu_core_ids.
+  repeated int32 cpu_core_ids = 3;
+
+  // NUMA node for memory allocation (mempolicy)
+  int32 numa_node = 4;
+
+}
+
+// BoundaryPlacement is one executable worker-to-worker packet boundary.
+// Logical region provenance is insufficient: each boundary names exact stage
+// instances and their sole sender/receiver workers.
+message BoundaryPlacement {
+  // Stable deterministic boundary identity.
+  string boundary_id = 1;
+
+  // Source executable stage instance.
+  string from_stage_instance_id = 2;
+
+  // Destination executable stage instance.
+  string to_stage_instance_id = 3;
+
+  // Worker with sole DATA/CUT producer ownership.
+  string sender_worker_id = 4;
+
+  // Worker with sole DATA/CUT consumer and ACK producer ownership.
+  string receiver_worker_id = 5;
+
+  // Power-of-two capacity, at least two, of the cross-worker DATA ring.
+  uint32 data_ring_capacity = 6;
+
+  // Power-of-two capacity, at least two, of the sender-owned future-output hold queue.
+  uint32 future_output_hold_capacity = 7;
+
+  // Explicit NUMA node on which the DATA ring is allocated.
+  int32 data_ring_numa_node = 8;
+}
+
+// RuntimeServiceKind identifies a provider-neutral control service placed by
+// the deployment plan outside the packet-worker core set.
+enum RuntimeServiceKind {
+  RUNTIME_SERVICE_KIND_UNSPECIFIED = 0;
+  RUNTIME_SERVICE_KIND_EPOCH_TRANSITION_COORDINATOR = 1;
+  RUNTIME_SERVICE_KIND_CONFIG_LIFECYCLE_EXECUTOR = 2;
+}
+
+// RuntimeServicePlacement binds one provider-neutral control service to explicit
+// CPU and NUMA ownership.
+message RuntimeServicePlacement {
+  // Stable deterministic service identity.
+  string service_id = 1;
+
+  // Service role implemented by this placement.
+  RuntimeServiceKind service_kind = 2;
+
+  // Dedicated CPU core selected for this service.
+  int32 cpu_core_id = 3;
+
+  // NUMA node used for service-local state and lifecycle work.
+  int32 numa_node = 4;
+
+  // Construction-time command-mailbox capacity. The coordinator requires a
+  // nonzero power of two; lifecycle executors require zero.
+  uint32 command_mailbox_capacity = 5;
+}
+
+// EpochTransitionPlan owns bounded global-transition policy. Absence means the
+// deployment is fixed-epoch and live configuration transitions are rejected.
+message EpochTransitionPlan {
+  // RuntimeServicePlacement that owns the serialized transition generation.
+  string coordinator_service_id = 1;
+
+  // NUMA-local lifecycle executors eligible for prepare and retire work.
+  repeated string lifecycle_executor_service_ids = 2;
+
+  // Maximum cold preparation duration before cooperative cancellation.
+  uint64 prepare_timeout_ms = 3;
+
+  // Grace allowed for a canceled prepare callback to return.
+  uint64 prepare_cancel_grace_ms = 4;
+
+  // Maximum PREPARED lease before an uncommitted transaction aborts.
+  uint64 prepared_lease_timeout_ms = 5;
+
+  // Maximum completion-only ordered-cut commit duration.
+  uint64 commit_timeout_ms = 6;
+
+  // Maximum wait before retirement freezes later transitions with old state
+  // retained; elapsed time never authorizes reclamation.
+  uint64 retirement_timeout_ms = 7;
+
+  // Fixed terminal-result journal capacity. Admission constrains this to 1..64.
+  uint32 result_history_capacity = 8;
+}
+
+// DeploymentPlan is the complete specification for executing a pipeline.
+// Generated by Gluon, consumed by the dataplane runtime.
+message DeploymentPlan {
+  // Unique plan identifier (deterministic hash of inputs)
+  string plan_id = 1;
+
+  // The pipeline being deployed (embedded to prevent drift)
+  kinetum.axiom.v1.Pipeline pipeline = 2;
+
+  // Execution regions with stage assignments
+  repeated Region regions = 3;
+
+  // Explicit executable worker-to-worker boundaries.
+  repeated BoundaryPlacement boundaries = 4;
+
+  // Bounded ordered-cut transition policy. Absent means fixed-epoch.
+  EpochTransitionPlan epoch_transition_plan = 5;
+
+  // Planning metadata and provenance
+  PlanMetadata metadata = 6;
+
+  // Exact process-facility instances.
+  repeated ProcessFacilityInstance process_facility_instances = 7;
+
+  // Exact packet-I/O driver instances.
+  repeated IoDriverInstance io_driver_instances = 8;
+
+  // Exact bounded packet-storage domains.
+  repeated PacketStorageDomain packet_storage_domains = 9;
+
+  // Exact stage-execution provider instances.
+  repeated ExecutionProviderInstance execution_provider_instances = 10;
+
+  // Exact storage/access transitions on directed packet-path endpoints.
+  repeated StorageTransition storage_transitions = 11;
+
+  // Exact logical-to-driver-port bindings.
+  repeated PortConfig ports = 12;
+
+  // Resolved execution lanes.
+  repeated ExecutionLane execution_lanes = 13;
+
+  // Resolved executable stage instances.
+  repeated StageInstance stage_instances = 14;
+
+  // Resolved executable I/O streams.
+  repeated IoStream io_streams = 15;
+
+  // Resolved traffic-steering profiles.
+  repeated TrafficSteeringProfile traffic_steering_profiles = 16;
+
+  // Resolved runtime worker placement.
+  repeated WorkerPlacement worker_placements = 18;
+
+  // SHA-256 hash of the plan for integrity verification
+  string content_hash = 19;
+
+  // Explicit provider-neutral control-service placement.
+  repeated RuntimeServicePlacement runtime_service_placements = 20;
+
+  // Exact module configuration identities and sorted context populations.
+  repeated ModuleContextDomain module_context_domains = 21;
+}

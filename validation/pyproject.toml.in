@@ -1,0 +1,18 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "kinetum-validation"
+version = "@KINETUM_VERSION@"
+description = "Private Kinetum physical-I/O validation and benchmark harness"
+requires-python = ">=3.12"
+readme = "kinetum_validation/data/README.md"
+license = "Apache-2.0"
+license-files = ["kinetum_validation/data/LICENSE"]
+dependencies = ["matplotlib>=3.8.3"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["kinetum_validation", "kinetum_benchmark"]
+
+[tool.hatch.build.targets.wheel.hooks.custom]

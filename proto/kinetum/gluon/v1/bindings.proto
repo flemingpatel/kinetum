@@ -1,0 +1,151 @@
+// Copyright (c) 2026 Fleming Patel. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Deployment Bindings: Exact Provider and Packet-Path Deployment Intent
+//
+// This module binds authored pipeline identities to exact provider instances,
+// driver ports/queues, storage domains, execution providers, and storage
+// transitions. Provider-specific attachment syntax lives only in the typed
+// provider configurations reused from the final plan schema.
+//
+// Design Philosophy (per PLATFORM_ENGINEERING_GUIDE.md):
+//   - hardware.proto = physical facts (what EXISTS)
+//   - bindings.proto = exact deployment intent (what we WANT)
+//   - plan provider graph = resolved runtime truth
+//
+// This separation ensures:
+//   - Hardware inventory stays stable across deployments
+//   - Bindings are environment-specific (dev/staging/prod can differ)
+//   - Same pipeline can deploy on different hardware via different bindings
+//   - No provider, queue, storage, or execution default is inferred
+
+syntax = "proto3";
+
+package kinetum.gluon.v1;
+
+import "kinetum/gluon/v1/plan.proto";
+import "google/protobuf/any.proto";
+
+option cc_enable_arenas = true;
+
+// LogicalPortBinding maps one pipeline interface to one exact driver-local
+// port. The selected IoDriverInstance.configuration owns attachment data.
+message LogicalPortBinding {
+  string logical_name = 1;
+  string io_driver_instance_id = 2;
+  string driver_port_id = 3;
+  PortDirection direction = 4;
+  optional int32 host_numa_node = 5;
+
+  // Exact nonzero MTU; no hardware/default completion occurs after authoring.
+  uint32 mtu = 6;
+}
+
+// DriverQueueBinding declares one exact queue, descriptor count, and storage
+// contract. The selected storage arm must match its enclosing I/O direction.
+message DriverQueueBinding {
+  uint32 driver_queue_id = 1;
+  uint32 descriptor_count = 2;
+  oneof storage {
+    string rx_storage_domain_id = 3;
+    TxStorageBinding tx_storage = 4;
+  }
+}
+
+// TrafficSteeringBinding declares the exact steering contract for one stream
+// binding. RSS requires a nonempty deterministic key.
+message TrafficSteeringBinding {
+  TrafficSteeringKind kind = 1;
+  bool symmetric = 2;
+  repeated string hash_fields = 3;
+  bytes hash_key = 4;
+}
+
+// IoStreamBinding explicitly requests every queue for one logical port
+// direction. Single-queue deployments carry queue zero rather than relying on
+// an omitted-means-one rule.
+message IoStreamBinding {
+  string logical_name = 1;
+  IoStreamDirection direction = 2;
+  repeated DriverQueueBinding queues = 3;
+  TrafficSteeringBinding steering = 5;
+}
+
+// StageExecutionBinding maps every logical stage to one exact execution
+// provider. CPU is explicit and never an omitted default.
+message StageExecutionBinding {
+  string logical_stage_id = 1;
+  string execution_provider_instance_id = 2;
+}
+
+// ActiveOriginBinding assigns one exact packet-storage domain to one
+// lane-local active stage origin. Passive stages carry no such binding.
+message ActiveOriginBinding {
+  string logical_stage_id = 1;
+  string lane_id = 2;
+  string storage_domain_id = 3;
+}
+
+// ModuleContextResourceBinding assigns exact lifecycle-memory bounds to one
+// lane-local module context. Both capacities are required and nonzero; absent
+// proto3 values never select a runtime default.
+message ModuleContextResourceBinding {
+  string logical_stage_id = 1;
+  string lane_id = 2;
+  uint64 context_memory_capacity_bytes = 3;
+  uint64 epoch_arena_capacity_bytes = 4;
+}
+
+// LogicalIoEndpoint identifies an authored I/O endpoint before Gluon resolves
+// it to the final deterministic io_stream_id.
+message LogicalIoEndpoint {
+  string logical_name = 1;
+  IoStreamDirection direction = 2;
+  uint32 driver_queue_id = 3;
+}
+
+// LogicalStageEndpoint identifies an authored stage endpoint before Gluon
+// resolves it to the final stage_instance_id.
+message LogicalStageEndpoint {
+  string logical_stage_id = 1;
+  string lane_id = 2;
+}
+
+// LogicalPacketPathEndpoint keeps stream and stage identities in distinct
+// namespaces during deterministic lowering.
+message LogicalPacketPathEndpoint {
+  oneof endpoint {
+    LogicalIoEndpoint io = 1;
+    LogicalStageEndpoint stage = 2;
+  }
+}
+
+// StorageTransitionBinding declares one exact transition while retaining
+// logical endpoint references for deterministic lowering.
+message StorageTransitionBinding {
+  string transition_id = 1;
+  LogicalPacketPathEndpoint from_endpoint = 2;
+  LogicalPacketPathEndpoint to_endpoint = 3;
+  string from_storage_domain_id = 4;
+  string to_storage_domain_id = 5;
+  repeated string facility_instance_ids = 6;
+  google.protobuf.Any configuration = 7;
+  uint32 staging_capacity = 8;
+  optional int32 staging_numa_node = 9;
+}
+
+// DeploymentBindings is the complete exact deployment-intent input to Gluon.
+// The first four arrays reuse final plan records so provider configuration has
+// one schema authority.
+message DeploymentBindings {
+  repeated ProcessFacilityInstance process_facility_instances = 1;
+  repeated IoDriverInstance io_driver_instances = 2;
+  repeated PacketStorageDomain packet_storage_domains = 3;
+  repeated ExecutionProviderInstance execution_provider_instances = 4;
+  repeated LogicalPortBinding logical_port_bindings = 5;
+  repeated IoStreamBinding io_stream_bindings = 6;
+  repeated StageExecutionBinding stage_execution_bindings = 7;
+  repeated StorageTransitionBinding storage_transition_bindings = 8;
+  repeated ActiveOriginBinding active_origin_bindings = 9;
+  repeated ModuleContextResourceBinding module_context_resource_bindings = 10;
+}

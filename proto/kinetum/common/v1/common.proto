@@ -1,0 +1,92 @@
+// Copyright (c) 2026 Fleming Patel. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Common application and logging observations shared across Kinetum APIs.
+
+syntax = "proto3";
+
+package kinetum.common.v1;
+
+option cc_enable_arenas = true;
+
+// Standard error codes aligned with gRPC canonical codes.
+// These provide consistent error semantics across all Kinetum APIs.
+enum ErrorCode {
+  ERROR_CODE_UNSPECIFIED = 0;
+  ERROR_CODE_OK = 1;
+  ERROR_CODE_CANCELLED = 2;
+  ERROR_CODE_UNKNOWN = 3;
+  ERROR_CODE_INVALID_ARGUMENT = 4;
+  ERROR_CODE_DEADLINE_EXCEEDED = 5;
+  ERROR_CODE_NOT_FOUND = 6;
+  ERROR_CODE_ALREADY_EXISTS = 7;
+  ERROR_CODE_PERMISSION_DENIED = 8;
+  ERROR_CODE_RESOURCE_EXHAUSTED = 9;
+  ERROR_CODE_FAILED_PRECONDITION = 10;
+  ERROR_CODE_ABORTED = 11;
+  ERROR_CODE_OUT_OF_RANGE = 12;
+  ERROR_CODE_UNIMPLEMENTED = 13;
+  ERROR_CODE_INTERNAL = 14;
+  ERROR_CODE_UNAVAILABLE = 15;
+  ERROR_CODE_DATA_LOSS = 16;
+  ERROR_CODE_UNAUTHENTICATED = 17;
+}
+
+// Status represents the application-level outcome of an API operation.
+// It is carried inside unary RPC responses in addition to grpc::Status.
+//
+// Design principles:
+//   - success is exactly code=0, ERROR_CODE_OK, and empty diagnostics
+//   - every nonzero code has one exact semantic error classification
+//   - message is the primary human-readable diagnostic
+//   - details is optional supplemental diagnostic text
+//   - neither text field selects retry, reconciliation, or policy behavior
+message Status {
+  // Numeric code: 0=OK, nonzero=error.
+  // CP and DP populate this field as the primary application status
+  // indicator.
+  int32 code = 1;
+
+  // Required semantic error classification paired with code at exact service
+  // boundaries, including ERROR_CODE_OK on success. The enum number is not
+  // the numeric code.
+  ErrorCode error_code = 2;
+
+  // Human-readable primary error message.
+  string message = 3;
+
+  // Optional human-readable supplemental diagnostic. Consumers must not parse
+  // this text to select behavior; typed status and response fields own that.
+  string details = 4;
+
+}
+
+// Process-owned diagnostic delivery observations. These fields never determine
+// serving readiness, packet admission, configuration outcome, or restart policy.
+// Every counter requires presence, including measured zero. Counters are read
+// independently while emitters run; their live values are not a conservation
+// equation. Filtered records are not rejected records.
+message LoggingStatus {
+  enum DestinationState {
+    DESTINATION_STATE_UNSPECIFIED = 0;
+    DESTINATION_STATE_AVAILABLE = 1;
+    DESTINATION_STATE_UNAVAILABLE = 2;
+    DESTINATION_STATE_CLOSED = 3;
+  }
+  DestinationState destination = 1;
+  optional uint64 accepted_records = 2;
+  optional uint64 queue_rejections = 3;
+  optional uint64 format_rejections = 4;
+  optional uint64 unavailable_rejections = 5;
+  optional uint64 undelivered_records = 6;
+  optional uint64 write_failures = 7;
+  optional uint64 console_failures = 8;
+  optional uint64 truncated_records = 9;
+  // First cause of the current outage, at most 255 printable ASCII bytes.
+  // Required when unavailable; empty after successful reopen.
+  string failure = 10;
+  // Packet-owner hooks reject before formatting, queueing, locking, or I/O.
+  optional uint64 packet_thread_rejections = 11;
+  // A timed-out file wait does not prove loss: the writer may complete later.
+  optional uint64 delivery_timeouts = 12;
+}

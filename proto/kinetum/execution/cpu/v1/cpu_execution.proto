@@ -1,0 +1,15 @@
+// Copyright (c) 2026 Fleming Patel. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Pure configuration contract for CPU packet execution.
+
+syntax = "proto3";
+
+package kinetum.execution.cpu.v1;
+
+option cc_enable_arenas = true;
+
+// CpuExecutionConfig selects the one exact current CPU-execution policy. Empty
+// is complete policy; worker identity, cores, NUMA, and module placement are
+// compiled plan facts and are never inferred from this payload.
+message CpuExecutionConfig {}

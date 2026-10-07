@@ -1,0 +1,142 @@
+# Fan-In Edge Gateway Pipeline
+#
+# Multi-ingress edge gateway pipeline:
+# - Each ingress worker owns RX, parsing, and its ACL context
+# - NAT is the join point; its selector chooses the exact session owner
+# - Exact BoundaryPlacement ownership derives from executable stage instances
+#   and workers; logical region IDs alone never authorize a boundary
+#
+# During an ordered transition, each NAT worker drains all its inbound DATA cuts
+# and retires local old work before activating and acknowledging either input.
+#
+# The preferred-region pins are load-bearing:
+#   rx0 -> parse0 -> acl0 @ region 0
+#   rx1 -> parse1 -> acl1 @ region 1
+#   nat -> qos -> tx @ region 2
+#
+# Executable boundary IDs and owners derive from stage-instance and worker IDs,
+# not region-pair naming or a join-marker switch.
+#
+# Flow:
+#   wan0 -> rx0 -> parse0 -> acl0 \
+#                                 -> NAT -> QoS -> lan0 (tx, r2)
+#   wan1 -> rx1 -> parse1 -> acl1 /
+#
+# Uses the built-in ACL, NAT44, and QoS modules.
+
+pipeline_id: "fan_in_edge_gateway_v1"
+allow_dag: true  # Pipeline has fan-in (acl0 + acl1 -> nat)
+
+metadata {
+  display_name: "Fan-In Edge Gateway"
+  description: "Multi-ingress gateway with join-safe epoch advancement"
+  author: "Kinetum Platform"
+  version: "0.1.0"
+}
+
+# ============================================================================
+# Multi-Ingress RX Stages (Separate Regions Required for Join Gating)
+# ============================================================================
+
+stages {
+  stage_id: "rx0"
+  kind: STAGE_KIND_RX
+  execution_mode: EXECUTION_MODE_PASSIVE
+  io { interface: "wan0" }
+  preferred_region: 0
+  description: "Ingress from WAN port 0 (region 0)"
+}
+
+stages {
+  stage_id: "rx1"
+  kind: STAGE_KIND_RX
+  execution_mode: EXECUTION_MODE_PASSIVE
+  io { interface: "wan1" }
+  preferred_region: 1
+  description: "Ingress from WAN port 1 (region 1)"
+}
+
+# ============================================================================
+# Ingress Parsing and ACL (One Chain Per Ingress Worker)
+# ============================================================================
+
+stages {
+  stage_id: "parse0"
+  kind: STAGE_KIND_PARSE_IPV4
+  execution_mode: EXECUTION_MODE_PASSIVE
+  preferred_region: 0
+  description: "Parse IPv4 headers from wan0"
+}
+
+stages {
+  stage_id: "parse1"
+  kind: STAGE_KIND_PARSE_IPV4
+  execution_mode: EXECUTION_MODE_PASSIVE
+  preferred_region: 1
+  description: "Parse IPv4 headers from wan1"
+}
+
+stages {
+  stage_id: "acl0"
+  kind: STAGE_KIND_MODULE
+  execution_mode: EXECUTION_MODE_PASSIVE
+  module { module_id: "kinetum.acl" context_selection: MODULE_CONTEXT_SELECTION_SAME_LANE }
+  preferred_region: 0
+  description: "Firewall for wan0 ingress"
+}
+
+stages {
+  stage_id: "acl1"
+  kind: STAGE_KIND_MODULE
+  execution_mode: EXECUTION_MODE_PASSIVE
+  module { module_id: "kinetum.acl" context_selection: MODULE_CONTEXT_SELECTION_SAME_LANE }
+  preferred_region: 1
+  description: "Firewall for wan1 ingress"
+}
+
+# ============================================================================
+# NAT Ownership, QoS, and TX (Region 2)
+# ============================================================================
+
+stages {
+  stage_id: "nat"
+  kind: STAGE_KIND_MODULE
+  execution_mode: EXECUTION_MODE_PASSIVE
+  module { module_id: "kinetum.nat44" context_selection: MODULE_CONTEXT_SELECTION_MODULE }
+  preferred_region: 2
+  description: "Stateful IPv4 address and port translation"
+}
+
+stages {
+  stage_id: "qos"
+  kind: STAGE_KIND_MODULE
+  execution_mode: EXECUTION_MODE_PASSIVE
+  module { module_id: "kinetum.qos" context_selection: MODULE_CONTEXT_SELECTION_SAME_LANE }
+  preferred_region: 2
+  description: "Per-flow rate limiting"
+}
+
+stages {
+  stage_id: "tx"
+  kind: STAGE_KIND_TX
+  execution_mode: EXECUTION_MODE_PASSIVE
+  io { interface: "lan0" }
+  preferred_region: 2
+  description: "Egress to LAN interface"
+}
+
+# ============================================================================
+# Edge Definitions (Fan-In DAG)
+# ============================================================================
+
+# Ingress work remains with its RX worker.
+edges { from_stage_id: "rx0" to_stage_id: "parse0" mode: EDGE_MODE_PUSH }
+edges { from_stage_id: "rx1" to_stage_id: "parse1" mode: EDGE_MODE_PUSH }
+edges { from_stage_id: "parse0" to_stage_id: "acl0" mode: EDGE_MODE_PUSH }
+edges { from_stage_id: "parse1" to_stage_id: "acl1" mode: EDGE_MODE_PUSH }
+
+# Every ingress context can reach every permitted NAT owner.
+edges { from_stage_id: "acl0" to_stage_id: "nat" mode: EDGE_MODE_PUSH }
+edges { from_stage_id: "acl1" to_stage_id: "nat" mode: EDGE_MODE_PUSH }
+edges { from_stage_id: "nat" to_stage_id: "qos" mode: EDGE_MODE_PUSH }
+edges { from_stage_id: "qos" to_stage_id: "tx" mode: EDGE_MODE_PUSH }

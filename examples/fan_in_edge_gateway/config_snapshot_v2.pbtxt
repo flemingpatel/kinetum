@@ -1,0 +1,49 @@
+# Fan-In Edge Gateway Configuration Snapshot - Version 2
+#
+# This version changes all three module policies for transition and selective
+# rollback validation:
+#   - ACL: TCP/22 deny followed by permit remainder, default deny
+#   - NAT44: timeout=600s (v1 was 300s)
+#   - QoS: DSCP 20 and 500 KiB burst (v1 used DSCP 10 and 1000 KiB)
+#     Both versions retain a 10 Gbps per-flow rate.
+#
+# The same topology and modules as v1, with changed module configuration so
+# epoch, commit-confirmed, and rollback validation exercise a real transition.
+# Each config_blob remains the exact strict-JSON module-policy authority.
+
+snapshot_id: "fan_in_edge_gw_baseline_v2"
+revision: 2
+description: "Fan-in edge-processing v2 - stricter ACL, longer NAT timeout, updated QoS marking and burst"
+
+# =============================================================================
+# ACL Module Configuration - Changed from v1
+# =============================================================================
+
+modules {
+  module_id: "kinetum.acl"
+  revision: 2
+  content_type: "application/json"
+  config_blob: "{ \"default_action\": 2, \"rules\": [ { \"priority\": 2000, \"src_cidr\": \"0.0.0.0/0\", \"dst_cidr\": \"0.0.0.0/0\", \"dst_port_min\": 22, \"dst_port_max\": 22, \"protocol\": 6, \"action\": 2, \"enabled\": true }, { \"priority\": 1000, \"src_cidr\": \"0.0.0.0/0\", \"dst_cidr\": \"0.0.0.0/0\", \"action\": 1, \"enabled\": true } ] }"
+}
+
+# =============================================================================
+# NAT44 Module Configuration - Changed from v1
+# =============================================================================
+
+modules {
+  module_id: "kinetum.nat44"
+  revision: 2
+  content_type: "application/json"
+  config_blob: "{ \"session_timeout_s\": 600, \"pools\": [ { \"public_ip_ranges\": [\"192.0.2.1-192.0.2.10\"], \"port_min\": 10000, \"port_max\": 60000 } ] }"
+}
+
+# =============================================================================
+# QoS Module Configuration - Changed from v1
+# =============================================================================
+
+modules {
+  module_id: "kinetum.qos"
+  revision: 2
+  content_type: "application/json"
+  config_blob: "{ \"default_profile\": \"standard\", \"profiles\": [ { \"name\": \"standard\", \"cir_kbps\": 10000000, \"cbs_kb\": 500, \"conform_dscp\": 20 } ] }"
+}

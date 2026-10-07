@@ -1,0 +1,81 @@
+# Kinetum Runtime @KINETUM_VERSION@
+
+Runtime artifacts for the Kinetum Platform.
+
+## Installation
+
+The versioned release page supplies a complete command for each architecture.
+Choose the x86-64 or AArch64 runtime entry explicitly. In this x86-64 example,
+`RELEASE_URL` denotes the versioned HTTPS asset directory from that page:
+
+```bash
+set -o pipefail
+curl -fsSL "$RELEASE_URL/kinetum-runtime-@KINETUM_VERSION@-x86_64.install.sh" | sudo /bin/sh
+```
+
+The AArch64 entry is `kinetum-runtime-@KINETUM_VERSION@-aarch64.install.sh`.
+Each entry is bound to one archive and rejects a different host architecture.
+It verifies the archive against the entry's embedded SHA-256 and invokes the native
+installer carried by that archive. There is no
+manual checksum or unpacking step. Ubuntu 24.04 and its runtime libraries are
+required; online setup installs those libraries through APT.
+
+Public-release CPU requirements are the Core i7/Nehalem instruction-set
+baseline on x86-64 and Armv8-A with CRC on AArch64. A locally built native
+package may require additional features of its build machine. The architecture
+check and integrity verification do not convert those compiled requirements.
+
+The same `.install.sh` is produced for a locally built package. To install
+local files, including on an offline host, place it beside its matching
+`.tar.gz`. With the system prerequisites already installed, run from that
+directory on x86-64:
+
+```bash
+sudo /bin/sh ./kinetum-runtime-@KINETUM_VERSION@-x86_64.install.sh --offline-directory "$PWD"
+```
+
+This mode skips downloads and APT installation. An installer produced without
+a publication URL requires `--offline-directory`; it never invents an address
+or chooses a local archive implicitly.
+
+The default prefix is `/opt/kinetum`; `--prefix /absolute/path` selects another
+protected prefix. Runtime installation requires root. It verifies the full
+payload before replacement, preserves `sdk/` and `dependencies/`, and checks
+the installed result. A failed replacement restores prior entries; an
+incomplete restoration reports the original failure and recovery state and
+retains the recovery tree. Stop services before replacement: installation does not
+coordinate a live runtime or start any service. An interrupted runtime
+replacement can be unavailable and must be retried before service startup.
+
+Only runtime and SDK are public products. Internal validation kits live outside
+the installation prefix. Build-only dependencies remain outside the runtime
+payload and are never runtime inputs.
+
+The release channel authenticates delivery. SHA-256 provides integrity under
+that channel; it is not a second publisher signature.
+
+## Runtime closure
+
+The package contains the runtime executables, the ACL, NAT44,
+and QoS built-in module images, and the exact host and DPDK provider components.
+The signed installed-provider inventory authenticates `kinetum_dp` and that
+provider closure. The payload manifest defines exact runtime membership and
+hashes every other installed runtime artifact, including the inventory,
+signature, native-admission receipt, and release metadata. Its own required
+path and grammar are verified independently; it does not expand the inventory
+signature's trust claim.
+
+`kinetum_pack` creates configuration-and-module deployment bundles. It does not
+redistribute runtime executables or provider artifacts.
+
+Apache-2.0 terms and the Kinetum notice are installed at the package root.
+Runtime-specific third-party notices are in `THIRD_PARTY_NOTICES.md`; exact
+DPDK license material is under `share/licenses/KinetumDPDK/dpdk/`, and exact
+static-closure attribution is in
+`share/licenses/KinetumDPDK/DPDK_STATIC_CLOSURE_NOTICE.txt`.
+
+## Verification
+
+```bash
+/opt/kinetum/bin/kinetum-info --check
+```

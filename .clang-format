@@ -1,0 +1,125 @@
+# Kinetum Platform clang-format configuration
+# Based on Linux kernel style, adapted for modern C++.
+#
+# Apply with: clang-format -i <file>
+# Check with:  clang-format --dry-run --Werror <file>
+#
+# See: docs/CODING_GUIDELINES.md
+---
+Language: Cpp
+
+# --- Indentation (kernel style: tabs, 8-wide) ---
+IndentWidth: 8
+TabWidth: 8
+UseTab: Always
+ContinuationIndentWidth: 8
+ConstructorInitializerIndentWidth: 8
+AccessModifierOffset: -4
+IndentCaseLabels: false
+IndentGotoLabels: false
+IndentPPDirectives: None
+IndentWrappedFunctionNames: false
+NamespaceIndentation: None
+
+# --- Column limit (120 to accommodate 8-wide tabs in C++) ---
+ColumnLimit: 120
+
+# --- Braces (K&R for control, own line for functions) ---
+BreakBeforeBraces: Custom
+BraceWrapping:
+  AfterClass: false
+  AfterControlStatement: false
+  AfterEnum: false
+  AfterFunction: true
+  AfterNamespace: true
+  AfterStruct: false
+  AfterUnion: false
+  AfterExternBlock: false
+  BeforeCatch: false
+  BeforeElse: false
+  IndentBraces: false
+  SplitEmptyFunction: true
+  SplitEmptyRecord: true
+  SplitEmptyNamespace: true
+
+# --- Alignment ---
+AlignAfterOpenBracket: Align
+AlignConsecutiveAssignments: false
+AlignConsecutiveDeclarations: false
+AlignEscapedNewlines: Left
+AlignOperands: true
+AlignTrailingComments: true
+
+# --- Line breaks ---
+AllowAllParametersOfDeclarationOnNextLine: false
+AllowShortBlocksOnASingleLine: false
+AllowShortCaseLabelsOnASingleLine: false
+AllowShortFunctionsOnASingleLine: None
+AllowShortIfStatementsOnASingleLine: false
+AllowShortLoopsOnASingleLine: false
+AlwaysBreakAfterDefinitionReturnType: None
+AlwaysBreakAfterReturnType: None
+AlwaysBreakBeforeMultilineStrings: false
+AlwaysBreakTemplateDeclarations: true
+
+# --- Arguments and parameters ---
+BinPackArguments: true
+BinPackParameters: true
+
+# --- Operators and initializers ---
+BreakBeforeBinaryOperators: None
+BreakBeforeInheritanceComma: false
+BreakBeforeTernaryOperators: false
+BreakConstructorInitializersBeforeComma: false
+BreakConstructorInitializers: BeforeComma
+BreakStringLiterals: false
+
+# --- Includes ---
+IncludeBlocks: Preserve
+SortIncludes: false
+SortUsingDeclarations: false
+
+# --- Spacing ---
+SpaceAfterCStyleCast: false
+SpaceAfterTemplateKeyword: true
+SpaceBeforeAssignmentOperators: true
+SpaceBeforeCtorInitializerColon: true
+SpaceBeforeInheritanceColon: true
+SpaceBeforeParens: ControlStatements
+SpaceBeforeRangeBasedForLoopColon: true
+SpaceInEmptyParentheses: false
+SpacesBeforeTrailingComments: 2
+SpacesInAngles: false
+SpacesInContainerLiterals: false
+SpacesInCStyleCastParentheses: false
+SpacesInParentheses: false
+SpacesInSquareBrackets: false
+
+# --- Pointer alignment ---
+# type *name (kernel/C convention)
+PointerAlignment: Right
+DerivePointerAlignment: false
+
+# --- Comments ---
+ReflowComments: false
+FixNamespaceComments: true
+CommentPragmas: '^ IWYU pragma:'
+
+# --- Misc ---
+CompactNamespaces: false
+Cpp11BracedListStyle: true
+DisableFormat: false
+ExperimentalAutoDetectBinPacking: false
+KeepEmptyLinesAtTheStartOfBlocks: false
+MaxEmptyLinesToKeep: 1
+Standard: c++20
+
+# --- Penalties ---
+PenaltyBreakAssignment: 10
+PenaltyBreakBeforeFirstCallParameter: 30
+PenaltyBreakComment: 10
+PenaltyBreakFirstLessLess: 0
+PenaltyBreakString: 10
+PenaltyExcessCharacter: 100
+PenaltyReturnTypeOnItsOwnLine: 60
+...

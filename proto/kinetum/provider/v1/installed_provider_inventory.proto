@@ -1,0 +1,47 @@
+// Copyright (c) 2026 Fleming Patel. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Canonical signed inventory for one exact installed provider release.
+
+syntax = "proto3";
+
+package kinetum.provider.v1;
+
+option cc_enable_arenas = true;
+
+// PrivateProviderArtifact identifies one redistributable dependency preloaded
+// from a held descriptor before its owning component. file_name and soname are
+// exact basename identities. needed_sonames is a sorted unique set.
+message PrivateProviderArtifact {
+  string file_name = 1;
+  string soname = 2;
+  bytes sha256 = 3;
+  uint64 size_bytes = 4;
+  repeated string needed_sonames = 5;
+}
+
+// ProviderComponentArtifact binds one exact component image to its immutable
+// descriptor claims and complete direct ELF dependency declaration.
+// contract_type_urls and needed_sonames are sorted unique sets. Paths are never
+// stored: fixed installation layout plus file_name is the sole path authority.
+message ProviderComponentArtifact {
+  string component_id = 1;
+  string file_name = 2;
+  bytes sha256 = 3;
+  uint64 size_bytes = 4;
+  repeated string contract_type_urls = 5;
+  repeated string needed_sonames = 6;
+}
+
+// InstalledProviderInventory is the canonical release-signed artifact
+// authority beneath one fixed Kinetum installation root. The detached
+// Ed25519 signature covers the fixed versioned provider-inventory domain
+// prefix followed by these exact deterministic serialized bytes.
+message InstalledProviderInventory {
+  string product_version = 1;
+  bytes provider_abi_identity = 2;
+  bytes runtime_sha256 = 3;
+  uint64 runtime_size_bytes = 4;
+  repeated PrivateProviderArtifact private_artifacts = 5;
+  repeated ProviderComponentArtifact components = 6;
+}

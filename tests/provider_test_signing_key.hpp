@@ -1,0 +1,33 @@
+// Copyright (c) 2026 Fleming Patel. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+#pragma once
+
+/**
+ * @file provider_test_signing_key.hpp
+ * @brief Test-only RFC 8032 Ed25519 key material.
+ * @author Fleming Patel
+ *
+ * This header is reachable only from the unit-test target. Production
+ * inventory signing is supplied by release-owned secret integration and the
+ * runtime receives only its separately owned trust anchor.
+ */
+
+#include "src/common/ed25519.hpp"
+
+namespace kinetum::test
+{
+
+/** Deterministic fixture signing seed shared by inventory and component tests. */
+inline constexpr common::ed25519_private_key PROVIDER_TEST_PRIVATE_KEY{
+	0x9d, 0x61, 0xb1, 0x9d, 0xef, 0xfd, 0x5a, 0x60, 0xba, 0x84, 0x4a, 0xf4, 0x92, 0xec, 0x2c, 0xc4,
+	0x44, 0x49, 0xc5, 0x69, 0x7b, 0x32, 0x69, 0x19, 0x70, 0x3b, 0xac, 0x03, 0x1c, 0xae, 0x7f, 0x60,
+};
+
+/** Matching fixture verification key supplied as explicit test trust authority. */
+inline constexpr common::ed25519_public_key PROVIDER_TEST_PUBLIC_KEY{
+	0xd7, 0x5a, 0x98, 0x01, 0x82, 0xb1, 0x0a, 0xb7, 0xd5, 0x4b, 0xfe, 0xd3, 0xc9, 0x64, 0x07, 0x3a,
+	0x0e, 0xe1, 0x72, 0xf3, 0xda, 0xa6, 0x23, 0x25, 0xaf, 0x02, 0x1a, 0x68, 0xf7, 0x07, 0x51, 0x1a,
+};
+
+}  // namespace kinetum::test

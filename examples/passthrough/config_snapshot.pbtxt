@@ -1,0 +1,9 @@
+# Passthrough Bootstrap Configuration Snapshot
+#
+# The passthrough pipeline has no module stages, so the exact plan module set
+# is intentionally empty. This explicit snapshot gives fresh-store bootstrap
+# one verified configuration identity.
+
+snapshot_id: "passthrough_baseline_v1"
+revision: 1
+description: "Module-free passthrough bootstrap baseline"

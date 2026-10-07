@@ -1,0 +1,53 @@
+// Copyright (c) 2026 Fleming Patel. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Hardware Inventory: Exact Single-Node Planning Facts
+//
+// This module carries only facts consumed by Gluon before live Quark and
+// provider admission. One inventory describes one runtime host; it cannot mix
+// CPU ownership from one host with PCI facts from another.
+
+syntax = "proto3";
+
+package kinetum.hw.v1;
+
+option cc_enable_arenas = true;
+
+// NicDriver identifies the exact live owner required for a PCI attachment.
+enum NicDriver {
+  NIC_DRIVER_UNSPECIFIED = 0;
+  NIC_DRIVER_DPDK = 2;
+}
+
+// NicPort records one exact DPDK-owned PCI attachment used by a binding.
+message NicPort {
+  string pci_address = 1;  // Canonical PCI BDF
+  uint32 max_mtu = 2;      // Exact nonzero maximum MTU
+  string mac_address = 3;  // Optional canonical xx:xx:xx:xx:xx:xx value
+  int32 numa_node = 4;     // Exact nonnegative host NUMA node
+  NicDriver driver = 5;    // Required DPDK ownership
+}
+
+// CpuCore is one exact process-selectable logical CPU.
+message CpuCore {
+  int32 core_id = 1;
+  int32 numa_node = 2;
+  bool is_hyperthread = 3;
+}
+
+// CpuInfo is the complete explicit CPU candidate set. Count-only synthesis is
+// forbidden; every selectable logical CPU has one row.
+message CpuInfo {
+  repeated CpuCore core_topology = 1;
+}
+
+// Node is the one runtime host represented by this inventory.
+message Node {
+  CpuInfo cpu = 1;
+  repeated NicPort nics = 2;
+}
+
+// HardwareInventory contains exactly one runtime host.
+message HardwareInventory {
+  Node node = 1;
+}

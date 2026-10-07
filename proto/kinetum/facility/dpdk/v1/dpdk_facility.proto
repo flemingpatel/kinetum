@@ -1,0 +1,16 @@
+// Copyright (c) 2026 Fleming Patel. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Pure configuration contract for the current DPDK process facility.
+
+syntax = "proto3";
+
+package kinetum.facility.dpdk.v1;
+
+option cc_enable_arenas = true;
+
+// DpdkFacilityConfig selects the one exact current DPDK facility policy.
+// Empty is a complete policy: worker/service ownership, devices, memory, NUMA,
+// and deterministic EAL arguments come from compiled plan and host facts. It
+// does not mean infer defaults and is not an escaped command-line surface.
+message DpdkFacilityConfig {}

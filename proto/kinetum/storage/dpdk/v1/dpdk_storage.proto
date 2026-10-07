@@ -1,0 +1,17 @@
+// Copyright (c) 2026 Fleming Patel. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Pure configuration contract for DPDK packet storage.
+
+syntax = "proto3";
+
+package kinetum.storage.dpdk.v1;
+
+option cc_enable_arenas = true;
+
+// DpdkStorageConfig owns the only storage policy not derived from the compiled
+// plan: the per-lcore mempool cache size. Zero disables caching; the catalog
+// rejects values above its named DPDK cache bound.
+message DpdkStorageConfig {
+  uint32 cache_size = 1;
+}

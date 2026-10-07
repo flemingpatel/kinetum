@@ -1,0 +1,276 @@
+// Copyright (c) 2026 Fleming Patel. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Axiom: Semantic Intermediate Representation for Packet Pipelines
+//
+// Axiom defines a vendor-neutral, declarative representation of packet
+// processing pipelines. It serves as the contract between:
+//   - Pipeline authors (defining intent)
+//   - Gluon planner (optimizing placement)
+//   - Dataplane runtime (executing stages)
+//
+// Design principles:
+//   1. Semantic clarity over implementation details
+//   2. Backend-agnostic stage definitions
+//   3. Extensibility via typed module stages
+//   4. DAG support for complex forwarding topologies
+
+syntax = "proto3";
+
+package kinetum.axiom.v1;
+
+option cc_enable_arenas = true;
+
+// StageKind enumerates packet processing operations.
+//
+// Module conformance model:
+// - Platform provides MECHANISM stages (RX, TX, PARSE)
+// - ALL policies (ACL, NAT, QoS, custom) use STAGE_KIND_MODULE
+// - Built-in and customer modules use the SAME SDK path
+//
+// Policy modules are specified through ModuleStageConfig.
+// Common module_ids: "kinetum.acl", "kinetum.nat44", "kinetum.qos"
+enum StageKind {
+  STAGE_KIND_UNSPECIFIED = 0;
+
+  // I/O boundary stages
+  // Platform-provided MECHANISM - handles packet ingress/egress
+  STAGE_KIND_RX = 1;  // Packet ingress from one logical interface
+  STAGE_KIND_TX = 2;  // Packet egress to one logical interface
+
+  // Parsing stages (extract packet metadata)
+  // Platform-provided MECHANISM - populates packet metadata
+  STAGE_KIND_PARSE_IPV4 = 3;  // Parse Ethernet + IPv4 + L4 headers
+
+  // Module stage - ALL policies route through this
+  // Platform provides MECHANISM; modules implement POLICY
+  //
+  // Built-in modules (same SDK as customer modules):
+  //   - kinetum.acl: Access Control List (CIDR matching, first-match-wins)
+  //   - kinetum.nat44: IPv4 NAPT (stateful SNAT/DNAT)
+  //   - kinetum.qos: Traffic policing (token bucket rate limiting)
+  //
+  // Customer modules implement the Kinetum module SDK
+  // (include/kinetum/kinetum_sdk.h).
+  STAGE_KIND_MODULE = 11;
+}
+
+// ExecutionMode determines how a stage is scheduled by the runtime.
+//
+// Every stage authors one explicit mode. UNSPECIFIED fails admission.
+// PASSIVE stages run only when a packet reaches them.
+// ACTIVE stages run on their declared owner-worker triggers independently of
+// packet arrival. LOOP selects every owner turn; timer, pull, and control
+// triggers remain event-driven.
+enum ExecutionMode {
+  EXECUTION_MODE_UNSPECIFIED = 0;
+  EXECUTION_MODE_ACTIVE = 1;   // Owner-worker trigger schedule
+  EXECUTION_MODE_PASSIVE = 2;  // Packet-driven
+}
+
+// TriggerMode is a bitmask of reasons an active stage's run() is invoked.
+// Multiple triggers can fire in a single loop iteration.
+//
+// Passive stages must carry zero (they are always packet-triggered).
+// Active stages declare which triggers they respond to.
+enum TriggerMode {
+  TRIGGER_MODE_UNSPECIFIED = 0;
+  TRIGGER_MODE_LOOP        = 1;  // Every region loop iteration
+  TRIGGER_MODE_TIMER       = 2;  // One or more timers expired
+  TRIGGER_MODE_PULL_READY  = 4;  // Downstream pull consumer requests data
+  TRIGGER_MODE_CONTROL     = 8;  // Control/feedback message arrived
+}
+
+// EdgeMode defines the work-driving direction of a packet edge.
+//
+// Every packet edge authors one explicit mode. UNSPECIFIED fails admission.
+// PUSH: upstream pushes packets to downstream.
+// PULL: downstream requests packets from upstream active stage.
+//
+// PULL edges must be same-region. They are local-schedule
+// semantics, not boundary semantics. Cross-region edges are always PUSH.
+enum EdgeMode {
+  EDGE_MODE_UNSPECIFIED = 0;
+  EDGE_MODE_PULL = 1;  // Downstream requests from upstream
+  EDGE_MODE_PUSH = 2;  // Upstream drives work
+}
+
+// ControlEdgeSubtype distinguishes control-path edge semantics.
+enum ControlEdgeSubtype {
+  CONTROL_EDGE_SUBTYPE_UNSPECIFIED = 0;
+  CONTROL_EDGE_FEEDBACK = 1;  // Latency-sensitive hardware/device feedback
+  CONTROL_EDGE_GENERIC = 2;   // General control/command message
+}
+
+// ControlEdge represents a non-packet directed connection between stages.
+// Control edges carry commands, configuration, or feedback, not packets.
+//
+// Control edges do NOT participate in packet DAG topo sort.
+// They must be same-region.
+message ControlEdge {
+  string from_stage_id = 1;  // Source of control/feedback
+  string to_stage_id   = 2;  // Consumer of control/feedback
+  ControlEdgeSubtype subtype = 3;
+}
+
+// ActiveStageLimits declare every bounded per-instance active resource.
+// Gluon replicates these limits exactly for each emitted active stage/lane;
+// runtime allocates no active resource from a default or inferred capacity.
+// Passive stages carry an empty message.
+message ActiveStageLimits {
+  uint32 retained_packet_capacity = 1;       // Maximum retained packet records
+  uint64 retained_byte_capacity = 2;         // Maximum retained packet bytes
+  uint32 timer_capacity = 3;                 // Maximum owner-local armed timers
+  uint32 control_mailbox_capacity = 4;       // Power-of-two queued message count
+  uint32 control_message_capacity_bytes = 5; // Maximum copied payload per message
+  uint32 async_work_capacity = 6;             // Maximum exact foreign-work tokens
+  uint64 async_cancel_grace_ms = 7;           // Fail-stop bound after cancellation
+}
+
+// IoStageConfig binds one RX or TX stage to a plan-owned logical interface.
+message IoStageConfig {
+  string interface = 1;
+}
+
+// ModuleContextSelection determines which admitted context receives a PUSH
+// packet after its logical successor has been selected. UNSPECIFIED rejects.
+enum ModuleContextSelection {
+  MODULE_CONTEXT_SELECTION_UNSPECIFIED = 0;
+  MODULE_CONTEXT_SELECTION_SAME_LANE = 1;
+  MODULE_CONTEXT_SELECTION_MODULE = 2;
+}
+
+// ModuleStageConfig identifies one SDK module image. module_path is an
+// authoring-time source location removed by kinetum_pack before publication.
+message ModuleStageConfig {
+  string module_id = 1;
+  optional string module_path = 2;
+  ModuleContextSelection context_selection = 3;
+}
+
+// StageConstraints express exact graph-placement relations.
+message StageConstraints {
+  // Stages that must be co-located in the same region
+  repeated string affinity_stages = 1;
+
+  // Stages that must NOT be in the same region
+  repeated string anti_affinity_stages = 2;
+}
+
+// Stage represents a single packet processing operation.
+message Stage {
+  // Unique identifier within the pipeline (immutable after creation).
+  // Shared topology identifier, e.g., "acl_inbound".
+  string stage_id = 1;
+
+  // Processing operation type.
+  StageKind kind = 2;
+
+  // Exact kind-specific configuration. RX/TX require io, MODULE requires
+  // module, and PARSE_IPV4 requires the oneof to remain unset.
+  oneof configuration {
+    IoStageConfig io = 3;
+    ModuleStageConfig module = 4;
+  }
+
+  // Exact optional region pin. When present, Gluon either assigns this stage
+  // to that region or rejects the complete partition; it never overrides the
+  // authored value. Absence leaves placement to the sole partitioner.
+  optional int32 preferred_region = 5;
+
+  // Execution cost weight for load balancing (0 = auto-infer from kind).
+  // Higher values indicate more CPU-intensive stages.
+  uint32 cost_weight = 6;
+
+  // Placement and resource constraints.
+  StageConstraints constraints = 7;
+
+  // Human-readable description for documentation.
+  string description = 8;
+
+  // === Active-Stage Semantics ===
+
+  // Required execution mode: PASSIVE or ACTIVE.
+  // Active stages run on owner-worker triggers and may retain packets.
+  ExecutionMode execution_mode = 9;
+
+  // Trigger modes this active stage responds to (bitmask of TriggerMode).
+  // Passive stages must carry zero. Example: LOOP | TIMER = 3.
+  uint32 trigger_mask = 10;
+
+  // Local schedule order within the owning region (lower = earlier).
+  // Only meaningful for active stages. Passive stages follow DAG topo order.
+  // Gluon uses this to compile the region-local execution schedule.
+  int32 schedule_order = 11;
+
+  // Exact per-instance active-stage resource capacities.
+  // Passive stages carry zero for every nested field.
+  ActiveStageLimits active_stage_limits = 12;
+}
+
+// Edge represents a directed connection between stages.
+// Edges define the packet flow graph topology.
+message Edge {
+  // Source stage (packet flows from this stage)
+  string from_stage_id = 1;
+
+  // Destination stage (packet flows to this stage)
+  string to_stage_id = 2;
+
+  // Optional condition for conditional forwarding
+  // Syntax: <field> <op> <value>
+  // Fields: dscp, src_ip, dst_ip, src_port, dst_port, proto, flow_hash
+  // Ops: ==, !=, <, <=, >, >=
+  // Example: "dscp >= 46" routes EF traffic
+  string condition = 3;
+
+  // Edge priority for ordered evaluation (higher = first)
+  int32 priority = 4;
+
+  // Required work-driving direction: PUSH or PULL.
+  // PULL edges must be same-region.
+  EdgeMode mode = 5;
+}
+
+// PipelineMetadata contains pipeline-level information.
+message PipelineMetadata {
+  // Human-readable name
+  string display_name = 1;
+
+  // Detailed description
+  string description = 2;
+
+  // Author/owner information
+  string author = 3;
+
+  // Semantic version of the pipeline definition
+  string version = 4;
+}
+
+// Pipeline is the top-level container for a packet processing graph.
+message Pipeline {
+  // Unique identifier for the pipeline.
+  // Shared topology identifier; slash-delimited namespaces are not accepted.
+  string pipeline_id = 1;
+
+  // Authored processing stages. Canonical graph order derives from edges and
+  // stable stage identities, not declaration order.
+  repeated Stage stages = 2;
+
+  // Directed edges defining packet flow.
+  // Every edge is explicit; Axiom never infers graph structure from order.
+  repeated Edge edges = 3;
+
+  // Whether non-linear (DAG) topologies are permitted.
+  // If false, the pipeline must form a simple chain.
+  // If true, the runtime supports fan-out, fan-in, and conditional paths.
+  bool allow_dag = 4;
+
+  // Pipeline metadata (documentation, version labels)
+  PipelineMetadata metadata = 5;
+
+  // Control edges for non-packet communication (commands, feedback).
+  // Control edges do not participate in packet DAG topo sort.
+  // Must be same-region.
+  repeated ControlEdge control_edges = 6;
+}

@@ -1,0 +1,86 @@
+# Exact imported target for the Kinetum-owned DPDK component closure.
+#
+# This file is instantiated only by tooling/environment/build_kinetum_dpdk.py from the
+# source-controlled dependency manifest. It deliberately contains no distro-
+# DPDK discovery, linker-token parsing, provider selection, or fallback
+# discovery. Threads and the declared ordinary system libraries remain dynamic
+# prerequisites of the exact static DPDK closure.
+
+include_guard(GLOBAL)
+
+set(KinetumDPDK_VERSION "@KINETUM_DPDK_VERSION@")
+set(KinetumDPDK_TUPLE "@KINETUM_DPDK_TUPLE@")
+
+if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  set(KinetumDPDK_FOUND FALSE)
+  set(KinetumDPDK_NOT_FOUND_MESSAGE
+      "KinetumDPDK supports exact Linux build tuples only")
+  return()
+endif()
+
+if(NOT CMAKE_SYSTEM_PROCESSOR STREQUAL "@KINETUM_DPDK_SYSTEM_PROCESSOR@")
+  set(KinetumDPDK_FOUND FALSE)
+  set(KinetumDPDK_NOT_FOUND_MESSAGE
+      "KinetumDPDK package tuple @KINETUM_DPDK_TUPLE@ does not match "
+      "CMAKE_SYSTEM_PROCESSOR=${CMAKE_SYSTEM_PROCESSOR}")
+  return()
+endif()
+
+get_filename_component(_KINETUM_DPDK_ROOT
+  "${CMAKE_CURRENT_LIST_DIR}/../../.." ABSOLUTE)
+set(_KINETUM_DPDK_INCLUDE_DIR "${_KINETUM_DPDK_ROOT}/include/dpdk")
+set(_KINETUM_DPDK_ARCHIVES
+@KINETUM_DPDK_ARCHIVE_ROWS@
+)
+set(_KINETUM_DPDK_COMPILE_OPTIONS
+  "SHELL:-include rte_config.h"
+@KINETUM_DPDK_COMPILE_OPTION_ROWS@
+)
+
+if(NOT IS_DIRECTORY "${_KINETUM_DPDK_INCLUDE_DIR}")
+  set(KinetumDPDK_FOUND FALSE)
+  set(KinetumDPDK_NOT_FOUND_MESSAGE
+      "KinetumDPDK package has no exact public-header tree")
+  return()
+endif()
+
+foreach(_KINETUM_DPDK_ARCHIVE IN LISTS _KINETUM_DPDK_ARCHIVES)
+  if(NOT EXISTS "${_KINETUM_DPDK_ARCHIVE}" OR
+     IS_DIRECTORY "${_KINETUM_DPDK_ARCHIVE}")
+    set(KinetumDPDK_FOUND FALSE)
+    set(KinetumDPDK_NOT_FOUND_MESSAGE
+        "KinetumDPDK package is missing an exact closure archive")
+    return()
+  endif()
+endforeach()
+
+find_package(Threads REQUIRED)
+
+if(NOT TARGET KinetumDPDK::StaticComponentClosure)
+  add_library(KinetumDPDK::StaticComponentClosure INTERFACE IMPORTED)
+  set_target_properties(KinetumDPDK::StaticComponentClosure PROPERTIES
+    INTERFACE_INCLUDE_DIRECTORIES "${_KINETUM_DPDK_INCLUDE_DIR}"
+  )
+  set_property(TARGET KinetumDPDK::StaticComponentClosure PROPERTY
+    INTERFACE_COMPILE_OPTIONS ${_KINETUM_DPDK_COMPILE_OPTIONS}
+  )
+  set_property(TARGET KinetumDPDK::StaticComponentClosure PROPERTY
+    INTERFACE_LINK_LIBRARIES
+      "-Wl,--start-group"
+      "-Wl,--whole-archive"
+      ${_KINETUM_DPDK_ARCHIVES}
+      "-Wl,--no-whole-archive"
+      "-Wl,--end-group"
+      "-Wl,--push-state,--as-needed,-Bdynamic"
+@KINETUM_DPDK_DYNAMIC_LINK_ROWS@
+      "-Wl,--pop-state"
+  )
+endif()
+
+set(KinetumDPDK_FOUND TRUE)
+
+unset(_KINETUM_DPDK_ARCHIVE)
+unset(_KINETUM_DPDK_ARCHIVES)
+unset(_KINETUM_DPDK_COMPILE_OPTIONS)
+unset(_KINETUM_DPDK_INCLUDE_DIR)
+unset(_KINETUM_DPDK_ROOT)

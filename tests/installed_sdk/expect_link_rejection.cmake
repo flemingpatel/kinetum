@@ -1,0 +1,20 @@
+# Prove object compilation succeeds before the actual SDK/dependency link fails.
+cmake_minimum_required(VERSION 3.28)
+if(NOT DEFINED build_root OR NOT DEFINED targets OR "${targets}" STREQUAL "" OR NOT DEFINED configuration)
+  message(FATAL_ERROR "Link-rejection test lacks its owning build, targets, or configuration")
+endif()
+execute_process(COMMAND "${CMAKE_COMMAND}" --build "${build_root}" --config "${configuration}" --target sdk_missing_import
+  RESULT_VARIABLE compiled OUTPUT_VARIABLE compile_output ERROR_VARIABLE compile_error)
+if(NOT compiled STREQUAL "0")
+  message(FATAL_ERROR "Rejection fixture did not compile: ${compile_output}${compile_error}")
+endif()
+foreach(target IN LISTS targets)
+  execute_process(COMMAND "${CMAKE_COMMAND}" --build "${build_root}" --config "${configuration}" --target "${target}"
+    RESULT_VARIABLE linked OUTPUT_VARIABLE link_output ERROR_VARIABLE link_error)
+  if(linked STREQUAL "0")
+    message(FATAL_ERROR "${target} accepted an unresolved strong import")
+  endif()
+  if(NOT "${link_output}${link_error}" MATCHES "undefined (reference to|symbol:)[^\n]*kinetum_sdk_missing_import")
+    message(FATAL_ERROR "${target} failed for a different reason: ${link_output}${link_error}")
+  endif()
+endforeach()

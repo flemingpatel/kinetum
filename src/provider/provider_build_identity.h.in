@@ -1,0 +1,37 @@
+// Copyright (c) 2026 Fleming Patel. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+#pragma once
+
+/**
+ * @file provider_build_identity.h
+ * @brief Generated exact product and provider-ABI identity constants.
+ * @author Fleming Patel
+ *
+ * CMake hashes the sole C ABI header plus every pure provider contract schema.
+ * Runtime and components embed the resulting bytes independently and admission
+ * requires exact equality. This file contains no compatibility negotiation.
+ */
+
+#include <stdint.h>
+
+/** Exact Kinetum product major version compiled into this component ABI. */
+#define KINETUM_PROVIDER_PRODUCT_VERSION_MAJOR UINT16_C(@PROJECT_VERSION_MAJOR@)
+
+/** Exact Kinetum product minor version compiled into this component ABI. */
+#define KINETUM_PROVIDER_PRODUCT_VERSION_MINOR UINT16_C(@PROJECT_VERSION_MINOR@)
+
+/** Exact Kinetum product patch version compiled into this component ABI. */
+#define KINETUM_PROVIDER_PRODUCT_VERSION_PATCH UINT16_C(@PROJECT_VERSION_PATCH@)
+
+/** Lowercase hexadecimal representation of the exact provider ABI identity. */
+#define KINETUM_PROVIDER_ABI_IDENTITY_HEX "@KINETUM_PROVIDER_ABI_IDENTITY_HEX@"
+
+/** First exact provider ABI identity byte, exposed for malformed-image tests. */
+#define KINETUM_PROVIDER_ABI_IDENTITY_BYTE_0 UINT8_C(0x@KINETUM_PROVIDER_ABI_IDENTITY_FIRST_BYTE_HEX@)
+
+/** Remaining exact provider ABI identity bytes, exposed for C initializers. */
+#define KINETUM_PROVIDER_ABI_IDENTITY_TAIL_INITIALIZER @KINETUM_PROVIDER_ABI_IDENTITY_TAIL_INITIALIZER@
+
+/** Complete exact provider ABI identity initializer. */
+#define KINETUM_PROVIDER_ABI_IDENTITY_INITIALIZER {@KINETUM_PROVIDER_ABI_IDENTITY_INITIALIZER@}

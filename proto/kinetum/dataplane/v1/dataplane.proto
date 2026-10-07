@@ -1,0 +1,347 @@
+// Copyright (c) 2026 Fleming Patel. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Dataplane Service API: Runtime Configuration and Telemetry
+//
+// The Dataplane Service API provides the runtime interface between the
+// Control Plane and Dataplane processes. It handles:
+//   - Epoch-consistent configuration updates
+//   - Runtime telemetry and statistics collection
+//   - Health monitoring and explicit lifecycle capability responses
+//
+// This is an internal API between CP and DP; not exposed to end users.
+
+syntax = "proto3";
+
+package kinetum.dataplane.v1;
+
+import "kinetum/common/v1/common.proto";
+import "kinetum/control/v1/control.proto";
+import "kinetum/telemetry/v1/telemetry.proto";
+
+option cc_enable_arenas = true;
+
+// =============================================================================
+// Exact Configuration Transition Contract
+// =============================================================================
+//
+// Configuration transitions carry one CP-allocated identity from preparation
+// through activation, status reconciliation, and optional pre-commit abort.
+// Bootstrap is a separate startup-only operation that restores CP's durable
+// active snapshot and allocation watermarks before packet admission.
+//
+// The wire contract is complete. The current runtime materializes the sole
+// transition coordinator, immutable participant set, bounded command mailbox,
+// exact transaction admission/journal, fixed Bootstrap path, module lifecycle,
+// ordered packet switching, and exact reclamation. Passive,
+// synchronous-active, and tracked-async plans all consume that same owner.
+// No handler bypasses the coordinator or ordered boundary protocol.
+// =============================================================================
+
+// Exact identity relation returned by every handled live-transition RPC.
+// UNSPECIFIED is never emitted for a non-null handled request.
+enum EpochTransitionIdentityResolution {
+  EPOCH_TRANSITION_IDENTITY_RESOLUTION_UNSPECIFIED = 0;
+  EPOCH_TRANSITION_IDENTITY_RESOLUTION_INVALID = 1;
+  EPOCH_TRANSITION_IDENTITY_RESOLUTION_ADMISSIBLE = 2;
+  EPOCH_TRANSITION_IDENTITY_RESOLUTION_ACTIVE_EXACT = 3;
+  EPOCH_TRANSITION_IDENTITY_RESOLUTION_TERMINAL_EXACT = 4;
+  EPOCH_TRANSITION_IDENTITY_RESOLUTION_STALE = 5;
+  EPOCH_TRANSITION_IDENTITY_RESOLUTION_INCONSISTENT = 6;
+  EPOCH_TRANSITION_IDENTITY_RESOLUTION_EXPIRED_RETRY = 7;
+  EPOCH_TRANSITION_IDENTITY_RESOLUTION_IDENTITY_CONFLICT = 8;
+  EPOCH_TRANSITION_IDENTITY_RESOLUTION_UNKNOWN_FUTURE = 9;
+  EPOCH_TRANSITION_IDENTITY_RESOLUTION_OVERLAP = 10;
+  EPOCH_TRANSITION_IDENTITY_RESOLUTION_POLICY_DISABLED = 11;
+  EPOCH_TRANSITION_IDENTITY_RESOLUTION_STATE_UNAVAILABLE = 12;
+}
+
+// Restore CP's exact durable active state before packet admission.
+message BootstrapConfigSnapshotRequest {
+  kinetum.control.v1.ConfigSnapshot snapshot = 1;
+  uint64 active_epoch = 2;
+  uint64 allocated_epoch_high_watermark = 3;
+  uint64 mutation_sequence_high_watermark = 4;
+  string plan_content_hash = 5;
+  string idempotency_key = 6;
+}
+
+message BootstrapConfigSnapshotResponse {
+  kinetum.common.v1.Status status = 1;
+  uint64 restored_epoch = 2;
+  bytes validation_hash = 3;
+  kinetum.telemetry.v1.EpochTransitionState transition_state = 4;
+  uint64 allocated_epoch_high_watermark = 5;
+  uint64 mutation_sequence_high_watermark = 6;
+}
+
+// Prepare one exact CP-allocated transition without changing live execution.
+message PrepareConfigSnapshotRequest {
+  kinetum.control.v1.ConfigSnapshot snapshot = 1;
+  uint64 target_epoch = 2;
+  string idempotency_key = 3;
+  uint64 mutation_sequence = 4;
+}
+
+message PrepareConfigSnapshotResponse {
+  kinetum.common.v1.Status status = 1;
+  uint64 prepared_epoch = 2;
+  bytes validation_hash = 3;
+  uint64 prepared_lease_deadline_unix_ms = 4;
+  uint64 mutation_sequence = 5;
+  kinetum.telemetry.v1.EpochTransitionState transition_state = 6;
+  EpochTransitionIdentityResolution identity_resolution = 7;
+  kinetum.telemetry.v1.EpochTransitionFailureCode failure_code = 8;
+}
+
+// Commit the exact prepared transaction. Completion includes retirement.
+message ActivateConfigSnapshotRequest {
+  uint64 epoch = 1;
+  bytes validation_hash = 2;
+  string idempotency_key = 3;
+  uint64 mutation_sequence = 4;
+}
+
+message ActivateConfigSnapshotResponse {
+  kinetum.common.v1.Status status = 1;
+  uint64 completed_epoch = 2;
+  kinetum.telemetry.v1.EpochTransitionState transition_state = 3;
+  uint64 transition_duration_ns = 4;
+  uint64 mutation_sequence = 5;
+  EpochTransitionIdentityResolution identity_resolution = 6;
+  kinetum.telemetry.v1.EpochTransitionFailureCode failure_code = 7;
+}
+
+// Abort the exact transaction only while it remains pre-commit.
+message AbortPreparedConfigSnapshotRequest {
+  uint64 epoch = 1;
+  bytes validation_hash = 2;
+  string idempotency_key = 3;
+  uint64 mutation_sequence = 4;
+}
+
+message AbortPreparedConfigSnapshotResponse {
+  kinetum.common.v1.Status status = 1;
+  kinetum.telemetry.v1.EpochTransitionState transition_state = 2;
+  uint64 mutation_sequence = 3;
+  EpochTransitionIdentityResolution identity_resolution = 4;
+  kinetum.telemetry.v1.EpochTransitionFailureCode failure_code = 5;
+}
+
+// Query one exact transition identity for retry and convergence handling.
+message GetEpochTransitionStatusRequest {
+  uint64 epoch = 1;
+  bytes validation_hash = 2;
+  string idempotency_key = 3;
+  uint64 mutation_sequence = 4;
+}
+
+message GetEpochTransitionStatusResponse {
+  kinetum.common.v1.Status status = 1;
+  kinetum.telemetry.v1.EpochTransitionState transition_state = 2;
+  uint64 from_epoch = 3;
+  uint64 to_epoch = 4;
+  bytes validation_hash = 5;
+  string plan_content_hash = 6;
+  uint64 prepare_duration_ns = 7;
+  uint64 commit_duration_ns = 8;
+  uint64 retirement_duration_ns = 9;
+  string failure_reason = 10;
+  uint64 mutation_sequence = 11;
+  EpochTransitionIdentityResolution identity_resolution = 12;
+  kinetum.telemetry.v1.EpochTransitionFailureCode failure_code = 13;
+}
+
+// =============================================================================
+// Statistics and Telemetry
+// =============================================================================
+
+// StatsRequest selects optional row families from the one shared telemetry
+// contract. Runtime, engine, transition, and protocol-fault summaries are
+// present in every successful response. The selection message itself must be
+// explicitly present; missing or stale unknown-wire input rejects.
+message StatsRequest {
+  kinetum.telemetry.v1.TelemetrySelection selection = 1;
+}
+
+// A non-OK status makes telemetry unavailable. The Data Plane never publishes
+// a partial message or fills an unavailable observation with numeric defaults.
+message StatsResponse {
+  kinetum.common.v1.Status status = 1;
+  kinetum.telemetry.v1.RuntimeTelemetry telemetry = 2;
+}
+
+// =============================================================================
+// Health and Lifecycle
+// =============================================================================
+
+message HealthRequest {}
+
+message HealthResponse {
+  // DP process readiness and lifecycle state machine. CONTROL_READY means the
+  // gRPC control surface is serving but packet execution is unavailable.
+  // PACKET_READY means exact bootstrap completed and packet workers/provider RX
+  // may admit traffic.
+  enum State {
+    STATE_UNSPECIFIED = 0;
+    STATE_STARTING = 1;       // Process initialization is in progress
+    STATE_CONTROL_READY = 2;  // Control RPCs are serving; packets are disabled
+    STATE_PACKET_READY = 3;   // Exact config and packet runtime are active
+    STATE_DRAINING = 4;       // Graceful drain is in progress
+    STATE_DRAINED = 5;        // All queues drained, ready for shutdown
+    STATE_STOPPING = 6;       // Shutdown is in progress
+    STATE_STOPPED = 7;        // Shutdown is complete
+    STATE_ERROR = 8;          // Fatal process error
+  }
+
+  State state = 1;
+  kinetum.common.v1.Status status = 2;
+
+  // Exact active epoch from the coherent runtime-status publication. Zero is
+  // required at CONTROL_READY and nonzero at PACKET_READY.
+  uint64 active_epoch = 3;
+
+  // Inherently nonnegative worker counts from coherent runtime publication.
+  uint32 active_workers = 4;
+  uint32 expected_workers = 5;
+
+  // Exact product version carried by this Data Plane image.
+  string version = 9;
+
+  // Nonzero process-generation identity from the same coherent publication.
+  uint64 runtime_generation = 11;
+  // Required diagnostic state, independent of packet or control readiness.
+  kinetum.common.v1.LoggingStatus logging = 12;
+}
+
+// Lifecycle drain request.
+message DrainRequest {
+  // Caller-supplied correlation identity. The unavailable drain RPC does not
+  // consume it.
+  string drain_id = 1;
+
+  // Absolute wall-clock deadline (Unix timestamp ms). The unavailable drain
+  // RPC does not consume it.
+  int64 deadline_unix_ms = 2;
+
+  // Requested force disposition. The unavailable drain RPC does not consume
+  // it.
+  bool force = 3;
+}
+
+message DrainResponse {
+  // A non-OK status makes every result field below semantically unavailable.
+  // The handler clears the response before returning UNAVAILABLE.
+  kinetum.common.v1.Status status = 1;
+
+  // Current lifecycle state
+  HealthResponse.State state = 2;
+
+  // Packets remaining in all queues after a successful observation.
+  uint64 packets_remaining = 3;
+
+  // When drain started (Unix timestamp ms)
+  int64 drain_started_unix_ms = 4;
+
+  // When drain completed (Unix timestamp ms, 0 if not yet complete)
+  int64 drain_completed_unix_ms = 5;
+
+  // Echo back the drain_id for correlation
+  string drain_id = 6;
+}
+
+// Poll drain status without re-issuing drain request.
+message DrainStatusRequest {
+  // Optional: specific drain operation to query (empty = current). The handler
+  // returns application UNAVAILABLE and does not select an operation.
+  string drain_id = 1;
+}
+
+message DrainStatusResponse {
+  // A non-OK status makes every result field below semantically unavailable.
+  // The handler clears the response before returning UNAVAILABLE.
+  kinetum.common.v1.Status status = 1;
+  HealthResponse.State state = 2;
+  uint64 packets_remaining = 3;
+  int64 drain_started_unix_ms = 4;
+  int64 drain_completed_unix_ms = 5;
+}
+
+message ShutdownRequest {
+  // Whether to force immediate shutdown (skip drain check)
+  // This field has no effect while RPC-driven shutdown is unavailable.
+  bool force = 1;
+
+  // Reason for shutdown (audit trail)
+  // This field has no effect while RPC-driven shutdown is unavailable.
+  string reason = 2;
+}
+
+message ShutdownResponse {
+  kinetum.common.v1.Status status = 1;
+}
+
+// =============================================================================
+// Debugging and Diagnostics
+// =============================================================================
+
+message DumpStateRequest {
+  // Include NAT session table dump
+  // This field has no effect while bounded state publication is unavailable.
+  bool include_nat_table = 1;
+
+  // Include ACL cache dump
+  // This field has no effect while bounded state publication is unavailable.
+  bool include_acl_cache = 2;
+
+  // Maximum entries to return per table
+  // This field has no effect while bounded state publication is unavailable.
+  int32 max_entries = 3;
+}
+
+message NatSessionEntry {
+  uint32 proto = 1;  // IP protocol number (6=TCP, 17=UDP)
+  uint32 internal_ip = 2;
+  uint32 internal_port = 3;
+  uint32 public_ip = 4;
+  uint32 public_port = 5;
+  uint32 remote_ip = 6;
+  uint32 remote_port = 7;
+  uint64 last_seen_ns = 8;
+  uint64 packets = 9;
+  uint64 bytes = 10;
+}
+
+message DumpStateResponse {
+  // A non-OK status makes every result field below semantically unavailable.
+  // The handler clears the response before returning UNAVAILABLE.
+  kinetum.common.v1.Status status = 1;
+  repeated NatSessionEntry nat_sessions = 2;
+  string acl_cache_json = 3;  // Serialized ACL cache on successful publication
+}
+
+// =============================================================================
+// Dataplane Service Definition
+// =============================================================================
+
+service DataplaneService {
+  // Exact configuration transition lifecycle.
+  rpc BootstrapConfigSnapshot(BootstrapConfigSnapshotRequest) returns (BootstrapConfigSnapshotResponse);
+  rpc PrepareConfigSnapshot(PrepareConfigSnapshotRequest) returns (PrepareConfigSnapshotResponse);
+  rpc ActivateConfigSnapshot(ActivateConfigSnapshotRequest) returns (ActivateConfigSnapshotResponse);
+  rpc AbortPreparedConfigSnapshot(AbortPreparedConfigSnapshotRequest)
+      returns (AbortPreparedConfigSnapshotResponse);
+  rpc GetEpochTransitionStatus(GetEpochTransitionStatusRequest) returns (GetEpochTransitionStatusResponse);
+
+  // Telemetry
+  rpc GetStats(StatsRequest) returns (StatsResponse);
+
+  // Health and lifecycle
+  rpc Health(HealthRequest) returns (HealthResponse);
+  rpc Drain(DrainRequest) returns (DrainResponse);
+  rpc DrainStatus(DrainStatusRequest) returns (DrainStatusResponse);
+  rpc Shutdown(ShutdownRequest) returns (ShutdownResponse);
+
+  // Debugging
+  rpc DumpState(DumpStateRequest) returns (DumpStateResponse);
+}

@@ -1,0 +1,102 @@
+# Passthrough - Exact DPDK TAP Deployment Bindings
+#
+# Binds the passthrough logical interfaces to one explicit DPDK facility,
+# driver, packet-storage domain, and CPU execution provider. Queue zero is
+# authored for both directions; no queue, provider, or storage default is
+# inferred.
+#
+# Logical pipeline: wan0 (RX) -> lan0 (TX)
+# TAP mapping:      wan0 -> neb_rx, lan0 -> neb_tx
+#
+# Usage:
+#   kinetum_gluon --axiom passthrough.axiom.pbtxt \
+#                --hw hardware_inventory_tap.pbtxt \
+#                --bindings passthrough_tap_bindings.pbtxt \
+#                --out plan.pbtxt --regions 1
+
+process_facility_instances {
+  facility_instance_id: "facility_dpdk_0"
+  configuration {
+    [type.googleapis.com/kinetum.facility.dpdk.v1.DpdkFacilityConfig] {}
+  }
+}
+
+io_driver_instances {
+  io_driver_instance_id: "io_dpdk_0"
+  facility_instance_ids: "facility_dpdk_0"
+  configuration {
+    [type.googleapis.com/kinetum.io.dpdk.v1.DpdkDriverConfig] {
+      ports {
+        driver_port_id: "lan0"
+        tap { interface_name: "neb_tx" }
+      }
+      ports {
+        driver_port_id: "wan0"
+        tap { interface_name: "neb_rx" }
+      }
+    }
+  }
+}
+
+packet_storage_domains {
+  storage_domain_id: "storage_dpdk_0"
+  facility_instance_ids: "facility_dpdk_0"
+  configuration {
+    [type.googleapis.com/kinetum.storage.dpdk.v1.DpdkStorageConfig] {
+      cache_size: 256
+    }
+  }
+  buffer_count: 131071
+  data_room_bytes: 2048
+  headroom_bytes: 128
+  alignment_bytes: 64
+  host_numa_node: 0
+}
+
+execution_provider_instances {
+  execution_provider_instance_id: "execution_cpu_0"
+  configuration {
+    [type.googleapis.com/kinetum.execution.cpu.v1.CpuExecutionConfig] {}
+  }
+}
+
+logical_port_bindings {
+  logical_name: "wan0"
+  io_driver_instance_id: "io_dpdk_0"
+  driver_port_id: "wan0"
+  direction: PORT_DIRECTION_RX_ONLY
+  mtu: 1500
+}
+logical_port_bindings {
+  logical_name: "lan0"
+  io_driver_instance_id: "io_dpdk_0"
+  driver_port_id: "lan0"
+  direction: PORT_DIRECTION_TX_ONLY
+  mtu: 1500
+}
+
+io_stream_bindings {
+  logical_name: "wan0"
+  direction: IO_STREAM_DIRECTION_RX
+  queues { driver_queue_id: 0 descriptor_count: 1024 rx_storage_domain_id: "storage_dpdk_0" }
+  steering { kind: TRAFFIC_STEERING_KIND_NONE }
+}
+io_stream_bindings {
+  logical_name: "lan0"
+  direction: IO_STREAM_DIRECTION_TX
+  queues {
+    driver_queue_id: 0
+    descriptor_count: 1024
+    tx_storage { storage_domain_ids: "storage_dpdk_0" }
+  }
+  steering { kind: TRAFFIC_STEERING_KIND_NONE }
+}
+
+stage_execution_bindings {
+  logical_stage_id: "rx"
+  execution_provider_instance_id: "execution_cpu_0"
+}
+stage_execution_bindings {
+  logical_stage_id: "tx"
+  execution_provider_instance_id: "execution_cpu_0"
+}

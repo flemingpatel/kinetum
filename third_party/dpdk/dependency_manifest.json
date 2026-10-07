@@ -1,0 +1,126 @@
+{
+  "schema_version": 1,
+  "dependency": {
+    "name": "KinetumDPDK",
+    "version": "24.11.7",
+    "archive_root": "dpdk-stable-24.11.7",
+    "url": "https://fast.dpdk.org/rel/dpdk-24.11.7.tar.xz",
+    "sha256": "fc7a9590bb7692dcd2a667cc054224ab3535121e08b1b79545b1da363f2c4071"
+  },
+  "build_tool": {
+    "name": "Meson",
+    "version": "1.12.0",
+    "archive_root": "meson-1.12.0",
+    "url": "https://github.com/mesonbuild/meson/releases/download/1.12.0/meson-1.12.0.tar.gz",
+    "sha256": "88afe0c20e52030218924ac37d0c81c59b4b5f3ae3752c8c6d7470c7d365886c"
+  },
+  "builder": {
+    "os_id": "ubuntu",
+    "os_version": "24.04",
+    "cc_version": "13.3.0",
+    "ld_version": "GNU ld (GNU Binutils for Ubuntu) 2.42",
+    "ar_version": "GNU ar (GNU Binutils for Ubuntu) 2.42",
+    "as_version": "GNU assembler (GNU Binutils for Ubuntu) 2.42",
+    "ninja_version": "1.11.1",
+    "pkg_config_version": "1.8.1",
+    "python_version": "3.12.3",
+    "pyelftools_version": "0.30",
+    "source_date_epoch": 0
+  },
+  "reproducibility": {
+    "canonical_build_root": "/usr/src/kinetum-dpdk-24.11.7",
+    "package_umask": "0022"
+  },
+  "meson_options": {
+    "buildtype": "release",
+    "b_ndebug": true,
+    "default_library": "static",
+    "b_staticpic": true,
+    "platform": "generic",
+    "tests": false,
+    "examples": "",
+    "enable_docs": false,
+    "enable_kmods": false,
+    "developer_mode": "disabled",
+    "enable_drivers": [
+      "bus/pci",
+      "bus/vdev",
+      "mempool/ring",
+      "net/i40e",
+      "net/tap"
+    ],
+    "c_args": [
+      "-fvisibility=hidden"
+    ],
+    "prefix": "/nonexistent/kinetum-dpdk-dynamic-pmds-disabled",
+    "libdir": "lib"
+  },
+  "generated_config_defines": {
+    "RTE_HAS_LIBFDT": "1",
+    "RTE_HAS_LIBNUMA": "1",
+    "RTE_HAS_LIBPCAP": "1",
+    "RTE_LIBRTE_VHOST_NUMA": "1"
+  },
+  "forbidden_generated_config_defines": [
+    "RTE_HAS_JANSSON",
+    "RTE_HAS_LIBARCHIVE",
+    "RTE_HAS_OPENSSL",
+    "RTE_USE_LIBBSD"
+  ],
+  "archive_targets": [
+    "drivers/librte_bus_pci.a",
+    "drivers/librte_bus_vdev.a",
+    "drivers/librte_mempool_ring.a",
+    "drivers/librte_net_i40e.a",
+    "drivers/librte_net_tap.a",
+    "lib/librte_gso.a",
+    "lib/librte_hash.a",
+    "lib/librte_pci.a",
+    "lib/librte_ethdev.a",
+    "lib/librte_meter.a",
+    "lib/librte_net.a",
+    "lib/librte_mbuf.a",
+    "lib/librte_mempool.a",
+    "lib/librte_rcu.a",
+    "lib/librte_ring.a",
+    "lib/librte_eal.a",
+    "lib/librte_telemetry.a",
+    "lib/librte_kvargs.a",
+    "lib/librte_log.a"
+  ],
+  "pmd_info_symbols": [
+    "net_i40e_pmd_info",
+    "net_tap_pmd_info",
+    "net_tun_pmd_info"
+  ],
+  "dynamic_link_libraries": [
+    "numa",
+    "Threads::Threads",
+    "${CMAKE_DL_LIBS}",
+    "m",
+    "rt"
+  ],
+  "tuples": {
+    "linux-gnu-aarch64": {
+      "machine": "aarch64",
+      "cmake_system_processor": "aarch64",
+      "cpu_instruction_set": "armv8-a+crc",
+      "consumer_compile_options": [
+        "-march=armv8-a+crc",
+        "-moutline-atomics"
+      ],
+      "expected_rte_build_config_sha256": "8173d2a45c6a3910297ae4ce775135a008963215f8b3cb3c78a7e2691e452ea3",
+      "expected_payload_sha256": "68ddfe604fe74d0fff67818245b1de642739041e065bd263a7ae58a8c9c4cdfb"
+    },
+    "linux-gnu-x86_64": {
+      "machine": "x86_64",
+      "cmake_system_processor": "x86_64",
+      "cpu_instruction_set": "corei7",
+      "consumer_compile_options": [
+        "-march=corei7"
+      ],
+      "expected_rte_build_config_sha256": "a37e992ba067f20fa87fbbf2785335a1592d5dcb3cf60445596bdde45b4f51ee",
+      "expected_payload_sha256": "351519c4b8c612818748b047528ad97bfd2877e46ae40b09d8cefaeb46f66e3f"
+    }
+  }
+}

@@ -1,0 +1,46 @@
+# Fan-In Edge Gateway Configuration Snapshot (v1)
+#
+# Baseline module configuration for the fan-in edge gateway. The topology
+# exercises region boundaries and join gating; the modules are the built-in
+# ACL, NAT44, and QoS modules.
+# Each config_blob is the module's strict snake-case JSON runtime contract;
+# alternate encodings, aliases, duplicate fields, and unknown fields reject.
+#
+# Modules: ACL (permit-all), NAT44 (NAPT), QoS (10 Gbps default profile)
+
+snapshot_id: "fan_in_edge_gw_baseline_v1"
+revision: 1
+description: "Fan-in edge-processing baseline with ACL, NAT44, QoS"
+
+# =============================================================================
+# ACL Module Configuration
+# =============================================================================
+
+modules {
+  module_id: "kinetum.acl"
+  revision: 1
+  content_type: "application/json"
+  config_blob: "{ \"default_action\": 1, \"rules\": [ { \"priority\": 1000, \"src_cidr\": \"0.0.0.0/0\", \"dst_cidr\": \"0.0.0.0/0\", \"action\": 1, \"enabled\": true } ] }"
+}
+
+# =============================================================================
+# NAT44 Module Configuration
+# =============================================================================
+
+modules {
+  module_id: "kinetum.nat44"
+  revision: 1
+  content_type: "application/json"
+  config_blob: "{ \"session_timeout_s\": 300, \"pools\": [ { \"public_ip_ranges\": [\"192.0.2.1-192.0.2.10\"], \"port_min\": 10000, \"port_max\": 60000 } ] }"
+}
+
+# =============================================================================
+# QoS Module Configuration
+# =============================================================================
+
+modules {
+  module_id: "kinetum.qos"
+  revision: 1
+  content_type: "application/json"
+  config_blob: "{ \"default_profile\": \"default\", \"profiles\": [ { \"name\": \"default\", \"cir_kbps\": 10000000, \"cbs_kb\": 1000, \"conform_dscp\": 10 } ] }"
+}

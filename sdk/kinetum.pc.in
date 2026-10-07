@@ -1,0 +1,29 @@
+# pkg-config file for the Kinetum C11 SDK
+#
+# Usage:
+#   pkg-config --cflags kinetum    # Get compiler flags
+#   pkg-config --libs kinetum      # Get strict module-image linker flags
+#
+# Example compilation:
+#   gcc -std=c11 -fPIC -shared $(pkg-config --cflags --libs kinetum) -o my_module.so my_module.c
+#
+# Environment setup (add to ~/.bashrc):
+#   export PKG_CONFIG_PATH="<prefix>/sdk/lib/pkgconfig${PKG_CONFIG_PATH:+:${PKG_CONFIG_PATH}}"
+
+# Resolve the installation root from this file so custom-prefix installs do not
+# rewrite package metadata after copying it into place.
+prefix=${pcfiledir}/../../..
+includedir=${prefix}/sdk/include
+
+Name: Kinetum
+Description: Kinetum packet-processing platform C11 SDK
+Version: @KINETUM_VERSION_STR_FILE@
+
+# Language-neutral C11 compiler flags. C++ modules use Kinetum::SDK so the
+# compiler-specific unload-safe ownership policy is applied only where valid.
+Cflags: -I${includedir} -fvisibility=hidden
+
+# No SDK runtime library is required. Every non-weak module import must resolve
+# from the module's explicitly declared dependencies at link time, and symbols
+# pulled from static archives remain local to the image.
+Libs: -Wl,-z,defs -Wl,--exclude-libs,ALL

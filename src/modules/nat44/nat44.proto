@@ -1,0 +1,60 @@
+// Copyright (c) 2026 Fleming Patel. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+//
+// NAT44 Module Protocol Buffer Schema
+//
+// This proto defines the configuration schema for the NAT44 module (libkinetum_nat44.so).
+// The module is the SOURCE OF TRUTH for the runtime contract. ConfigSnapshot
+// carries strict snake-case JSON in config_blob. This proto is a host/offline
+// authoring model only; generated code is never linked into the unloadable
+// module image.
+//
+// Ownership model:
+//   - Platform provides MECHANISM (epoch transitions, blob routing)
+//   - Module provides POLICY (NAT pools, session management)
+//   - Platform does NOT parse this proto - it routes opaque bytes to module
+//
+// Usage:
+//   1. Build or author a NatPools payload.
+//   2. Encode populated fields as strict snake-case JSON.
+//   3. Send via ConfigSnapshot.modules[].config_blob.
+//   4. Module parses, validates, and applies.
+
+syntax = "proto3";
+
+package kinetum.module.nat44.v1;
+
+option cc_enable_arenas = true;
+
+// =============================================================================
+// NAT Pool Definition
+// =============================================================================
+
+// NatPool defines a pool of public addresses for NAT.
+message NatPool {
+  // Disjoint public IP ranges (e.g., "203.0.113.10-203.0.113.20").
+  // Duplicate and overlapping ranges are invalid; authored order is not
+  // allocation authority because PREPARE sorts the admitted set by address.
+  repeated string public_ip_ranges = 1;
+
+  // Port range for NAPT
+  int32 port_min = 2;
+  int32 port_max = 3;
+}
+
+// =============================================================================
+// NAT Pools (Module Configuration)
+// =============================================================================
+
+// NatPools is the complete NAT44 module configuration.
+// This is what gets serialized to config_blob.
+message NatPools {
+  // Available pools
+  repeated NatPool pools = 1;
+
+  // Global session timeout in seconds
+  int32 session_timeout_s = 2;
+
+  // Maximum total sessions across all pools
+  int32 max_total_sessions = 3;
+}

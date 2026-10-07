@@ -1,0 +1,76 @@
+# KinetumConfig.cmake - CMake package configuration for Kinetum SDK
+#
+# This file is installed to <prefix>/sdk/lib/cmake/Kinetum/KinetumConfig.cmake
+# and enables find_package(Kinetum) to work for customer module development.
+#
+# Usage in customer CMakeLists.txt:
+#   find_package(Kinetum CONFIG REQUIRED)
+#   target_link_libraries(my_module PRIVATE Kinetum::SDK)
+#   target_link_libraries(my_module_dependency PRIVATE Kinetum::ModuleDependency)
+#
+# Provides:
+#   Kinetum_FOUND        - True if SDK found
+#   Kinetum_VERSION      - Version string (e.g., "0.1.0")
+#   Kinetum::SDK         - Header-only ABI plus strict module-image export/link policy
+#   Kinetum::ModuleDependency - Export-capable, unload-safe shared-dependency policy
+
+set(Kinetum_VERSION "@KINETUM_VERSION_STR_FILE@")
+
+if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  set(Kinetum_FOUND FALSE)
+  if(Kinetum_FIND_REQUIRED)
+    message(FATAL_ERROR "Kinetum module SDK supports Linux targets only")
+  endif()
+  return()
+endif()
+
+# Compute installation prefix from this file's location
+get_filename_component(_KINETUM_CMAKE_DIR "${CMAKE_CURRENT_LIST_FILE}" PATH)
+get_filename_component(_KINETUM_INSTALL_PREFIX "${_KINETUM_CMAKE_DIR}/../../../.." ABSOLUTE)
+
+set(_KINETUM_INCLUDE_DIR "${_KINETUM_INSTALL_PREFIX}/sdk/include")
+
+# Check the required package entry points before exposing imported targets.
+if(NOT EXISTS "${_KINETUM_INCLUDE_DIR}/kinetum/kinetum_sdk.h" OR
+   NOT EXISTS "${_KINETUM_INCLUDE_DIR}/kinetum/kinetum_sdk.hpp" OR
+   NOT EXISTS "${_KINETUM_INCLUDE_DIR}/kinetum/algo/algo.hpp" OR
+   NOT EXISTS "${_KINETUM_CMAKE_DIR}/KinetumModulePolicy.cmake")
+  set(Kinetum_FOUND FALSE)
+  if(Kinetum_FIND_REQUIRED)
+    message(FATAL_ERROR
+      "Kinetum SDK installation is incomplete at ${_KINETUM_INSTALL_PREFIX}")
+  endif()
+  unset(_KINETUM_CMAKE_DIR)
+  unset(_KINETUM_INSTALL_PREFIX)
+  unset(_KINETUM_INCLUDE_DIR)
+  return()
+endif()
+include("${_KINETUM_CMAKE_DIR}/KinetumModulePolicy.cmake")
+
+# Create imported interface library for SDK
+if(NOT TARGET Kinetum::SDK)
+  add_library(Kinetum::SDK INTERFACE IMPORTED)
+  set_target_properties(Kinetum::SDK PROPERTIES
+    INTERFACE_INCLUDE_DIRECTORIES "${_KINETUM_INCLUDE_DIR}"
+  )
+  _kinetum_apply_module_sdk_policy(Kinetum::SDK)
+endif()
+
+# Shared module dependencies export their own declared API, so they must not
+# inherit the module image's hidden-by-default visibility. They still reject
+# unresolved imports and avoid GNU-unique process-lifetime ownership.
+if(NOT TARGET Kinetum::ModuleDependency)
+  add_library(Kinetum::ModuleDependency INTERFACE IMPORTED)
+  _kinetum_apply_module_dependency_policy(Kinetum::ModuleDependency)
+endif()
+
+set(Kinetum_FOUND TRUE)
+
+# Print status if not in quiet mode
+if(NOT Kinetum_FIND_QUIETLY)
+  message(STATUS "Found Kinetum SDK ${Kinetum_VERSION} at ${_KINETUM_INSTALL_PREFIX}")
+endif()
+
+unset(_KINETUM_CMAKE_DIR)
+unset(_KINETUM_INSTALL_PREFIX)
+unset(_KINETUM_INCLUDE_DIR)

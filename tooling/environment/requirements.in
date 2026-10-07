@@ -1,0 +1,18 @@
+# Python dependencies for development, packaging, and documentation.
+# Resolve on Python 3.12 with pip-compile --generate-hashes. Verify Linux
+# x86_64/AArch64 wheels and the PlantUML extension's source archive.
+build==1.2.2.post1
+flake8==7.3.0
+hatchling>=1.27
+matplotlib==3.11.2
+pip==26.2.1
+pip-tools==7.6.1
+pyelftools==0.30
+pylint==4.0.4
+pytest==7.4.4
+pytest-subtests==0.11.0
+
+Sphinx==8.1.3
+MyST-Parser==4.0.1
+sphinx-rtd-theme==3.1.0
+sphinxcontrib-plantuml==0.31

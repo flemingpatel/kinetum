@@ -1,0 +1,75 @@
+// Copyright (c) 2026 Fleming Patel. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+//
+// QoS Module Protocol Buffer Schema
+//
+// This proto defines the configuration schema for the QoS module (libkinetum_qos.so).
+// The module is the SOURCE OF TRUTH for the runtime contract. ConfigSnapshot
+// carries strict snake-case JSON in config_blob. This proto is a host/offline
+// authoring model only; generated code is never linked into the unloadable
+// module image.
+//
+// Ownership model:
+//   - Platform provides MECHANISM (epoch transitions, blob routing)
+//   - Module provides POLICY (rate limiting, traffic shaping)
+//   - Platform does NOT parse this proto - it routes opaque bytes to module
+//
+// Usage:
+//   1. Build or author a QosProfiles payload.
+//   2. Encode populated fields as strict snake-case JSON.
+//   3. Send via ConfigSnapshot.modules[].config_blob.
+//   4. Module parses, validates, and applies.
+
+syntax = "proto3";
+
+package kinetum.module.qos.v1;
+
+option cc_enable_arenas = true;
+
+// =============================================================================
+// QoS Profile Definition
+// =============================================================================
+
+// QosProfile defines a traffic class with rate limits.
+message QosProfile {
+  // Profile name
+  string name = 1;
+
+  // Committed Information Rate (kbps)
+  int64 cir_kbps = 2;
+
+  // Committed Burst Size (KB)
+  int64 cbs_kb = 3;
+
+  // DSCP remarking for conforming packets (0 = no remark)
+  // When set, the module writes this DSCP value into the IPv4 DS field
+  // of every packet that passes policing. Both SoA metadata and on-wire
+  // bytes are updated, with IPv4 header checksum recomputed.
+  int32 conform_dscp = 4;
+}
+
+// =============================================================================
+// QoS Profiles (Module Configuration)
+// =============================================================================
+
+// QosProfiles is the complete QoS module configuration.
+// This is what gets serialized to config_blob.
+message QosProfiles {
+  // Available profiles
+  repeated QosProfile profiles = 1;
+
+  // Default profile name for unclassified traffic
+  string default_profile = 2;
+
+  // GC trigger mask (run GC when (counter & mask) == 0).
+  // Default: 0xffff (every 65536 packets)
+  uint64 gc_trigger_mask = 3;
+
+  // Maximum flow buckets to evict per GC cycle (1..1024 when authored).
+  // Default: 256
+  uint32 gc_max_evictions = 4;
+
+  // Flow idle timeout before GC eviction (seconds).
+  // Default: 30
+  uint32 idle_timeout_s = 5;
+}

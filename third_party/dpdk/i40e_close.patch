@@ -1,0 +1,38 @@
+Preserve i40e close status when interrupt unregistration returns a count.
+Retain a final -EAGAIN after exhausted retries as a close failure.
+
+--- a/drivers/net/i40e/i40e_ethdev.c
++++ b/drivers/net/i40e/i40e_ethdev.c
+@@ -2693,6 +2693,7 @@
+ 	uint32_t reg;
+ 	int i;
+ 	int ret;
++	int cb_ret;
+ 	uint8_t aq_fail = 0;
+ 	int retries = 0;
+ 
+@@ -2761,17 +2762,20 @@
+ 	i40e_pf_host_uninit(dev);
+ 
+ 	do {
+-		ret = rte_intr_callback_unregister(intr_handle,
++		cb_ret = rte_intr_callback_unregister(intr_handle,
+ 				i40e_dev_interrupt_handler, dev);
+-		if (ret >= 0 || ret == -ENOENT) {
++		if (cb_ret >= 0 || cb_ret == -ENOENT) {
+ 			break;
+-		} else if (ret != -EAGAIN) {
++		} else if (cb_ret != -EAGAIN) {
+ 			PMD_INIT_LOG(ERR,
+ 				 "intr callback unregister failed: %d",
+-				 ret);
++				 cb_ret);
++			break;
+ 		}
+ 		i40e_msec_delay(500);
+ 	} while (retries++ < 5);
++	if (ret == 0 && cb_ret < 0 && cb_ret != -ENOENT)
++		ret = cb_ret;
+ 
+ 	i40e_rm_ethtype_filter_list(pf);
+ 	i40e_rm_tunnel_filter_list(pf);

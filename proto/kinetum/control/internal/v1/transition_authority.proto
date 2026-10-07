@@ -1,0 +1,105 @@
+// Copyright (c) 2026 Fleming Patel. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Private Control Plane persistence contract.
+//
+// This schema is not an RPC, SDK, module, provider, or package interface. It
+// defines the one deterministic mutable record in a CP durable store. Canonical
+// snapshots themselves remain immutable corpus objects; this record atomically
+// binds active Bootstrap truth, at most one current/latest live transition,
+// commit-confirmed state, one guardrails policy, and one safety intent.
+
+syntax = "proto3";
+
+package kinetum.control.internal.v1;
+
+import "kinetum/common/v1/common.proto";
+import "kinetum/control/v1/control.proto";
+import "kinetum/dataplane/v1/dataplane.proto";
+
+option cc_enable_arenas = true;
+
+// DurableEpochTransitionPhase records CP's durable intent and knowledge. It is
+// deliberately distinct from the DP coordinator's EpochTransitionState.
+enum DurableEpochTransitionPhase {
+  DURABLE_EPOCH_TRANSITION_PHASE_UNSPECIFIED = 0;
+  DURABLE_EPOCH_TRANSITION_PHASE_ALLOCATED = 1;
+  DURABLE_EPOCH_TRANSITION_PHASE_PREPARED = 2;
+  DURABLE_EPOCH_TRANSITION_PHASE_COMPLETION_PENDING = 3;
+  DURABLE_EPOCH_TRANSITION_PHASE_ABORT_PENDING = 4;
+  DURABLE_EPOCH_TRANSITION_PHASE_COMPLETE = 5;
+  DURABLE_EPOCH_TRANSITION_PHASE_ABORTED = 6;
+}
+
+// DurableEpochTransition binds one canonical corpus object to its exact CP-
+// allocated runtime identity. The original bounded key is retained so restart
+// reconciliation can reconstruct the exact DP request; runtime authorities
+// consume only idempotency_key_digest.
+message DurableEpochTransition {
+  string snapshot_id = 1;
+  uint64 target_epoch = 2;
+  uint64 mutation_sequence = 3;
+  string idempotency_key = 4;
+  bytes validation_hash = 5;
+  bytes idempotency_key_digest = 6;
+  DurableEpochTransitionPhase phase = 7;
+  uint32 confirm_timeout_ms = 8;
+
+  // Present only for COMPLETE or ABORTED. Only code, error_code, and bounded
+  // message are admitted; details, request IDs, and nested causes are absent.
+  kinetum.common.v1.Status terminal_status = 9;
+}
+
+// DurableGuardrailsPolicy binds one canonical policy to its exact generation
+// and retry identity. The policy hash is SHA-256 over deterministic validated
+// policy bytes; the full caller key is intentionally not persisted.
+message DurableGuardrailsPolicy {
+  // Required message presence, including for explicit empty disabled policy.
+  kinetum.control.v1.GuardrailsPolicy policy = 1;
+  uint64 generation = 2;
+  bytes policy_hash = 3;
+  bytes idempotency_key_digest = 4;
+}
+
+// DurableRollbackCause is the typed origin of one safety intent. It is audit
+// identity only; the existing durable epoch transition remains mutation
+// authority.
+enum DurableRollbackCause {
+  DURABLE_ROLLBACK_CAUSE_UNSPECIFIED = 0;
+  DURABLE_ROLLBACK_CAUSE_COMMIT_CONFIRM_DEADLINE = 1;
+  DURABLE_ROLLBACK_CAUSE_THRESHOLD_DEGRADATION = 2;
+  DURABLE_ROLLBACK_CAUSE_CORRELATED_DEGRADATION = 3;
+  DURABLE_ROLLBACK_CAUSE_BOUNDARY_ACK_TIMEOUT = 4;
+}
+
+// DurableRollbackIntent is one desired rollback awaiting the existing
+// transition authority. Absence means no intent. terminal_status is absent
+// while pending and retains one typed failure permanently when convergence is
+// impossible; successful convergence clears the complete message atomically.
+message DurableRollbackIntent {
+  string target_snapshot_id = 1;
+  string guarded_snapshot_id = 2;
+  uint64 guarded_epoch = 3;
+  int64 guarded_revision = 4;
+  bytes guarded_validation_hash = 5;
+  uint64 wait_for_mutation_sequence = 6;
+  uint64 policy_generation = 7;
+  uint64 runtime_generation = 8;
+  string idempotency_key = 9;
+  bytes idempotency_key_digest = 10;
+  DurableRollbackCause cause = 11;
+  uint64 observed_monotonic_ns = 12;
+  int64 created_unix_ms = 13;
+  kinetum.common.v1.Status terminal_status = 14;
+}
+
+// ControlPlaneTransitionAuthority is the one atomically replaced mutable CP
+// record. Message presence is the sole authority for optional transition and
+// commit-confirmed state; no parallel boolean or sidecar file exists.
+message ControlPlaneTransitionAuthority {
+  kinetum.dataplane.v1.BootstrapConfigSnapshotRequest active_bootstrap = 1;
+  DurableEpochTransition transition = 2;
+  kinetum.control.v1.PendingConfirm pending_confirm = 3;
+  DurableGuardrailsPolicy guardrails_policy = 4;
+  DurableRollbackIntent rollback_intent = 5;
+}

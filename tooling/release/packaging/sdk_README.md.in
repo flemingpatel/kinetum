@@ -1,0 +1,77 @@
+# Kinetum SDK @KINETUM_VERSION@
+
+Development kit for building custom Kinetum modules.
+
+## Installation
+
+The versioned release page supplies a complete command for each architecture.
+The public headers are common to both architectures; the native installer in
+each archive determines its target. In this x86-64 example, `RELEASE_URL`
+denotes the versioned HTTPS asset directory from that page:
+
+```bash
+set -o pipefail
+curl -fsSL "$RELEASE_URL/kinetum-sdk-@KINETUM_VERSION@-x86_64.install.sh" | sudo /bin/sh
+```
+
+For AArch64, choose `kinetum-sdk-@KINETUM_VERSION@-aarch64.install.sh`.
+Each entry verifies its selected architecture and archive before installation.
+Ubuntu 24.04 and the native installer's system-library prerequisites are
+required. Online setup installs those libraries through APT.
+
+The public installer's CPU requirements are the Core i7/Nehalem instruction-set
+baseline on x86-64 and Armv8-A with CRC on AArch64. A locally built native
+installer may require additional features of its build machine. SDK headers
+remain common, and the exported CMake/pkg-config interfaces leave CPU flags
+to the module author's build.
+
+The same `.install.sh` is produced for a locally built package. To install
+local files, including on an offline host, place it beside its matching
+`.tar.gz`. With the system prerequisites already installed, run from that
+directory on x86-64:
+
+```bash
+sudo /bin/sh ./kinetum-sdk-@KINETUM_VERSION@-x86_64.install.sh --offline-directory "$PWD"
+```
+
+This mode skips downloads and APT installation. An installer produced without
+a publication URL requires `--offline-directory`; it never invents an address
+or chooses a local archive implicitly.
+
+The SDK installs under `/opt/kinetum/sdk`; `--prefix /absolute/path` selects
+another protected prefix. Only `sdk/` is replaced, with prior bytes retained
+until installed verification succeeds. A failed replacement restores prior
+entries; a restoration failure reports both causes and retains recovery state.
+Runtime and build-dependency peers remain untouched. With `--offline-directory`,
+installed prerequisites, and a user-owned prefix, SDK installation can run
+without root.
+
+The SDK contains headers, examples, build integration, and applicable legal
+material. The documentation website is built and published separately.
+The release channel authenticates delivery; checksums provide integrity
+under that channel.
+
+## Discovery
+
+```bash
+export PKG_CONFIG_PATH="/opt/kinetum/sdk/lib/pkgconfig${PKG_CONFIG_PATH:+:${PKG_CONFIG_PATH}}"
+pkg-config --cflags --libs kinetum
+```
+
+For C++20 projects:
+
+```cmake
+find_package(Kinetum CONFIG REQUIRED)
+target_link_libraries(my_module PRIVATE Kinetum::SDK)
+```
+
+Point CMake at the installed package domain when configuring:
+
+```bash
+cmake -S . -B build -DCMAKE_PREFIX_PATH=/opt/kinetum/sdk
+```
+
+Examples are installed under `sdk/examples/`. The source repository's `docs/`
+index and the separately published website own the guides and API reference;
+they are not installed into the SDK. Package-level legal material remains at
+the SDK root.

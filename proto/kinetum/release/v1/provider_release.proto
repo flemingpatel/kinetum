@@ -1,0 +1,40 @@
+// Copyright (c) 2026 Fleming Patel. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Deterministic native self-admission evidence for one runtime candidate.
+
+syntax = "proto3";
+
+package kinetum.release.v1;
+
+import "kinetum/provider/v1/installed_provider_inventory.proto";
+
+option cc_enable_arenas = true;
+
+// NativeProviderAdmissionReceipt records the exact inventory-bound artifact
+// set that the target-native prepare process loaded and self-admitted. The
+// architecture-neutral finalizer independently reconstructs and preflights
+// every inventory-covered artifact before requiring byte equality with this
+// receipt. The receipt is deterministic and unsigned, not cryptographic
+// producer attestation; its content can never replace or suppress a finalizer
+// check.
+message NativeProviderAdmissionReceipt {
+  // Exact receipt wire-contract version; the producer writes 1 and every
+  // finalizer rejects any other value.
+  uint32 format_version = 1;
+
+  // Canonical target tuple whose native process performed self-admission.
+  string target_tuple = 2;
+
+  // SHA-256 of the exact canonical unsigned installed-provider inventory.
+  bytes inventory_sha256 = 3;
+
+  // Byte length of the same canonical unsigned inventory.
+  uint64 inventory_size_bytes = 4;
+
+  // Canonically ordered component records loaded by native preparation.
+  repeated kinetum.provider.v1.ProviderComponentArtifact admitted_components = 5;
+
+  // Canonically ordered private-artifact records loaded before their owners.
+  repeated kinetum.provider.v1.PrivateProviderArtifact admitted_private_artifacts = 6;
+}

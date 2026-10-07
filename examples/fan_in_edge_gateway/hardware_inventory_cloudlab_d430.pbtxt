@@ -1,0 +1,40 @@
+# Hardware Inventory - CloudLab d430 Fan-In Runtime
+#
+# This fixture records only Gluon-consumed planning facts for the assigned
+# runtime host. Regenerate the CPU and PCI rows when CloudLab assigns another
+# host. Quark and the selected DPDK provider perform the final live host proof.
+
+node {
+  cpu {
+    core_topology { core_id: 0 numa_node: 0 is_hyperthread: false }
+    core_topology { core_id: 2 numa_node: 0 is_hyperthread: false }
+    core_topology { core_id: 4 numa_node: 0 is_hyperthread: false }
+    core_topology { core_id: 6 numa_node: 0 is_hyperthread: false }
+    core_topology { core_id: 8 numa_node: 0 is_hyperthread: false }
+    core_topology { core_id: 10 numa_node: 0 is_hyperthread: false }
+    core_topology { core_id: 12 numa_node: 0 is_hyperthread: false }
+    core_topology { core_id: 16 numa_node: 0 is_hyperthread: true }
+  }
+
+  nics {
+    pci_address: "0000:06:00.0"
+    max_mtu: 9702
+    mac_address: "3c:fd:fe:05:e0:20"
+    numa_node: 0
+    driver: NIC_DRIVER_DPDK
+  }
+  nics {
+    pci_address: "0000:06:00.2"
+    max_mtu: 9702
+    mac_address: "3c:fd:fe:05:e0:24"
+    numa_node: 0
+    driver: NIC_DRIVER_DPDK
+  }
+  nics {
+    pci_address: "0000:06:00.1"
+    max_mtu: 9702
+    mac_address: "3c:fd:fe:05:e0:22"
+    numa_node: 0
+    driver: NIC_DRIVER_DPDK
+  }
+}

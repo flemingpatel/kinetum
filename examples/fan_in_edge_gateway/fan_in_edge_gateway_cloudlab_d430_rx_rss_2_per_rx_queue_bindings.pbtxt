@@ -1,0 +1,323 @@
+# Fan-In Edge Gateway - CloudLab d430 RSS2 with Separate RX Storage
+#
+# Each port/queue pair allocates from its own domain. Either NAT owner can
+# receive any ingress buffer; both lan0 TX queues admit all four domains.
+
+process_facility_instances {
+  facility_instance_id: "facility_dpdk_0"
+  configuration {
+    [type.googleapis.com/kinetum.facility.dpdk.v1.DpdkFacilityConfig] {}
+  }
+}
+
+io_driver_instances {
+  io_driver_instance_id: "io_dpdk_0"
+  facility_instance_ids: "facility_dpdk_0"
+  configuration {
+    [type.googleapis.com/kinetum.io.dpdk.v1.DpdkDriverConfig] {
+      ports { driver_port_id: "lan0" pci { pci_address: "0000:06:00.1" } }
+      ports { driver_port_id: "wan0" pci { pci_address: "0000:06:00.0" } }
+      ports { driver_port_id: "wan1" pci { pci_address: "0000:06:00.2" } }
+    }
+  }
+}
+
+packet_storage_domains {
+  storage_domain_id: "storage_wan0_q0"
+  facility_instance_ids: "facility_dpdk_0"
+  configuration {
+    [type.googleapis.com/kinetum.storage.dpdk.v1.DpdkStorageConfig] { cache_size: 256 }
+  }
+  buffer_count: 32767
+  data_room_bytes: 2048
+  headroom_bytes: 128
+  alignment_bytes: 64
+  host_numa_node: 0
+}
+packet_storage_domains {
+  storage_domain_id: "storage_wan0_q1"
+  facility_instance_ids: "facility_dpdk_0"
+  configuration {
+    [type.googleapis.com/kinetum.storage.dpdk.v1.DpdkStorageConfig] { cache_size: 256 }
+  }
+  buffer_count: 32767
+  data_room_bytes: 2048
+  headroom_bytes: 128
+  alignment_bytes: 64
+  host_numa_node: 0
+}
+packet_storage_domains {
+  storage_domain_id: "storage_wan1_q0"
+  facility_instance_ids: "facility_dpdk_0"
+  configuration {
+    [type.googleapis.com/kinetum.storage.dpdk.v1.DpdkStorageConfig] { cache_size: 256 }
+  }
+  buffer_count: 32767
+  data_room_bytes: 2048
+  headroom_bytes: 128
+  alignment_bytes: 64
+  host_numa_node: 0
+}
+packet_storage_domains {
+  storage_domain_id: "storage_wan1_q1"
+  facility_instance_ids: "facility_dpdk_0"
+  configuration {
+    [type.googleapis.com/kinetum.storage.dpdk.v1.DpdkStorageConfig] { cache_size: 256 }
+  }
+  buffer_count: 32767
+  data_room_bytes: 2048
+  headroom_bytes: 128
+  alignment_bytes: 64
+  host_numa_node: 0
+}
+
+execution_provider_instances {
+  execution_provider_instance_id: "execution_cpu_0"
+  configuration {
+    [type.googleapis.com/kinetum.execution.cpu.v1.CpuExecutionConfig] {}
+  }
+}
+
+logical_port_bindings {
+  logical_name: "wan0"
+  io_driver_instance_id: "io_dpdk_0"
+  driver_port_id: "wan0"
+  direction: PORT_DIRECTION_RX_ONLY
+  host_numa_node: 0
+  mtu: 1500
+}
+logical_port_bindings {
+  logical_name: "wan1"
+  io_driver_instance_id: "io_dpdk_0"
+  driver_port_id: "wan1"
+  direction: PORT_DIRECTION_RX_ONLY
+  host_numa_node: 0
+  mtu: 1500
+}
+logical_port_bindings {
+  logical_name: "lan0"
+  io_driver_instance_id: "io_dpdk_0"
+  driver_port_id: "lan0"
+  direction: PORT_DIRECTION_TX_ONLY
+  host_numa_node: 0
+  mtu: 1500
+}
+
+io_stream_bindings {
+  logical_name: "wan0"
+  direction: IO_STREAM_DIRECTION_RX
+  queues { driver_queue_id: 0 descriptor_count: 1024 rx_storage_domain_id: "storage_wan0_q0" }
+  queues { driver_queue_id: 1 descriptor_count: 1024 rx_storage_domain_id: "storage_wan0_q1" }
+  steering {
+    kind: TRAFFIC_STEERING_KIND_RSS
+    symmetric: true
+    hash_fields: "ipv4"
+    hash_fields: "udp"
+    hash_key: "\x6d\x5a\x56\xda\x25\x5b\x0e\xc2\x41\x67\x25\x3d\x43\xa3\x8f\xb0\xd0\xca\x2b\xcb\xae\x7b\x30\xb4\x77\xcb\x2d\xa3\x80\x30\xf2\x0c\x6a\x42\xb7\x3b\xbe\xac\x01\xfa"
+  }
+}
+io_stream_bindings {
+  logical_name: "wan1"
+  direction: IO_STREAM_DIRECTION_RX
+  queues { driver_queue_id: 0 descriptor_count: 1024 rx_storage_domain_id: "storage_wan1_q0" }
+  queues { driver_queue_id: 1 descriptor_count: 1024 rx_storage_domain_id: "storage_wan1_q1" }
+  steering {
+    kind: TRAFFIC_STEERING_KIND_RSS
+    symmetric: true
+    hash_fields: "ipv4"
+    hash_fields: "udp"
+    hash_key: "\x6d\x5a\x56\xda\x25\x5b\x0e\xc2\x41\x67\x25\x3d\x43\xa3\x8f\xb0\xd0\xca\x2b\xcb\xae\x7b\x30\xb4\x77\xcb\x2d\xa3\x80\x30\xf2\x0c\x6a\x42\xb7\x3b\xbe\xac\x01\xfa"
+  }
+}
+io_stream_bindings {
+  logical_name: "lan0"
+  direction: IO_STREAM_DIRECTION_TX
+  queues {
+    driver_queue_id: 0
+    descriptor_count: 1024
+    tx_storage {
+      storage_domain_ids: "storage_wan0_q0"
+      storage_domain_ids: "storage_wan0_q1"
+      storage_domain_ids: "storage_wan1_q0"
+      storage_domain_ids: "storage_wan1_q1"
+    }
+  }
+  queues {
+    driver_queue_id: 1
+    descriptor_count: 1024
+    tx_storage {
+      storage_domain_ids: "storage_wan0_q0"
+      storage_domain_ids: "storage_wan0_q1"
+      storage_domain_ids: "storage_wan1_q0"
+      storage_domain_ids: "storage_wan1_q1"
+    }
+  }
+  steering { kind: TRAFFIC_STEERING_KIND_NONE }
+}
+
+stage_execution_bindings {
+  logical_stage_id: "rx0"
+  execution_provider_instance_id: "execution_cpu_0"
+}
+stage_execution_bindings {
+  logical_stage_id: "rx1"
+  execution_provider_instance_id: "execution_cpu_0"
+}
+stage_execution_bindings {
+  logical_stage_id: "parse0"
+  execution_provider_instance_id: "execution_cpu_0"
+}
+stage_execution_bindings {
+  logical_stage_id: "parse1"
+  execution_provider_instance_id: "execution_cpu_0"
+}
+stage_execution_bindings {
+  logical_stage_id: "acl0"
+  execution_provider_instance_id: "execution_cpu_0"
+}
+stage_execution_bindings {
+  logical_stage_id: "acl1"
+  execution_provider_instance_id: "execution_cpu_0"
+}
+stage_execution_bindings {
+  logical_stage_id: "nat"
+  execution_provider_instance_id: "execution_cpu_0"
+}
+stage_execution_bindings {
+  logical_stage_id: "qos"
+  execution_provider_instance_id: "execution_cpu_0"
+}
+stage_execution_bindings {
+  logical_stage_id: "tx"
+  execution_provider_instance_id: "execution_cpu_0"
+}
+
+storage_transition_bindings {
+  transition_id: "acl0_lane_0_to_nat_lane_0_share"
+  from_endpoint { stage { logical_stage_id: "acl0" lane_id: "lane_0" } }
+  to_endpoint { stage { logical_stage_id: "nat" lane_id: "lane_0" } }
+  from_storage_domain_id: "storage_wan0_q0"
+  to_storage_domain_id: "storage_wan0_q0"
+  configuration {
+    [type.googleapis.com/kinetum.transition.core.v1.ZeroCopyShareConfig] {}
+  }
+}
+storage_transition_bindings {
+  transition_id: "acl0_lane_0_to_nat_lane_1_share"
+  from_endpoint { stage { logical_stage_id: "acl0" lane_id: "lane_0" } }
+  to_endpoint { stage { logical_stage_id: "nat" lane_id: "lane_1" } }
+  from_storage_domain_id: "storage_wan0_q0"
+  to_storage_domain_id: "storage_wan0_q0"
+  configuration {
+    [type.googleapis.com/kinetum.transition.core.v1.ZeroCopyShareConfig] {}
+  }
+}
+storage_transition_bindings {
+  transition_id: "acl0_lane_1_to_nat_lane_0_share"
+  from_endpoint { stage { logical_stage_id: "acl0" lane_id: "lane_1" } }
+  to_endpoint { stage { logical_stage_id: "nat" lane_id: "lane_0" } }
+  from_storage_domain_id: "storage_wan0_q1"
+  to_storage_domain_id: "storage_wan0_q1"
+  configuration {
+    [type.googleapis.com/kinetum.transition.core.v1.ZeroCopyShareConfig] {}
+  }
+}
+storage_transition_bindings {
+  transition_id: "acl0_lane_1_to_nat_lane_1_share"
+  from_endpoint { stage { logical_stage_id: "acl0" lane_id: "lane_1" } }
+  to_endpoint { stage { logical_stage_id: "nat" lane_id: "lane_1" } }
+  from_storage_domain_id: "storage_wan0_q1"
+  to_storage_domain_id: "storage_wan0_q1"
+  configuration {
+    [type.googleapis.com/kinetum.transition.core.v1.ZeroCopyShareConfig] {}
+  }
+}
+storage_transition_bindings {
+  transition_id: "acl1_lane_0_to_nat_lane_0_share"
+  from_endpoint { stage { logical_stage_id: "acl1" lane_id: "lane_0" } }
+  to_endpoint { stage { logical_stage_id: "nat" lane_id: "lane_0" } }
+  from_storage_domain_id: "storage_wan1_q0"
+  to_storage_domain_id: "storage_wan1_q0"
+  configuration {
+    [type.googleapis.com/kinetum.transition.core.v1.ZeroCopyShareConfig] {}
+  }
+}
+storage_transition_bindings {
+  transition_id: "acl1_lane_0_to_nat_lane_1_share"
+  from_endpoint { stage { logical_stage_id: "acl1" lane_id: "lane_0" } }
+  to_endpoint { stage { logical_stage_id: "nat" lane_id: "lane_1" } }
+  from_storage_domain_id: "storage_wan1_q0"
+  to_storage_domain_id: "storage_wan1_q0"
+  configuration {
+    [type.googleapis.com/kinetum.transition.core.v1.ZeroCopyShareConfig] {}
+  }
+}
+storage_transition_bindings {
+  transition_id: "acl1_lane_1_to_nat_lane_0_share"
+  from_endpoint { stage { logical_stage_id: "acl1" lane_id: "lane_1" } }
+  to_endpoint { stage { logical_stage_id: "nat" lane_id: "lane_0" } }
+  from_storage_domain_id: "storage_wan1_q1"
+  to_storage_domain_id: "storage_wan1_q1"
+  configuration {
+    [type.googleapis.com/kinetum.transition.core.v1.ZeroCopyShareConfig] {}
+  }
+}
+storage_transition_bindings {
+  transition_id: "acl1_lane_1_to_nat_lane_1_share"
+  from_endpoint { stage { logical_stage_id: "acl1" lane_id: "lane_1" } }
+  to_endpoint { stage { logical_stage_id: "nat" lane_id: "lane_1" } }
+  from_storage_domain_id: "storage_wan1_q1"
+  to_storage_domain_id: "storage_wan1_q1"
+  configuration {
+    [type.googleapis.com/kinetum.transition.core.v1.ZeroCopyShareConfig] {}
+  }
+}
+
+module_context_resource_bindings {
+  logical_stage_id: "acl0"
+  lane_id: "lane_0"
+  context_memory_capacity_bytes: 1048576
+  epoch_arena_capacity_bytes: 1048576
+}
+module_context_resource_bindings {
+  logical_stage_id: "acl1"
+  lane_id: "lane_0"
+  context_memory_capacity_bytes: 1048576
+  epoch_arena_capacity_bytes: 1048576
+}
+module_context_resource_bindings {
+  logical_stage_id: "acl0"
+  lane_id: "lane_1"
+  context_memory_capacity_bytes: 1048576
+  epoch_arena_capacity_bytes: 1048576
+}
+module_context_resource_bindings {
+  logical_stage_id: "acl1"
+  lane_id: "lane_1"
+  context_memory_capacity_bytes: 1048576
+  epoch_arena_capacity_bytes: 1048576
+}
+module_context_resource_bindings {
+  logical_stage_id: "nat"
+  lane_id: "lane_0"
+  context_memory_capacity_bytes: 16777216
+  epoch_arena_capacity_bytes: 1048576
+}
+module_context_resource_bindings {
+  logical_stage_id: "nat"
+  lane_id: "lane_1"
+  context_memory_capacity_bytes: 16777216
+  epoch_arena_capacity_bytes: 1048576
+}
+module_context_resource_bindings {
+  logical_stage_id: "qos"
+  lane_id: "lane_0"
+  context_memory_capacity_bytes: 16777216
+  epoch_arena_capacity_bytes: 1048576
+}
+module_context_resource_bindings {
+  logical_stage_id: "qos"
+  lane_id: "lane_1"
+  context_memory_capacity_bytes: 16777216
+  epoch_arena_capacity_bytes: 1048576
+}

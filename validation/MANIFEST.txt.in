@@ -1,0 +1,36 @@
+Kinetum private validation kit @KINETUM_VERSION@
+
+Purpose:
+  Internal integration and CloudLab validation of an independently installed runtime.
+
+Runtime linkage:
+  Each run names an explicit disjoint runtime root. The harness requires
+  kinetum-info --check --json before admitting metadata or starting traffic.
+  No runtime executable, module, provider artifact, or public installer is
+  included in this private transport.
+
+Validation-only binaries:
+@KINETUM_VALIDATION_BINARY_MANIFEST@
+
+Host preparation helpers:
+  scripts/dpdk_hugepages.sh
+  scripts/install_trex_ubuntu.sh
+
+Harness:
+  Python modules: kinetum_validation, kinetum_benchmark
+  Resource root: kinetum_validation/data/
+  cloudlab/fan_in_edge_gateway_profile.py
+
+Harness authorities:
+  kinetum_benchmark/contracts.py
+  kinetum_validation/engine/json_contract.py
+  kinetum_validation/engine/runtime_release.py
+  kinetum_validation/process/run_owner.py
+  kinetum_validation/process/system_tools.py
+  kinetum_validation/traffic/trex_remote_script.py
+  kinetum_validation/version_contract.py
+
+Packaging policy:
+  Python bytecode, caches, and source tests are excluded structurally.
+  Pip installs into the selected Python environment.
+  Validation resources remain outside the public runtime prefix.

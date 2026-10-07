@@ -1,0 +1,29 @@
+// Copyright (c) 2026 Fleming Patel. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Pure typed configuration for the development UDP I/O driver.
+
+syntax = "proto3";
+
+package kinetum.io.udp.v1;
+
+option cc_enable_arenas = true;
+
+// UdpDriverPort binds one stable driver-local identity to one numeric IPv4
+// socket endpoint. DNS names, IPv6, and alternate textual IPv4 spellings are
+// outside this exact current contract. Port zero remains a typed value here;
+// direction-specific bind legality is proved when a plan consumes the port.
+// driver_port_id uses the shared topology-identifier grammar and is bounded to
+// 128 bytes.
+message UdpDriverPort {
+  string driver_port_id = 1;
+  string ipv4_address = 2;
+  uint32 port = 3;
+}
+
+// UdpDriverConfig is a nonempty set of exact endpoints. Input order is not
+// policy; canonicalization sorts ports by driver_port_id and rejects duplicate
+// identities.
+message UdpDriverConfig {
+  repeated UdpDriverPort ports = 1;
+}

@@ -1,0 +1,44 @@
+# Fan-In Edge Gateway Guardrails Degradation Snapshot
+#
+# This snapshot preserves the v2 module set, NAT44 policy, and QoS policy. Its
+# ACL denies only the validation traffic envelope so the
+# guardrails scenario observes deterministic terminal drops and TX reduction.
+# Each config_blob remains the exact strict-JSON module-policy authority.
+
+snapshot_id: "fan_in_edge_gw_guardrails_degradation_v2"
+revision: 2
+description: "Fan-in edge-processing guardrails degradation fixture"
+
+# =============================================================================
+# ACL Module Configuration - Exact Validation Flow Denied
+# =============================================================================
+
+modules {
+  module_id: "kinetum.acl"
+  revision: 2
+  content_type: "application/json"
+  config_blob: "{ \"default_action\": 2, \"rules\": [ { \"priority\": 2000, \"src_cidr\": \"10.0.0.100/32\", \"dst_cidr\": \"192.168.1.1/32\", \"dst_port_min\": 9999, \"dst_port_max\": 9999, \"protocol\": 17, \"action\": 2, \"enabled\": true }, { \"priority\": 1000, \"src_cidr\": \"0.0.0.0/0\", \"dst_cidr\": \"0.0.0.0/0\", \"action\": 1, \"enabled\": true } ] }"
+  content_hash: "b67987074d51a36561880241a2863578fdafba67dcbc50e9b2f56e6b8767ce98"
+}
+
+# =============================================================================
+# NAT44 Module Configuration - Byte-Identical to v2
+# =============================================================================
+
+modules {
+  module_id: "kinetum.nat44"
+  revision: 2
+  content_type: "application/json"
+  config_blob: "{ \"session_timeout_s\": 600, \"pools\": [ { \"public_ip_ranges\": [\"192.0.2.1-192.0.2.10\"], \"port_min\": 10000, \"port_max\": 60000 } ] }"
+}
+
+# =============================================================================
+# QoS Module Configuration - Byte-Identical to v2
+# =============================================================================
+
+modules {
+  module_id: "kinetum.qos"
+  revision: 2
+  content_type: "application/json"
+  config_blob: "{ \"default_profile\": \"standard\", \"profiles\": [ { \"name\": \"standard\", \"cir_kbps\": 10000000, \"cbs_kb\": 500, \"conform_dscp\": 20 } ] }"
+}

@@ -1,0 +1,13 @@
+# Hardware Inventory - Passthrough TAP Validation
+#
+# The three explicit CPU rows provide exactly one packet worker, one transition
+# coordinator, and one lifecycle executor. TAP device identity belongs to the
+# typed deployment bindings.
+
+node {
+  cpu {
+    core_topology { core_id: 0 numa_node: 0 is_hyperthread: false }
+    core_topology { core_id: 1 numa_node: 0 is_hyperthread: false }
+    core_topology { core_id: 2 numa_node: 0 is_hyperthread: false }
+  }
+}

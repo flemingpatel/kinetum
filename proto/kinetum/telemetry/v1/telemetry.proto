@@ -1,0 +1,541 @@
+// Copyright (c) 2026 Fleming Patel. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Shared provider-neutral runtime telemetry contract.
+//
+// This package is the sole wire authority for observations returned through
+// both the internal Data Plane service and the operator-facing Control Plane
+// service. A successful response carries one complete generation-scoped
+// RuntimeTelemetry message. Missing observations are represented by explicit
+// typed state or by field presence; numeric zero never substitutes for an
+// unavailable counter.
+
+syntax = "proto3";
+
+package kinetum.telemetry.v1;
+
+import "kinetum/gluon/v1/plan.proto";
+
+option cc_enable_arenas = true;
+
+// Exact externally observable state of one configuration transition.
+enum EpochTransitionState {
+  EPOCH_TRANSITION_STATE_UNSPECIFIED = 0;
+  EPOCH_TRANSITION_STATE_AWAITING_BOOTSTRAP = 1;
+  EPOCH_TRANSITION_STATE_BOOTSTRAPPING = 2;
+  EPOCH_TRANSITION_STATE_PREPARING = 3;
+  EPOCH_TRANSITION_STATE_PREPARED = 4;
+  EPOCH_TRANSITION_STATE_COMMITTING = 5;
+  EPOCH_TRANSITION_STATE_RETIRING = 6;
+  EPOCH_TRANSITION_STATE_COMPLETE = 7;
+  EPOCH_TRANSITION_STATE_FAILED_STOP = 8;
+  EPOCH_TRANSITION_STATE_ABORTED = 9;
+  EPOCH_TRANSITION_STATE_IDLE = 10;
+}
+
+// Typed transition failure or abort cause. NONE is a real observation;
+// UNSPECIFIED is malformed wherever a failure field is present.
+enum EpochTransitionFailureCode {
+  EPOCH_TRANSITION_FAILURE_CODE_UNSPECIFIED = 0;
+  EPOCH_TRANSITION_FAILURE_CODE_NONE = 1;
+  EPOCH_TRANSITION_FAILURE_CODE_EXPLICIT_ABORT = 2;
+  EPOCH_TRANSITION_FAILURE_CODE_SHUTDOWN_ABORT = 3;
+  EPOCH_TRANSITION_FAILURE_CODE_PREPARE_FAILURE = 4;
+  EPOCH_TRANSITION_FAILURE_CODE_PREPARE_CANCELLED = 5;
+  EPOCH_TRANSITION_FAILURE_CODE_PREPARE_DEADLINE_EXCEEDED = 6;
+  EPOCH_TRANSITION_FAILURE_CODE_PREPARED_LEASE_EXPIRED = 7;
+  EPOCH_TRANSITION_FAILURE_CODE_COMMIT_DEADLINE_EXCEEDED = 8;
+  EPOCH_TRANSITION_FAILURE_CODE_CERTIFICATE_CONTRADICTION = 9;
+  EPOCH_TRANSITION_FAILURE_CODE_RETIREMENT_GRACE_DEADLINE_EXCEEDED = 10;
+  EPOCH_TRANSITION_FAILURE_CODE_RETIRE_CALLBACK_FAILURE = 11;
+  EPOCH_TRANSITION_FAILURE_CODE_RETIRE_CALLBACK_DEADLINE_EXCEEDED = 12;
+  EPOCH_TRANSITION_FAILURE_CODE_COMMIT_SHUTDOWN = 13;
+  EPOCH_TRANSITION_FAILURE_CODE_PROTOCOL_FAULT = 14;
+}
+
+// Retained terminal transaction outcome.
+enum EpochTransitionOutcome {
+  EPOCH_TRANSITION_OUTCOME_UNSPECIFIED = 0;
+  EPOCH_TRANSITION_OUTCOME_NONE = 1;
+  EPOCH_TRANSITION_OUTCOME_COMPLETE = 2;
+  EPOCH_TRANSITION_OUTCOME_ABORTED = 3;
+  EPOCH_TRANSITION_OUTCOME_FAILED_STOP = 4;
+}
+
+// Exact status of one provider-owned observation.
+enum ProviderObservationState {
+  PROVIDER_OBSERVATION_STATE_UNSPECIFIED = 0;
+  PROVIDER_OBSERVATION_STATE_AVAILABLE_EXACT = 1;
+  PROVIDER_OBSERVATION_STATE_AVAILABLE_APPROXIMATE = 2;
+  PROVIDER_OBSERVATION_STATE_UNSUPPORTED = 3;
+  PROVIDER_OBSERVATION_STATE_READ_FAILED = 4;
+}
+
+// Current exact certificate result.
+enum EpochCertificateState {
+  EPOCH_CERTIFICATE_STATE_UNSPECIFIED = 0;
+  EPOCH_CERTIFICATE_STATE_INCOMPLETE = 1;
+  EPOCH_CERTIFICATE_STATE_EXECUTION_COMPLETE = 2;
+  EPOCH_CERTIFICATE_STATE_RECLAMATION_READY = 3;
+  EPOCH_CERTIFICATE_STATE_CONTRADICTION = 4;
+}
+
+// Typed source of a coherent certificate contradiction.
+enum EpochCertificateFault {
+  EPOCH_CERTIFICATE_FAULT_UNSPECIFIED = 0;
+  EPOCH_CERTIFICATE_FAULT_NONE = 1;
+  EPOCH_CERTIFICATE_FAULT_REQUEST_IDENTITY = 2;
+  EPOCH_CERTIFICATE_FAULT_EXECUTION_MEMBERSHIP = 3;
+  EPOCH_CERTIFICATE_FAULT_EXECUTION_STATE = 4;
+  EPOCH_CERTIFICATE_FAULT_BOUNDARY_MEMBERSHIP = 5;
+  EPOCH_CERTIFICATE_FAULT_BOUNDARY_STATE = 6;
+  EPOCH_CERTIFICATE_FAULT_CUT_IDENTITY = 7;
+  EPOCH_CERTIFICATE_FAULT_READER_MEMBERSHIP = 8;
+}
+
+// Exact sender-gate phase for one boundary.
+enum BoundarySenderPhase {
+  BOUNDARY_SENDER_PHASE_UNSPECIFIED = 0;
+  BOUNDARY_SENDER_PHASE_UNBOUND = 1;
+  BOUNDARY_SENDER_PHASE_OPEN = 2;
+  BOUNDARY_SENDER_PHASE_DRAINING = 3;
+  BOUNDARY_SENDER_PHASE_CUT_PENDING = 4;
+  BOUNDARY_SENDER_PHASE_WAITING_ACK = 5;
+}
+
+// Exact receiver CUT/ACK phase for one boundary.
+enum BoundaryReceiverPhase {
+  BOUNDARY_RECEIVER_PHASE_UNSPECIFIED = 0;
+  BOUNDARY_RECEIVER_PHASE_UNBOUND = 1;
+  BOUNDARY_RECEIVER_PHASE_OPEN = 2;
+  BOUNDARY_RECEIVER_PHASE_WAITING_CUT = 3;
+  BOUNDARY_RECEIVER_PHASE_CUT_DRAINING = 4;
+  BOUNDARY_RECEIVER_PHASE_CUT_DRAINED = 5;
+  BOUNDARY_RECEIVER_PHASE_ACK_PENDING = 6;
+  BOUNDARY_RECEIVER_PHASE_ACK_PUBLISHED = 7;
+}
+
+// Complete protocol-fault vocabulary. Counts are cumulative and saturating
+// within one materialized runtime generation.
+enum EpochProtocolFaultCode {
+  EPOCH_PROTOCOL_FAULT_CODE_UNSPECIFIED = 0;
+  EPOCH_PROTOCOL_FAULT_CODE_EPOCH_EXECUTION_MISMATCH = 1;
+  EPOCH_PROTOCOL_FAULT_CODE_OLD_DATA_AFTER_SEAL = 2;
+  EPOCH_PROTOCOL_FAULT_CODE_FUTURE_DATA_BEFORE_ACK = 3;
+  EPOCH_PROTOCOL_FAULT_CODE_CUT_IDENTITY_MISMATCH = 4;
+  EPOCH_PROTOCOL_FAULT_CODE_ACK_BEFORE_ACTIVATION = 5;
+  EPOCH_PROTOCOL_FAULT_CODE_ACK_BEFORE_CUT_DRAIN = 6;
+  EPOCH_PROTOCOL_FAULT_CODE_RETIREMENT_BEFORE_QUIESCENCE = 7;
+  EPOCH_PROTOCOL_FAULT_CODE_OWNERSHIP_UNDERFLOW = 8;
+  EPOCH_PROTOCOL_FAULT_CODE_OWNERSHIP_OVERFLOW = 9;
+  EPOCH_PROTOCOL_FAULT_CODE_OWNERSHIP_DOUBLE_RETIRE = 10;
+  EPOCH_PROTOCOL_FAULT_CODE_OWNERSHIP_WRONG_SLOT = 11;
+  EPOCH_PROTOCOL_FAULT_CODE_SEQUENCE_EXHAUSTED = 12;
+  EPOCH_PROTOCOL_FAULT_CODE_EPOCH_ALLOCATOR_EXHAUSTED = 13;
+}
+
+// Disposition taken after the first protocol fault was captured.
+enum EpochProtocolFaultDisposition {
+  EPOCH_PROTOCOL_FAULT_DISPOSITION_UNSPECIFIED = 0;
+  EPOCH_PROTOCOL_FAULT_DISPOSITION_DROP_AND_RETIRE = 1;
+  EPOCH_PROTOCOL_FAULT_DISPOSITION_TERMINATE = 2;
+  EPOCH_PROTOCOL_FAULT_DISPOSITION_RESOURCE_REFUSED = 3;
+}
+
+// Exact availability of one module-health row.
+enum ModuleHealthState {
+  MODULE_HEALTH_STATE_UNSPECIFIED = 0;
+  MODULE_HEALTH_STATE_CALLBACK_UNAVAILABLE = 1;
+  MODULE_HEALTH_STATE_AWAITING_OBSERVATION = 2;
+  MODULE_HEALTH_STATE_SIGNAL_AVAILABLE = 3;
+  MODULE_HEALTH_STATE_ATTEMPT_SUPPRESSED = 4;
+  MODULE_HEALTH_STATE_STALE_EPOCH = 5;
+}
+
+// Selects optional bounded row families. Runtime, engine, transition, and
+// protocol-fault summaries are present in every successful response.
+message TelemetrySelection {
+  bool include_stage_stats = 1;
+  bool include_module_metrics = 2;
+  bool include_module_health = 3;
+  bool include_worker_epoch_stats = 4;
+  bool include_region_epoch_stats = 5;
+  bool include_boundary_epoch_stats = 6;
+  bool include_stream_stats = 7;
+  bool include_storage_domain_stats = 8;
+  bool include_port_stats = 9;
+  bool include_topology_stats = 10;
+}
+
+// Coherent runtime status and collection provenance.
+message RuntimeObservation {
+  uint64 runtime_generation = 1;
+  uint64 status_publication_generation = 2;
+  uint64 active_epoch = 3;
+  uint64 minimum_retained_epoch = 4;
+  uint64 last_activated_epoch = 5;
+  uint32 active_workers = 6;
+  uint32 expected_workers = 7;
+  uint64 collection_monotonic_ns = 8;
+  uint64 latest_bank_publication_monotonic_ns = 9;
+  uint64 skipped_publications = 10;
+}
+
+// Generation-cumulative platform packet counters.
+message EngineStats {
+  uint64 rx_packets = 1;
+  uint64 tx_packets = 2;
+  uint64 dropped_packets = 3;
+  uint64 rx_bytes = 4;
+  uint64 tx_bytes = 5;
+  uint64 fanout_overflow = 6;
+}
+
+// Exact transaction identity and phase timing. Optional timestamps are absent
+// until their named edge has occurred.
+message EpochTransactionTelemetry {
+  uint64 mutation_sequence = 1;
+  uint64 from_epoch = 2;
+  uint64 to_epoch = 3;
+  bytes validation_hash = 4;
+  bytes idempotency_key_digest = 5;
+  uint64 admitted_monotonic_ns = 6;
+  // End of PREPARING: the PREPARED edge on success, or the terminal end of a
+  // failed/aborted preparation attempt.
+  optional uint64 prepared_monotonic_ns = 7;
+  optional uint64 prepared_lease_deadline_monotonic_ns = 8;
+  optional uint64 prepared_lease_deadline_unix_ms = 9;
+  optional uint64 commit_started_monotonic_ns = 10;
+  optional uint64 retiring_started_monotonic_ns = 11;
+  optional uint64 failure_observed_monotonic_ns = 12;
+  optional uint64 terminal_monotonic_ns = 13;
+  EpochTransitionOutcome outcome = 14;
+  EpochTransitionFailureCode failure_code = 15;
+  bool retirement_frozen = 16;
+}
+
+// Last exact certificate observation made by the completion owner.
+message EpochCertificateTelemetry {
+  uint64 evaluated_monotonic_ns = 1;
+  uint64 runtime_generation = 2;
+  uint64 transition_generation = 3;
+  uint64 from_epoch = 4;
+  uint64 to_epoch = 5;
+  uint32 execution_complete = 6;
+  uint32 execution_total = 7;
+  uint32 boundary_complete = 8;
+  uint32 boundary_total = 9;
+  uint32 reader_complete = 10;
+  uint32 reader_total = 11;
+  uint32 fault_index = 12;
+  EpochCertificateState state = 13;
+  EpochCertificateFault fault = 14;
+}
+
+// Exact reader-grace ownership and timing.
+message EpochGraceTelemetry {
+  uint64 generation = 1;
+  optional uint64 started_monotonic_ns = 2;
+  optional uint64 completion_observed_monotonic_ns = 3;
+  optional uint64 finished_monotonic_ns = 4;
+  uint32 readers_complete = 5;
+  uint32 readers_total = 6;
+  bool active = 7;
+  bool update_frozen = 8;
+}
+
+// Coherent coordinator, transaction, certificate, and grace projection.
+message EpochTransitionTelemetry {
+  uint64 publication_generation = 1;
+  EpochTransitionState state = 2;
+  uint64 active_epoch = 3;
+  uint64 target_epoch = 4;
+  uint64 allocated_epoch_high_watermark = 5;
+  uint64 mutation_sequence_high_watermark = 6;
+  bytes plan_content_hash = 7;
+  // True exactly while one active transition generation binds the immutable
+  // participant set; false in stable IDLE and before transition admission.
+  bool participant_set_frozen = 8;
+  uint32 execution_participant_count = 9;
+  uint32 region_count = 10;
+  uint32 boundary_count = 11;
+  uint32 source_participant_count = 12;
+  uint32 sink_participant_count = 13;
+  uint32 module_context_count = 14;
+  uint32 quiescence_reader_count = 15;
+  uint32 terminal_history_size = 16;
+  bool retirement_frozen = 17;
+  optional EpochTransactionTelemetry active_transaction = 18;
+  optional EpochTransactionTelemetry latest_terminal = 19;
+  optional EpochCertificateTelemetry certificate = 20;
+  optional EpochGraceTelemetry grace = 21;
+  // Raw SHA-256 of the ConfigSnapshot identified by active_epoch. This remains
+  // the last globally COMPLETE content identity throughout RETIRING.
+  bytes active_validation_hash = 22;
+}
+
+// One cumulative typed protocol-fault count.
+message EpochProtocolFaultCounter {
+  EpochProtocolFaultCode code = 1;
+  uint64 count = 2;
+}
+
+// Immutable first protocol-fault identity.
+message EpochProtocolFirstFault {
+  EpochProtocolFaultCode code = 1;
+  EpochProtocolFaultDisposition disposition = 2;
+  uint64 runtime_generation = 3;
+  uint64 transition_generation = 4;
+  uint64 from_epoch = 5;
+  uint64 to_epoch = 6;
+  uint64 observed_epoch = 7;
+  uint32 worker_index = 8;
+  uint32 boundary_index = 9;
+  uint32 context_index = 10;
+  uint32 stage_instance_index = 11;
+  uint64 expected_value = 12;
+  uint64 observed_value = 13;
+  uint64 observed_monotonic_ns = 14;
+}
+
+// Complete generation-scoped protocol-fault observation.
+message EpochProtocolFaultSummary {
+  bool transition_success_blocked = 1;
+  repeated EpochProtocolFaultCounter counters = 2;
+  optional EpochProtocolFirstFault first_fault = 3;
+}
+
+// Exact logical-stage counters. No unsupported subtype is zero-filled.
+message StageStats {
+  string stage_id = 1;
+  uint64 in_packets = 2;
+  uint64 out_packets = 3;
+  uint64 dropped_packets = 4;
+  uint64 in_bytes = 5;
+  uint64 out_bytes = 6;
+}
+
+// Latest absolute registered module counter value.
+message ModuleCounterStats {
+  string module_id = 1;
+  string context_instance_id = 2;
+  uint32 context_index = 3;
+  uint32 worker_index = 4;
+  uint64 epoch = 5;
+  string name = 6;
+  uint64 value = 7;
+}
+
+// Cold merged context-and-epoch histogram. Empty histograms have sample_count
+// zero, sum zero, and no optional distribution fields.
+message ModuleHistogramStats {
+  string module_id = 1;
+  string context_instance_id = 2;
+  uint32 context_index = 3;
+  uint32 worker_index = 4;
+  uint64 epoch = 5;
+  string name = 6;
+  uint64 sample_count = 7;
+  uint64 sample_sum = 8;
+  optional uint64 minimum = 9;
+  optional uint64 maximum = 10;
+  optional uint64 p50 = 11;
+  optional uint64 p90 = 12;
+  optional uint64 p99 = 13;
+  optional uint64 p999 = 14;
+}
+
+// Latest exact per-context epoch-mismatch projection.
+message ModuleEpochMismatchStats {
+  string module_id = 1;
+  string context_instance_id = 2;
+  uint32 context_index = 3;
+  uint32 worker_index = 4;
+  uint64 observation_epoch = 5;
+  uint64 mismatch_count = 6;
+  optional uint64 first_packet_epoch = 7;
+  optional uint64 first_active_epoch = 8;
+  optional uint32 first_stage_instance_index = 9;
+  optional int32 first_region_id = 10;
+}
+
+// Completed owner-worker module-health observation.
+message ModuleHealthStats {
+  string module_id = 1;
+  string context_instance_id = 2;
+  uint32 context_index = 3;
+  uint32 worker_index = 4;
+  uint32 stage_instance_index = 5;
+  ModuleHealthState state = 6;
+  uint64 publication_generation = 7;
+  optional uint64 observation_epoch = 8;
+  optional uint64 observed_at_ns = 9;
+  optional uint64 callback_duration_ns = 10;
+  uint64 contract_fault_count = 11;
+  // Bit 0: score out of range; bit 1: unknown assessment flags; bit 2:
+  // unterminated reason; bit 3: callback budget exceeded. Every other bit is
+  // malformed. Zero means the latest attempt had no contract fault.
+  uint32 latest_fault_mask = 12;
+  // Immutable bit union from the first malformed or over-budget attempt, using
+  // the same four-bit vocabulary as latest_fault_mask.
+  uint32 first_fault_mask = 13;
+  optional uint64 first_fault_epoch = 14;
+  optional uint64 first_fault_timestamp_ns = 15;
+  optional uint64 first_fault_duration_ns = 16;
+  optional uint32 health_score = 17;
+  optional uint32 health_flags = 18;
+  optional string reason = 19;
+}
+
+// Current coherent worker ownership and activation progress.
+message WorkerEpochStats {
+  string worker_id = 1;
+  uint32 worker_index = 2;
+  int32 region_id = 3;
+  string lane_id = 4;
+  uint64 ledger_publication_generation = 5;
+  uint64 active_epoch = 6;
+  uint64 source_epoch = 7;
+  uint64 active_unretired = 8;
+  optional uint64 future_epoch = 9;
+  uint64 future_unretired = 10;
+  uint64 activation_publication_generation = 11;
+  optional uint64 transition_generation = 12;
+  optional uint64 from_epoch = 13;
+  optional uint64 to_epoch = 14;
+  optional uint64 activation_monotonic_ns = 15;
+  bool activation_complete = 16;
+}
+
+// Cold region derivation over exact worker rows.
+message RegionEpochStats {
+  int32 region_id = 1;
+  uint32 worker_count = 2;
+  uint64 minimum_active_epoch = 3;
+  uint64 maximum_active_epoch = 4;
+  uint64 minimum_source_epoch = 5;
+  uint64 maximum_source_epoch = 6;
+  uint64 active_unretired = 7;
+  uint64 future_unretired = 8;
+  uint32 activated_participants = 9;
+  optional uint64 minimum_activation_monotonic_ns = 10;
+  optional uint64 maximum_activation_monotonic_ns = 11;
+  uint64 fanout_overflow = 12;
+}
+
+// Exact ordered-boundary transport and transition progress.
+message BoundaryEpochStats {
+  string boundary_id = 1;
+  uint32 boundary_index = 2;
+  uint32 from_stage_instance_index = 3;
+  uint32 to_stage_instance_index = 4;
+  uint32 sender_worker_index = 5;
+  uint32 receiver_worker_index = 6;
+  int32 from_region_id = 7;
+  int32 to_region_id = 8;
+  uint32 data_ring_capacity = 9;
+  uint32 future_output_hold_capacity = 10;
+  uint64 data_enqueued_sequence = 11;
+  uint64 data_dequeued_sequence = 12;
+  uint64 data_backpressure_events = 13;
+  optional uint64 pending_cut_epoch = 14;
+  optional uint64 pending_cut_sequence = 15;
+  optional uint64 pending_ack_epoch = 16;
+  optional uint64 pending_ack_sequence = 17;
+  optional uint64 transition_generation = 18;
+  optional uint64 from_epoch = 19;
+  optional uint64 to_epoch = 20;
+  optional uint64 cut_sequence = 21;
+  BoundarySenderPhase sender_phase = 22;
+  BoundaryReceiverPhase receiver_phase = 23;
+  uint64 duplicate_cut_count = 24;
+  uint64 duplicate_ack_count = 25;
+  optional uint64 cut_published_monotonic_ns = 27;
+  optional uint64 cut_observed_monotonic_ns = 28;
+  optional uint64 cut_drained_monotonic_ns = 29;
+  optional uint64 activation_monotonic_ns = 30;
+  optional uint64 ack_published_monotonic_ns = 31;
+  optional uint64 ack_observed_monotonic_ns = 32;
+  optional uint64 cut_delivery_duration_ns = 33;
+  optional uint64 cut_drain_duration_ns = 34;
+  optional uint64 ack_gate_duration_ns = 35;
+}
+
+// Owner-published software accounting for one executable I/O stream.
+// TX transfers count provider acceptance, never wire delivery. RX rejections
+// precede runtime ownership; TX rejections are an unaccepted suffix the caller
+// actually retired. Native hardware errors remain port observations.
+message StreamStats {
+  string io_stream_id = 1;
+  uint32 logical_port_id = 2;
+  kinetum.gluon.v1.IoStreamDirection direction = 3;
+  int32 owning_region_id = 4;
+  uint32 worker_index = 5;
+  uint32 driver_queue_id = 6;
+  optional uint64 packets = 9;
+  optional uint64 bytes = 10;
+  uint64 published_monotonic_ns = 12;
+  optional uint64 rejected_packets = 13;
+}
+
+// Compiled packet-storage capacity and provider occupancy observation. Both
+// available states partition buffer_count exactly; approximate means that the
+// complete sampled partition may change immediately after callback return.
+message StorageDomainStats {
+  string storage_domain_id = 1;
+  optional int32 host_numa_node = 2;
+  uint64 buffer_count = 3;
+  uint64 required_min_buffers = 4;
+  uint32 safety_margin = 5;
+  ProviderObservationState observation_state = 6;
+  optional uint64 observed_monotonic_ns = 7;
+  optional uint64 in_use = 8;
+  optional uint64 available = 9;
+}
+
+// Logical-port identity and provider-native cumulative counters.
+message PortStats {
+  uint32 logical_port_id = 1;
+  string logical_name = 2;
+  string io_driver_instance_id = 3;
+  string driver_port_id = 4;
+  ProviderObservationState observation_state = 5;
+  optional uint64 observed_monotonic_ns = 6;
+  optional uint64 rx_packets = 7;
+  optional uint64 tx_packets = 8;
+  optional uint64 rx_bytes = 9;
+  optional uint64 tx_bytes = 10;
+  optional uint64 rx_missed = 11;
+  optional uint64 rx_errors = 12;
+  optional uint64 tx_errors = 13;
+  optional uint64 rx_no_buffer = 14;
+}
+
+// Admitted materialized traffic-steering topology.
+message TrafficSteeringStats {
+  string steering_profile_id = 1;
+  kinetum.gluon.v1.TrafficSteeringKind kind = 2;
+  bool symmetric = 3;
+  repeated string io_stream_ids = 4;
+}
+
+// One complete generation-scoped runtime observation.
+message RuntimeTelemetry {
+  RuntimeObservation runtime = 1;
+  EngineStats engine = 2;
+  EpochTransitionTelemetry transition = 3;
+  EpochProtocolFaultSummary protocol_faults = 4;
+  repeated StageStats stages = 5;
+  repeated ModuleCounterStats module_counters = 6;
+  repeated ModuleHistogramStats module_histograms = 7;
+  repeated ModuleEpochMismatchStats module_epoch_mismatches = 8;
+  repeated ModuleHealthStats module_health = 9;
+  repeated WorkerEpochStats workers = 10;
+  repeated RegionEpochStats regions = 11;
+  repeated BoundaryEpochStats boundaries = 12;
+  repeated StreamStats streams = 13;
+  repeated StorageDomainStats storage_domains = 14;
+  repeated PortStats ports = 15;
+  repeated TrafficSteeringStats steering_profiles = 16;
+  repeated kinetum.gluon.v1.ModuleContextDomain module_context_domains = 18;
+}

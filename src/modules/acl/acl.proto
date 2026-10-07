@@ -1,0 +1,88 @@
+// Copyright (c) 2026 Fleming Patel. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+//
+// ACL Module Protocol Buffer Schema
+//
+// This proto defines the configuration schema for the ACL module (libkinetum_acl.so).
+// The module is the SOURCE OF TRUTH for the runtime contract. ConfigSnapshot
+// carries strict snake-case JSON in config_blob. This proto is a host/offline
+// authoring model only; generated code is never linked into the unloadable
+// module image.
+//
+// Ownership model:
+//   - Platform provides MECHANISM (epoch transitions, blob routing)
+//   - Module provides POLICY (ACL rules, evaluation logic)
+//   - Platform does NOT parse this proto - it routes opaque bytes to module
+//
+// Usage:
+//   1. Build or author an AclRuleset payload.
+//   2. Encode populated fields as strict snake-case JSON with integer enums.
+//   3. Send via ConfigSnapshot.modules[].config_blob.
+//   4. Module parses, validates, and applies.
+
+syntax = "proto3";
+
+package kinetum.module.acl.v1;
+
+option cc_enable_arenas = true;
+
+// =============================================================================
+// ACL Actions and Match Fields
+// =============================================================================
+
+// AclAction defines the action to take when a rule matches.
+enum AclAction {
+  ACL_ACTION_UNSPECIFIED = 0;
+  ACL_ACTION_PERMIT = 1;  // Allow packet through
+  ACL_ACTION_DENY = 2;    // Drop packet
+}
+
+// =============================================================================
+// ACL Rule Definition
+// =============================================================================
+
+// AclRule represents a single access control rule.
+message AclRule {
+  // Priority for rule ordering (higher = evaluated first)
+  int32 priority = 1;
+
+  // Source CIDR (e.g., "10.0.0.0/8", empty = any)
+  string src_cidr = 2;
+
+  // Destination CIDR (e.g., "0.0.0.0/0")
+  string dst_cidr = 3;
+
+  // Required nonzero action to take on match
+  AclAction action = 4;
+
+  // L4 protocol filter (6=TCP, 17=UDP, 0=any)
+  int32 protocol = 5;
+
+  // Source port range (0 = any)
+  int32 src_port_min = 6;
+  int32 src_port_max = 7;
+
+  // Destination port range
+  int32 dst_port_min = 8;
+  int32 dst_port_max = 9;
+
+  // Whether rule is enabled
+  bool enabled = 10;
+}
+
+// =============================================================================
+// ACL Ruleset (Module Configuration)
+// =============================================================================
+
+// AclRuleset is the complete ACL module configuration.
+// This is what gets serialized to config_blob.
+message AclRuleset {
+  // Ordered list of rules (higher priority first; authored order breaks ties)
+  repeated AclRule rules = 1;
+
+  // Required nonzero action when no rules match
+  AclAction default_action = 2;
+
+  // Maximum rules enforced by validation
+  int32 max_rules = 3;
+}

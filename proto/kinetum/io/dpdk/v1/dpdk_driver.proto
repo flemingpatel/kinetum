@@ -1,0 +1,42 @@
+// Copyright (c) 2026 Fleming Patel. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Pure typed configuration for DPDK I/O driver ports.
+
+syntax = "proto3";
+
+package kinetum.io.dpdk.v1;
+
+option cc_enable_arenas = true;
+
+// PciAttachment names one exact PCI function in canonical lowercase
+// dddd:bb:ss.f form. Alternate BDF spellings are rejected, not normalized.
+message PciAttachment {
+  string pci_address = 1;
+}
+
+// TapAttachment names one existing or provider-created Linux TAP interface.
+// The name uses exact [A-Za-z_][A-Za-z0-9_.-]{0,14} ASCII grammar. Arbitrary
+// DPDK vdev arguments are intentionally not part of this contract.
+message TapAttachment {
+  string interface_name = 1;
+}
+
+// DpdkDriverPort binds one stable driver-local identity to one exact native
+// attachment. driver_port_id uses the shared topology-identifier grammar and
+// is bounded to 128 bytes.
+message DpdkDriverPort {
+  string driver_port_id = 1;
+
+  oneof attachment {
+    PciAttachment pci = 2;
+    TapAttachment tap = 3;
+  }
+}
+
+// DpdkDriverConfig is a nonempty set of exact driver ports. Input order is not
+// policy; canonicalization sorts ports by driver_port_id and rejects duplicate
+// identities.
+message DpdkDriverConfig {
+  repeated DpdkDriverPort ports = 1;
+}

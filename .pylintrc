@@ -1,0 +1,24 @@
+[MASTER]
+persistent=no
+
+[FORMAT]
+max-line-length=120
+
+[DESIGN]
+max-args=10
+max-attributes=20
+max-branches=30
+max-locals=60
+max-module-lines=2200
+max-positional-arguments=10
+max-public-methods=30
+max-returns=10
+max-statements=150
+min-public-methods=0
+
+[SIMILARITIES]
+ignore-comments=yes
+ignore-docstrings=yes
+# Pylint's default of 4 flags short package export lists and CSV/async
+# boilerplate. Keep this low enough to catch real large clones.
+min-similarity-lines=20

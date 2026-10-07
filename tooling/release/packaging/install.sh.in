@@ -1,0 +1,107 @@
+#!/bin/sh
+{
+# The selected package's producer fills this complete POSIX-sh compound command.
+# The published closing brace is the final byte: a proper truncated prefix
+# cannot execute any command. Exit-trap children also use detached input.
+exec </dev/null
+set -eu
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+LC_ALL=C
+export PATH LC_ALL
+umask 077
+
+fail() {
+  printf 'Kinetum installation: %s\n' "$*" >&2
+  exit 1
+}
+
+main() {
+  prefix=/opt/kinetum
+  offline=
+  release_url='@RELEASE_URL@'
+  seen_prefix= seen_offline=
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --help)
+        printf '%s\n' 'Kinetum @PRODUCT@ @VERSION@ (@ARCH@) installer' \
+          'Options: --prefix /absolute/path --offline-directory /asset/directory'
+        return 0
+        ;;
+      --prefix|--offline-directory)
+        option=$1
+        [ "$#" -ge 2 ] || fail "$option requires a value"
+        [ -n "$2" ] || fail "$option requires a nonempty value"
+        case "$option" in
+          --prefix) [ -z "$seen_prefix" ] || fail 'duplicate --prefix'; seen_prefix=1; prefix=$2 ;;
+          --offline-directory) [ -z "$seen_offline" ] || fail 'duplicate --offline-directory'; seen_offline=1; offline=$2 ;;
+        esac
+        shift 2
+        ;;
+      *) fail "unknown option: $1" ;;
+    esac
+  done
+  if [ -z "$offline" ] && [ -z "$release_url" ]; then
+    fail 'this installer has no download URL; use --offline-directory with its matching archive'
+  fi
+  case "$prefix" in /*) ;; *) fail 'prefix must be absolute' ;; esac
+  case "$prefix" in /|*/|*/./*|*/../*|*/.|*/..|*//*) fail 'prefix must be exact and must not be the filesystem root' ;; esac
+  [ -r /etc/os-release ] || fail '/etc/os-release is required'
+  ID= VERSION_ID=
+  . /etc/os-release
+  [ "$ID" = ubuntu ] && [ "$VERSION_ID" = 24.04 ] || fail 'Ubuntu 24.04 is required'
+  machine=$(/usr/bin/uname -m)
+  [ "$machine" = '@ARCH@' ] || fail "this package requires @ARCH@; host reports $machine"
+  digest=@SHA256@
+
+  set -- libarchive13t64 zlib1g libelf1t64 libgrpc++1.51t64 libnuma1 libprotobuf32t64 libssl3t64
+  if [ -z "$offline" ]; then
+    [ "$(/usr/bin/id -u)" = 0 ] || fail 'online setup requires sudo /bin/sh'
+    /usr/bin/env -i PATH="$PATH" LC_ALL=C DEBIAN_FRONTEND=noninteractive \
+      /usr/bin/apt-get update
+    /usr/bin/env -i PATH="$PATH" LC_ALL=C DEBIAN_FRONTEND=noninteractive \
+      /usr/bin/apt-get install -y --no-install-recommends ca-certificates curl tar gzip "$@"
+  else
+    case "$offline" in /*) ;; *) fail 'offline asset directory must be absolute' ;; esac
+    for package do
+      package_status=$(/usr/bin/dpkg-query -W -f='${Status}' "$package") || fail "missing offline prerequisite: $package"
+      [ "$package_status" = 'install ok installed' ] || fail "unconfigured offline prerequisite: $package"
+    done
+  fi
+
+  stage=$(/usr/bin/mktemp -d /var/tmp/kinetum-install.XXXXXXXX)
+  cleanup() {
+    result=$?
+    trap - EXIT HUP INT TERM
+    if ! /usr/bin/env -i PATH="$PATH" LC_ALL=C /bin/rm -rf -- "$stage"; then
+      printf '%s\n' 'Kinetum installation: private download cleanup failed' >&2
+      result=1
+    fi
+    if [ "$result" -eq 0 ]; then
+      printf '[kinetum] SUCCESS - @PRODUCT@ @VERSION@ installed in %s\n' "$prefix" || result=$?
+    fi
+    exit "$result"
+  }
+  trap cleanup EXIT
+  trap 'exit 1' HUP INT TERM
+  asset=kinetum-@PRODUCT@-@VERSION@-@ARCH@.tar.gz
+  root=kinetum-@PRODUCT@-@VERSION@
+  if [ -n "$offline" ]; then
+    /usr/bin/env -i PATH="$PATH" LC_ALL=C /usr/bin/head -c 9663676417 -- "$offline/$asset" >"$stage/$asset"
+  else
+    /usr/bin/env -i PATH="$PATH" LC_ALL=C /usr/bin/curl --disable --fail --show-error --location \
+      --proto '=https' --proto-redir '=https' --max-filesize 9663676416 \
+      --output "$stage/$asset" "$release_url/$asset"
+  fi
+  [ "$(/usr/bin/stat -c %s -- "$stage/$asset")" -le 9663676416 ] || fail 'archive exceeds its byte bound'
+  printf '%s  %s\n' "$digest" "$stage/$asset" | /usr/bin/sha256sum --check --status - || fail 'archive checksum mismatch'
+  # Only the delivery-verified native installer is emitted; TAR never chooses
+  # a destination pathname. Native code subsequently admits the entire archive.
+  /usr/bin/env -i PATH="$PATH" LC_ALL=C /usr/bin/tar --extract --gzip --to-stdout \
+    --file "$stage/$asset" -- "$root/kinetum_package" >"$stage/kinetum_package"
+  /usr/bin/chmod 0700 -- "$stage/kinetum_package"
+  /usr/bin/env -i PATH="$PATH" LC_ALL=C "$stage/kinetum_package" install \
+    --archive "$stage/$asset" --sha256 "$digest" --prefix "$prefix"
+}
+
+main "$@"
+}

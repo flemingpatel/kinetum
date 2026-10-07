@@ -1,0 +1,52 @@
+# Kinetum Private Validation Kit @KINETUM_VERSION@
+
+Internal integration and CloudLab tools for an independently installed runtime.
+Install this private Python wheel with pip into the operator's chosen environment.
+
+## Preparation
+
+Use the existing configured platform build directory; `build` below is the
+name chosen when running `cmake -S . -B build`. The command
+`cmake --build build --target kinetum_validation_kit` packages the compiled
+helpers, rebuilding them only if needed, and stages the kit beneath that same
+directory. It creates no second platform build. On x86-64 the result is
+`build/kinetum_validation-@KINETUM_VERSION@-py3-none-linux_x86_64.whl`;
+the AArch64 build produces the corresponding `linux_aarch64.whl`.
+Its native helpers target the build host architecture; use the matching
+native build for the validation machine. Documentation rendering and release
+signing are not prerequisites for this target.
+
+On the prepared Linux lab host, install the transferred wheel into a Python
+environment outside the runtime prefix. This x86-64 example creates that
+environment at `/var/tmp/kinetum-validation`:
+
+```bash
+python3 -B -m venv /var/tmp/kinetum-validation
+/var/tmp/kinetum-validation/bin/python3 -B -m pip install ./kinetum_validation-@KINETUM_VERSION@-py3-none-linux_x86_64.whl
+```
+
+## Running
+
+```bash
+sudo /var/tmp/kinetum-validation/bin/python3 -I -B -X utf8 -m kinetum_validation --runtime-root /opt/kinetum --test-type standard
+sudo /var/tmp/kinetum-validation/bin/python3 -I -B -X utf8 -m kinetum_benchmark run --runtime-root /opt/kinetum --runs 30
+/var/tmp/kinetum-validation/bin/python3 -I -B -X utf8 -m kinetum_benchmark report --input-dir /tmp/kinetum_benchmark
+```
+
+Python 3.12 or newer is required locally. The remote traffic endpoint retains
+its independent interpreter setting. Run commands require an explicit runtime;
+reporting consumes recorded artifacts and does not require a runtime root.
+The installed `kinetum_validation/data/` directory supplies the default
+`--validation-root`, which may also be selected explicitly. Runtime and
+validation resource roots must be disjoint. Pip installs declared Python
+dependencies, including Matplotlib; system tools remain host prerequisites.
+
+Before run metadata or traffic setup, the harness executes the protected
+runtime's `kinetum-info --check --json` and admits its verified metadata.
+Runtime, kit, and information-image versions must agree. No compatibility subset or
+additional kit attestation is involved.
+
+Hugepage and TRex helpers remain explicit lab-owner actions. Runtime binaries,
+module/provider images, source-build dependency production, and documentation
+build tools are not contained here. Apache-2.0 terms, the Kinetum notice, and
+kit-specific third-party notices are included with the package resources.

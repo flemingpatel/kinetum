@@ -1,0 +1,53 @@
+# =============================================================================
+# Passthrough Pipeline - Simple RX to TX Forwarding
+# =============================================================================
+#
+# Minimal pipeline for baseline validation and TAP PMD testing.
+# Receives and forwards packets without a module stage.
+#
+# Use Case:
+#   - TAP PMD integration testing
+#   - Baseline throughput measurement
+#   - DPDK initialization validation
+#
+# Flow: RX -> TX (no processing)
+#
+# =============================================================================
+
+pipeline_id: "passthrough_v1"
+allow_dag: false
+
+metadata {
+  display_name: "Passthrough"
+  description: "Simple packet forwarding for baseline validation"
+  author: "Kinetum Platform"
+  version: "0.1.0"
+}
+
+# =============================================================================
+# Stage Definitions
+# =============================================================================
+
+# Ingress - receives packets
+stages {
+  stage_id: "rx"
+  kind: STAGE_KIND_RX
+  execution_mode: EXECUTION_MODE_PASSIVE
+  io { interface: "wan0" }
+  description: "Packet ingress"
+}
+
+# Egress - transmits packets
+stages {
+  stage_id: "tx"
+  kind: STAGE_KIND_TX
+  execution_mode: EXECUTION_MODE_PASSIVE
+  io { interface: "lan0" }
+  description: "Packet egress"
+}
+
+# =============================================================================
+# Edge Definitions (Packet Flow)
+# =============================================================================
+
+edges { from_stage_id: "rx" to_stage_id: "tx" mode: EDGE_MODE_PUSH }

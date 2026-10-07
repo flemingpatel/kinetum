@@ -1,0 +1,6 @@
+{
+  global:
+    kinetum_provider_component_query;
+  local:
+    *;
+};
