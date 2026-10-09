@@ -72,10 +72,11 @@ constexpr std::size_t TEST_RSS_KEY_SIZE = 40;
 constexpr std::array<uint8_t, 6> TEST_MAC{0x02, 0x00, 0x00, 0x00, 0x00, 0x01};
 
 /** One fake DPDK object preserving exact mbuf-private and payload geometry. */
-struct alignas(64) fake_mbuf_object {
+struct fake_mbuf_object {
 	rte_mbuf mbuf{};  ///< Native header consumed by provider-private helpers.
-	std::array<std::byte, sizeof(kinetum_packet_record)> private_area{};  ///< Exact record bytes.
-	std::array<uint8_t, TEST_DATA_ROOM_BYTES> payload{};		      ///< Exact native data room.
+	alignas(kinetum_packet_record)
+		std::array<std::byte, sizeof(kinetum_packet_record)> private_area{};  ///< Exact record bytes.
+	std::array<uint8_t, TEST_DATA_ROOM_BYTES> payload{};			      ///< Exact native data room.
 };
 
 static_assert(offsetof(fake_mbuf_object, private_area) == sizeof(rte_mbuf));

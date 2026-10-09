@@ -9,6 +9,7 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -85,6 +86,15 @@ class malformed_transition_service final : public kinetum::dataplane::v1::Datapl
 class terminal_transport_service final : public kinetum::dataplane::v1::DataplaneService::Service {
     public:
 	/**
+	 * @brief Own the exact diagnostic returned with the transport refusal.
+	 * @param diagnostic Remote diagnostic bytes, including empty or oversized input.
+	 */
+	explicit terminal_transport_service(std::string diagnostic)
+		: diagnostic_(std::move(diagnostic))
+	{
+	}
+
+	/**
 	 * @brief Return a canonical non-retryable transport refusal.
 	 * @return PERMISSION_DENIED without writing an application response.
 	 */
@@ -92,8 +102,11 @@ class terminal_transport_service final : public kinetum::dataplane::v1::Dataplan
 					      const kinetum::dataplane::v1::GetEpochTransitionStatusRequest *,
 					      kinetum::dataplane::v1::GetEpochTransitionStatusResponse *) override
 	{
-		return grpc::Status(grpc::StatusCode::PERMISSION_DENIED, "fake terminal transport refusal");
+		return grpc::Status(grpc::StatusCode::PERMISSION_DENIED, diagnostic_);
 	}
+
+    private:
+	std::string diagnostic_;  ///< Exact remote diagnostic owned through each RPC.
 };
 
 /** @brief Service returning one exact PREPARED identity with retirement residue. */
@@ -193,7 +206,7 @@ TEST(dataplane_transition_client, exact_prepare_activate_and_status_are_typed)
 	server.shutdown();
 }
 
-/** @brief Prove malformed wire and non-retryable transport failures stay exact. */
+/** @brief Malformed wire rejects, while transport failures retain exact codes and bounded diagnostics. */
 TEST(dataplane_transition_client, malformed_typed_response_fails_closed)
 {
 	malformed_transition_service service;
@@ -208,16 +221,25 @@ TEST(dataplane_transition_client, malformed_typed_response_fails_closed)
 	EXPECT_EQ(result.error().code(), kinetum::common::status_code::DATA_LOSS);
 	server.shutdown();
 
-	terminal_transport_service terminal_service;
-	kinetum::test::fake_dp_server terminal_server;
-	terminal_server.start_with_service(&terminal_service);
-	auto terminal_client_or = dataplane_transition_client::create(terminal_server.stub, std::chrono::seconds(1));
-	ASSERT_TRUE(terminal_client_or.is_ok()) << terminal_client_or.error().message();
-	auto terminal_client = std::move(terminal_client_or).value();
-	const auto terminal = terminal_client->query(fixture.identity, TEST_KEY, std::string(64u, 'a'));
-	ASSERT_FALSE(terminal.is_ok());
-	EXPECT_EQ(terminal.error().code(), kinetum::common::status_code::PERMISSION_DENIED);
-	terminal_server.shutdown();
+	const std::array<std::string, 4> diagnostics{"", "denied", "fake terminal transport refusal",
+						     std::string(kinetum::common::MAX_TRANSITION_DIAGNOSTIC_BYTES + 1u,
+								 'd')};
+	for (const auto &diagnostic : diagnostics) {
+		SCOPED_TRACE(diagnostic.size());
+		terminal_transport_service terminal_service(diagnostic);
+		kinetum::test::fake_dp_server terminal_server;
+		terminal_server.start_with_service(&terminal_service);
+		auto terminal_client_or =
+			dataplane_transition_client::create(terminal_server.stub, std::chrono::seconds(1));
+		ASSERT_TRUE(terminal_client_or.is_ok()) << terminal_client_or.error().message();
+		auto terminal_client = std::move(terminal_client_or).value();
+		const auto terminal = terminal_client->query(fixture.identity, TEST_KEY, std::string(64u, 'a'));
+		ASSERT_FALSE(terminal.is_ok());
+		EXPECT_EQ(terminal.error().code(), kinetum::common::status_code::PERMISSION_DENIED);
+		EXPECT_EQ(terminal.error().details(),
+			  diagnostic.substr(0u, kinetum::common::MAX_TRANSITION_DIAGNOSTIC_BYTES));
+		terminal_server.shutdown();
+	}
 
 	duration_residue_transition_service residue_service;
 	kinetum::test::fake_dp_server residue_server;

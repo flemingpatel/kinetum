@@ -58,7 +58,6 @@ set_target_properties(kinetum_qos_module PROPERTIES
 
 foreach(target_name kinetum_qos_impl kinetum_qos_module)
   target_compile_options(${target_name} PRIVATE
-    -ffast-math
     -funroll-loops
   )
 endforeach()

@@ -319,8 +319,8 @@ status parse_dynamic_symbols(Elf *elf, Elf_Scn *section, const GElf_Shdr &header
 		if (name == nullptr || *name == '\0') {
 			return status::invalid_argument("provider ELF contains an unnamed public definition");
 		}
-		parsed->public_definitions.push_back(
-			parsed_elf::public_definition{name, binding, visibility, GELF_ST_TYPE(symbol.st_info)});
+		parsed->public_definitions.push_back(parsed_elf::public_definition{
+			name, binding, visibility, static_cast<unsigned char>(GELF_ST_TYPE(symbol.st_info))});
 	}
 	std::sort(parsed->public_definitions.begin(), parsed->public_definitions.end(),
 		  [](const auto &left, const auto &right) { return left.name < right.name; });

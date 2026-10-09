@@ -58,7 +58,6 @@ set_target_properties(kinetum_nat44_module PROPERTIES
 
 foreach(target_name kinetum_nat44_impl kinetum_nat44_module)
   target_compile_options(${target_name} PRIVATE
-    -ffast-math
     -funroll-loops
   )
 endforeach()

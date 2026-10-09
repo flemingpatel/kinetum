@@ -124,8 +124,9 @@ status transport_failure(const grpc::Status &transport) noexcept
 	}
 	try {
 		status failure(code, "Data Plane transition transport did not complete");
-		const std::string_view diagnostic = transport.error_message();
-		failure.set_details(std::string(diagnostic.substr(0u, MAX_REMOTE_TRANSITION_DIAGNOSTIC_BYTES)));
+		const std::string diagnostic = transport.error_message();
+		failure.set_details(std::string(diagnostic.data(),
+						std::min(diagnostic.size(), MAX_REMOTE_TRANSITION_DIAGNOSTIC_BYTES)));
 		return failure;
 	} catch (const std::bad_alloc &) {
 		return status::resource_exhausted(
