@@ -64,7 +64,6 @@ set_target_properties(kinetum_acl_module PROPERTIES
 # Compiler flags for hot-path optimization
 foreach(target_name kinetum_acl_impl kinetum_acl_module)
   target_compile_options(${target_name} PRIVATE
-    -ffast-math                      # Allow aggressive FP optimizations
     -funroll-loops                   # Unroll loops for better pipelining
   )
 endforeach()

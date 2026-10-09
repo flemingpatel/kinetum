@@ -5,6 +5,11 @@ targets DPDK. It compiles declared packet pipelines, plans them across
 CPU cores, runs them as a long-lived dataplane, and applies configuration
 snapshots through an epoch-based reconfiguration subsystem.
 
+Kinetum provides a common runtime and control plane for custom packet-processing
+applications composed from reusable pipeline stages. It separates application
+policy from execution, resource management, and live configuration coordination,
+reducing the infrastructure each application must implement.
+
 > **Epoch-transition status:** Live configuration updates use one
 > sequence-defined DATA/CUT/ACK protocol, exact worker ownership
 > accounting, owner-worker activation, and quiescence-gated reclamation. The

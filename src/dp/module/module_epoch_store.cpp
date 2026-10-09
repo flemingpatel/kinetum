@@ -12,8 +12,6 @@
 #include <exception>
 #include <limits>
 #include <new>
-#include <stdexcept>
-#include <string>
 #include <utility>
 
 #include "src/common/time.hpp"
@@ -23,7 +21,6 @@ namespace kinetum::dp::module
 {
 
 using kinetum::common::status;
-using kinetum::common::status_code;
 using kinetum::common::status_or;
 using kinetum::dp::lifecycle::lifecycle_context_owner;
 using kinetum::dp::lifecycle::prepared_config_ownership;
@@ -32,40 +29,35 @@ namespace
 {
 
 /**
- * @brief Convert one exact-slot rejection into a stable cold-path status.
+ * @brief Convert one exact-slot result into an allocation-free status.
  *
  * @param result Exact slot-table outcome.
- * @param operation Stable operation name for diagnostics.
- * @param epoch Exact epoch involved in the rejected operation.
  * @return OK for APPLIED; otherwise the precise public status category.
  */
-[[nodiscard]] status slot_status(epoch_slot_result result, const char *operation, uint64_t epoch) noexcept
-try {
-	const std::string prefix =
-		std::string(operation) + " rejected exact module epoch " + std::to_string(epoch) + ": ";
+[[nodiscard]] status slot_status(epoch_slot_result result) noexcept
+{
 	switch (result) {
 	case epoch_slot_result::APPLIED:
 		return status::ok();
 	case epoch_slot_result::INVALID_EPOCH:
-		return status::invalid_argument(prefix + "invalid epoch identity");
+		return status::invalid_argument(kinetum::common::static_status_text("invalid module epoch identity"));
 	case epoch_slot_result::INVALID_STATE:
-		return status::failed_precondition(prefix + "slot lifecycle state does not permit the operation");
+		return status::failed_precondition(kinetum::common::static_status_text(
+			"module slot lifecycle state does not permit the operation"));
 	case epoch_slot_result::EPOCH_ALREADY_PRESENT:
-		return status::failed_precondition(prefix + "epoch already occupies an exact slot");
+		return status::failed_precondition(
+			kinetum::common::static_status_text("module epoch already occupies an exact slot"));
 	case epoch_slot_result::EPOCH_NOT_FOUND:
-		return status::not_found(prefix + "epoch does not occupy an exact slot");
+		return status::not_found(
+			kinetum::common::static_status_text("module epoch does not occupy an exact slot"));
 	case epoch_slot_result::EPOCH_ORDER_VIOLATION:
-		return status::failed_precondition(prefix + "epoch does not advance the published epoch");
+		return status::failed_precondition(
+			kinetum::common::static_status_text("module epoch does not advance the published epoch"));
 	case epoch_slot_result::NO_EMPTY_SLOT:
-		return status::resource_exhausted(prefix + "both exact slots remain owned");
+		return status::resource_exhausted(
+			kinetum::common::static_status_text("both exact module epoch slots remain owned"));
 	}
-	return status::internal_error(prefix + "unknown slot result");
-} catch (const std::bad_alloc &) {
-	return status::resource_exhausted(
-		kinetum::common::static_status_text("module slot diagnostic exhausted memory"));
-} catch (const std::length_error &) {
-	return status(status_code::OUT_OF_RANGE,
-		      kinetum::common::static_status_text("module slot diagnostic exceeded a representation bound"));
+	return status::internal_error(kinetum::common::static_status_text("unknown module epoch slot result"));
 }
 
 }  // namespace
@@ -226,7 +218,7 @@ status module_epoch_store::stage_prepared(prepared_config_ownership &ownership) 
 	const uint64_t epoch = ownership.epoch();
 	const auto stage_preflight = slots_.preflight_stage_prepared(epoch);
 	if (!stage_preflight.applied()) {
-		return slot_status(stage_preflight.result, "PREPARE publication", epoch);
+		return slot_status(stage_preflight.result);
 	}
 	const uint64_t current_epoch = active_epoch();
 	if (current_epoch != 0u && !telemetry_owner_.telemetry_target_reserved(current_epoch, epoch)) {
@@ -326,7 +318,7 @@ module_epoch_store::preflight_activation_(uint64_t epoch) const noexcept
 	}
 	const auto preflight = slots_.preflight_publish_prepared(epoch);
 	if (!preflight.applied()) {
-		return slot_status(preflight.result, "ACTIVATE preflight", epoch);
+		return slot_status(preflight.result);
 	}
 	if (preflight.slot_index >= ownership_.size()) {
 		return status::internal_error(
@@ -581,7 +573,7 @@ status_or<module_retirement_claim> module_epoch_store::claim_(uint64_t epoch, mo
 	if (kind == module_retirement_kind::PUBLISHED_SHUTDOWN) {
 		const auto preflight = slots_.preflight_retire_published(epoch);
 		if (!preflight.applied()) {
-			return slot_status(preflight.result, "published shutdown claim", epoch);
+			return slot_status(preflight.result);
 		}
 	}
 	if (!telemetry_owner_.telemetry_epoch_aggregated(epoch)) {
