@@ -8,7 +8,8 @@ The harness exercises Kinetum under two evidence profiles:
   kernel-path latency, and ordering.
 - **Physical DPDK PCI:** explicit PCI bindings and an operator-prepared TRex
   endpoint measure real-NIC loss and stream ownership. DP boundary telemetry
-  supplies ordered-CUT evidence; TRex supplies no packet-latency measurement.
+  supplies Ordered-CUT Boundary Protocol evidence; TRex supplies no
+  packet-latency measurement.
 
 `--backend` selects validation infrastructure; the plan alone selects runtime
 providers. Photon owns the DP/CP pair. The harness drives epoch, commit-confirmed,
@@ -94,7 +95,7 @@ Together they provide:
   commit-confirmed, selective rollback, and telemetry-attributed guardrails.
 - A local-TAP pcap pipeline for loss, local kernel-path latency, and packet
   ordering, plus physical TRex counters for loss and stream ownership and DP
-  telemetry for ordered-CUT evidence.
+  telemetry for protocol evidence.
 - A multi-run benchmark loop with deterministic per-run isolation.
 
 The private kit stays outside the finalized runtime prefix. Installed
@@ -123,7 +124,7 @@ Three concerns are deliberately out of scope here:
 
 Use this guide for:
 
-- Local CP, DP, module, and boundary-protocol validation.
+- Local CP, DP, module, and Ordered-CUT Boundary Protocol validation.
 - Checking deployment fixtures after module or snapshot changes.
 - Repeated performance measurements under matched conditions (Section 18).
 - Integrating physical-I/O validation into CI gates.
@@ -962,10 +963,10 @@ is a 16-bit traffic-profile discriminator; it never carries or predicts a DP
 epoch. Each result is specific to the recorded runtime, profile, and measured
 traffic interval.
 
-**Goal.** Validate loss and exact ordered-cut completion during one live
-snapshot apply: every compiled boundary must finish the same from/to
-generation with drained sequence cut, open sender/receiver phases, complete
-edge timing, and zero new typed protocol faults.
+**Goal.** Validate loss and exact Ordered-CUT Boundary Protocol completion
+during one live snapshot apply: every compiled boundary must finish the same
+from/to generation with drained sequence cut, open sender/receiver phases,
+complete edge timing, and zero new typed protocol faults.
 
 **Inputs.**
 
@@ -1030,7 +1031,7 @@ ownership evidence agree for one real ordered transition. It does not by
 itself qualify package identity, another architecture, a subsequent transition,
 fault injection, or throughput beyond the measured workload.
 
-No runtime or build selector weakens the ordered-CUT evidence gate. A physical
+No runtime or build selector weakens the protocol evidence gate. A physical
 negative control requires its own explicit mechanism and evidence contract; it
 cannot be inferred from missing telemetry or an alternate build label.
 
@@ -1685,7 +1686,7 @@ Top-level fields:
 | `transition_success_blocked`, `protocol_fault_counts`, `first_protocol_fault` | mixed | Sticky safety latch, complete typed counters, and immutable first fault. |
 | `stage_stats` | array | One entry per pipeline stage. |
 | `module_counter_stats`, `module_histogram_stats`, `module_epoch_mismatch_stats`, `module_health_stats` | array | Complete selected module observations. |
-| `worker_epoch_stats`, `region_epoch_stats`, `boundary_epoch_stats` | array | Exact ownership, cold aggregation, and ordered-cut evidence. |
+| `worker_epoch_stats`, `region_epoch_stats`, `boundary_epoch_stats` | array | Exact ownership, cold aggregation, and protocol evidence. |
 | `stream_stats` | array | One entry per compiled executable I/O stream with `published_monotonic_ns`, transferred `packets`/`bytes`, and `rejected_packets`. |
 | `storage_domain_stats` | array | Compiled capacity plus typed optional occupancy. |
 | `port_stats` | array | Exact logical/driver identity plus typed optional native counter tuple. |
@@ -2070,8 +2071,8 @@ What is **the same**:
 - The plan compilation chain: Axiom admission followed by Gluon lowering
   inside the installed `kinetum_pack` process.
 - The same provider-contract, compiled-topology, materialization, packet-record,
-  snapshot, module-hosting, and boundary-protocol authorities. Only the typed
-  driver attachment and physical evidence differ.
+  snapshot, module-hosting, and Ordered-CUT Boundary Protocol authorities.
+  Only the typed driver attachment and physical evidence differ.
 - The CP RPC surface and the snapshot file schema.
 - The module ABI and the SDK contract.
 - The stats schema and the boundary telemetry counters.
@@ -2261,7 +2262,7 @@ This section summarizes the exact validation-profile and evidence boundaries.
 | Drive CP from `kinetumctl` directly (apply, confirm, rollback) | [`KINETUMCTL.md`](KINETUMCTL.md) |
 | Understand the snapshot, guardrails, and rollback model in CP | [`CONTROL_PLANE_AND_GUARDRAILS_AND_ROLLBACK.md`](CONTROL_PLANE_AND_GUARDRAILS_AND_ROLLBACK.md) |
 | Trace what DP does during a two-phase apply | [`DATA_PLANE.md`](DATA_PLANE.md) |
-| Inspect current ordered-CUT boundary behavior | [`DATA_PLANE.md`](DATA_PLANE.md) and [`diagrams/ordered_cut_boundary_protocol.md`](diagrams/ordered_cut_boundary_protocol.md) |
+| Inspect the Ordered-CUT Boundary Protocol | [`DATA_PLANE.md`](DATA_PLANE.md) and [`diagrams/ordered_cut_boundary_protocol.md`](diagrams/ordered_cut_boundary_protocol.md) |
 | Understand the module ABI the test loads | [`MODULE_SDK.md`](MODULE_SDK.md) |
 | See the built-in module config fields exercised by the snapshots | [`../src/modules/README.md`](../src/modules/README.md) |
 | Wire scripts against the platform's gRPC | [`GRPC_API.md`](GRPC_API.md) |

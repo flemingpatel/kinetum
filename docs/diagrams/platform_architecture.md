@@ -1278,7 +1278,7 @@ Each worker resolves its own packet, active, and async ownership during drain.
 `src/dp/epoch/epoch_transition_preparation.cpp`, and
 `src/dp/epoch/epoch_transition_completion.cpp`. See
 [`GRPC_API.md`](../GRPC_API.md), [`DATA_PLANE.md`](../DATA_PLANE.md), and the
-[`ordered-CUT guide`](ordered_cut_boundary_protocol.md).
+[Ordered-CUT Boundary Protocol](ordered_cut_boundary_protocol.md).
 
 ## 8. Configuration Publication
 
@@ -2421,4 +2421,4 @@ stop
 `src/dp/epoch/boundary_epoch_channel.cpp`, and
 `src/dp/packet_worker_kernel.cpp`. See [`DATA_PLANE.md`](../DATA_PLANE.md),
 [`MODULE_SDK.md`](../MODULE_SDK.md), and the
-[`ordered-CUT guide`](ordered_cut_boundary_protocol.md).
+[protocol guide](ordered_cut_boundary_protocol.md).

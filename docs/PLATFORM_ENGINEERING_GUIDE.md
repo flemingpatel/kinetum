@@ -144,12 +144,13 @@ algorithm selector. CP mutation retry resolves through one
 durable canonical authority: snapshot transitions retain full exact identity,
 policy and Confirm retain bounded keyed results, and no process-local TTL/FIFO
 cache can outlive or contradict restart truth.
-The boundary protocol requires an exact ordered CUT/ACK barrier instead of an
-epoch-only best-effort marker. Photon resolves DP/CP from its canonical Linux
-process image and launches them with exact-path `posix_spawn()`; the packer and
-installation-info tool consume the same process-image authority instead of
-inferring from invocation context. Every 0.1.0 path must therefore have a
-current owner; remembered behavior without one is not a compatibility policy.
+The Ordered-CUT Boundary Protocol requires an exact ordered CUT/ACK barrier
+instead of an epoch-only best-effort marker. Photon resolves DP/CP from its
+canonical Linux process image and launches them with exact-path
+`posix_spawn()`; the packer and installation-info tool consume the same
+process-image authority instead of inferring from invocation context. Every
+0.1.0 path must therefore have a current owner; remembered behavior without
+one is not a compatibility policy.
 
 ### P-5: Plan Is the Source of Truth for Runtime Wiring
 
@@ -230,10 +231,10 @@ then re-implemented later is a code smell.
 
 ### P-8: Deterministic Boundary Semantics Over Best-Effort
 
-**Why.** Best-effort region or epoch transitions permit silent drops and
-reordering, violating the boundary protocol's correctness contract.
+**Why.** Best-effort packet handoffs or epoch transitions permit silent drops and
+reordering, violating the protocol's correctness contract.
 
-**Rule.** Cross-region and cross-epoch handoff uses a lossless, sequence-defined
+**Rule.** Cross-worker and cross-epoch handoff uses a lossless, sequence-defined
 CUT/ACK barrier with bounded data backpressure. The CUT identifies the final
 successful old-epoch DATA enqueue. The sender seals old DATA at that cut and
 holds future DATA. The receiver drains through the exact cut, retires all local
@@ -259,8 +260,8 @@ content.
 **Rule.** Configuration apply is two phases: Prepare validates the complete
 snapshot, builds immutable execution artifacts under the exact next epoch,
 computes its hash, and signals readiness without changing live execution.
-Activate commits that prepared transaction through the ordered boundary
-protocol; no fallible compilation remains after commit. The active config and
+Activate commits that prepared transaction through the Ordered-CUT Boundary
+Protocol; no fallible compilation remains after commit. The active config and
 prepared config coexist until activation, and the old config remains retained
 through the global quiescence/grace point. Rollback prepares the desired prior
 content as a new monotonically increasing epoch through the same path; it never
@@ -986,8 +987,8 @@ release defects; they do not justify weakening safety bounds.
   `branches`, `cycles`, `instructions` for low-level CPU behavior.
 - `perf record` / `perf report` for hotspot identification.
 - The physical-I/O validation harness's transition telemetry
-  (`transition_metrics.jsonl`) is the canonical regression source for boundary
-  protocol behavior.
+  (`transition_metrics.jsonl`) is the canonical regression source for
+  Ordered-CUT Boundary Protocol behavior.
 - Target qualification traces the ordinary turn refresh, the health-return
   sample, and all four transition-edge sample classes. It rejects a
   syscall-backed worker call path, a per-boundary sampling loop, or a sample
@@ -1593,7 +1594,7 @@ mechanics, behavior, and operator detail.
 | Host CPU/NUMA and process-allowed memory evidence; strict runtime compatibility | `QUARK.md` |
 | Supervisor boot, readiness, restart policy, and pair cleanup | `PHOTON.md` |
 | Cold diagnostics, record format, file ownership, rotation, and logging health | `LOGGING.md` |
-| DP process lifecycle, hot path, boundary protocol, two-phase apply (DP side), module hosting | `DATA_PLANE.md` |
+| DP process lifecycle, hot path, Ordered-CUT Boundary Protocol, two-phase apply (DP side), module hosting | `DATA_PLANE.md` |
 | CP process lifecycle, mutation pipeline, snapshot store, guardrails runner, commit-confirmed, rollback | `CONTROL_PLANE_AND_GUARDRAILS_AND_ROLLBACK.md` |
 | Module ABI, descriptor, batch layout, telemetry, health, lifecycle hooks | `MODULE_SDK.md` |
 | Module-image symbol closure and installed SDK build policy | `MODULE_SDK.md`, `CODING_GUIDELINES.md` |
@@ -1609,7 +1610,7 @@ mechanics, behavior, and operator detail.
 | Vocabulary and component model | `CONCEPTS.md` |
 | Algorithm primitives (cuckoo, RCU/QSBR, SPSC, token bucket, timer wheel, SIMD) | `docs/ALGORITHM_LIBRARY.md` |
 | Built-in modules (ACL, NAT44, QoS) implementation, config schema, hot path | `src/modules/README.md` |
-| End-to-end and ordered-CUT diagrams | `docs/diagrams/README.md`, `docs/diagrams/ordered_cut_boundary_protocol.md` |
+| Platform architecture and Ordered-CUT Boundary Protocol diagrams | `docs/diagrams/README.md`, `docs/diagrams/ordered_cut_boundary_protocol.md` |
 | Coding conventions: naming, comments, file structure, error handling | `CODING_GUIDELINES.md` |
 | Foreign-callback claims, cancellation, and predicate-safe waits | `MODULE_SDK.md`, `DATA_PLANE.md`, `CONTROL_PLANE_AND_GUARDRAILS_AND_ROLLBACK.md` |
 | Runtime/SDK package production, installation, roots, and manifests | `GETTING_STARTED.md`, root `CMakeLists.txt`, release packaging sources |

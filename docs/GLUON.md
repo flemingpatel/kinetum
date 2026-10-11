@@ -808,7 +808,7 @@ from these compiled sets before worker launch. It derives certificate membership
 from the same worker/boundary graph rather than introducing another plan
 capacity or cycle validator. Allocation does not authorize a transition: each
 worker must drain every inbound CUT and its local old work before activation.
-[Data Plane boundary integration](DATA_PLANE.md#12-cross-region-boundary-integration)
+[Data Plane boundary integration](DATA_PLANE.md#12-cross-worker-boundary-integration)
 owns the queue placement, transition sequence, and reclamation mechanics.
 
 #### 9.3 What lives in the plan vs. the dataplane

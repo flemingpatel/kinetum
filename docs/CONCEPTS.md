@@ -117,7 +117,8 @@ the bundle verifier's compiled result and passes that same object to Quark.
 **Boundary** - A handoff between two runtime workers, including lane-local
 workers in the same region. DATA transfers packet-record ownership; separate
 CUT and ACK lanes order configuration changes. The
-[boundary protocol](#boundary-protocol) below explains their sequence and placement.
+[Ordered-CUT Boundary Protocol](#ordered-cut-boundary-protocol)
+below explains their sequence and placement.
 
 **Worker epoch activation** - One immutable owner-worker projection of exact
 module stores and source-domain queue pairs. It validates the old state, then
@@ -134,7 +135,7 @@ and reclamation readiness without owning transition policy or retiring objects.
 
 **Transition completion owner** - Coordinator-thread logic that uses the
 certificate and reader grace to retire old module/snapshot objects and publish
-the terminal transition result. [Data Plane](DATA_PLANE.md#12-cross-region-boundary-integration)
+the terminal transition result. [Data Plane](DATA_PLANE.md#12-cross-worker-boundary-integration)
 defines its ordering and timeout behavior.
 
 **Worker epoch ledger** - The sole logical-work accounting authority for one
@@ -162,8 +163,8 @@ policy.
 **Epoch** - A nonzero monotonic configuration identity. Bootstrap activates one
 exact epoch across every worker before provider ingress activates and packet
 worker bodies are released. Every executing packet uses exactly its assigned
-epoch's configuration; the live ordered-CUT protocol changes that identity
-without forward or backward leakage.
+epoch's configuration. The protocol activates the next configuration on each
+worker only after its old work drains.
 
 **Snapshot** - A configuration state pushed to the running dataplane:
 `message ConfigSnapshot` in `proto/kinetum/control/v1/control.proto`.
@@ -227,7 +228,7 @@ authority. DP activates configuration and I/O before `PACKET_READY` releases
 packet execution. The [end-to-end sequence](diagrams/platform_architecture.md#1-end-to-end-overview)
 shows those owners and readiness gates together.
 
-## Boundary Protocol
+## Ordered-CUT Boundary Protocol
 
 ### Current ordered transition transport
 
@@ -280,13 +281,13 @@ propagates terminal sender closure through the worker DAG, joins workers,
 deactivates provider I/O, and only then retires the published generation
 artifacts and provider dependencies.
 
-### Live ordered-CUT behavior
+### Live transition behavior
 
 During a live transition, boundary-connected workers can reach the activation
 point at different times. A packet processed
 under epoch *E+1* in worker A must not arrive at worker B before B has applied
 *E+1*; old epoch *E* work must also not execute after B activates *E+1*. The
-final protocol composes three bounded channels over the same exact boundary
+protocol composes three bounded channels over the same exact boundary
 ownership:
 
 ```{uml}

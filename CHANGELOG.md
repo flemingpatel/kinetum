@@ -20,9 +20,9 @@ Initial experimental release for Ubuntu 24.04 on x86-64 and AArch64.
 - Added durable two-phase snapshot updates with exact retry identity,
   commit-confirmed operation, full and selective rollback, and restart
   reconciliation.
-- Added the sequence-defined DATA/CUT/ACK protocol, worker ownership ledgers,
-  exact reader grace, and certificate-gated reclamation for passive and active
-  pipelines.
+- Added the sequence-defined Ordered-CUT Boundary Protocol (DATA/CUT/ACK),
+  worker ownership ledgers, exact reader grace, and certificate-gated reclamation
+  for passive and active pipelines.
 - Added owner-worker active timers, control delivery, pull readiness, retained
   packets, tracked foreign work, cancellation, and same-instance
   recirculation under one bounded conservation model.
