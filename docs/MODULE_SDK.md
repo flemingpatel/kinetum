@@ -592,7 +592,7 @@ Layout invariants:
   corruption is a module-contract fault.
 - `epoch` is the config epoch the batch belongs to. All packets in one batch
   share that epoch. This is a batch-construction invariant, not by itself a
-  proof of cross-region per-packet consistency; see
+  proof of cross-worker per-packet consistency; see
   [`DATA_PLANE.md`](DATA_PLANE.md).
 - `ctx` is the sole-owner live context for this callback. Its `state` pointer
   reaches context-local mutable state; it exposes no cold service table.
@@ -1060,7 +1060,7 @@ not allocate, parse, block, log, or reclaim. The platform separately publishes
 Live activation requires all old packet, retained, timer, control, PULL,
 callback, and async work to have drained. Packet callbacks cannot interleave
 with ACTIVATE. The platform owns queue rotation, ledger promotion, and ordered
-acknowledgement; see [DP boundary integration](DATA_PLANE.md#12-cross-region-boundary-integration).
+acknowledgement; see [DP boundary integration](DATA_PLANE.md#12-cross-worker-boundary-integration).
 
 #### RETIRE: exact reclamation
 

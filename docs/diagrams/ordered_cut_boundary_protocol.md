@@ -5,7 +5,7 @@ activating its new view. These diagrams show the boundary and reclamation
 proof. Data-plane and wire contracts are in
 [`DATA_PLANE.md`](../DATA_PLANE.md) and [`GRPC_API.md`](../GRPC_API.md).
 
-## 1. What the Ordered-CUT Protocol Is
+## 1. What the Ordered-CUT Boundary Protocol Is
 
 Every packet enters the data plane with one immutable epoch. Cross-worker DATA
 travels through a bounded SPSC ring. A separate control lane carries a `CUT`
@@ -550,7 +550,7 @@ semantics, not a small lookup substitution.
 For immutable, stateless forwarding on a fixed graph, dual-version dispatch may
 be the better trade because it avoids a quiescent owner handoff. Kinetum does
 not claim that versioning is incorrect or impossible. Live topology replacement
-is outside both the ordered-CUT protocol and the Kinetum 0.1.0 product
+is outside both the protocol and the Kinetum 0.1.0 product
 contract.
 
 ## 12. Invariants, Proof Sketch, and Evidence Map

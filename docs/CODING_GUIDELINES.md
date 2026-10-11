@@ -355,7 +355,7 @@ All platform code lives under `kinetum::` with a subsystem qualifier:
 | `kinetum::cp` | Control plane |
 | `kinetum::algo` | Algorithm primitives |
 | `kinetum::photon` | Supervisor |
-| `kinetum::axiom` | Pipeline compiler |
+| `kinetum::axiom` | Pipeline definition and validation |
 | `kinetum::modules` | Built-in modules |
 | `kinetum::pack` | Bundle tools |
 

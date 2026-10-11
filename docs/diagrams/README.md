@@ -27,7 +27,7 @@ own schemas, APIs, limits, and failure tables.
 | What happens when the data plane starts? | [Architecture Section 11](platform_architecture.md#11-data-plane-host) | [`DATA_PLANE.md`](../DATA_PLANE.md), [`KINETUM_PACK.md`](../KINETUM_PACK.md) |
 | What is paid by a packet worker? | [Architecture Section 12](platform_architecture.md#12-worker-hot-path) | [`DATA_PLANE.md`](../DATA_PLANE.md), [`PLATFORM_ENGINEERING_GUIDE.md`](../PLATFORM_ENGINEERING_GUIDE.md) |
 | How does one packet move and retire? | [Architecture Section 13](platform_architecture.md#13-packet-lifecycle) | [`DATA_PLANE.md`](../DATA_PLANE.md), [`MODULE_SDK.md`](../MODULE_SDK.md) |
-| Why does the boundary carry a sequence cut? | [Ordered-CUT guide](ordered_cut_boundary_protocol.md) | [`DATA_PLANE.md`](../DATA_PLANE.md) |
+| Why does the boundary carry a sequence cut? | [Ordered-CUT Boundary Protocol](ordered_cut_boundary_protocol.md) | [`DATA_PLANE.md`](../DATA_PLANE.md) |
 
 ## Stable Source Anchors
 

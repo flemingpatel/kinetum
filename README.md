@@ -1,7 +1,7 @@
 # Kinetum (0.1.0)
 
 Kinetum is a Linux packet-processing platform whose production hot path
-targets DPDK. It compiles declared packet pipelines, plans them across
+targets DPDK. It validates declared packet pipelines, plans them across
 CPU cores, runs them as a long-lived dataplane, and applies configuration
 snapshots through an epoch-based reconfiguration subsystem.
 
@@ -10,8 +10,8 @@ applications composed from reusable pipeline stages. It separates application
 policy from execution, resource management, and live configuration coordination,
 reducing the infrastructure each application must implement.
 
-> **Epoch-transition status:** Live configuration updates use one
-> sequence-defined DATA/CUT/ACK protocol, exact worker ownership
+> **Epoch-transition status:** Live configuration updates use the sequence-defined
+> Ordered-CUT Boundary Protocol (DATA/CUT/ACK), exact worker ownership
 > accounting, owner-worker activation, and quiescence-gated reclamation. The
 > control plane exposes durable Prepare/Activate convergence, commit-confirmed
 > updates, and evidence-gated guardrails. Physical results apply to the tested
@@ -66,7 +66,7 @@ Kinetum 0.1.0 is the initial experimental release.
 - `proto/kinetum/release/`   installed-provider and release evidence
 
 **Core components**
-- `src/axiom/`   pipeline compiler and validation
+- `src/axiom/`   pipeline definition and validation
 - `src/gluon/`   planner and binding resolution
 - `src/quark/`   host topology probe and strict runtime compatibility gate
 - `src/photon/`  single-node supervisor

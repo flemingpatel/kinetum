@@ -14,8 +14,8 @@ batches, configuration views, telemetry, and health are documented in
 [`MODULE_SDK.md`](MODULE_SDK.md). Provider roles, the C ABI, native resources,
 and component integration are documented in [Providers](PROVIDERS.md).
 
-For the boundary protocol and proof that an epoch-only marker cannot implement
-an ordered cut, see
+For the Ordered-CUT Boundary Protocol and proof that an epoch-only marker
+cannot implement an ordered cut, see
 [`diagrams/ordered_cut_boundary_protocol.md`](diagrams/ordered_cut_boundary_protocol.md).
 For the wire-format DataplaneService proto, see
 [`GRPC_API.md`](GRPC_API.md). For the Quark runtime compatibility gate
@@ -39,7 +39,7 @@ that runs at DP startup, see [`QUARK.md`](QUARK.md).
 9. [RX Path](#9-rx-path)
 10. [Stage Dispatch](#10-stage-dispatch)
 11. [TX and Egress](#11-tx-and-egress)
-12. [Cross-Region Boundary Integration](#12-cross-region-boundary-integration)
+12. [Cross-Worker Boundary Integration](#12-cross-worker-boundary-integration)
 13. [Active Stage Dispatch](#13-active-stage-dispatch)
 
 **Part 3: Module Lifecycle and Telemetry**
@@ -78,7 +78,7 @@ region; RSS multi-lane plans may create multiple workers inside one logical
 region. Each worker runs a tight busy-poll loop: receives packets from its
 assigned RX sources, executes pipeline
 stages, dispatches results either locally (next stage) or across a
-region boundary (the ordered-CUT protocol), and either drops, forwards to
+worker boundary using the protocol, and either drops, forwards to
 a TX operation, or hands off to a downstream worker.
 
 The cold compiler resolves worker ownership, source schedules, storage/access
@@ -991,8 +991,8 @@ conversion, or unbounded module-selected clone loop.
 **TX-stage handling** (`stage->kind() == STAGE_KIND_TX`) is described
 in [Section 11](#11-tx-and-egress).
 
-**Cross-region handling** is described in
-[Section 12](#12-cross-region-boundary-integration).
+**Cross-worker handling** is described in
+[Section 12](#12-cross-worker-boundary-integration).
 
 **Drop semantics:** rejected mechanisms and fail-closed route outcomes append
 the exact record to its storage domain's bounded grouped release burst and
@@ -1049,7 +1049,7 @@ drained, then exits. After every worker joins, cold provider teardown reclaims
 its remaining native resources and accepted ownership; it does not invoke the
 packet operation table a second time.
 
-### 12. Cross-Region Boundary Integration
+### 12. Cross-Worker Boundary Integration
 
 When the next stage instance belongs to another worker, dispatch requires an
 exact executable boundary. Gluon emits and
@@ -2046,7 +2046,7 @@ provider-selection bypass.
 
 ### 21. Determinism
 
-**Deterministic within a region:**
+**Deterministic within one worker:**
 
 - Stage execution order per packet (`stages_` compact-index lookup on one
   owner worker).
@@ -2058,11 +2058,11 @@ provider-selection bypass.
 - Owner-local worker/module counters change in the same deterministic ownership
   order as packet outcomes; immutable bank merge is exact once per token.
 
-**Non-deterministic across regions and across iterations:**
+**Non-deterministic between workers and across iterations:**
 
-- Cross-region timing: busy-poll cadence, bounded DATA backpressure, and the
+- Inter-worker timing: busy-poll cadence, bounded DATA backpressure, and the
   order in which independent workers process available input vary.
-- Boundary order between regions: fan-in DATA can arrive in any inter-worker
+- Boundary order between workers: fan-in DATA can arrive in any inter-worker
   timing consistent with each SPSC channel's order. Every record still carries
   one immutable exact epoch, and execution admits it only at that same epoch;
   a live cut may therefore have old and target records in different owned tiers
@@ -2106,7 +2106,7 @@ the certified old-work and reader-grace boundary.
 | Fixed Bootstrap, allocator watermarks, current/latest transition, pending Confirm, guardrails policy, and rollback-intent authority | CP `config_store` owns one atomically replaced private envelope; DP validates and coherently publishes the nested Bootstrap epoch/watermarks/content hash |
 | Live epoch/mutation allocation and pending-transition reconciliation | CP durably allocates both values, persists PREPARED/COMPLETION_PENDING before their irreversible edges, and classifies only typed DP identity/state/failure |
 | Exact executable boundary declarations                              | Gluon (`boundary_topology_lowering.cpp`)                    |
-| Boundary protocol materialization and execution                     | DP compiled provider topology, transactional worker-local endpoint slabs plus channel materialization, and owner-worker kernels |
+| Ordered-CUT Boundary Protocol materialization and execution          | DP compiled provider topology, transactional worker-local endpoint slabs plus channel materialization, and owner-worker kernels |
 | Boundary telemetry collection                                       | DP final snapshot source over the immutable certificate graph and exact endpoint publications; exposed only inside a successful all-or-none shared telemetry response |
 | Boundary ACK-stall observation and rollback-intent submission      | CP guardrails evaluator consumes exact generation-local boundary rows and persists one desired action before the existing transition authority executes it |
 | Atomic module image/context admission and cold lifecycle serialization | DP (`module_manager` + `module_lifecycle_adapter`)  |
@@ -2125,8 +2125,8 @@ the certified old-work and reader-grace boundary.
 | See the DP host process and threading visually                   | [`diagrams/platform_architecture.md` Section 11 (Data-Plane Host)](diagrams/platform_architecture.md#11-data-plane-host) |
 | See the runtime worker loop visually                              | [`diagrams/platform_architecture.md` Section 12 (Worker Hot Path)](diagrams/platform_architecture.md#12-worker-hot-path) |
 | See a single packet's lifecycle                                  | [`diagrams/platform_architecture.md` Section 13 (Packet Lifecycle)](diagrams/platform_architecture.md#13-packet-lifecycle) |
-| Inspect the current boundary transport                           | [Section 12 (Cross-Region Boundary Integration)](#12-cross-region-boundary-integration) |
-| Understand the ordered-CUT proof and alternatives                | [`diagrams/ordered_cut_boundary_protocol.md`](diagrams/ordered_cut_boundary_protocol.md) |
+| Inspect the current boundary transport                           | [Section 12 (Cross-Worker Boundary Integration)](#12-cross-worker-boundary-integration) |
+| Understand the protocol's proof and alternatives                 | [`diagrams/ordered_cut_boundary_protocol.md`](diagrams/ordered_cut_boundary_protocol.md) |
 | See the exact transition RPC boundary                            | [`diagrams/platform_architecture.md` Section 7 (Transition RPC Boundary)](diagrams/platform_architecture.md#7-transition-rpc-boundary) |
 | See exact DP snapshot lifecycle and CP reader publication        | [`diagrams/platform_architecture.md` Section 8 (Configuration Publication)](diagrams/platform_architecture.md#8-configuration-publication) |
 | Author or maintain a module                                      | [`MODULE_SDK.md`](MODULE_SDK.md)                           |

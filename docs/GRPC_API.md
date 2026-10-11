@@ -73,7 +73,7 @@ cover mutation ordering, snapshot apply, guardrails decisions, and DP transition
 | What does the CP single-writer thread do?        | [`CONTROL_PLANE_AND_GUARDRAILS_AND_ROLLBACK.md`](CONTROL_PLANE_AND_GUARDRAILS_AND_ROLLBACK.md) |
 | What does guardrails do with `GuardrailsPolicy`? | Same                                                                    |
 | What does DP do during transition RPC admission? | [`DATA_PLANE.md`](DATA_PLANE.md)                                       |
-| Boundary protocol semantics                      | [`DATA_PLANE.md`](DATA_PLANE.md) + [`diagrams/ordered_cut_boundary_protocol.md`](diagrams/ordered_cut_boundary_protocol.md) |
+| Ordered-CUT Boundary Protocol semantics           | [`DATA_PLANE.md`](DATA_PLANE.md) + [`diagrams/ordered_cut_boundary_protocol.md`](diagrams/ordered_cut_boundary_protocol.md) |
 
 #### 1.1 Schema roles
 
@@ -1177,7 +1177,7 @@ not exceed 1.0. A nonzero module weight or boost requires complete current
 module-health evidence; absence suppresses the sample rather than contributing
 zero.
 
-#### 8.3 Boundary protocol monitoring
+#### 8.3 Ordered-CUT Boundary Protocol monitoring
 
 `GuardrailsBoundaryPolicy` contains one `uint64 ack_timeout_ms`. Message
 presence enables the detector; absence disables it. The value is positive,
@@ -1350,7 +1350,8 @@ COMPLETION_PENDING, and exact terminal publication. A control-only CP keeps the
 loop stopped. Neither partial component state nor default response fields are
 reported as a successful observation.
 The behavioral mechanism and runtime ownership boundary are in
-[`DATA_PLANE.md`](DATA_PLANE.md) and the boundary protocol diagram.
+[`DATA_PLANE.md`](DATA_PLANE.md) and the
+[protocol guide](diagrams/ordered_cut_boundary_protocol.md).
 
 ### 10. Authentication and TLS
 
