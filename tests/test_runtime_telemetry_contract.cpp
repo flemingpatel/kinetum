@@ -39,6 +39,12 @@ telemetry::RuntimeTelemetry valid_telemetry()
 	runtime->set_collection_monotonic_ns(100u);
 	runtime->set_latest_bank_publication_monotonic_ns(90u);
 	value.mutable_engine();
+	auto *counters = value.add_worker_counters();
+	counters->set_worker_index(0u);
+	counters->set_observation_epoch(5u);
+	counters->set_publication_generation(1u);
+	counters->set_published_monotonic_ns(90u);
+	counters->mutable_counters();
 	auto *transition = value.mutable_transition();
 	transition->set_publication_generation(1u);
 	transition->set_state(telemetry::EPOCH_TRANSITION_STATE_IDLE);
@@ -127,6 +133,83 @@ TEST(runtime_telemetry_contract, mandatory_families_and_service_wrappers_are_exa
 	EXPECT_FALSE(validate_control_stats_request(stale_control).is_ok());
 }
 
+/** @brief Every successful response includes one exact counter observation per worker. */
+TEST(runtime_telemetry_contract, worker_counter_membership_and_shape_are_mandatory)
+{
+	const telemetry::TelemetrySelection selection;
+	for (int fault = 0; fault < 8; ++fault) {
+		auto value = valid_telemetry();
+		auto *row = value.mutable_worker_counters(0);
+		switch (fault) {
+		case 0:
+			value.clear_worker_counters();
+			break;
+		case 1:
+			*value.add_worker_counters() = *row;
+			break;
+		case 2:
+			row->set_worker_index(1u);
+			break;
+		case 3:
+			row->set_publication_generation(0u);
+			break;
+		case 4:
+			row->set_published_monotonic_ns(101u);
+			break;
+		case 5:
+			row->set_observation_epoch(6u);
+			break;
+		case 6:
+			row->clear_counters();
+			break;
+		case 7:
+			ASSERT_TRUE(row->MergeFromString(std::string{"\xf8\x07\x01", 3u}));
+			break;
+		}
+		EXPECT_FALSE(validate_runtime_telemetry(value, selection).is_ok()) << fault;
+	}
+}
+
+/** @brief Processing-only terminal drops remain visible when no optional worker or stream rows are requested. */
+TEST(runtime_telemetry_contract, engine_totals_include_workers_without_io)
+{
+	auto value = valid_telemetry();
+	value.mutable_runtime()->set_expected_workers(2u);
+	value.mutable_runtime()->set_active_workers(2u);
+	value.mutable_transition()->set_execution_participant_count(2u);
+	value.mutable_transition()->set_quiescence_reader_count(2u);
+	auto *drop_owner = value.add_worker_counters();
+	*drop_owner = value.worker_counters(0);
+	drop_owner->set_worker_index(1u);
+	drop_owner->mutable_counters()->set_dropped_packets(3u);
+	value.mutable_engine()->set_dropped_packets(3u);
+	const telemetry::TelemetrySelection selection;
+	ASSERT_TRUE(validate_runtime_telemetry(value, selection).is_ok());
+	value.mutable_engine()->set_dropped_packets(0u);
+	EXPECT_FALSE(validate_runtime_telemetry(value, selection).is_ok());
+}
+
+/** @brief Conflicting population claims reject before stream-to-worker indexing. */
+TEST(runtime_telemetry_contract, runtime_and_transition_worker_counts_must_agree)
+{
+	auto value = valid_telemetry();
+	auto *stream = value.add_streams();
+	stream->set_io_stream_id("ingress.rx");
+	stream->set_worker_index(0u);
+	stream->set_direction(kinetum::gluon::v1::IO_STREAM_DIRECTION_RX);
+	stream->set_packets(0u);
+	stream->set_bytes(0u);
+	stream->set_rejected_packets(0u);
+	stream->set_published_monotonic_ns(90u);
+	telemetry::TelemetrySelection selection;
+	selection.set_include_stream_stats(true);
+	ASSERT_TRUE(validate_runtime_telemetry(value, selection).is_ok());
+	value.mutable_transition()->set_execution_participant_count(2u);
+	value.mutable_transition()->set_quiescence_reader_count(2u);
+	stream->set_worker_index(1u);
+	EXPECT_FALSE(validate_runtime_telemetry(value, selection).is_ok());
+}
+
 /** @brief Reject exhausted engine transfers even without selected stream detail. */
 TEST(runtime_telemetry_contract, summary_transfer_counts_exclude_the_exhaustion_marker)
 {
@@ -145,6 +228,7 @@ TEST(runtime_telemetry_contract, summary_transfer_counts_exclude_the_exhaustion_
 		engine->set_tx_packets(UINT64_MAX - 1u);
 		engine->set_rx_bytes(UINT64_MAX - 1u);
 		engine->set_tx_bytes(UINT64_MAX - 1u);
+		*value.mutable_worker_counters(0)->mutable_counters() = *engine;
 		ASSERT_TRUE(validate_runtime_telemetry(value, selection).is_ok());
 		(engine->*setter)(UINT64_MAX);
 		EXPECT_FALSE(validate_runtime_telemetry(value, selection).is_ok());
@@ -186,6 +270,7 @@ TEST(runtime_telemetry_contract, optional_row_membership_is_selection_exact)
 	region->set_maximum_source_epoch(5u);
 	EXPECT_TRUE(validate_runtime_telemetry(value, selection).is_ok());
 	value.mutable_engine()->set_fanout_overflow(1u);
+	value.mutable_worker_counters(0)->mutable_counters()->set_fanout_overflow(1u);
 	EXPECT_FALSE(validate_runtime_telemetry(value, selection).is_ok());
 	region->set_fanout_overflow(1u);
 	EXPECT_TRUE(validate_runtime_telemetry(value, selection).is_ok());
@@ -281,6 +366,7 @@ TEST(runtime_telemetry_contract, stream_totals_preserve_exact_packet_and_byte_co
 	stream->set_rejected_packets(0u);
 	value.mutable_engine()->set_rx_packets(7u);
 	value.mutable_engine()->set_rx_bytes(448u);
+	*value.mutable_worker_counters(0)->mutable_counters() = value.engine();
 	ASSERT_TRUE(validate_runtime_telemetry(value, selection).is_ok());
 	value.mutable_engine()->set_rx_packets(8u);
 	EXPECT_FALSE(validate_runtime_telemetry(value, selection).is_ok());
@@ -464,6 +550,9 @@ TEST(runtime_telemetry_contract, causal_and_identity_contradictions_fail_closed)
 	auto value = valid_telemetry();
 	value.mutable_runtime()->set_active_workers(2u);
 	value.mutable_runtime()->set_expected_workers(2u);
+	auto *second_worker = value.add_worker_counters();
+	*second_worker = value.worker_counters(0);
+	second_worker->set_worker_index(1u);
 	value.mutable_transition()->set_execution_participant_count(2u);
 	value.mutable_transition()->set_quiescence_reader_count(2u);
 	value.mutable_transition()->set_boundary_count(1u);

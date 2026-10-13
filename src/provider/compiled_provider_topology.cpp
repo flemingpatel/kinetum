@@ -2751,9 +2751,9 @@ status provider_topology_compiler::compile_schedules_and_budgets_()
 	}
 	for (const auto &stream : out_.io_streams) {
 		auto &schedule = out_.worker_schedules[stream.worker_index];
-		// One physical TX queue can hold its entire descriptor population from
-		// any admitted domain. Charge that complete floor to each domain once;
-		// the queue and its owner schedule are still constructed only once.
+		// Each TX stream reserves its full descriptor bound for native queue
+		// backing in every admitted domain. Charge that floor to each domain
+		// once; the queue and its owner schedule are constructed only once.
 		for (const uint32_t domain : stream.storage_domain_indices()) {
 			auto &descriptors = stream.direction == compiled_io_stream_direction::RX ?
 						    rx_descriptors[domain] :

@@ -77,11 +77,11 @@ constexpr uint32_t MAX_HISTORY_CAPACITY = 100'000u;	    ///< Bounded CP storage.
 
 kinetum::common::status validate_guardrails_policy(const kinetum::control::v1::GuardrailsPolicy &policy)
 {
-	const auto unknown = kinetum::common::reject_unknown_protobuf_fields_recursive(policy, "GuardrailsPolicy");
+	auto unknown = kinetum::common::reject_unknown_protobuf_fields_recursive(policy, "GuardrailsPolicy");
 	if (!unknown.is_ok()) {
 		return unknown;
 	}
-	const auto enums = kinetum::common::reject_invalid_protobuf_enum_values_recursive(policy, "GuardrailsPolicy");
+	auto enums = kinetum::common::reject_invalid_protobuf_enum_values_recursive(policy, "GuardrailsPolicy");
 	if (!enums.is_ok()) {
 		return enums;
 	}
@@ -98,21 +98,13 @@ kinetum::common::status validate_guardrails_policy(const kinetum::control::v1::G
 	}
 
 	if (policy.poll_interval_ms() == 0u || policy.poll_interval_ms() > MAX_POLL_INTERVAL_MS ||
-	    policy.evaluation_window_ms() < policy.poll_interval_ms() ||
-	    policy.evaluation_window_ms() > MAX_EVALUATION_WINDOW_MS || policy.telemetry_history_capacity() == 0u ||
-	    policy.telemetry_history_capacity() > MAX_HISTORY_CAPACITY) {
+	    policy.evaluation_window_ms() == 0u || policy.evaluation_window_ms() > MAX_EVALUATION_WINDOW_MS ||
+	    policy.telemetry_history_capacity() == 0u || policy.telemetry_history_capacity() > MAX_HISTORY_CAPACITY) {
 		return kinetum::common::status::invalid_argument(
 			"enabled guardrails cadence, window, or history capacity is out of range");
 	}
 
-	const uint64_t sample_intervals = policy.evaluation_window_ms() / policy.poll_interval_ms() +
-					  (policy.evaluation_window_ms() % policy.poll_interval_ms() != 0u ? 1u : 0u);
-	if (sample_intervals > policy.telemetry_history_capacity()) {
-		return kinetum::common::status::invalid_argument(
-			"guardrails history capacity cannot retain one complete evaluation window");
-	}
-
-	const auto attribution = validate_attribution(policy);
+	auto attribution = validate_attribution(policy);
 	if (!attribution.is_ok()) {
 		return attribution;
 	}
@@ -139,7 +131,6 @@ kinetum::common::status validate_guardrails_policy(const kinetum::control::v1::G
 		    correlation.hysteresis_band() >= correlation.degradation_threshold() ||
 		    correlation.min_samples() == 0u ||
 		    correlation.min_samples() > policy.telemetry_history_capacity() ||
-		    correlation.min_samples() > sample_intervals ||
 		    !finite_positive(correlation.normalization_max_drop_ratio(), 1.0) ||
 		    !finite_positive(correlation.normalization_min_tx_ratio(), 1.0) ||
 		    correlation.normalization_min_tx_ratio() >= 1.0) {

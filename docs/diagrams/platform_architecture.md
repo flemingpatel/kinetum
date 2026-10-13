@@ -1379,36 +1379,59 @@ partition "Guardrails observer" {
 :Read enabled durable policy identity;
 :Read CP authority, collect DP telemetry,
 then re-read and fence CP authority;
+if (Transient unavailable or deadline-expired read?) then (yes)
+    :Retain counter cursors without a new sample;
+    stop
+endif
 if (Complete, coherent, fault-free observation?) then (yes)
 else (no)
     :Break interval continuity;
     :Do not advance valid observation time;
     stop
 endif
+:Validate every worker publication identity
+and retained counter high watermark;
+if (Changed same-generation row or regression?) then (yes)
+    :Break interval continuity;
+    stop
+endif
 if (Enabled ACK timeout with exact in-flight
 identity and a distinct rollback target?) then (yes)
     :Select the timeout rollback target;
 else (ordinary evaluation)
-    if (IDLE and required module health available?) then (yes)
+    if (IDLE?) then (yes)
     else (no)
         :Break interval continuity;
         stop
     endif
-    :Check runtime/content identity
-    and cumulative counter high watermarks;
-    if (Counters regress?) then (yes)
+    :Bind active content and freeze
+    an eligible prior baseline on change;
+    if (Required health and current-epoch worker rows available?) then (yes)
+    else (no)
         :Break interval continuity;
         stop
-    elseif (New baseline or broken interval?) then (yes)
+    endif
+    if (New content binding or broken interval?) then (yes)
         :Seed without a fabricated delta;
         stop
     endif
-    :Compute one elapsed-time and counter delta;
+    if (Every worker advanced with positive common coverage?) then (yes)
+    else (no)
+        :Wait for another source publication;
+        stop
+    endif
+    :Compute per-worker rates
+    and common covered duration;
     if (Baseline window?) then (yes)
-        :Accumulate valid samples;
-        :Arm only with positive baseline TX;
+        :Update duration-weighted baseline;
+        :Arm only with enough intervals and positive TX;
         stop
     else (candidate with frozen baseline)
+        if (History full or complete interval exceeds remaining time?) then (yes)
+            :End evaluation without automatic action;
+            stop
+        endif
+        :Advance only covered observation time;
         :Apply the threshold or correlation detector;
         if (Triggered?) then (yes)
             :Score attribution against the real baseline and window;
@@ -1458,7 +1481,8 @@ state EVALUATING
 EVALUATING : Disable policy: DISABLED
 BASELINE_BUILDING -right-> ARMED : sufficient stable\nbaseline
 ARMED -right-> EVALUATING : active content\nchanges
-EVALUATING -[norank]-> BASELINE_BUILDING : valid window ends\nwithout action
+EVALUATING -[norank]-> BASELINE_BUILDING : window or history ends\nwithout action
+ARMED -[norank]-> BASELINE_BUILDING : baseline TX\nbecomes zero
 state ROLLBACK_PENDING
 ROLLBACK_PENDING : Failed terminal intent stays pending
 ROLLBACK_PENDING : until explicit recovery
@@ -1485,7 +1509,9 @@ The following events override or pause the ordinary evaluation path:
 |-------|--------|
 | New policy generation | Reconstruct `DISABLED` or `BASELINE_BUILDING` from the complete policy. |
 | Runtime replacement, overlapping content change, or same-content epoch change | Rebuild the enabled evaluator's baseline. |
-| Missing, faulted, or regressing evidence | Break interval continuity without advancing valid time. |
+| Repeated or partially advanced worker publications | Wait; add no sample or valid time. |
+| Transient unavailable/deadline-expired read | Add no sample; later exact endpoints may cover the gap. |
+| Faulted, regressing, non-IDLE, or health-incomplete evidence | Break interval continuity without advancing valid time. |
 | Independently durable safety intent, including commit-confirmed expiry | Enter `ROLLBACK_PENDING`; no second decision is admitted. |
 | Exact intent convergence | Rebuild according to current policy presence and enabledness. |
 
@@ -1573,7 +1599,8 @@ stop
 
 - Each evaluated DP observation is fenced by durable active-identity reads
   before and after its response.
-- Observation time advances only across valid, same-generation samples.
+- Rates use worker publication times; valid time advances only by their positive
+  common coverage. RPC collection time remains provenance and ACK-age input.
 - Module health is current only at the coherent active epoch; unavailable rows
   suppress evaluation when the policy requires that evidence.
 - The sticky protocol-fault latch is transition-safety authority, not

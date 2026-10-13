@@ -220,7 +220,7 @@ def parse_args() -> argparse.Namespace:
     packet_group.add_argument(
         "--all-sizes",
         action="store_true",
-        help="Test all standard sizes (64, 128, 256, 512, 1024, 1518)",
+        help="Test all standard sizes (64, 128, 256, 512, 1024, 1514)",
     )
     packet_group.add_argument(
         "--num-flows",

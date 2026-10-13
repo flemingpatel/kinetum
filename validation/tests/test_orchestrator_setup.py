@@ -14,6 +14,8 @@ from kinetum_validation.config.types import (
     AnalysisResult,
     BackendConfig,
     BackendType,
+    DEPLOYMENT_SPECS,
+    DeploymentMode,
     EpochConfig,
     PacketConfig,
     PacketStats,
@@ -44,7 +46,10 @@ from kinetum_validation.process.telemetry import (
     StorageDomainStatsResult,
     StreamStatsResult,
     TrafficSteeringStatsResult,
+    WorkerCounterStatsResult,
 )
+
+from .traffic_fixtures import complete_native_analysis
 
 
 class _FakeEpochKinetumCtl:
@@ -71,6 +76,19 @@ class _FakeEpochKinetumCtl:
                 success=True,
                 rx_packets=packet_count,
                 tx_packets=packet_count,
+                rx_bytes=packet_count * 64,
+                tx_bytes=packet_count * 64,
+                expected_workers=1,
+                execution_participant_count=1,
+                allocated_epoch_high_watermark=self._baseline_epoch,
+                collection_monotonic_ns=self._stats_calls * 100,
+                latest_bank_publication_monotonic_ns=self._stats_calls * 100,
+                worker_counters=[WorkerCounterStatsResult(
+                    worker_index=0, observation_epoch=self._baseline_epoch,
+                    publication_generation=self._stats_calls, published_monotonic_ns=self._stats_calls * 100,
+                    rx_packets=packet_count, tx_packets=packet_count, dropped_packets=0,
+                    rx_bytes=packet_count * 64, tx_bytes=packet_count * 64, fanout_overflow=0,
+                )],
                 active_epoch=self._baseline_epoch,
                 active_snapshot_id="v1",
                 active_revision=1,
@@ -105,6 +123,19 @@ class _FakeEpochKinetumCtl:
             success=True,
             rx_packets=110,
             tx_packets=110,
+            rx_bytes=7040,
+            tx_bytes=7040,
+            expected_workers=1,
+            execution_participant_count=1,
+            allocated_epoch_high_watermark=3,
+            collection_monotonic_ns=self._stats_calls * 100,
+            latest_bank_publication_monotonic_ns=self._stats_calls * 100,
+            worker_counters=[WorkerCounterStatsResult(
+                worker_index=0, observation_epoch=3,
+                publication_generation=self._stats_calls, published_monotonic_ns=self._stats_calls * 100,
+                rx_packets=110, tx_packets=110, dropped_packets=0,
+                rx_bytes=7040, tx_bytes=7040, fanout_overflow=0,
+            )],
             active_epoch=3,
             active_snapshot_id="v2",
             active_revision=2,
@@ -274,21 +305,13 @@ class _FakeEpochTraffic:
     ) -> AnalysisResult:
         """Return zero-loss generation-tag analysis."""
         del pcap_file
-        result = AnalysisResult(
+        if not self.sustained_overlap:
+            return complete_native_analysis(((1, 50), (2, 50)), 2)
+        return AnalysisResult(
             total_rx=expected_count,
             valid=expected_count,
-            tag_transition_count=0 if self.sustained_overlap else 1,
-            transition_seq=-1 if self.sustained_overlap else 50,
+            tag_counts={1: 50, 2: 50},
         )
-        result.tag_counts = {1: 50, 2: 50}
-        result.set_latency_stats({
-            "avg": 10.0,
-            "min": 5.0,
-            "max": 20.0,
-            "p50": 9.0,
-            "p99": 19.0,
-        })
-        return result
 
     def make_sender(self, packet_config):
         """Return the fake epoch sender."""
@@ -314,9 +337,13 @@ class _FakePackerProcess:
         return b"", b"packer rejected fixture"
 
 
-def _config_with_example_dir(root: Path) -> ValidationConfig:
+def _config_with_example_dir(
+    root: Path, backend_type: BackendType = BackendType.DPDK_TAP,
+) -> ValidationConfig:
     """Build a TestConfig rooted in one temporary installed layout."""
+    profile = DEPLOYMENT_SPECS[DeploymentMode.FAN_IN_EDGE_GATEWAY].backend_profile(backend_type)
     return ValidationConfig(
+        backend=BackendConfig(backend_type=backend_type, ports=profile.ports),
         process=ProcessConfig(
             runtime_root=root / "runtime",
             validation_root=root / "validation",
@@ -480,7 +507,7 @@ class TestEpochTiming(unittest.IsolatedAsyncioTestCase):
 
     async def test_epoch_preserves_packet_configuration_for_both_sender_modes(self):
         """Direct-switch and overlapping traffic preserve packet size and flow identity."""
-        for size in (64, 1518, 9000):
+        for size in (64, 512, 1514):
             for sustained_overlap in (False, True):
                 with (
                     self.subTest(size=size, sustained_overlap=sustained_overlap),
@@ -489,7 +516,9 @@ class TestEpochTiming(unittest.IsolatedAsyncioTestCase):
                     root = Path(tmpdir)
                     clock = _ObservationClock()
                     config = replace(
-                        _config_with_example_dir(root),
+                        _config_with_example_dir(
+                            root, BackendType.DPDK_PCI if sustained_overlap else BackendType.DPDK_TAP,
+                        ),
                         packet=PacketConfig(
                             pps=123,
                             count=456,
@@ -535,6 +564,47 @@ class TestEpochTiming(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(sender.overlap_end_count, 1)
                     self.assertGreaterEqual(sender.finish_called_at, config.epoch.duration_s)
 
+    async def test_native_epoch_rejects_input_tag_faults_with_a_failed_message(self) -> None:
+        """Correct global totals cannot hide a reversed generation or incorrect per-input tag population."""
+        complete = complete_native_analysis(((1, 50), (2, 50)), 2)
+        faults = (
+            replace(complete, streams=(
+                replace(complete.streams[0], tag_transition_count=3, transition_seq=2),
+                complete.streams[1],
+            )),
+            replace(complete, streams=(
+                replace(complete.streams[0], tag_counts={1: 26, 2: 24}, transition_seq=52),
+                replace(complete.streams[1], tag_counts={1: 24, 2: 26}, transition_seq=49),
+            )),
+        )
+        for fault in faults:
+            fault.set_latency_stats(complete.latency_stats())
+            with self.subTest(streams=fault.streams), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                clock = _ObservationClock()
+                config = _config_with_example_dir(root)
+                config.output_dir.mkdir()
+                candidate = config.process.examples_dir / config.spec.example_dir / config.spec.config_snapshot_v2
+                candidate.parent.mkdir(parents=True)
+                candidate.write_text('snapshot_id: "v2"\n', encoding="ascii")
+                traffic = _FakeEpochTraffic(_FakeEpochSender(clock.monotonic), sustained_overlap=False)
+                traffic.analyze_capture = AsyncMock(return_value=fault)
+                orchestrator = ValidationOrchestrator(config)
+                orchestrator._traffic = traffic  # pylint: disable=protected-access
+                orchestrator._kinetumctl = _FakeEpochKinetumCtl()  # pylint: disable=protected-access
+                with patch(
+                    "kinetum_validation.scenario_context.time", new=clock,
+                ), patch(
+                    "kinetum_validation.scenarios.time", new=clock,
+                ), patch(
+                    "kinetum_validation.scenario_context.asyncio.sleep", side_effect=clock.sleep,
+                ):
+                    result = await run_epoch_test(orchestrator.scenario_context())
+                self.assertFalse(result.passed)
+                self.assertTrue(result.boundary_ordering_validated)
+                self.assertIn("GENERATION-TAG EVIDENCE FAILED", result.message)
+                self.assertTrue((config.output_dir / "epoch_capture.traffic.json").is_file())
+
     async def test_orchestrated_epoch_waits_for_duration_before_finish(self):
         """A sustained-overlap driver must run until epoch duration expires."""
         clock = {"now": 0.0}
@@ -559,7 +629,7 @@ class TestEpochTiming(unittest.IsolatedAsyncioTestCase):
 
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
-            config = _config_with_example_dir(root)
+            config = _config_with_example_dir(root, BackendType.DPDK_PCI)
             config = replace(
                 config,
                 epoch=EpochConfig(
@@ -650,7 +720,7 @@ class TestEpochTiming(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             config = replace(
-                _config_with_example_dir(root),
+                _config_with_example_dir(root, BackendType.DPDK_PCI),
                 epoch=EpochConfig(
                     duration_s=15.0,
                     transition_time_s=5.0,
@@ -714,7 +784,7 @@ class TestEpochTiming(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             config = replace(
-                _config_with_example_dir(root),
+                _config_with_example_dir(root, BackendType.DPDK_PCI),
                 epoch=EpochConfig(
                     duration_s=15.0,
                     transition_time_s=5.0,
@@ -852,6 +922,10 @@ class TestStatsSnapshot(unittest.IsolatedAsyncioTestCase):
         stats = TestStreamTopologyStatsValidation._clean_rx_rss_2_stats()  # pylint: disable=protected-access
         stats.collection_monotonic_ns = collected
         stats.latest_bank_publication_monotonic_ns = published
+        stats.worker_counters = [
+            replace(row, publication_generation=published, published_monotonic_ns=published)
+            for row in stats.worker_counters
+        ]
         for row in stats.stream_stats:
             row.published_monotonic_ns = published
         return stats
@@ -868,7 +942,12 @@ class TestStatsSnapshot(unittest.IsolatedAsyncioTestCase):
             baseline = self._final_observation(100, 200)
             equal = self._final_observation(200, 250)
             partial = self._final_observation(201, 300)
-            partial.stream_stats[-1].published_monotonic_ns = 200
+            partial.worker_counters[1] = replace(
+                partial.worker_counters[1], publication_generation=200, published_monotonic_ns=200,
+            )
+            for row in partial.stream_stats:
+                if row.worker_index == 1:
+                    row.published_monotonic_ns = 200
             fresh = self._final_observation(301, 400)
             client = _SequenceStatsKinetumCtl([baseline, equal, partial, fresh])
             orch._kinetumctl = client  # pylint: disable=protected-access
@@ -916,6 +995,9 @@ class TestStatsSnapshot(unittest.IsolatedAsyncioTestCase):
         regressed.stream_stats[0].bytes -= 64
         regressed.rx_packets -= 1
         regressed.rx_bytes -= 64
+        regressed.worker_counters[0] = replace(
+            regressed.worker_counters[0], rx_packets=199, rx_bytes=12736,
+        )
         for candidate in (changed_generation, changed_plan, missing, regressed):
             with self.subTest(candidate=candidate), tempfile.TemporaryDirectory() as directory:
                 orch = self._final_orchestrator(Path(directory))
@@ -942,10 +1024,29 @@ class TestStatsSnapshot(unittest.IsolatedAsyncioTestCase):
             ), patch(
                 "kinetum_validation.scenario_context.asyncio.sleep", clock.sleep
             ), patch("kinetum_validation.scenario_context.CONTROL_OBSERVATION_TIMEOUT_S", 0.3), self.assertRaisesRegex(
-                RuntimeError, "deadline"
+                RuntimeError, "observation window"
             ):
                 await orch.scenario_context().get_final_stats_snapshot()  # pylint: disable=protected-access
             self.assertGreaterEqual(client.calls, 1)
+
+    async def test_final_snapshot_rejects_changed_worker_publication(self):
+        """A new retrieval timestamp cannot hide changed contents under one worker generation."""
+        for fault in ("worker", "stream"):
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as directory:
+                orch = self._final_orchestrator(Path(directory))
+                baseline = self._final_observation(100, 200)
+                changed = self._final_observation(301 if fault == "worker" else 100, 400)
+                if fault == "worker":
+                    changed.worker_counters = [
+                        replace(row, publication_generation=100) for row in changed.worker_counters
+                    ]
+                else:
+                    changed.stream_stats[0].rejected_packets = 1
+                client = _SequenceStatsKinetumCtl([baseline, changed])
+                orch._kinetumctl = client  # pylint: disable=protected-access
+                with self.assertRaisesRegex(RuntimeError, "changed without publication"):
+                    await orch.scenario_context().get_final_stats_snapshot()
+                self.assertEqual(client.calls, 2)
 
     async def test_final_snapshot_cancellation_propagates(self):
         """Cancellation leaves the observation incomplete rather than returning old evidence."""
@@ -1197,6 +1298,14 @@ class TestStreamTopologyStatsValidation(unittest.TestCase):
             rx_bytes=25600,
             tx_packets=400,
             tx_bytes=25600,
+            expected_workers=2,
+            execution_participant_count=2,
+            allocated_epoch_high_watermark=1,
+            worker_counters=[WorkerCounterStatsResult(
+                worker_index=lane, observation_epoch=1, publication_generation=1, published_monotonic_ns=100,
+                rx_packets=200, tx_packets=200, dropped_packets=0,
+                rx_bytes=12800, tx_bytes=12800, fanout_overflow=0,
+            ) for lane in (0, 1)],
             stream_stats=[
                 StreamStatsResult(
                     io_stream_id=f"{port}.rx.lane_{lane}",

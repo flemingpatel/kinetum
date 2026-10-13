@@ -19,21 +19,27 @@ from .config.types import (
 )
 from .process.installation import is_symlink_free_regular_file
 from .process.telemetry import StatsResult
+from .process.kinetumctl import ApplyConfigResult
+from .process.guardrails_observation import GuardrailsPolicyIdentity, GuardrailsRead
 from .scenario_context import (
     ScenarioContext,
+    CONTROL_OBSERVATION_TIMEOUT_S,
     TRANSITION_STATS,
     INITIAL_GENERATION_TAG,
     NEXT_GENERATION_TAG,
-    GUARDRAILS_CANDIDATE_TRAFFIC_S,
-    GUARDRAILS_MAX_DROP_RATIO,
-    GUARDRAILS_MIN_TX_RATIO,
 )
 from .report.artifacts import round_latency
-from .process.telemetry_validation import boundary_transition_is_complete
+from .process.telemetry_validation import (
+    boundary_transition_is_complete,
+    worker_counters_advanced,
+    worker_counters_are_exact,
+)
 from .process.system_tools import RECOVERABLE_EXCEPTIONS
 
 
 CONFIRM_TIMEOUT_ROLLBACK_MS = 1500
+
+CONFIRM_TIMEOUT_MS = 5000
 
 COMMIT_CONFIRMED_TRAFFIC_S = 30.0
 
@@ -43,9 +49,82 @@ POST_SEND_DRAIN_S = 2.0
 
 GUARDRAILS_POLL_INTERVAL_MS = 100
 
-GUARDRAILS_EVALUATION_WINDOW_MS = 1000
+GUARDRAILS_EVALUATION_WINDOW_MS = 10_000
 
-GUARDRAILS_BASELINE_TRAFFIC_S = 2.0
+GUARDRAILS_TRAFFIC_S = 60.0
+
+GUARDRAILS_ARMING_TIMEOUT_S = 30.0
+
+GUARDRAILS_MAX_DROP_RATIO = 0.01
+
+GUARDRAILS_MIN_TX_RATIO = 0.99
+
+
+def _guardrails_is_armed(read: GuardrailsRead, policy: GuardrailsPolicyIdentity, baseline: StatsResult) -> bool:
+    """Require CP's actual armed baseline under the exact configured policy and content."""
+    if read.identity != policy:
+        raise RuntimeError("guardrails policy changed while awaiting evidence")
+    evaluation = read.evaluation
+    if evaluation is None or evaluation.observed_identity is None:
+        return False
+    identity = evaluation.observed_identity
+    identity_changed = (
+        identity.runtime_generation != baseline.runtime_generation
+        or identity.snapshot_id != baseline.active_snapshot_id or identity.epoch != baseline.active_epoch
+        or identity.revision != baseline.active_revision
+    )
+    if (
+        identity_changed
+        or identity.validation_hash != baseline.transition_active_validation_hash
+        or identity.expected_workers != baseline.expected_workers
+    ):
+        raise RuntimeError("guardrails armed observation crossed baseline identity")
+    return evaluation.state == "GUARDRAILS_EVALUATION_STATE_ARMED"
+
+
+def _guardrails_attribution_is_accepted(
+    read: GuardrailsRead,
+    policy: GuardrailsPolicyIdentity,
+    baseline: StatsResult,
+    candidate: ApplyConfigResult,
+) -> bool:
+    """Prove both detector legs and accepted attribution even when rollback wins the poll race."""
+    if read.identity != policy:
+        raise RuntimeError("guardrails policy changed during candidate evaluation")
+    evaluation = read.evaluation
+    if evaluation is None or evaluation.observed_identity is None:
+        return False
+    if evaluation.observed_identity.runtime_generation != baseline.runtime_generation:
+        raise RuntimeError("runtime generation changed during guardrails evaluation")
+    completed = evaluation.last_completed
+    if completed is not None and completed.candidate.epoch == candidate.epoch and (
+        completed.outcome != "GUARDRAILS_EVALUATION_OUTCOME_ROLLBACK_ACCEPTED"
+    ):
+        raise RuntimeError(f"guardrails candidate ended without rollback: {completed.outcome}")
+    proof = evaluation.last_attribution
+    if proof is None or proof.candidate.epoch != candidate.epoch or not proof.intent_accepted:
+        return False
+    identity = proof.candidate
+    identity_changed = (
+        identity.snapshot_id != candidate.snapshot_id or identity.revision != candidate.revision
+        or identity.expected_workers != baseline.expected_workers
+        or proof.rollback_snapshot_id != baseline.active_snapshot_id
+    )
+    if (
+        identity_changed
+        or proof.recommendation != "GUARDRAILS_RECOMMENDATION_AUTO_ROLLBACK"
+        or not proof.evidence_complete or completed is None or completed.candidate != identity
+    ):
+        raise RuntimeError("guardrails attribution contradicts the exact candidate or rollback target")
+    tx_rate, drop_rate = proof.rates()
+    rx_delta = sum(new.rx_packets - old.rx_packets for old, new in zip(proof.previous_workers, proof.current_workers))
+    if (
+        rx_delta <= 0 or tx_rate + drop_rate <= 0
+        or drop_rate / (tx_rate + drop_rate) <= GUARDRAILS_MAX_DROP_RATIO
+        or tx_rate / proof.baseline_tx_pps >= GUARDRAILS_MIN_TX_RATIO
+    ):
+        raise RuntimeError("guardrails retained measurements do not prove both degradation thresholds")
+    return True
 
 
 async def run_packet_test(context: ScenarioContext, packet_size: int) -> TestResult:
@@ -67,12 +146,9 @@ async def run_packet_test(context: ScenarioContext, packet_size: int) -> TestRes
         # Keep capture open for the bounded post-send dataplane drain.
         await asyncio.sleep(POST_SEND_DRAIN_S)
 
-        # Stop capture
-        await context.require_traffic().stop_capture()
-
-        analysis = await context.analyze_capture(
+        analysis = await context.complete_capture(
             pcap_file=pcap_file,
-            expected_count=stats.tx_count,
+            sender=stats,
         )
 
         # Calculate results
@@ -97,7 +173,6 @@ async def run_packet_test(context: ScenarioContext, packet_size: int) -> TestRes
             ),
         )
 
-        context.reporter.print_test_result(result)
         return result
 
     except RECOVERABLE_EXCEPTIONS as e:
@@ -108,6 +183,26 @@ async def run_packet_test(context: ScenarioContext, packet_size: int) -> TestRes
             duration_s=time.monotonic() - start_time,
             message=str(e),
         )
+
+
+def _native_generation_transition_is_exact(analysis: AnalysisResult, initial_count: int) -> bool:
+    """Require one ordered tag change per ingress within its successful-send populations."""
+    if not analysis.streams or initial_count <= 0:
+        return False
+    stream_count = len(analysis.streams)
+    for row in analysis.streams:
+        initial_sent = initial_count // stream_count + int(row.stream_index < initial_count % stream_count)
+        if (
+            row.first_tag != INITIAL_GENERATION_TAG or row.last_tag != NEXT_GENERATION_TAG
+            or row.tag_transition_count != 1 or row.transition_seq < initial_count
+        ):
+            return False
+        if (
+            not 0 < row.tag_counts.get(INITIAL_GENERATION_TAG, 0) <= initial_sent
+            or not 0 < row.tag_counts.get(NEXT_GENERATION_TAG, 0) <= row.expected_count - initial_sent
+        ):
+            return False
+    return True
 
 
 async def run_epoch_test(context: ScenarioContext) -> EpochTestResult:
@@ -214,23 +309,10 @@ async def run_epoch_test(context: ScenarioContext) -> EpochTestResult:
         # -----------------------------------------------------------------
         pre_stats: Optional[StatsResult] = None
         if context.control:
-            pre_stats = await context.get_stats_before_deadline(transition_deadline, "pre-transition")
-            if not pre_stats.success:
-                context.reporter.print_error(
-                    "Pre-transition stats collection failed", pre_stats.diagnostic,
-                )
-                raise RuntimeError("Pre-transition stats collection failed")
-            if (
-                pre_stats.active_epoch != dp_epoch_start
-                or pre_stats.transition_success_blocked
-            ):
-                raise RuntimeError(
-                    "Pre-transition stats disagree with exact current-epoch truth"
-                )
-            context.require_traffic_progress(
-                traffic_start_stats,
-                pre_stats,
+            pre_stats = await context.wait_for_traffic_progress(
+                traffic_start_stats, transition_deadline,
                 "epoch pre-transition traffic",
+                required_live_task=None,
             )
             context.reporter.print_progress(
                 f"Pre-transition snapshot: epoch={pre_stats.active_epoch}"
@@ -316,16 +398,14 @@ async def run_epoch_test(context: ScenarioContext) -> EpochTestResult:
         # Keep capture open for the bounded post-send dataplane drain.
         await asyncio.sleep(POST_SEND_DRAIN_S)
 
-        await context.require_traffic().stop_capture()
-
         # -----------------------------------------------------------------
         # ANALYZE RESULTS
         # -----------------------------------------------------------------
         context.reporter.print_progress("Analyzing epoch transition...")
 
-        analysis = await context.analyze_capture(
+        analysis = await context.complete_capture(
             pcap_file=pcap_file,
-            expected_count=stats.tx_count,
+            sender=stats,
         )
 
         # Calculate results
@@ -369,10 +449,7 @@ async def run_epoch_test(context: ScenarioContext) -> EpochTestResult:
             and 0 < next_generation_rx <= next_generation_sent
             and (
                 sustained_overlap
-                or (
-                    analysis.tag_transition_count == 1
-                    and analysis.transition_seq >= 0
-                )
+                or _native_generation_transition_is_exact(analysis, initial_generation_sent)
             )
         )
 
@@ -500,11 +577,6 @@ async def run_epoch_test(context: ScenarioContext) -> EpochTestResult:
             and boundary_ordering_validated
         )
 
-        context.print_boundary_ordering(
-            protocol_faults_observed, boundary_ordering_validated,
-            completed_boundaries, boundary_count, total_backpressure,
-        )
-
         result = EpochTestResult(
             passed=passed,
             duration_s=time.monotonic() - start_time,
@@ -525,15 +597,8 @@ async def run_epoch_test(context: ScenarioContext) -> EpochTestResult:
             protocol_faults_observed=protocol_faults_observed,
             backpressure_events=total_backpressure,
             boundary_ordering_validated=boundary_ordering_validated,
-            message=context.epoch_result_message(
-                traffic_within_tolerance, protocol_faults_observed,
-                completed_boundaries, boundary_count,
-                transitions_observed,
-                stats.tx_count, analysis.valid, dp_epoch_after,
-            ),
         )
-
-        context.print_epoch_results(result, stats, analysis)
+        result.message = context.epoch_result_message(result, traffic_within_tolerance, generation_tags_valid)
 
         return result
 
@@ -560,10 +625,10 @@ async def run_commit_confirmed_test(context: ScenarioContext) -> CommitConfirmed
     Tests the commit-confirmed pattern from
     docs/CONTROL_PLANE_AND_GUARDRAILS_AND_ROLLBACK.md:
     1. Use the baseline snapshot already applied during setup.
-    2. Apply config with --confirm-timeout (e.g., 30 seconds).
+    2. Apply config with a five-second confirmation deadline.
     3. Verify traffic is working (send some test packets).
     4. Confirm within timeout.
-    5. Verify config is permanent.
+    5. Observe the confirmed identity beyond its deadline and prove continued traffic.
 
     Returns
     -------
@@ -603,6 +668,7 @@ async def run_commit_confirmed_test(context: ScenarioContext) -> CommitConfirmed
     cc_gen_task = None
     cc_capturing = False
     cc_sender = None
+    result = CommitConfirmedTestResult(passed=False)
     try:
         # FULL runs follow the epoch scenario, which intentionally leaves
         # v2 active. Re-establish the authored baseline through the same
@@ -668,21 +734,13 @@ async def run_commit_confirmed_test(context: ScenarioContext) -> CommitConfirmed
             cc_sender.run_timed(COMMIT_CONFIRMED_TRAFFIC_S)
         )
 
-        # Allow baseline traffic
-        await asyncio.sleep(1.0)
-
         # -----------------------------------------------------------------
         # PRE-TRANSITION TELEMETRY SNAPSHOT (under load)
         # -----------------------------------------------------------------
-        pre_stats = await context.get_stats_before_deadline(cc_deadline, "pre-confirmation")
-        if not pre_stats.success:
-            raise RuntimeError(
-                "pre-confirmation transition telemetry is unavailable"
-            )
-        context.require_traffic_progress(
-            normalized_stats,
-            pre_stats,
+        pre_stats = await context.wait_for_traffic_progress(
+            normalized_stats, cc_deadline,
             "commit-confirmed pre-transition traffic",
+            cc_gen_task,
         )
         context.require_live_traffic_task(
             cc_gen_task, "commit-confirmed first mutation"
@@ -691,130 +749,211 @@ async def run_commit_confirmed_test(context: ScenarioContext) -> CommitConfirmed
         # -----------------------------------------------------------------
         # Apply the candidate with commit-confirmed mode under load.
         # -----------------------------------------------------------------
-        confirm_timeout_ms = 30000  # 30 seconds
+        confirm_timeout_ms = CONFIRM_TIMEOUT_MS
         context.reporter.print_progress(
             f"Applying config with --confirm-timeout {confirm_timeout_ms}ms"
         )
 
-        confirm_deadline = time.monotonic() + confirm_timeout_ms / 1000.0
-        apply_result = await context.control.apply_config_with_confirm(
-            config_file,
-            confirm_timeout_ms,
-            expected_revision=pre_stats.active_revision,
-        )
+        try:
+            async with asyncio.timeout(max(0.0, cc_deadline - time.monotonic())):
+                apply_result = await context.control.apply_config_with_confirm(
+                    config_file,
+                    confirm_timeout_ms,
+                    expected_revision=pre_stats.active_revision,
+                )
+        except TimeoutError as exc:
+            raise RuntimeError("confirmed apply exceeded the traffic window") from exc
 
         if not apply_result.success:
-            return CommitConfirmedTestResult(
-                passed=False,
-                duration_s=time.monotonic() - start_time,
-                message=f"Failed to apply config: {apply_result.diagnostic}",
-            )
+            raise RuntimeError(f"Failed to apply config: {apply_result.diagnostic}")
 
         snapshot_id = apply_result.snapshot_id
+        result.confirm_snapshot_id = snapshot_id
         context.reporter.print_progress(f"Config applied: snapshot_id={snapshot_id}")
 
         # -----------------------------------------------------------------
         # POST-TRANSITION TELEMETRY SNAPSHOT (under load)
         # -----------------------------------------------------------------
         post_stats = await context.get_stats_before_deadline(
-            min(cc_deadline, confirm_deadline), "post-confirmation transition",
+            cc_deadline, "post-confirmation transition",
         )
         if not post_stats.success:
             raise RuntimeError(
                 "post-confirmation transition telemetry is unavailable"
             )
+        applied_identity = (apply_result.snapshot_id, apply_result.revision, apply_result.epoch)
+        observed_identity = (post_stats.active_snapshot_id, post_stats.active_revision, post_stats.active_epoch)
+        runtime_exact = (
+            post_stats.runtime_generation == pre_stats.runtime_generation
+            and post_stats.transition_plan_content_hash == pre_stats.transition_plan_content_hash
+        )
+        transition_ready = (
+            post_stats.transition_state == "EPOCH_TRANSITION_STATE_IDLE"
+            and not post_stats.transition_success_blocked and not post_stats.retirement_frozen
+        )
         if (
-            post_stats.active_snapshot_id != apply_result.snapshot_id
-            or post_stats.active_revision != apply_result.revision
-            or post_stats.active_epoch != apply_result.epoch
+            observed_identity != applied_identity or apply_result.epoch <= pre_stats.active_epoch
+            or not runtime_exact or not transition_ready
         ):
             raise RuntimeError(
                 "commit-confirmed result and telemetry identity disagree"
             )
-        context.artifacts.write_transition_metrics(
-            pre_stats, post_stats, pre_stats.active_epoch,
-            post_stats.active_epoch,
-            transition_type=TransitionType.COMMIT_CONFIRMED,
-        )
 
         # -----------------------------------------------------------------
         # Confirm within the timeout while traffic remains live.
         # -----------------------------------------------------------------
         context.reporter.print_progress(f"Confirming config: {snapshot_id}")
 
-        confirm_result = await context.control.confirm(
-            snapshot_id,
-            apply_result.epoch,
-            apply_result.revision,
-        )
+        try:
+            async with asyncio.timeout(max(0.0, cc_deadline - time.monotonic())):
+                confirm_result = await context.control.confirm(
+                    snapshot_id,
+                    apply_result.epoch,
+                    apply_result.revision,
+                )
+        except TimeoutError as exc:
+            raise RuntimeError("confirmation exceeded the traffic window") from exc
 
         if not confirm_result.success:
-            return CommitConfirmedTestResult(
-                passed=False,
-                duration_s=time.monotonic() - start_time,
-                confirm_snapshot_id=snapshot_id,
-                message=f"Failed to confirm: {confirm_result.diagnostic}",
-            )
+            raise RuntimeError(f"Failed to confirm: {confirm_result.diagnostic}")
+
+        if not 0 < confirm_result.time_remaining_ms <= confirm_timeout_ms:
+            raise RuntimeError("confirmation returned an invalid remaining interval")
+        result.confirm_success = True
+        result.confirm_time_remaining_ms = confirm_result.time_remaining_ms
+        confirmed_at = time.monotonic()
+        survival_not_before = confirmed_at + confirm_result.time_remaining_ms / 1000.0
+        if not worker_counters_are_exact(post_stats):
+            raise RuntimeError("confirmed configuration lacks exact worker observations")
+        confirmed_cursor = post_stats.worker_counters
 
         # -----------------------------------------------------------------
-        # Verify the confirmed identity remains active.
+        # The expiry boundary is only a time floor. Exact active identity and
+        # subsequent source progress are the success evidence.
         # -----------------------------------------------------------------
-        context.reporter.print_progress("Verifying config is permanent...")
+        context.reporter.print_progress("Observing confirmed config beyond its original deadline...")
 
-        stats_result = await context.get_stats_before_deadline(cc_deadline, "confirmed identity")
-        if not stats_result.success:
-            return CommitConfirmedTestResult(
-                passed=False,
-                duration_s=time.monotonic() - start_time,
-                confirm_success=True,
-                confirm_snapshot_id=snapshot_id,
-                confirm_time_remaining_ms=confirm_result.time_remaining_ms,
-                message="Failed to verify: stats query failed",
+        def confirmed_identity_survived(observed: StatsResult) -> bool:
+            """Reject any intervening identity change before accepting an after-deadline read."""
+            nonlocal confirmed_cursor
+            context.require_active_snapshot_observation(observed, "confirmed identity", apply_result.snapshot_id)
+            identity_changed = (
+                observed.runtime_generation != post_stats.runtime_generation
+                or observed.active_revision != apply_result.revision
+                or observed.active_epoch != apply_result.epoch
+                or observed.transition_plan_content_hash != post_stats.transition_plan_content_hash
+                or observed.transition_active_validation_hash != post_stats.transition_active_validation_hash
             )
-        if (
-            stats_result.active_snapshot_id != apply_result.snapshot_id
-            or stats_result.active_revision != apply_result.revision
-            or stats_result.active_epoch != apply_result.epoch
-        ):
-            raise RuntimeError("confirmed active identity changed unexpectedly")
+            if (
+                identity_changed or observed.transition_state != "EPOCH_TRANSITION_STATE_IDLE"
+                or observed.transition_success_blocked or observed.retirement_frozen
+                or not worker_counters_are_exact(observed)
+            ):
+                raise RuntimeError("confirmed active identity changed unexpectedly")
+            worker_counters_advanced(confirmed_cursor, observed.worker_counters)
+            confirmed_cursor = observed.worker_counters
+            return time.monotonic() >= survival_not_before
+
+        surviving = await context.wait_for_observation(
+            context.get_stats_snapshot, confirmed_identity_survived, cc_deadline,
+            "confirmed configuration survival", cc_gen_task,
+        )
+        stats_result = await context.wait_for_traffic_progress(
+            surviving, cc_deadline, "confirmed traffic after deadline", cc_gen_task,
+        )
+        confirmed_survival_elapsed_ms = int((time.monotonic() - confirmed_at) * 1000.0)
+        if confirmed_survival_elapsed_ms < confirm_result.time_remaining_ms:
+            raise RuntimeError("confirmed configuration was not observed beyond its deadline")
+        result.confirmed_survived_deadline = True
+        result.confirmed_survival_elapsed_ms = confirmed_survival_elapsed_ms
+        context.artifacts.write_transition_metrics(
+            pre_stats, stats_result, pre_stats.active_epoch, stats_result.active_epoch,
+            transition_type=TransitionType.COMMIT_CONFIRMED,
+        )
         context.require_live_traffic_task(
             cc_gen_task, "commit-confirmed timeout rollback"
         )
 
-        timeout_deadline = time.monotonic() + CONFIRM_TIMEOUT_ROLLBACK_MS / 1000.0
-        timeout_apply = await context.control.apply_config_with_confirm(
-            baseline_file,
-            CONFIRM_TIMEOUT_ROLLBACK_MS,
-            expected_revision=stats_result.active_revision,
-        )
-        if not timeout_apply.success or timeout_apply.epoch <= apply_result.epoch:
+        try:
+            async with asyncio.timeout(max(0.0, cc_deadline - time.monotonic())):
+                timeout_apply = await context.control.apply_config_with_confirm(
+                    baseline_file,
+                    CONFIRM_TIMEOUT_ROLLBACK_MS,
+                    expected_revision=stats_result.active_revision,
+                )
+        except TimeoutError as exc:
+            raise RuntimeError("unconfirmed apply exceeded the traffic window") from exc
+        if (
+            not timeout_apply.success or timeout_apply.epoch <= stats_result.active_epoch
+            or timeout_apply.snapshot_id != normalized_stats.active_snapshot_id
+            or timeout_apply.revision != normalized_stats.active_revision
+        ):
             raise RuntimeError(
                 "unconfirmed transition failed: " + timeout_apply.diagnostic
             )
-        timeout_active = await context.get_stats_before_deadline(
-            min(cc_deadline, timeout_deadline), "unconfirmed candidate",
+        # CP starts the durable timeout at COMPLETE. The apply reply can arrive
+        # after automatic rollback; retain its exact candidate identity without
+        # inventing a candidate counter observation or a second expiry clock.
+        rollback_before = stats_result
+        rollback_cursor = stats_result.worker_counters
+
+        def confirmation_rollback_completed(observed: StatsResult) -> bool:
+            """Accept only the exact candidate-to-confirmed terminal transition."""
+            nonlocal rollback_before, rollback_cursor
+            context.require_active_snapshot_observation(observed, "confirmation rollback")
+            if (
+                observed.runtime_generation != stats_result.runtime_generation
+                or observed.transition_plan_content_hash != stats_result.transition_plan_content_hash
+                or observed.transition_success_blocked or observed.retirement_frozen
+                or not worker_counters_are_exact(observed)
+            ):
+                raise RuntimeError("confirmation rollback crossed runtime/plan identity or invalid evidence")
+            worker_counters_advanced(rollback_cursor, observed.worker_counters)
+            rollback_cursor = observed.worker_counters
+            if observed.transition_active_epoch == timeout_apply.epoch:
+                if (
+                    observed.active_snapshot_id != timeout_apply.snapshot_id
+                    or observed.active_revision != timeout_apply.revision
+                    or observed.transition_active_validation_hash != normalized_stats.transition_active_validation_hash
+                ):
+                    raise RuntimeError("unconfirmed result and active telemetry disagree")
+                # During RETIRING, packet execution has advanced but CP still
+                # owns the predecessor. Keep the earlier counter endpoint.
+                if observed.active_epoch == timeout_apply.epoch:
+                    rollback_before = observed
+                return False
+            terminal = observed.latest_terminal
+            restored_identity_exact = (
+                observed.transition_active_epoch > timeout_apply.epoch
+                and observed.active_epoch == observed.transition_active_epoch
+                and observed.active_snapshot_id == stats_result.active_snapshot_id
+                and observed.active_revision == stats_result.active_revision
+                and observed.transition_active_validation_hash == stats_result.transition_active_validation_hash
+            )
+            terminal_exact = terminal is not None and all((
+                terminal.from_epoch == timeout_apply.epoch,
+                terminal.to_epoch == observed.active_epoch,
+                terminal.outcome == "EPOCH_TRANSITION_OUTCOME_COMPLETE",
+                terminal.failure_code == "EPOCH_TRANSITION_FAILURE_CODE_NONE",
+            ))
+            if not restored_identity_exact or not terminal_exact:
+                raise RuntimeError("confirmation rollback lacks the exact candidate-to-confirmed terminal transition")
+            return observed.transition_state == "EPOCH_TRANSITION_STATE_IDLE"
+
+        restored = await context.wait_for_observation(
+            context.get_stats_snapshot, confirmation_rollback_completed,
+            min(cc_deadline, time.monotonic() + CONTROL_OBSERVATION_TIMEOUT_S),
+            "confirmation rollback", cc_gen_task,
         )
-        context.require_active_snapshot_observation(
-            timeout_active,
-            "unconfirmed candidate",
-            timeout_apply.snapshot_id,
+        restored = await context.wait_for_traffic_progress(
+            restored, cc_deadline, "confirmation rollback traffic", cc_gen_task,
         )
-        if (
-            timeout_active.active_epoch != timeout_apply.epoch
-            or timeout_active.active_revision != timeout_apply.revision
-        ):
-            raise RuntimeError("unconfirmed result and active telemetry disagree")
-        restored = await context.wait_for_active_snapshot(
-            apply_result.snapshot_id,
-            timeout_apply.epoch,
-            stats_result.runtime_generation,
-            cc_deadline,
-            required_live_task=cc_gen_task,
-        )
+        result.timeout_rollback_occurred = True
+        result.timeout_rollback_snapshot_id = restored.active_snapshot_id
         context.artifacts.write_transition_metrics(
-            timeout_active,
+            rollback_before,
             restored,
-            timeout_active.active_epoch,
+            timeout_apply.epoch,
             restored.active_epoch,
             transition_type=TransitionType.COMMIT_CONFIRMED_TIMEOUT_ROLLBACK,
         )
@@ -824,38 +963,16 @@ async def run_commit_confirmed_test(context: ScenarioContext) -> CommitConfirmed
         # scenario retire traffic and summarize its packet evidence.
         cc_stats = await cc_gen_task
         await asyncio.sleep(1.0)
-        await context.require_traffic().stop_capture()
+        cc_analysis = await context.complete_capture(cc_pcap, cc_stats)
         cc_capturing = False
 
         cc_tx = cc_stats.tx_count
-        cc_rx = 0
-        cc_loss = 0.0
-        cc_latency: Optional[float] = None
-        cc_analysis: Optional[AnalysisResult] = None
-        if cc_tx > 0:
-            cc_analysis = await context.analyze_capture(
-                pcap_file=cc_pcap,
-                expected_count=cc_tx,
-            )
-            cc_rx = cc_analysis.valid
-            cc_loss = cc_analysis.loss_pct(cc_tx)
-            cc_latency = context.measured_average_latency(cc_analysis)
-
-        latency_text = (
-            f"{cc_latency:.1f}us"
-            if cc_latency is not None
-            else "unavailable"
-        )
-        context.reporter.print_progress(
-            f"Commit-confirmed traffic: TX={cc_tx} RX={cc_rx} "
-            f"loss={cc_loss:.2f}% latency={latency_text}"
-        )
+        cc_rx = cc_analysis.valid
+        cc_loss = cc_analysis.loss_pct(cc_tx)
+        cc_latency = context.measured_average_latency(cc_analysis)
 
         # Build result with traffic metrics
-        cc_traffic_evidence_exact = (
-            cc_analysis is not None
-            and context.traffic_observation_is_clean(cc_stats, cc_analysis)
-        )
+        cc_traffic_evidence_exact = context.traffic_observation_is_clean(cc_stats, cc_analysis)
         cc_traffic_ok = (
             cc_traffic_evidence_exact
             and cc_loss <= context.config.max_loss_pct
@@ -865,6 +982,7 @@ async def run_commit_confirmed_test(context: ScenarioContext) -> CommitConfirmed
             cc_message = (
                 "COMMIT-CONFIRMED VALIDATED: "
                 f"confirmed with {confirm_result.time_remaining_ms}ms remaining, "
+                f"retained through {confirmed_survival_elapsed_ms}ms, "
                 f"{traffic_summary}"
             )
         elif not cc_traffic_evidence_exact:
@@ -878,14 +996,10 @@ async def run_commit_confirmed_test(context: ScenarioContext) -> CommitConfirmed
                 f"traffic loss {cc_loss:.2f}% exceeds threshold "
                 f"{context.config.max_loss_pct}%, {traffic_summary}"
             )
-        result = CommitConfirmedTestResult(
+        result = replace(
+            result,
             passed=cc_traffic_ok,
             duration_s=time.monotonic() - start_time,
-            confirm_success=True,
-            confirm_snapshot_id=snapshot_id,
-            confirm_time_remaining_ms=confirm_result.time_remaining_ms,
-            timeout_rollback_occurred=True,
-            timeout_rollback_snapshot_id=restored.active_snapshot_id,
             tx_count=cc_tx,
             rx_count=cc_rx,
             loss_pct=round(cc_loss, 4),
@@ -893,14 +1007,11 @@ async def run_commit_confirmed_test(context: ScenarioContext) -> CommitConfirmed
             message=cc_message,
         )
 
-        # Print results
-        context.print_commit_confirmed_results(result)
-
         return result
 
     except RECOVERABLE_EXCEPTIONS as e:
-        return CommitConfirmedTestResult(
-            passed=False,
+        return replace(
+            result,
             duration_s=time.monotonic() - start_time,
             message=f"Error: {e}",
         )
@@ -986,6 +1097,7 @@ async def run_rollback_test(context: ScenarioContext) -> RollbackTestResult:
     rb_gen_task = None
     rb_capturing = False
     rb_sender = None
+    result = RollbackTestResult(passed=False)
     try:
         traffic_start_stats = await context.get_stats_snapshot()
         context.require_active_snapshot_observation(
@@ -1014,20 +1126,14 @@ async def run_rollback_test(context: ScenarioContext) -> RollbackTestResult:
         rb_deadline = time.monotonic() + ROLLBACK_TRAFFIC_S
         rb_gen_task = asyncio.create_task(rb_sender.run_timed(ROLLBACK_TRAFFIC_S))
 
-        # Allow baseline traffic
-        await asyncio.sleep(1.0)
-
         # -----------------------------------------------------------------
         # PRE-TRANSITION TELEMETRY SNAPSHOT (under load)
         # -----------------------------------------------------------------
         pre_rb_stats: Optional[StatsResult] = None
-        pre_rb_stats = await context.get_stats_before_deadline(rb_deadline, "pre-rollback")
-        if not pre_rb_stats.success:
-            raise RuntimeError("pre-rollback exact telemetry is unavailable")
-        context.require_traffic_progress(
-            traffic_start_stats,
-            pre_rb_stats,
+        pre_rb_stats = await context.wait_for_traffic_progress(
+            traffic_start_stats, rb_deadline,
             "rollback pre-transition traffic",
+            rb_gen_task,
         )
         context.require_live_traffic_task(
             rb_gen_task, "rollback v1 apply"
@@ -1208,6 +1314,9 @@ async def run_rollback_test(context: ScenarioContext) -> RollbackTestResult:
                 rollback_result.new_snapshot_id,
                 rollback_result.new_revision,
             )
+            result.selective_rollback_success = selective_success
+            result.selective_rollback_modules = modules_to_rollback if selective_success else []
+            result.selective_rollback_snapshot_id = hybrid_snapshot_id
             context.artifacts.write_transition_metrics(
                 stats_v2, stats_selective,
                 v2_epoch, selective_epoch,
@@ -1265,6 +1374,8 @@ async def run_rollback_test(context: ScenarioContext) -> RollbackTestResult:
                 raise RuntimeError(
                     "full rollback did not restore exact v1 snapshot content"
                 )
+            result.full_rollback_success = True
+            result.full_rollback_snapshot_id = restored_snapshot
 
             context.reporter.print_progress(
                 f"Full rollback restored: {restored_snapshot}"
@@ -1289,58 +1400,28 @@ async def run_rollback_test(context: ScenarioContext) -> RollbackTestResult:
         # -----------------------------------------------------------------
         rb_pkt_stats = await rb_gen_task
         await asyncio.sleep(1.0)
-        await context.require_traffic().stop_capture()
+        rb_analysis = await context.complete_capture(rb_pcap, rb_pkt_stats)
         rb_capturing = False
 
         rb_tx = rb_pkt_stats.tx_count
-        rb_rx = 0
-        rb_loss = 0.0
-        rb_latency: Optional[float] = None
-        rb_analysis: Optional[AnalysisResult] = None
-        if rb_tx > 0:
-            rb_analysis = await context.analyze_capture(
-                pcap_file=rb_pcap,
-                expected_count=rb_tx,
-            )
-            rb_rx = rb_analysis.valid
-            rb_loss = rb_analysis.loss_pct(rb_tx)
-            rb_latency = context.measured_average_latency(rb_analysis)
-
-        latency_text = (
-            f"{rb_latency:.1f}us"
-            if rb_latency is not None
-            else "unavailable"
-        )
-        context.reporter.print_progress(
-            f"Rollback traffic: TX={rb_tx} RX={rb_rx} "
-            f"loss={rb_loss:.2f}% latency={latency_text}"
-        )
+        rb_rx = rb_analysis.valid
+        rb_loss = rb_analysis.loss_pct(rb_tx)
+        rb_latency = context.measured_average_latency(rb_analysis)
 
         # -----------------------------------------------------------------
         # Build result
         # -----------------------------------------------------------------
-        rb_traffic_evidence_exact = (
-            rb_analysis is not None
-            and context.traffic_observation_is_clean(
-                rb_pkt_stats, rb_analysis
-            )
-        )
+        rb_traffic_evidence_exact = context.traffic_observation_is_clean(rb_pkt_stats, rb_analysis)
         traffic_ok = (
             rb_traffic_evidence_exact
             and rb_loss <= context.config.max_loss_pct
         )
         passed = full_success and selective_success and traffic_ok
 
-        result = RollbackTestResult(
+        result = replace(
+            result,
             passed=passed,
             duration_s=time.monotonic() - start_time,
-            full_rollback_success=full_success,
-            full_rollback_snapshot_id=(
-                full_rollback_result.new_snapshot_id if full_success else ""
-            ),
-            selective_rollback_success=selective_success,
-            selective_rollback_modules=modules_to_rollback if selective_success else [],
-            selective_rollback_snapshot_id=hybrid_snapshot_id,
             tx_count=rb_tx,
             rx_count=rb_rx,
             loss_pct=round(rb_loss, 4),
@@ -1354,14 +1435,11 @@ async def run_rollback_test(context: ScenarioContext) -> RollbackTestResult:
             ),
         )
 
-        # Print results
-        context.print_rollback_results(result)
-
         return result
 
     except RECOVERABLE_EXCEPTIONS as e:
-        return RollbackTestResult(
-            passed=False,
+        return replace(
+            result,
             duration_s=time.monotonic() - start_time,
             message=f"Error: {e}",
         )
@@ -1404,15 +1482,15 @@ async def run_guardrails_test(context: ScenarioContext) -> GuardrailsTestResult:
     sender = None
     candidate_task: Optional[asyncio.Task] = None
     policy_enabled = False
+    policy_cleanup_required = False
     result: Optional[GuardrailsTestResult] = None
     try:
-        baseline = await context.get_stats_snapshot(
-            selection=replace(TRANSITION_STATS, include_stage_stats=False, include_module_health=True),
-        )
+        baseline = await context.get_stats_snapshot()
         baseline_id, baseline_epoch = context.require_active_snapshot_observation(
             baseline, "guardrails baseline"
         )
-        policy_enabled = await context.control.configure_guardrails(
+        policy_cleanup_required = True
+        configured_policy = await context.control.configure_guardrails(
             enabled=True,
             poll_interval_ms=GUARDRAILS_POLL_INTERVAL_MS,
             evaluation_window_ms=GUARDRAILS_EVALUATION_WINDOW_MS,
@@ -1420,92 +1498,65 @@ async def run_guardrails_test(context: ScenarioContext) -> GuardrailsTestResult:
             min_tx_ratio=GUARDRAILS_MIN_TX_RATIO,
             min_packets_per_window=1,
         )
-        if not policy_enabled:
+        policy_enabled = configured_policy is not None
+        if configured_policy is None:
             raise RuntimeError("guardrails policy configuration failed")
 
         sender = context.require_traffic().make_sender(context.config.packet)
-        baseline_traffic = await sender.run_timed(GUARDRAILS_BASELINE_TRAFFIC_S)
-        if baseline_traffic.tx_count == 0 or baseline_traffic.errors != 0:
-            raise RuntimeError("guardrails baseline traffic is not valid evidence")
-        baseline_ready = await context.get_stats_snapshot(
-            selection=replace(TRANSITION_STATS, include_stage_stats=False, include_module_health=True),
-        )
-        context.require_active_snapshot_observation(
-            baseline_ready, "guardrails armed baseline", baseline_id
-        )
-        if (
-            baseline_ready.active_epoch != baseline_epoch
-            or baseline_ready.runtime_generation != baseline.runtime_generation
-        ):
-            raise RuntimeError("guardrails baseline identity changed while arming")
-        _, baseline_tx = context.require_traffic_progress(
-            baseline,
-            baseline_ready,
-            "guardrails baseline traffic",
-        )
-        if baseline_tx <= 0:
-            raise RuntimeError("guardrails baseline lacks positive accepted TX")
-        baseline_elapsed = (
-            baseline_ready.collection_monotonic_ns
-            - baseline.collection_monotonic_ns
-        )
-        if baseline_elapsed <= 0:
-            raise RuntimeError("guardrails baseline time did not advance")
-        baseline_tx_rate = baseline_tx / baseline_elapsed
-        if not baseline_ready.module_health_stats or any(
-            row.state != "MODULE_HEALTH_STATE_SIGNAL_AVAILABLE"
-            or row.observation_epoch != baseline_epoch
-            for row in baseline_ready.module_health_stats
-        ):
-            raise RuntimeError("guardrails baseline lacks current module health")
-
-        candidate = await context.control.apply_config(
-            candidate_file,
-            expected_revision=baseline_ready.active_revision,
-        )
-        if not candidate.success or candidate.epoch <= baseline_epoch:
-            raise RuntimeError(
-                "guardrails candidate transition failed: " + candidate.diagnostic
-            )
-        candidate_stats = await context.get_stats_snapshot(
-            selection=replace(TRANSITION_STATS, include_module_health=True),
-        )
-        context.require_active_snapshot_observation(
-            candidate_stats, "guardrails candidate", candidate.snapshot_id
-        )
-        if (
-            candidate_stats.active_epoch != candidate.epoch
-            or candidate_stats.active_revision != candidate.revision
-        ):
-            raise RuntimeError("guardrails candidate result and telemetry disagree")
-
-        candidate_deadline = time.monotonic() + GUARDRAILS_CANDIDATE_TRAFFIC_S
-        candidate_task = asyncio.create_task(
-            sender.run_timed(GUARDRAILS_CANDIDATE_TRAFFIC_S)
-        )
-        await context.wait_for_guardrails_degradation(
-            baseline_tx_rate,
-            candidate_stats,
-            candidate.snapshot_id,
-            candidate.epoch,
-            candidate_task,
-            candidate_deadline,
-        )
-        context.require_live_traffic_task(
-            candidate_task, "guardrails rollback observation"
+        traffic_started = time.monotonic()
+        traffic_deadline = traffic_started + GUARDRAILS_TRAFFIC_S
+        arming_deadline = traffic_started + GUARDRAILS_ARMING_TIMEOUT_S
+        candidate_task = asyncio.create_task(sender.run_timed(GUARDRAILS_TRAFFIC_S))
+        baseline_ready = await context.wait_for_traffic_progress(
+            baseline, arming_deadline, "guardrails baseline traffic", candidate_task,
         )
 
+        def armed(read: GuardrailsRead) -> bool:
+            """Wait for the current policy's ten real baseline intervals."""
+            return _guardrails_is_armed(read, configured_policy, baseline_ready)
+
+        armed_observation = await context.wait_for_observation(
+            context.control.get_guardrails, armed, arming_deadline,
+            "guardrails baseline arming", candidate_task,
+        )
+        arming_elapsed_s = time.monotonic() - traffic_started
+        if arming_elapsed_s >= GUARDRAILS_ARMING_TIMEOUT_S:
+            raise RuntimeError("guardrails arming completed outside its authored window")
+        context.require_live_traffic_task(candidate_task, "guardrails candidate apply")
+        context.reporter.print_progress("Applying the ACL fixture that deliberately drops validation traffic...")
+        candidate = await asyncio.wait_for(
+            context.control.apply_config(
+                candidate_file, expected_revision=baseline_ready.active_revision,
+            ),
+            timeout=max(0.0, traffic_deadline - time.monotonic()),
+        )
+        if not candidate.success or candidate.epoch <= baseline_epoch or candidate.snapshot_id == baseline_id:
+            raise RuntimeError("guardrails candidate transition failed: " + candidate.diagnostic)
+
+        def attributed(read: GuardrailsRead) -> bool:
+            """Require retained candidate measurements and the accepted safety intent."""
+            return _guardrails_attribution_is_accepted(read, configured_policy, baseline_ready, candidate)
+
+        decision = await context.wait_for_observation(
+            context.control.get_guardrails, attributed, traffic_deadline,
+            "guardrails candidate attribution", candidate_task,
+        )
         restored = await context.wait_for_active_snapshot(
-            baseline_id,
-            candidate.epoch,
-            baseline.runtime_generation,
-            candidate_deadline,
+            baseline_id, candidate.epoch, baseline.runtime_generation, traffic_deadline,
             required_live_task=candidate_task,
         )
+        if (
+            restored.latest_terminal is None
+            or restored.latest_terminal.from_epoch != candidate.epoch
+            or restored.transition_active_validation_hash != baseline.transition_active_validation_hash
+        ):
+            raise RuntimeError("guardrails rollback lacks the exact candidate-to-baseline terminal transition")
+        worker_counters_advanced(decision.evaluation.last_attribution.current_workers, restored.worker_counters)
+        context.artifacts.write_guardrails_evaluation(armed_observation, decision, arming_elapsed_s)
         candidate_traffic = await candidate_task
         candidate_task = None
         if candidate_traffic.tx_count == 0 or candidate_traffic.errors != 0:
-            raise RuntimeError("guardrails candidate traffic is not valid evidence")
+            raise RuntimeError("guardrails traffic is not valid evidence")
         if set(restored.protocol_fault_counts) != set(
             baseline.protocol_fault_counts
         ):
@@ -1519,7 +1570,7 @@ async def run_guardrails_test(context: ScenarioContext) -> GuardrailsTestResult:
         if protocol_faults != 0:
             raise RuntimeError("guardrails rollback crossed a protocol fault")
         context.artifacts.write_transition_metrics(
-            candidate_stats,
+            baseline_ready,
             restored,
             candidate.epoch,
             restored.active_epoch,
@@ -1528,6 +1579,7 @@ async def run_guardrails_test(context: ScenarioContext) -> GuardrailsTestResult:
         if not await context.control.configure_guardrails(enabled=False):
             raise RuntimeError("guardrails policy could not be disabled")
         policy_enabled = False
+        policy_cleanup_required = False
         result = GuardrailsTestResult(
             passed=True,
             duration_s=time.monotonic() - started,
@@ -1551,7 +1603,7 @@ async def run_guardrails_test(context: ScenarioContext) -> GuardrailsTestResult:
         return result
     finally:
         cleanup_failures: List[Tuple[str, BaseException]] = []
-        if policy_enabled:
+        if policy_cleanup_required:
             try:
                 if not await context.control.configure_guardrails(
                     enabled=False

@@ -196,8 +196,7 @@ status guardrails_runner::start()
 	if (!loop_.is_running()) {
 		return status::failed_precondition("guardrails runner requires the active Control Plane writer");
 	}
-	bool expected = false;
-	if (!running_.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+	if (running_.load(std::memory_order_acquire)) {
 		return status::ok();
 	}
 	try {
@@ -205,6 +204,10 @@ status guardrails_runner::start()
 			thread_.join();
 		}
 		state_ = std::make_unique<runtime_state>();
+		// Lifecycle calls are serialized. Replace the old observation while
+		// readers still see a stopped owner, before publishing running again.
+		evaluation_.store(state_->evaluator.evaluation());
+		running_.store(true, std::memory_order_release);
 		thread_ = std::thread([this]() { thread_main_(); });
 		return status::ok();
 	} catch (const std::bad_alloc &) {
@@ -230,6 +233,14 @@ void guardrails_runner::stop() noexcept
 	}
 }
 
+std::optional<kinetum::control::v1::GuardrailsEvaluation> guardrails_runner::evaluation() const
+{
+	if (!running_.load(std::memory_order_acquire) || !evaluation_.has_value()) {
+		return std::nullopt;
+	}
+	return evaluation_.get();
+}
+
 void guardrails_runner::thread_main_() noexcept
 {
 	try {
@@ -249,9 +260,11 @@ void guardrails_runner::thread_main_() noexcept
 			}
 			request.idempotency_key = std::move(key_or).value();
 			request.created_unix_ms = created_unix_ms;
+			const bool attributed = request.cause == rollback_intent_cause::THRESHOLD_DEGRADATION ||
+						request.cause == rollback_intent_cause::CORRELATED_DEGRADATION;
 			const auto accepted = loop_.submit_safety_intent(std::move(request));
 			if (accepted.is_ok()) {
-				state_->evaluator.mark_rollback_pending();
+				state_->evaluator.mark_rollback_pending(attributed);
 				return;
 			}
 			if (accepted.code() != status_code::FAILED_PRECONDITION &&
@@ -285,7 +298,7 @@ void guardrails_runner::thread_main_() noexcept
 										 observed_unix_ms;
 			auto retained_intent_or = store_->rollback_intent();
 			if (retained_intent_or.is_ok()) {
-				state_->evaluator.mark_rollback_pending();
+				state_->evaluator.mark_rollback_pending(false);
 				return true;
 			}
 			if (retained_intent_or.error().code() != status_code::NOT_FOUND) {
@@ -344,7 +357,7 @@ void guardrails_runner::thread_main_() noexcept
 
 			auto retained_intent_or = store_->rollback_intent();
 			if (retained_intent_or.is_ok()) {
-				state_->evaluator.mark_rollback_pending();
+				state_->evaluator.mark_rollback_pending(false);
 			} else if (retained_intent_or.error().code() == status_code::NOT_FOUND) {
 				if (state_->evaluator.state() == guardrails_evaluator_state::ROLLBACK_PENDING) {
 					state_->evaluator.resume_after_intent();
@@ -355,9 +368,11 @@ void guardrails_runner::thread_main_() noexcept
 			}
 
 			const auto now = std::chrono::steady_clock::now();
-			if (state_->evaluator.enabled() &&
-			    state_->evaluator.state() != guardrails_evaluator_state::ROLLBACK_PENDING &&
-			    !confirmation_due && dp_ != nullptr && now >= next_telemetry) {
+			const bool telemetry_eligible = state_->evaluator.enabled() &&
+							state_->evaluator.state() !=
+								guardrails_evaluator_state::ROLLBACK_PENDING &&
+							!confirmation_due && dp_ != nullptr;
+			if (telemetry_eligible && now >= next_telemetry) {
 				kinetum::telemetry::v1::TelemetrySelection selection;
 				selection.set_include_module_health(state_->evaluator.requires_module_health());
 				selection.set_include_boundary_epoch_stats(state_->evaluator.requires_boundary_rows());
@@ -366,21 +381,28 @@ void guardrails_runner::thread_main_() noexcept
 				if (observation_or.is_ok()) {
 					auto decision_or = state_->evaluator.observe(observation_or.value());
 					if (!decision_or.is_ok()) {
-						std::terminate();
+						if (decision_or.error().code() != status_code::DATA_LOSS) {
+							std::terminate();
+						}
+						state_->evaluator.pause_observation();
+					} else {
+						auto decision = std::move(decision_or).value();
+						if (decision.has_value()) {
+							submit_intent(std::move(decision).value(),
+								      kinetum::common::unix_time_ms());
+						}
 					}
-					auto decision = std::move(decision_or).value();
-					if (decision.has_value()) {
-						submit_intent(std::move(decision).value(),
-							      kinetum::common::unix_time_ms());
-					}
-				} else {
+				} else if (observation_or.error().code() != status_code::UNAVAILABLE &&
+					   observation_or.error().code() != status_code::DEADLINE_EXCEEDED) {
 					state_->evaluator.pause_observation();
 				}
 				next_telemetry = std::chrono::steady_clock::now() + state_->evaluator.poll_interval();
 			}
 
+			evaluation_.store(state_->evaluator.evaluation());
 			auto wake_deadline = std::chrono::steady_clock::now() + CONTROL_SERVICE_INTERVAL;
-			if (state_->evaluator.enabled() && next_telemetry < wake_deadline) {
+			// A suspended poll must not turn its expired deadline into a busy loop.
+			if (telemetry_eligible && next_telemetry < wake_deadline) {
 				wake_deadline = next_telemetry;
 			}
 			std::unique_lock<std::mutex> lock(wait_mutex_);

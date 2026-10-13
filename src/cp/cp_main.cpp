@@ -454,7 +454,7 @@ int main(int argc, char **argv)
 	// ---------------------------------------------------------------------------
 	// Create Control Plane Service (shared loop reference)
 	// ---------------------------------------------------------------------------
-	kinetum::cp::control_service_impl control_service(store.get(), dp_stub, loop);
+	kinetum::cp::control_service_impl control_service(store.get(), dp_stub, loop, guardrails.get());
 
 	// ---------------------------------------------------------------------------
 	// Start Control Plane gRPC Server

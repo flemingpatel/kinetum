@@ -189,7 +189,7 @@ descriptors, worker queues, active/future staging, boundary holds, bounded
 copies, retained records, bursts, caches, and safety capacity. Paths converging
 on one physical boundary population are charged once per carried domain.
 Each TX queue charges its full descriptor population to every accepted domain
-because all descriptors may temporarily hold records from that domain. The
+to cover native queue backing that may retain buffers from that domain. The
 queue itself is created once.
 
 Host checks run where the required facts are available:
@@ -587,6 +587,13 @@ reclaims each completed mbuf through its own pool. Multi-pool TX rejects
 `RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE` before device configuration because that
 mode requires one pool per queue. Writable fan-out uses `rte_pktmbuf_copy`;
 exhaustion never selects host storage.
+
+The TAP PMD requires paired native RX/TX queues. The provider constructs those
+pairs while publishing only the authored packet directions. On a TX-only port,
+the unused RX backing uses the first canonical accepted pool within the TX
+descriptor reservation; TAP releases accepted TX buffers before returning.
+Bidirectional ports keep the plan's equal RX/TX populations, so every native
+RX queue has an authored owner. PCI ports retain their authored queue counts.
 
 Port configuration immediately records ownership before another fallible
 native call. The factory leaves ports cold. Activation starts ports, programs

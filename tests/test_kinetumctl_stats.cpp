@@ -613,6 +613,13 @@ class poisoned_stats_service final : public kinetum::control::v1::ControlService
 			runtime->set_collection_monotonic_ns(100u);
 			runtime->set_latest_bank_publication_monotonic_ns(90u);
 			telemetry->mutable_engine()->set_rx_packets(10u);
+			telemetry->mutable_engine()->set_rx_bytes(640u);
+			auto *measurement = telemetry->add_worker_counters();
+			measurement->set_worker_index(0u);
+			measurement->set_observation_epoch(1u);
+			measurement->set_publication_generation(1u);
+			measurement->set_published_monotonic_ns(90u);
+			*measurement->mutable_counters() = telemetry->engine();
 			auto *transition = telemetry->mutable_transition();
 			transition->set_publication_generation(1u);
 			transition->set_state(kinetum::telemetry::v1::EPOCH_TRANSITION_STATE_IDLE);
@@ -1043,10 +1050,10 @@ TEST(kinetumctl_mutation, guardrails_policy_and_key_are_exact_across_transport_r
 					{"guardrails", "on", "--poll-ms", "1000", "--window-ms", "30000",
 					 "--max-drop-ratio", "0.05", "--min-tx-ratio", "0.70", "--min-packets", "1000"},
 					1);
-	auto oversized_window_or = run_kinetumctl(endpoint,
-						  {"guardrails", "on", "--poll-ms", "1", "--window-ms", "101",
-						   "--max-drop-ratio", "0.05", "--min-tx-ratio", "0.70"},
-						  0);
+	auto independent_window_or = run_kinetumctl(endpoint,
+						    {"guardrails", "on", "--poll-ms", "1", "--window-ms", "101",
+						     "--max-drop-ratio", "0.05", "--min-tx-ratio", "0.70"},
+						    0);
 	service.corrupt_guardrails_hash.store(true, std::memory_order_release);
 	auto malformed_success_or = run_kinetumctl(endpoint,
 						   {"guardrails", "on", "--poll-ms", "1000", "--window-ms", "30000",
@@ -1055,17 +1062,15 @@ TEST(kinetumctl_mutation, guardrails_policy_and_key_are_exact_across_transport_r
 	server->Shutdown();
 	ASSERT_TRUE(result_or.is_ok()) << result_or.error().message();
 	EXPECT_EQ(result_or->exit_code, 0) << result_or->standard_error;
-	ASSERT_TRUE(oversized_window_or.is_ok()) << oversized_window_or.error().message();
-	EXPECT_EQ(oversized_window_or->exit_code, 2);
-	EXPECT_NE(oversized_window_or->standard_error.find("requires more than 100 retained intervals"),
-		  std::string::npos);
+	ASSERT_TRUE(independent_window_or.is_ok()) << independent_window_or.error().message();
+	EXPECT_EQ(independent_window_or->exit_code, 0) << independent_window_or->standard_error;
 	ASSERT_TRUE(malformed_success_or.is_ok()) << malformed_success_or.error().message();
 	EXPECT_EQ(malformed_success_or->exit_code, 1);
 	EXPECT_TRUE(malformed_success_or->standard_output.empty());
 	EXPECT_NE(malformed_success_or->standard_error.find("contradictory success identity"), std::string::npos);
-	EXPECT_EQ(service.guardrails_calls.load(std::memory_order_relaxed), 3u);
+	EXPECT_EQ(service.guardrails_calls.load(std::memory_order_relaxed), 4u);
 	std::lock_guard<std::mutex> lock(service.mutex);
-	ASSERT_EQ(service.guardrails_requests.size(), 3u);
+	ASSERT_EQ(service.guardrails_requests.size(), 4u);
 	const auto &first = service.guardrails_requests.front();
 	const auto &retry = service.guardrails_requests[1];
 	EXPECT_EQ(first.SerializeAsString(), retry.SerializeAsString());

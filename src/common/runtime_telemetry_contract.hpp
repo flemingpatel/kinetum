@@ -22,6 +22,9 @@
  * this file is reachable from a packet worker or provider packet operation.
  */
 
+#include <array>
+#include <cstdint>
+
 #include "gen/kinetum/control/v1/control.pb.h"
 #include "gen/kinetum/dataplane/v1/dataplane.pb.h"
 #include "gen/kinetum/telemetry/v1/telemetry.pb.h"
@@ -29,6 +32,24 @@
 
 namespace kinetum::common
 {
+
+/**
+ * @brief Project all engine counters in one canonical comparison order.
+ * @param counters Immutable cumulative packet accounting.
+ * @return RX, TX, drops, RX bytes, TX bytes, and fan-out overflow.
+ */
+[[nodiscard]] std::array<uint64_t, 6>
+engine_counter_values(const kinetum::telemetry::v1::EngineStats &counters) noexcept;
+
+/**
+ * @brief Validate one worker measurement independently of enclosing membership.
+ * @param row Immutable completed observation with explicit counters.
+ * @return True for valid epoch/publication/time and exact nonexhausted counts.
+ *
+ * Allocation-free cold validation. The enclosing reader additionally proves
+ * compact owner membership, runtime namespace, timestamp bounds, and totals.
+ */
+[[nodiscard]] bool valid_worker_counter_observation(const kinetum::telemetry::v1::WorkerCounterStats &row) noexcept;
 
 /**
  * @brief Validate one exact Data Plane statistics request wrapper.

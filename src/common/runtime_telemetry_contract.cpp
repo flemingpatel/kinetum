@@ -10,6 +10,7 @@
 #include "src/common/runtime_telemetry_contract.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -896,6 +897,26 @@ static status validate_module_context_domains(const telemetry::RuntimeTelemetry 
 	return status::ok();
 }
 
+std::array<uint64_t, 6> engine_counter_values(const kinetum::telemetry::v1::EngineStats &counters) noexcept
+{
+	return {counters.rx_packets(), counters.tx_packets(), counters.dropped_packets(),
+		counters.rx_bytes(),   counters.tx_bytes(),   counters.fanout_overflow()};
+}
+
+bool valid_worker_counter_observation(const kinetum::telemetry::v1::WorkerCounterStats &row) noexcept
+{
+	if (!valid_epoch_id(row.observation_epoch()) || row.publication_generation() == 0u ||
+	    row.published_monotonic_ns() == 0u || !row.has_counters()) {
+		return false;
+	}
+	const auto &counts = row.counters();
+	return counts.rx_packets() != UINT64_MAX && counts.tx_packets() != UINT64_MAX &&
+	       counts.dropped_packets() != UINT64_MAX && counts.rx_bytes() != UINT64_MAX &&
+	       counts.tx_bytes() != UINT64_MAX && counts.fanout_overflow() != UINT64_MAX &&
+	       (counts.rx_packets() == 0u) == (counts.rx_bytes() == 0u) && counts.rx_bytes() >= counts.rx_packets() &&
+	       (counts.tx_packets() == 0u) == (counts.tx_bytes() == 0u) && counts.tx_bytes() >= counts.tx_packets();
+}
+
 /**
  * @brief Validate one complete runtime telemetry message intrinsically.
  * @param value Candidate complete runtime telemetry message.
@@ -938,6 +959,30 @@ static status validate_runtime_telemetry_impl(const telemetry::RuntimeTelemetry 
 		return status::invalid_argument("RuntimeTelemetry runtime identity or timestamp shape is malformed");
 	}
 	const auto &transition = value.transition();
+	if (static_cast<uint64_t>(value.worker_counters_size()) != runtime.expected_workers() ||
+	    transition.execution_participant_count() != runtime.expected_workers()) {
+		return status::invalid_argument("RuntimeTelemetry lacks its exact worker counter population");
+	}
+	std::array<uint64_t, 6> worker_totals{};
+	for (int index = 0; index < value.worker_counters_size(); ++index) {
+		const auto &row = value.worker_counters(index);
+		if (row.worker_index() != static_cast<uint32_t>(index) || !valid_worker_counter_observation(row) ||
+		    row.observation_epoch() > transition.allocated_epoch_high_watermark() ||
+		    row.published_monotonic_ns() > runtime.latest_bank_publication_monotonic_ns()) {
+			return status::invalid_argument(
+				"RuntimeTelemetry contains a malformed worker counter observation");
+		}
+		const auto values = engine_counter_values(row.counters());
+		for (std::size_t ordinal = 0u; ordinal < values.size(); ++ordinal) {
+			if (values[ordinal] >= UINT64_MAX - worker_totals[ordinal]) {
+				return status::invalid_argument("RuntimeTelemetry worker counter totals are exhausted");
+			}
+			worker_totals[ordinal] += values[ordinal];
+		}
+	}
+	if (worker_totals != engine_counter_values(engine)) {
+		return status::invalid_argument("RuntimeTelemetry engine counters disagree with worker totals");
+	}
 	if (transition.publication_generation() == 0u ||
 	    transition.state() == telemetry::EPOCH_TRANSITION_STATE_UNSPECIFIED ||
 	    transition.state() == telemetry::EPOCH_TRANSITION_STATE_AWAITING_BOOTSTRAP ||
@@ -1530,6 +1575,8 @@ static status validate_runtime_telemetry_impl(const telemetry::RuntimeTelemetry 
 	uint64_t stream_rx_bytes = 0u;
 	uint64_t stream_tx_packets = 0u;
 	uint64_t stream_tx_bytes = 0u;
+	std::vector<std::array<uint64_t, 4>> stream_worker_totals(
+		selection.include_stream_stats() ? static_cast<std::size_t>(value.worker_counters_size()) : 0u);
 	for (const auto &row : value.streams()) {
 		if (!stream_valid(row) || row.owning_region_id() < 0 ||
 		    static_cast<uint32_t>(row.owning_region_id()) >= transition.region_count() ||
@@ -1537,6 +1584,11 @@ static status validate_runtime_telemetry_impl(const telemetry::RuntimeTelemetry 
 		    row.published_monotonic_ns() > runtime.latest_bank_publication_monotonic_ns() ||
 		    row.published_monotonic_ns() > runtime.collection_monotonic_ns()) {
 			return status::invalid_argument("RuntimeTelemetry contains a malformed stream observation");
+		}
+		if (row.published_monotonic_ns() !=
+		    value.worker_counters(static_cast<int>(row.worker_index())).published_monotonic_ns()) {
+			return status::invalid_argument(
+				"RuntimeTelemetry stream timestamp disagrees with its worker bank");
 		}
 		if (selection.include_worker_epoch_stats() &&
 		    value.workers(static_cast<int>(row.worker_index())).region_id() != row.owning_region_id()) {
@@ -1546,9 +1598,21 @@ static status validate_runtime_telemetry_impl(const telemetry::RuntimeTelemetry 
 		if (row.direction() == kinetum::gluon::v1::IO_STREAM_DIRECTION_RX) {
 			add_saturating(stream_rx_packets, row.packets());
 			add_saturating(stream_rx_bytes, row.bytes());
+			add_saturating(stream_worker_totals[row.worker_index()][0], row.packets());
+			add_saturating(stream_worker_totals[row.worker_index()][1], row.bytes());
 		} else {
 			add_saturating(stream_tx_packets, row.packets());
 			add_saturating(stream_tx_bytes, row.bytes());
+			add_saturating(stream_worker_totals[row.worker_index()][2], row.packets());
+			add_saturating(stream_worker_totals[row.worker_index()][3], row.bytes());
+		}
+	}
+	for (std::size_t index = 0u; index < stream_worker_totals.size(); ++index) {
+		const auto &counts = value.worker_counters(static_cast<int>(index)).counters();
+		if (stream_worker_totals[index] != std::array<uint64_t, 4>{counts.rx_packets(), counts.rx_bytes(),
+									   counts.tx_packets(), counts.tx_bytes()}) {
+			return status::invalid_argument(
+				"RuntimeTelemetry worker transfers disagree with owned streams");
 		}
 	}
 	if (selection.include_stream_stats() &&
@@ -1635,13 +1699,11 @@ status validate_runtime_telemetry(const kinetum::telemetry::v1::RuntimeTelemetry
 status validate_failed_dataplane_stats_response(const kinetum::dataplane::v1::StatsResponse &response)
 {
 	try {
-		const auto unknown =
-			reject_unknown_protobuf_fields_recursive(response, "failed dataplane StatsResponse");
+		auto unknown = reject_unknown_protobuf_fields_recursive(response, "failed dataplane StatsResponse");
 		if (!unknown.is_ok()) {
 			return unknown;
 		}
-		const auto enums =
-			reject_invalid_protobuf_enum_values_recursive(response, "failed dataplane StatsResponse");
+		auto enums = reject_invalid_protobuf_enum_values_recursive(response, "failed dataplane StatsResponse");
 		if (!enums.is_ok()) {
 			return enums;
 		}

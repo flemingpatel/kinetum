@@ -418,13 +418,23 @@ int native_statistics(void *state, uint16_t port_id, rte_eth_stats *statistics) 
 	return match;
 }
 
+/** @brief Cold native queue setup borrowing one admitted storage dependency. */
+struct dpdk_queue_setup {
+	uint16_t descriptors{0};		      ///< Authored bound for native queue-held buffers.
+	const dpdk_packet_storage *storage{nullptr};  ///< RX pool and common queue NUMA authority.
+};
+
 /** @brief One preflighted native port and reverse-order rollback ledger row. */
 struct dpdk_port_state {
-	uint16_t physical_port{0};		     ///< Exact facility-resolved ethdev port.
-	uint16_t mtu{0};			     ///< Exact configured MTU.
-	uint32_t port_index{0};			     ///< Compact generic port identity.
-	uint16_t rx_queue_count{0};		     ///< Exact dense RX queue count.
-	uint16_t tx_queue_count{0};		     ///< Exact dense TX queue count.
+	uint16_t physical_port{0};   ///< Exact facility-resolved ethdev port.
+	uint16_t mtu{0};	     ///< Exact configured MTU.
+	uint32_t port_index{0};	     ///< Compact generic port identity.
+	uint32_t rx_queue_count{0};  ///< Authored RX population before native capability admission.
+	uint32_t tx_queue_count{0};  ///< Authored TX population before native capability admission.
+
+	std::vector<dpdk_queue_setup> native_rx_queues;	 ///< Complete native RX setup, including TAP counterparts.
+	std::vector<dpdk_queue_setup> native_tx_queues;	 ///< Complete native TX setup, including TAP counterparts.
+
 	rte_eth_conf configuration{};		     ///< Fully preflighted port configuration.
 	rte_eth_rxconf rx_configuration{};	     ///< PMD-provided RX queue defaults.
 	rte_eth_txconf tx_configuration{};	     ///< PMD-provided TX queue defaults.
@@ -635,11 +645,12 @@ void inspect_pool_object(rte_mempool *pool, void *argument, void *object, unsign
  * @param native_port Materialization state receiving the owned RSS key, queue set, and RETA.
  * @param diagnostic Optional caller-owned bounded failure diagnostic.
  * @return OK after preparing admitted steering state, or a precise contract/capability failure.
+ * @throws std::bad_alloc Steering storage allocation fails; the driver factory owns the exception boundary.
  */
 [[nodiscard]] kinetum_provider_status prepare_rss(const kinetum_provider_io_driver_facts &facts,
 						  const kinetum_provider_io_port_fact &port,
 						  const rte_eth_dev_info &device_info, dpdk_port_state &native_port,
-						  kinetum_provider_diagnostic *diagnostic) noexcept
+						  kinetum_provider_diagnostic *diagnostic)
 {
 	const kinetum_provider_steering_fact *steering = nullptr;
 	uint32_t rx_stream_count = 0;
@@ -1445,7 +1456,24 @@ kinetum_provider_status dpdk_io_driver::create(const kinetum_provider_factory_re
 					++native_port.tx_queue_count;
 				}
 			}
-			for (uint16_t queue = 0; queue < native_port.rx_queue_count; ++queue) {
+			if ((native_port.rx_queue_count == 0u && native_port.tx_queue_count == 0u) ||
+			    (port.direction == KINETUM_PROVIDER_IO_DIRECTION_BIDIRECTIONAL &&
+			     native_port.rx_queue_count != native_port.tx_queue_count)) {
+				return fail(KINETUM_PROVIDER_STATUS_INVALID_ARGUMENT, diagnostic,
+					    "DPDK queue population disagrees with the compiled port direction");
+			}
+			const bool paired_queues = attachment.kind == KINETUM_PROVIDER_ATTACHMENT_TAP;
+			const uint32_t paired_count = std::max(native_port.rx_queue_count, native_port.tx_queue_count);
+			const uint32_t native_rx_count = paired_queues ? paired_count : native_port.rx_queue_count;
+			const uint32_t native_tx_count = paired_queues ? paired_count : native_port.tx_queue_count;
+			rte_eth_dev_info device_info{};
+			if (api.device_info(api.state, native_port.physical_port, &device_info) != 0 ||
+			    native_rx_count > device_info.max_rx_queues ||
+			    native_tx_count > device_info.max_tx_queues) {
+				return fail(KINETUM_PROVIDER_STATUS_FAILED_PRECONDITION, diagnostic,
+					    "DPDK PMD cannot satisfy the exact queue population");
+			}
+			for (uint32_t queue = 0; queue < native_port.rx_queue_count; ++queue) {
 				uint32_t matches = 0;
 				for (uint32_t stream_index = 0; stream_index < facts.stream_count; ++stream_index) {
 					const auto &stream = facts.streams[stream_index];
@@ -1460,7 +1488,7 @@ kinetum_provider_status dpdk_io_driver::create(const kinetum_provider_factory_re
 						    "DPDK RX queue IDs are not one dense exact range");
 				}
 			}
-			for (uint16_t queue = 0; queue < native_port.tx_queue_count; ++queue) {
+			for (uint32_t queue = 0; queue < native_port.tx_queue_count; ++queue) {
 				uint32_t matches = 0;
 				for (uint32_t stream_index = 0; stream_index < facts.stream_count; ++stream_index) {
 					const auto &stream = facts.streams[stream_index];
@@ -1476,13 +1504,8 @@ kinetum_provider_status dpdk_io_driver::create(const kinetum_provider_factory_re
 				}
 			}
 
-			rte_eth_dev_info device_info{};
-			if (api.device_info(api.state, native_port.physical_port, &device_info) != 0 ||
-			    native_port.rx_queue_count > device_info.max_rx_queues ||
-			    native_port.tx_queue_count > device_info.max_tx_queues) {
-				return fail(KINETUM_PROVIDER_STATUS_FAILED_PRECONDITION, diagnostic,
-					    "DPDK PMD cannot satisfy the exact queue population");
-			}
+			native_port.native_rx_queues.resize(native_rx_count);
+			native_port.native_tx_queues.resize(native_tx_count);
 			for (uint32_t stream_index = 0; stream_index < facts.stream_count; ++stream_index) {
 				const auto &stream = facts.streams[stream_index];
 				if (stream.port_index != port.port_index) {
@@ -1495,6 +1518,21 @@ kinetum_provider_status dpdk_io_driver::create(const kinetum_provider_factory_re
 							       limits)) {
 					return fail(KINETUM_PROVIDER_STATUS_FAILED_PRECONDITION, diagnostic,
 						    "DPDK PMD rejected an exact descriptor count");
+				}
+				const uint32_t opposite_count = stream.direction == KINETUM_PROVIDER_IO_DIRECTION_RX ?
+									native_port.tx_queue_count :
+									native_port.rx_queue_count;
+				if (paired_queues && stream.driver_queue_id >= opposite_count) {
+					const auto &opposite_limits = stream.direction ==
+										      KINETUM_PROVIDER_IO_DIRECTION_RX ?
+									      device_info.tx_desc_lim :
+									      device_info.rx_desc_lim;
+					if (!descriptor_count_is_exact(static_cast<uint16_t>(stream.descriptor_count),
+								       opposite_limits)) {
+						return fail(
+							KINETUM_PROVIDER_STATUS_FAILED_PRECONDITION, diagnostic,
+							"DPDK TAP paired queue rejected the authored descriptor count");
+					}
 				}
 			}
 			const int device_socket = api.device_socket(api.state, native_port.physical_port);
@@ -1565,6 +1603,7 @@ kinetum_provider_status dpdk_io_driver::create(const kinetum_provider_factory_re
 				queue.logical_port = static_cast<uint16_t>(port->logical_port_id);
 				queue.descriptors = static_cast<uint16_t>(stream.descriptor_count);
 				queue.storage = storage_dependency(request, stream.storage_domain_indices[0]);
+				native_port->native_rx_queues[queue.queue_id] = {queue.descriptors, queue.storage};
 				state->rx_operations[rx_position] = kinetum_packet_rx_burst_operations{
 					.state = &queue,
 					.receive_burst = receive_burst_,
@@ -1596,6 +1635,8 @@ kinetum_provider_status dpdk_io_driver::create(const kinetum_provider_factory_re
 					const uint32_t domain = stream.storage_domain_indices[domain_index];
 					queue.storage_by_domain[domain] = storage_dependency(request, domain);
 				}
+				native_port->native_tx_queues[queue.queue_id] = {
+					queue.descriptors, queue.storage_by_domain[stream.storage_domain_indices[0]]};
 				state->tx_operations[tx_position] = kinetum_packet_tx_burst_operations{
 					.state = &queue,
 					.transmit_burst = transmit_burst_,
@@ -1612,6 +1653,21 @@ kinetum_provider_status dpdk_io_driver::create(const kinetum_provider_factory_re
 			return fail(KINETUM_PROVIDER_STATUS_IMPLEMENTATION_ERROR, diagnostic,
 				    "DPDK queue operation publication is incomplete");
 		}
+		for (uint32_t index = 0; index < state->port_count; ++index) {
+			auto &port = state->ports[index];
+			// TAP shares one native file descriptor between each RX/TX pair.
+			// Only authored directions publish packet operations. A missing native
+			// counterpart uses the declared side's queue ID and descriptor bound.
+			// TAP releases accepted TX buffers synchronously, so its unused RX
+			// counterpart fits the TX descriptor reserve already charged to every
+			// accepted domain; the first canonical domain supplies that pool.
+			for (std::size_t queue = port.rx_queue_count; queue < port.native_rx_queues.size(); ++queue) {
+				port.native_rx_queues[queue] = port.native_tx_queues[queue];
+			}
+			for (std::size_t queue = port.tx_queue_count; queue < port.native_tx_queues.size(); ++queue) {
+				port.native_tx_queues[queue] = port.native_rx_queues[queue];
+			}
+		}
 
 		// Complete every allocation and capability check before this owner crosses
 		// the first foreign call that establishes configured ethdev ownership.
@@ -1619,8 +1675,9 @@ kinetum_provider_status dpdk_io_driver::create(const kinetum_provider_factory_re
 		candidate->operations_.io_driver_index = facts.io_driver_index;
 		for (uint32_t port_index = 0; port_index < candidate->state_->port_count; ++port_index) {
 			auto &port = candidate->state_->ports[port_index];
-			if (api.configure(api.state, port.physical_port, port.rx_queue_count, port.tx_queue_count,
-					  &port.configuration) != 0) {
+			if (api.configure(
+				    api.state, port.physical_port, static_cast<uint16_t>(port.native_rx_queues.size()),
+				    static_cast<uint16_t>(port.native_tx_queues.size()), &port.configuration) != 0) {
 				return fail(KINETUM_PROVIDER_STATUS_IMPLEMENTATION_ERROR, diagnostic,
 					    "DPDK ethdev configuration failed");
 			}
@@ -1631,25 +1688,22 @@ kinetum_provider_status dpdk_io_driver::create(const kinetum_provider_factory_re
 				return fail(KINETUM_PROVIDER_STATUS_FAILED_PRECONDITION, diagnostic,
 					    "DPDK PMD rejected the exact MTU");
 			}
-			for (uint32_t index = 0; index < candidate->state_->rx_queue_count; ++index) {
-				const auto &queue = candidate->state_->rx_queues[index];
-				if (queue.physical_port != port.physical_port) {
-					continue;
-				}
-				if (api.setup_rx_queue(api.state, port.physical_port, queue.queue_id, queue.descriptors,
+			// Native queue order fixes TAP's kernel file-descriptor queue indices.
+			for (std::size_t index = 0; index < port.native_rx_queues.size(); ++index) {
+				const auto &queue = port.native_rx_queues[index];
+				if (api.setup_rx_queue(api.state, port.physical_port, static_cast<uint16_t>(index),
+						       queue.descriptors,
 						       static_cast<unsigned int>(queue.storage->host_numa_node()),
 						       &port.rx_configuration, queue.storage->native_pool()) != 0) {
 					return fail(KINETUM_PROVIDER_STATUS_IMPLEMENTATION_ERROR, diagnostic,
 						    "DPDK RX queue setup failed");
 				}
 			}
-			for (uint32_t index = 0; index < candidate->state_->tx_queue_count; ++index) {
-				const auto &queue = candidate->state_->tx_queues[index];
-				if (queue.physical_port != port.physical_port) {
-					continue;
-				}
-				if (api.setup_tx_queue(api.state, port.physical_port, queue.queue_id, queue.descriptors,
-						       static_cast<unsigned int>(queue.host_numa_node),
+			for (std::size_t index = 0; index < port.native_tx_queues.size(); ++index) {
+				const auto &queue = port.native_tx_queues[index];
+				if (api.setup_tx_queue(api.state, port.physical_port, static_cast<uint16_t>(index),
+						       queue.descriptors,
+						       static_cast<unsigned int>(queue.storage->host_numa_node()),
 						       &port.tx_configuration) != 0) {
 					return fail(KINETUM_PROVIDER_STATUS_IMPLEMENTATION_ERROR, diagnostic,
 						    "DPDK TX queue setup failed");

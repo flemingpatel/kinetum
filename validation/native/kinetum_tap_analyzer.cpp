@@ -7,9 +7,8 @@
  * @author Fleming Patel
  *
  * Parses pcap files and extracts KINETUM payload fields (seq, tag,
- * timestamp) to compute loss, latency, generation-tag transition, and tag
- * distribution metrics. Replaces the Python/scapy analyzer for
- * high packet counts.
+ * timestamp) to compute exact packet membership, latency, and per-input
+ * ordering and generation-tag changes.
  *
  * Reads pcap format directly (no libpcap dependency). Outputs
  * analysis results as JSON to stdout.
@@ -31,6 +30,7 @@
 #include <map>
 #include <memory>
 #include <new>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -43,18 +43,19 @@
 #include <vector>
 
 #include "src/common/process_output.hpp"
+#include "validation/native/tap_packet_profile.hpp"
 
 // =============================================================================
 // Constants (must match KINETUM payload format)
 // =============================================================================
 
-static constexpr uint8_t MAGIC[] = {'K', 'I', 'N', 'E', 'T', 'U', 'M'};	 ///< Exact payload magic.
-static constexpr size_t MAGIC_LEN = 7;					 ///< Bytes in `MAGIC`.
-static constexpr size_t HEADER_SIZE = 21;  ///< Magic, sequence, tag, and binary64 timestamp bytes.
-
-static constexpr size_t ETH_HDR_LEN = 14;  ///< Exact Ethernet-II header bytes.
-static constexpr size_t IP_HDR_LEN = 20;   ///< Exact option-free IPv4 header bytes.
-static constexpr size_t UDP_HDR_LEN = 8;   ///< Exact UDP header bytes.
+using kinetum::validation::tap::ETH_HDR_LEN;
+using kinetum::validation::tap::HEADER_SIZE;
+using kinetum::validation::tap::IP_HDR_LEN;
+using kinetum::validation::tap::MAGIC;
+using kinetum::validation::tap::MAGIC_LEN;
+using kinetum::validation::tap::MAX_STREAMS;
+using kinetum::validation::tap::UDP_HDR_LEN;
 static constexpr size_t PAYLOAD_OFFSET = ETH_HDR_LEN + IP_HDR_LEN + UDP_HDR_LEN;  ///< Test payload offset.
 
 static_assert(sizeof(double) == sizeof(uint64_t) && std::numeric_limits<double>::is_iec559,
@@ -78,7 +79,8 @@ struct pcap_file_header {
 };
 
 /** Complete native analyzer usage text. */
-constexpr std::string_view USAGE = "Usage: kinetum_tap_analyzer --pcap <file> [--expected N] [--no-latency] [--help]\n";
+constexpr std::string_view USAGE =
+	"Usage: kinetum_tap_analyzer --pcap <file> --expected N --stream-count N [--no-latency] [--help]\n";
 
 /**
  * @brief On-disk per-packet pcap header.
@@ -149,22 +151,54 @@ static double read_be_double(const uint8_t *p)
 // Analysis
 // =============================================================================
 
+/** @brief Packet membership and arrival order for one authored TAP input. */
+struct stream_analysis_result {
+	uint32_t stream_index{0};		   ///< Index in the sender's ordered ingress list.
+	uint64_t expected_count{0};		   ///< Successful sends assigned to this input.
+	uint64_t valid{0};			   ///< Unique valid packet identities.
+	uint64_t duplicates{0};			   ///< Repeated packet identities.
+	uint64_t out_of_order{0};		   ///< Unique arrivals below this input's highest received ID.
+	int64_t transition_seq{-1};		   ///< First unique packet whose tag changes within this input.
+	uint64_t tag_transition_count{0};	   ///< Tag changes between unique arrivals on this input.
+	std::optional<uint32_t> highest_sequence;  ///< Nondecreasing ordering reference.
+	std::optional<uint16_t> first_tag;	   ///< First unique arrival's tag, absent on an empty input.
+	std::optional<uint16_t> last_tag;	   ///< Latest unique arrival's tag.
+	std::map<uint32_t, uint64_t> tag_counts;   ///< All valid received records grouped by tag.
+
+	/** @return Expected identities absent from the completed capture. */
+	[[nodiscard]] uint64_t missing_count() const noexcept
+	{
+		return expected_count - valid;
+	}
+};
+
 /**
- * @brief Native analyzer counters serialized to stdout as JSON.
+ * @brief Append one exact numeric tag-count object to the pending JSON output.
+ * @param output Caller-owned output buffer, never flushed here.
+ * @param counts Ordered tag membership.
  */
+static void append_tag_counts(std::ostream &output, const std::map<uint32_t, uint64_t> &counts)
+{
+	output << '{';
+	bool first = true;
+	for (const auto &[tag, count] : counts) {
+		if (!first) {
+			output << ',';
+		}
+		output << '"' << tag << "\":" << count;
+		first = false;
+	}
+	output << '}';
+}
+
+/** @brief Complete capture evidence with ordering owned by individual inputs. */
 struct analysis_result {
-	uint64_t total_rx{0};			  ///< Packet records read from the pcap.
-	uint64_t valid{0};			  ///< Records carrying a valid Kinetum payload.
-	uint64_t invalid{0};			  ///< Records outside the exact packet-profile contract.
-	uint64_t duplicates{0};			  ///< Repeated sequence numbers.
-	uint64_t out_of_order{0};		  ///< Sequence numbers lower than the previous record.
-	int64_t transition_seq{-1};		  ///< First sequence number whose tag differs from prior tag.
-	uint64_t tag_transition_count{0};	  ///< Number of observed adjacent generation-tag changes.
-	uint64_t max_gap{0};			  ///< Largest observed sequence-number gap.
-	std::map<uint32_t, uint64_t> tag_counts;  ///< Valid packet counts by generation tag.
-	std::vector<double> latencies;		  ///< Accepted latency samples in microseconds.
-	uint64_t missing_count{0};		  ///< Sum of observed sequence-number gaps.
-	bool fatal_error{false};		  ///< True when the pcap structure is malformed.
+	uint64_t total_rx{0};			      ///< Packet records read from the pcap.
+	uint64_t invalid{0};			      ///< Records outside the exact packet-profile contract.
+	uint64_t max_gap{0};			      ///< Longest contiguous run of actually absent packet IDs.
+	std::vector<stream_analysis_result> streams;  ///< Exact declared input population, including empty inputs.
+	std::vector<double> latencies;		      ///< Accepted latency samples in microseconds.
+	bool fatal_error{false};		      ///< True when the pcap structure is malformed.
 
 	/**
 	 * @brief Render the analyzer result using the JSON schema consumed by Python.
@@ -174,11 +208,30 @@ struct analysis_result {
 	 */
 	[[nodiscard]] std::string render_json(uint64_t expected_count) const
 	{
-		double loss_pct = 0.0;
-		if (expected_count > 0 && valid < expected_count) {
-			loss_pct = static_cast<double>(expected_count - valid) / static_cast<double>(expected_count) *
-				   100.0;
+		uint64_t valid = 0;
+		uint64_t duplicates = 0;
+		uint64_t out_of_order = 0;
+		uint64_t missing_count = 0;
+		uint64_t tag_transition_count = 0;
+		int64_t transition_seq = -1;
+		std::map<uint32_t, uint64_t> tag_counts;
+		for (const auto &input : streams) {
+			valid += input.valid;
+			duplicates += input.duplicates;
+			out_of_order += input.out_of_order;
+			missing_count += input.missing_count();
+			tag_transition_count += input.tag_transition_count;
+			if (input.transition_seq >= 0 &&
+			    (transition_seq < 0 || input.transition_seq < transition_seq)) {
+				transition_seq = input.transition_seq;
+			}
+			for (const auto &[tag, count] : input.tag_counts) {
+				tag_counts[tag] += count;
+			}
 		}
+		const double loss_pct = expected_count == 0 ? 0.0 :
+							      static_cast<double>(missing_count) /
+								      static_cast<double>(expected_count) * 100.0;
 
 		// Latency stats
 		double lat_avg = 0, lat_min = 0, lat_max = 0, lat_p50 = 0, lat_p99 = 0;
@@ -208,17 +261,36 @@ struct analysis_result {
 		       << ",\"loss_pct\":" << std::fixed << std::setprecision(4) << loss_pct
 		       << ",\"missing_count\":" << missing_count << ",\"latency\":{\"avg\":" << std::setprecision(2)
 		       << lat_avg << ",\"min\":" << lat_min << ",\"max\":" << lat_max << ",\"p50\":" << lat_p50
-		       << ",\"p99\":" << lat_p99 << ",\"count\":" << latencies.size() << "},\"tag_counts\":{";
-
-		bool first = true;
-		for (const auto &[tag, count] : tag_counts) {
-			if (!first) {
+		       << ",\"p99\":" << lat_p99 << ",\"count\":" << latencies.size() << "},\"tag_counts\":";
+		append_tag_counts(output, tag_counts);
+		output << ",\"streams\":[";
+		for (std::size_t index = 0; index < streams.size(); ++index) {
+			if (index != 0) {
 				output << ',';
 			}
-			output << '"' << tag << "\":" << count;
-			first = false;
+			const auto &input = streams[index];
+			output << "{\"stream_index\":" << input.stream_index
+			       << ",\"expected_count\":" << input.expected_count << ",\"valid\":" << input.valid
+			       << ",\"duplicates\":" << input.duplicates << ",\"out_of_order\":" << input.out_of_order
+			       << ",\"missing_count\":" << input.missing_count()
+			       << ",\"transition_seq\":" << input.transition_seq
+			       << ",\"tag_transition_count\":" << input.tag_transition_count << ",\"first_tag\":";
+			if (input.first_tag.has_value()) {
+				output << *input.first_tag;
+			} else {
+				output << "null";
+			}
+			output << ",\"last_tag\":";
+			if (input.last_tag.has_value()) {
+				output << *input.last_tag;
+			} else {
+				output << "null";
+			}
+			output << ",\"tag_counts\":";
+			append_tag_counts(output, input.tag_counts);
+			output << '}';
 		}
-		output << "}}\n";
+		output << "]}\n";
 		return output.str();
 	}
 };
@@ -266,13 +338,21 @@ static bool parse_uint64_arg(std::string_view text, const char *flag, uint64_t &
  * @brief Analyze one pcap file and fail closed on malformed capture structure.
  *
  * @param path Pcap file path to read.
- * @param expected_count Expected packet count used for duplicate-set preallocation.
+ * @param expected_count Exact successful-send population.
+ * @param stream_count Exact number of sender ingress interfaces.
  * @param measure_latency True to compute latency samples from sender timestamps.
  * @return Analysis counters and fatal-error flag.
  */
-static analysis_result analyze_pcap(const char *path, uint64_t expected_count, bool measure_latency)
+static analysis_result analyze_pcap(const char *path, uint64_t expected_count, uint32_t stream_count,
+				    bool measure_latency)
 {
 	analysis_result result;
+	result.streams.resize(stream_count);
+	for (uint32_t index = 0; index < stream_count; ++index) {
+		result.streams[index].stream_index = index;
+		result.streams[index].expected_count =
+			expected_count / stream_count + (index < expected_count % stream_count ? 1u : 0u);
+	}
 
 	if (path == nullptr || path[0] != '/') {
 		fprintf(stderr, "analyzer: pcap path must be absolute\n");
@@ -334,9 +414,6 @@ static analysis_result analyze_pcap(const char *path, uint64_t expected_count, b
 		return result;
 	}
 
-	int64_t last_seq = -1;
-	uint32_t last_tag = 0;
-	bool has_last_tag = false;
 	std::unordered_set<uint32_t> seen_sequences;
 	if (expected_count > 0) {
 		constexpr uint64_t MAX_RESERVE = 1000000;
@@ -411,7 +488,7 @@ static analysis_result analyze_pcap(const char *path, uint64_t expected_count, b
 		uint32_t seq = read_be32(payload + MAGIC_LEN);
 		uint16_t tag = read_be16(payload + MAGIC_LEN + 4);
 		double tx_time = read_be_double(payload + MAGIC_LEN + 6);
-		if (expected_count > 0 && static_cast<uint64_t>(seq) >= expected_count) {
+		if (static_cast<uint64_t>(seq) >= expected_count) {
 			result.invalid++;
 			continue;
 		}
@@ -426,44 +503,33 @@ static analysis_result analyze_pcap(const char *path, uint64_t expected_count, b
 			}
 		}
 
-		result.valid++;
-		if (!seen_sequences.insert(seq).second) {
-			result.duplicates++;
-		}
-		result.tag_counts[tag]++;
-
-		// Transition detection
-		if (has_last_tag && tag != last_tag) {
-			result.tag_transition_count++;
-			if (result.transition_seq < 0) {
-				result.transition_seq = static_cast<int64_t>(seq);
+		auto &input = result.streams[kinetum::validation::tap::stream_index(seq, stream_count)];
+		const bool unique = seen_sequences.insert(seq).second;
+		if (!unique) {
+			++input.duplicates;
+		} else {
+			++input.valid;
+			++input.tag_counts[tag];
+			if (input.highest_sequence.has_value() && seq < *input.highest_sequence) {
+				++input.out_of_order;
 			}
-		}
-		last_tag = tag;
-		has_last_tag = true;
-
-		// Gap and out-of-order detection
-		if (last_seq >= 0) {
-			int64_t s = static_cast<int64_t>(seq);
-			if (s < last_seq) {
-				result.out_of_order++;
-			} else if (s > last_seq + 1) {
-				uint64_t gap = static_cast<uint64_t>(s - last_seq - 1);
-				if (gap > result.max_gap) {
-					result.max_gap = gap;
-				}
-				if (result.missing_count > std::numeric_limits<uint64_t>::max() - gap) {
-					fprintf(stderr, "analyzer: sequence-gap accounting overflow\n");
-					result.fatal_error = true;
-					break;
-				}
-				result.missing_count += gap;
+			if (!input.highest_sequence.has_value() || seq > *input.highest_sequence) {
+				input.highest_sequence = seq;
 			}
+			if (!input.first_tag.has_value()) {
+				input.first_tag = tag;
+			}
+			if (input.last_tag.has_value() && tag != *input.last_tag) {
+				++input.tag_transition_count;
+				if (input.transition_seq < 0) {
+					input.transition_seq = static_cast<int64_t>(seq);
+				}
+			}
+			input.last_tag = tag;
 		}
-		last_seq = static_cast<int64_t>(seq);
 
 		// Latency measurement
-		if (measure_latency) {
+		if (measure_latency && unique) {
 			result.latencies.push_back(latency_us);
 		}
 	}
@@ -471,6 +537,18 @@ static analysis_result analyze_pcap(const char *path, uint64_t expected_count, b
 	if (ferror(stream.get()) != 0) {
 		fprintf(stderr, "analyzer: failed while reading pcap: %s\n", strerror(errno));
 		result.fatal_error = true;
+	}
+	if (!result.fatal_error) {
+		// Arrival gaps can be filled later. Only completed membership defines loss.
+		// Storage and sorting scale with captured identities, not the expected domain.
+		std::vector<uint32_t> ordered(seen_sequences.begin(), seen_sequences.end());
+		std::sort(ordered.begin(), ordered.end());
+		uint64_t next = 0;
+		for (const uint32_t sequence : ordered) {
+			result.max_gap = std::max(result.max_gap, static_cast<uint64_t>(sequence) - next);
+			next = static_cast<uint64_t>(sequence) + 1u;
+		}
+		result.max_gap = std::max(result.max_gap, expected_count - next);
 	}
 	return result;
 }
@@ -487,6 +565,8 @@ int main(int argc, char *argv[])
 	try {
 		const char *pcap_path = nullptr;
 		uint64_t expected_count = 0;
+		uint64_t stream_count = 0;
+		bool expected_set = false;
 		bool measure_latency = true;
 		std::string error;
 
@@ -506,6 +586,10 @@ int main(int argc, char *argv[])
 				}
 				pcap_path = argv[++i];
 			} else if (strcmp(argv[i], "--expected") == 0) {
+				if (expected_set) {
+					fprintf(stderr, "kinetum_tap_analyzer: --expected is repeated\n");
+					return 2;
+				}
 				if (i + 1 >= argc) {
 					fprintf(stderr, "kinetum_tap_analyzer: --expected requires an argument\n");
 					print_usage(stderr);
@@ -521,6 +605,19 @@ int main(int argc, char *argv[])
 						"kinetum_tap_analyzer: --expected exceeds the packet sequence domain\n");
 					return 2;
 				}
+				expected_set = true;
+			} else if (strcmp(argv[i], "--stream-count") == 0) {
+				if (stream_count != 0 || i + 1 >= argc) {
+					fprintf(stderr, "kinetum_tap_analyzer: --stream-count requires one argument\n");
+					return 2;
+				}
+				++i;
+				if (!parse_uint64_arg(argv[i], "--stream-count", stream_count, error) ||
+				    stream_count == 0 || stream_count > MAX_STREAMS) {
+					fprintf(stderr,
+						"kinetum_tap_analyzer: --stream-count must occur once in range 1..64\n");
+					return 2;
+				}
 			} else if (strcmp(argv[i], "--no-latency") == 0) {
 				measure_latency = false;
 			} else {
@@ -530,13 +627,14 @@ int main(int argc, char *argv[])
 			}
 		}
 
-		if (!pcap_path) {
-			fprintf(stderr, "kinetum_tap_analyzer: --pcap is required\n");
+		if (!pcap_path || !expected_set || stream_count == 0) {
+			fprintf(stderr, "kinetum_tap_analyzer: --pcap, --expected, and --stream-count are required\n");
 			print_usage(stderr);
 			return 2;
 		}
 
-		auto result = analyze_pcap(pcap_path, expected_count, measure_latency);
+		auto result =
+			analyze_pcap(pcap_path, expected_count, static_cast<uint32_t>(stream_count), measure_latency);
 		if (result.fatal_error) {
 			return 1;
 		}

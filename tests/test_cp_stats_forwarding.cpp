@@ -53,6 +53,7 @@
 #include "gen/kinetum/dataplane/v1/dataplane.pb.h"
 #include "gen/kinetum/gluon/v1/plan.pb.h"
 #include "src/common/canonical_content_identity.hpp"
+#include "src/common/runtime_telemetry_contract.hpp"
 #include "src/common/sha256.hpp"
 #include "src/common/status.hpp"
 #include "src/cp/config_store.hpp"
@@ -83,6 +84,7 @@ void poison_aggregate_stats(kinetum::control::v1::StatsResponse *response)
 	response->mutable_active_config()->set_snapshot_id("poisoned.snapshot");
 	response->mutable_telemetry()->mutable_runtime()->set_runtime_generation(99u);
 	response->mutable_telemetry()->mutable_engine()->set_rx_packets(1u);
+	response->mutable_telemetry()->add_worker_counters()->set_publication_generation(99u);
 	response->mutable_telemetry()->add_stages();
 	response->mutable_telemetry()->add_boundaries();
 	response->mutable_telemetry()->add_regions();
@@ -370,7 +372,7 @@ class CpStatsForwardingTest : public ::testing::Test {
 		}
 		loop_ = std::make_unique<control_loop>(store_.get(), dp_.stub);
 		ASSERT_TRUE(loop_->start().is_ok());
-		cp_service_ = std::make_unique<control_service_impl>(store_.get(), dp_.stub, *loop_);
+		cp_service_ = std::make_unique<control_service_impl>(store_.get(), dp_.stub, *loop_, nullptr);
 		forwarder_ = std::make_unique<stats_forwarding_service>(*cp_service_);
 		grpc::ServerBuilder builder;
 		int port = 0;
@@ -396,6 +398,41 @@ class CpStatsForwardingTest : public ::testing::Test {
 // ===============================================================================
 // Tests
 // ===============================================================================
+
+/** @brief Default fake telemetry is valid, while nonzero packet counts require nonzero byte totals. */
+TEST(fake_dp_service, default_statistics_preserve_packet_and_byte_consistency)
+{
+	test::fake_dp_service service;
+	grpc::ServerContext context;
+	kinetum::dataplane::v1::StatsRequest request;
+	request.mutable_selection();
+	kinetum::dataplane::v1::StatsResponse response;
+	ASSERT_TRUE(service.GetStats(&context, &request, &response).ok());
+	ASSERT_EQ(response.telemetry().transition().plan_content_hash().size(), common::SHA256_DIGEST_SIZE);
+	ASSERT_EQ(response.telemetry().transition().active_validation_hash().size(), common::SHA256_DIGEST_SIZE);
+	const auto valid = common::validate_successful_dataplane_stats_response(response, request.selection());
+	ASSERT_TRUE(valid.is_ok()) << valid.message();
+	ASSERT_EQ(response.telemetry().worker_counters_size(), 1);
+	ASSERT_GT(response.telemetry().engine().rx_packets(), 0u);
+	ASSERT_GT(response.telemetry().engine().tx_packets(), 0u);
+
+	for (const bool receive : {true, false}) {
+		SCOPED_TRACE(receive ? "RX packets without bytes" : "TX packets without bytes");
+		auto malformed = response;
+		auto *engine = malformed.mutable_telemetry()->mutable_engine();
+		auto *worker = malformed.mutable_telemetry()->mutable_worker_counters(0)->mutable_counters();
+		if (receive) {
+			engine->set_rx_bytes(0u);
+			worker->set_rx_bytes(0u);
+		} else {
+			engine->set_tx_bytes(0u);
+			worker->set_tx_bytes(0u);
+		}
+		const auto invalid =
+			common::validate_successful_dataplane_stats_response(malformed, request.selection());
+		EXPECT_EQ(invalid.code(), common::status_code::INVALID_ARGUMENT);
+	}
+}
 
 // ---------------------------------------------------------------------------
 // 1. Full stats forwarding (all flags true)

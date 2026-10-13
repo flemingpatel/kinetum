@@ -191,6 +191,18 @@ message EngineStats {
   uint64 fanout_overflow = 6;
 }
 
+// One worker's generation-cumulative counters at its last completed bank.
+// The cold merger advances publication_generation only for a worker bank,
+// never for a read, module update, or returned-bank acknowledgment. Equal
+// generations identify identical rows within the enclosing runtime generation.
+message WorkerCounterStats {
+  uint32 worker_index = 1;
+  uint64 observation_epoch = 2;
+  uint64 publication_generation = 3;
+  uint64 published_monotonic_ns = 4;
+  EngineStats counters = 5;
+}
+
 // Exact transaction identity and phase timing. Optional timestamps are absent
 // until their named edge has occurred.
 message EpochTransactionTelemetry {
@@ -538,4 +550,6 @@ message RuntimeTelemetry {
   repeated PortStats ports = 15;
   repeated TrafficSteeringStats steering_profiles = 16;
   repeated kinetum.gluon.v1.ModuleContextDomain module_context_domains = 18;
+  // Mandatory compact worker-index order, including workers without I/O.
+  repeated WorkerCounterStats worker_counters = 19;
 }

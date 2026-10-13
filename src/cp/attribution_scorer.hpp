@@ -251,21 +251,21 @@ class attribution_scorer {
 	/**
 	 * @brief Compute average health score from snapshots.
 	 * @param snaps Nonempty exact interval set.
-	 * @return Arithmetic mean of correlated health scores.
+	 * @return Mean health weighted by common covered duration.
 	 */
 	[[nodiscard]] static double average_health(const std::vector<telemetry_snapshot> &snaps);
 
 	/**
 	 * @brief Compute average drop ratio from snapshots.
 	 * @param snaps Nonempty exact interval set.
-	 * @return Arithmetic mean of interval drop ratios.
+	 * @return Mean drop ratio weighted by common covered duration.
 	 */
 	[[nodiscard]] static double average_drop_ratio(const std::vector<telemetry_snapshot> &snaps);
 
 	/**
 	 * @brief Compute standard deviation of health scores.
 	 * @param snaps Exact interval set; fewer than two rows returns zero.
-	 * @return Sample standard deviation of correlated health scores.
+	 * @return Duration-weighted sample deviation; equal durations reproduce the ordinary sample deviation.
 	 */
 	[[nodiscard]] static double health_stddev(const std::vector<telemetry_snapshot> &snaps);
 
@@ -510,11 +510,16 @@ inline double attribution_scorer::average_health(const std::vector<telemetry_sna
 	if (snaps.empty()) {
 		std::terminate();
 	}
-	double sum = 0.0;
+	long double sum = 0.0L;
+	long double duration = 0.0L;
 	for (const auto &s : snaps) {
-		sum += s.health_score;
+		if (s.covered_duration_ns == 0u) {
+			std::terminate();
+		}
+		sum += static_cast<long double>(s.health_score) * s.covered_duration_ns;
+		duration += static_cast<long double>(s.covered_duration_ns);
 	}
-	return sum / static_cast<double>(snaps.size());
+	return static_cast<double>(sum / duration);
 }
 
 inline double attribution_scorer::average_drop_ratio(const std::vector<telemetry_snapshot> &snaps)
@@ -522,24 +527,36 @@ inline double attribution_scorer::average_drop_ratio(const std::vector<telemetry
 	if (snaps.empty()) {
 		std::terminate();
 	}
-	double sum = 0.0;
+	long double sum = 0.0L;
+	long double duration = 0.0L;
 	for (const auto &s : snaps) {
-		sum += s.drop_ratio;
+		if (s.covered_duration_ns == 0u) {
+			std::terminate();
+		}
+		sum += static_cast<long double>(s.drop_ratio) * s.covered_duration_ns;
+		duration += static_cast<long double>(s.covered_duration_ns);
 	}
-	return sum / static_cast<double>(snaps.size());
+	return static_cast<double>(sum / duration);
 }
 
 inline double attribution_scorer::health_stddev(const std::vector<telemetry_snapshot> &snaps)
 {
 	if (snaps.size() < 2)
 		return 0.0;
-	double mean = average_health(snaps);
-	double sq_sum = 0.0;
+	const long double mean = average_health(snaps);
+	long double sq_sum = 0.0L;
+	long double weight_sum = 0.0L;
+	long double pair_weight_sum = 0.0L;
 	for (const auto &s : snaps) {
-		double diff = s.health_score - mean;
-		sq_sum += diff * diff;
+		const long double weight = static_cast<long double>(s.covered_duration_ns);
+		const long double diff = static_cast<long double>(s.health_score) - mean;
+		sq_sum += weight * diff * diff;
+		pair_weight_sum += weight * weight_sum;
+		weight_sum += weight;
 	}
-	return std::sqrt(sq_sum / static_cast<double>(snaps.size() - 1));
+	// Equivalent to sum(w) - sum(w*w)/sum(w), without subtracting near equals.
+	const long double denominator = 2.0L * pair_weight_sum / weight_sum;
+	return denominator > 0.0L ? static_cast<double>(std::sqrt(sq_sum / denominator)) : 0.0;
 }
 
 }  // namespace kinetum::cp

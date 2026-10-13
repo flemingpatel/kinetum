@@ -14,11 +14,25 @@ from datetime import datetime
 from typing import Optional
 
 from ..config.types import (
+    CommitConfirmedTestResult,
+    EpochTestResult,
+    GuardrailsTestResult,
+    NatExchangeResult,
+    RollbackTestResult,
     TestConfig,
     TestResult,
     TestSuiteResult,
     TestType,
 )
+
+
+_SCENARIO_NAMES = {
+    EpochTestResult: "EPOCH",
+    CommitConfirmedTestResult: "COMMIT-CONFIRMED",
+    RollbackTestResult: "ROLLBACK",
+    GuardrailsTestResult: "GUARDRAILS",
+    NatExchangeResult: "NAT EXCHANGE",
+}
 
 
 class ConsoleReporter:
@@ -130,9 +144,18 @@ class ConsoleReporter:
         """Print progress message."""
         print(f"  {message}", file=sys.stderr)
 
-    def print_test_result(self, result: TestResult) -> None:
-        """Print packet test result."""
-        print(self._header(f"\n[RESULT - {result.packet_size}B]"), file=sys.stderr)
+    def print_test_result(
+        self,
+        result: TestResult | EpochTestResult | CommitConfirmedTestResult | RollbackTestResult
+        | GuardrailsTestResult | NatExchangeResult,
+    ) -> None:
+        """Render one returned verdict after the scenario retires its resources.
+
+        Failed observations always show their diagnostic. Default counters and
+        incomplete control evidence are not presented as measured zero or success.
+        """
+        name = f"{result.packet_size}B" if isinstance(result, TestResult) else _SCENARIO_NAMES[type(result)]
+        print(self._header(f"\n[RESULT - {name}]"), file=sys.stderr)
 
         if result.passed:
             status = self._success("PASSED")
@@ -140,26 +163,59 @@ class ConsoleReporter:
             status = self._error("FAILED")
 
         print(f"  Status:     {status}", file=sys.stderr)
-        print(f"  TX:         {result.tx_count:,}", file=sys.stderr)
-        print(f"  RX:         {result.rx_count:,}", file=sys.stderr)
-
-        if result.loss_pct > 1.0:
-            print(f"  Loss:       {self._error(f'{result.loss_pct:.2f}%')}", file=sys.stderr)
-        elif result.loss_pct > 0:
-            print(f"  Loss:       {self._warning(f'{result.loss_pct:.2f}%')}", file=sys.stderr)
-        else:
-            print(f"  Loss:       {self._success('0.00%')}", file=sys.stderr)
-
-        if result.avg_latency_us is not None:
-            print(f"  Latency:    {result.avg_latency_us:.1f}us", file=sys.stderr)
-        else:
-            print("  Latency:    unavailable", file=sys.stderr)
-
-        print(f"  Throughput: {result.throughput_pps:.0f} PPS", file=sys.stderr)
+        if isinstance(result, (TestResult, CommitConfirmedTestResult, RollbackTestResult)):
+            if result.passed or result.tx_count > 0:
+                self._print_traffic(result.tx_count, result.rx_count, result.loss_pct, result.avg_latency_us)
+                if isinstance(result, TestResult):
+                    print(f"  Throughput: {result.throughput_pps:.0f} PPS", file=sys.stderr)
+        elif isinstance(result, EpochTestResult) and (result.passed or result.total_sent > 0):
+            self._print_traffic(result.total_sent, result.total_received, result.loss_pct, result.avg_latency_us)
+            self.print_progress(f"Boundaries: {result.completed_boundaries}/{result.boundary_count} complete")
+            self.print_progress(f"Protocol faults: {result.protocol_faults_observed}")
+            self.print_progress(f"Backpressure: {result.backpressure_events}")
+            self.print_progress(
+                f"Initial tag: TX={result.initial_generation_sent:,} RX={result.initial_generation_received:,}"
+            )
+            self.print_progress(
+                f"Next tag: TX={result.next_generation_sent:,} RX={result.next_generation_received:,}"
+            )
+            if result.generation_tag_transition_seq >= 0:
+                self.print_progress(f"First tag-change sequence: {result.generation_tag_transition_seq}")
+        if isinstance(result, CommitConfirmedTestResult):
+            if result.confirm_success:
+                self.print_progress(f"Confirmed: {result.confirm_snapshot_id}")
+                self.print_progress(f"Remaining at confirm: {result.confirm_time_remaining_ms}ms")
+            if result.confirmed_survived_deadline:
+                self.print_progress(f"Observed survival: {result.confirmed_survival_elapsed_ms}ms")
+            if result.timeout_rollback_occurred:
+                self.print_progress(f"Timeout rollback: {result.timeout_rollback_snapshot_id}")
+        elif isinstance(result, RollbackTestResult):
+            if result.full_rollback_success:
+                self.print_progress(f"Full rollback: {result.full_rollback_snapshot_id}")
+            if result.selective_rollback_success:
+                self.print_progress(f"Selective rollback: {result.selective_rollback_snapshot_id}")
+                self.print_progress(f"Restored modules: {', '.join(result.selective_rollback_modules)}")
+        elif result.passed:
+            if isinstance(result, GuardrailsTestResult):
+                self.print_progress(f"Candidate: {result.candidate_snapshot_id} (epoch {result.candidate_epoch})")
+                self.print_progress(f"Restored: {result.rollback_snapshot_id} (epoch {result.rollback_epoch})")
+                self.print_progress(f"Protocol faults: {result.protocol_faults_observed}")
+            elif isinstance(result, NatExchangeResult):
+                self.print_progress(f"Mappings: {result.session_count}; return packets: {result.return_count}")
+                self.print_progress(f"NAT contexts: {result.context_count}")
         print(f"  Duration:   {result.duration_s:.2f}s", file=sys.stderr)
 
-        if result.message:
+        if result.message and not result.passed:
             print(f"  Message:    {result.message}", file=sys.stderr)
+
+    @staticmethod
+    def _print_traffic(tx: int, rx: int, loss_pct: float, latency_us: Optional[float]) -> None:
+        """Print observed traffic values once, preserving explicit latency absence."""
+        print(f"  TX:         {tx:,}", file=sys.stderr)
+        print(f"  RX:         {rx:,}", file=sys.stderr)
+        print(f"  Loss:       {loss_pct:.2f}%", file=sys.stderr)
+        latency = f"{latency_us:.1f}us" if latency_us is not None else "unavailable"
+        print(f"  Latency:    {latency}", file=sys.stderr)
 
     def print_suite_result(self, result: TestSuiteResult) -> None:
         """Print test suite summary."""

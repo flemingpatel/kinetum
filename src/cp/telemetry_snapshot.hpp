@@ -10,7 +10,7 @@
  *
  * Guardrails telemetry collection infrastructure.
  *
- * This module captures periodic telemetry snapshots that enable:
+ * This module stores accepted source intervals that enable:
  * - Before/after comparison around configuration changes
  * - Historical baseline establishment
  * - Attribution analysis (did config change cause degradation?)
@@ -40,7 +40,7 @@ namespace kinetum::cp
 {
 
 /**
- * @brief Complete telemetry snapshot at a point in time.
+ * @brief One accepted interval across the worker counter publications.
  *
  * Contains infrastructure metrics, module health, and metadata
  * for attribution analysis.
@@ -78,11 +78,12 @@ struct telemetry_snapshot {
 	// -------------------------------------------------------------------------
 	// Metadata
 	// -------------------------------------------------------------------------
-	std::string config_snapshot_id;	 ///< Config snapshot this applies to
-	uint64_t epoch{0};		 ///< Active epoch at capture time
-	uint64_t runtime_generation{0};	 ///< Exact cumulative-counter namespace.
-	uint64_t timestamp_ms{0};	 ///< Unix timestamp (milliseconds) - persistence/audit
-	uint64_t timestamp_mono_ns{0};	 ///< Monotonic timestamp (nanoseconds) - precise timing
+	std::string config_snapshot_id;	  ///< Config snapshot this applies to
+	uint64_t epoch{0};		  ///< Active epoch at capture time
+	uint64_t runtime_generation{0};	  ///< Exact cumulative-counter namespace.
+	uint64_t timestamp_ms{0};	  ///< Unix timestamp (milliseconds) - persistence/audit
+	uint64_t timestamp_mono_ns{0};	  ///< End of common worker measurement coverage.
+	uint64_t covered_duration_ns{0};  ///< Positive intersection of all worker intervals.
 
 	// -------------------------------------------------------------------------
 	// Infrastructure Metrics
@@ -94,7 +95,7 @@ struct telemetry_snapshot {
 	// Computed rates (packets per second)
 	double tx_pps{0.0};	       ///< Accepted-TX rate for this exact interval.
 	double drop_pps{0.0};	       ///< Terminal-drop rate for this exact interval.
-	double drop_ratio{0.0};	       ///< dropped / (tx + dropped)
+	double drop_ratio{0.0};	       ///< drop_pps / (tx_pps + drop_pps).
 	double throughput_ratio{1.0};  ///< tx_pps / baseline_tx_pps (deviation from normal)
 
 	// -------------------------------------------------------------------------
@@ -115,7 +116,7 @@ struct telemetry_snapshot {
 /** @brief Constant-time aggregate over one exact content history. */
 struct telemetry_history_summary {
 	std::size_t sample_count{0};  ///< Number of retained exact intervals.
-	double mean_tx_pps{0.0};      ///< Mean accepted-TX rate, or zero when empty.
+	double mean_tx_pps{0.0};      ///< Duration-weighted accepted-TX rate, or zero when empty.
 };
 
 /**
@@ -138,7 +139,7 @@ struct telemetry_history_summary {
  * @code
  *   telemetry_history history(100);  // Keep last 100 snapshots per config
  *
- *   // Record snapshot at each poll
+ *   // Record each accepted source interval
  *   history.record(snapshot);
  *
  *   // Get history for a specific config
@@ -223,8 +224,24 @@ class telemetry_history {
 
 	/** @brief One bounded row set plus its constant-time throughput aggregate. */
 	struct content_history {
-		std::deque<telemetry_snapshot> samples;	 ///< Oldest-first exact intervals.
-		long double tx_pps_sum{0.0L};		 ///< Sum matching every retained sample.
+		std::deque<telemetry_snapshot> samples;	   ///< Oldest-first exact intervals.
+		long double weighted_tx_sum{0.0L};	   ///< Rate times covered duration over retained rows.
+		long double weighted_tx_correction{0.0L};  ///< Retains small terms across insertion and eviction.
+		uint64_t duration_sum{0u};		   ///< Exact sum of nonoverlapping covered nanoseconds.
+		std::size_t positive_tx_intervals{0u};	   ///< Retained intervals with positive TX.
+
+		/**
+		 * @brief Add or evict one interval's weighted throughput with compensated summation.
+		 * @param value Signed rate-times-duration contribution.
+		 */
+		void adjust_weighted_tx(long double value) noexcept
+		{
+			const long double next = weighted_tx_sum + value;
+			weighted_tx_correction += std::abs(weighted_tx_sum) >= std::abs(value) ?
+							  (weighted_tx_sum - next) + value :
+							  (value - next) + weighted_tx_sum;
+			weighted_tx_sum = next;
+		}
 	};
 
 	std::unordered_map<std::string, content_history> history_;  ///< Exact bounded content rows.
@@ -244,8 +261,8 @@ inline telemetry_history::telemetry_history(std::size_t max_per_config)
 
 inline void telemetry_history::record(const telemetry_snapshot &snap)
 {
-	if (snap.config_snapshot_id.empty() || !std::isfinite(snap.tx_pps) || snap.tx_pps < 0.0 ||
-	    !std::isfinite(snap.drop_ratio) || snap.drop_ratio < 0.0 || snap.drop_ratio > 1.0 ||
+	if (snap.config_snapshot_id.empty() || snap.covered_duration_ns == 0u || !std::isfinite(snap.tx_pps) ||
+	    snap.tx_pps < 0.0 || !std::isfinite(snap.drop_ratio) || snap.drop_ratio < 0.0 || snap.drop_ratio > 1.0 ||
 	    !std::isfinite(snap.health_score) || snap.health_score < 0.0 || snap.health_score > 100.0) {
 		std::terminate();
 	}
@@ -256,7 +273,9 @@ inline void telemetry_history::record(const telemetry_snapshot &snap)
 		}
 		content_history candidate;
 		candidate.samples.push_back(snap);
-		candidate.tx_pps_sum = static_cast<long double>(snap.tx_pps);
+		candidate.duration_sum = snap.covered_duration_ns;
+		candidate.weighted_tx_sum = static_cast<long double>(snap.tx_pps) * candidate.duration_sum;
+		candidate.positive_tx_intervals = snap.tx_pps > 0.0 ? 1u : 0u;
 		const bool inserted = history_.try_emplace(snap.config_snapshot_id, std::move(candidate)).second;
 		if (!inserted) {
 			std::terminate();
@@ -267,13 +286,25 @@ inline void telemetry_history::record(const telemetry_snapshot &snap)
 	// Publish first so a failed copy leaves every retained sample untouched.
 	// The one temporary extra element is bounded cold-path storage.
 	entry.samples.push_back(snap);
-	entry.tx_pps_sum += static_cast<long double>(snap.tx_pps);
-	if (!std::isfinite(entry.tx_pps_sum)) {
+	entry.positive_tx_intervals += snap.tx_pps > 0.0 ? 1u : 0u;
+	if (entry.samples.size() > max_per_config_) {
+		const auto &oldest = entry.samples.front();
+		entry.adjust_weighted_tx(-static_cast<long double>(oldest.tx_pps) * oldest.covered_duration_ns);
+		entry.duration_sum -= oldest.covered_duration_ns;
+		entry.positive_tx_intervals -= oldest.tx_pps > 0.0 ? 1u : 0u;
+		entry.samples.pop_front();
+	}
+	if (snap.covered_duration_ns > UINT64_MAX - entry.duration_sum) {
 		std::terminate();
 	}
-	if (entry.samples.size() > max_per_config_) {
-		entry.tx_pps_sum -= static_cast<long double>(entry.samples.front().tx_pps);
-		entry.samples.pop_front();
+	entry.duration_sum += snap.covered_duration_ns;
+	entry.adjust_weighted_tx(static_cast<long double>(snap.tx_pps) * snap.covered_duration_ns);
+	if (!std::isfinite(entry.weighted_tx_sum) || !std::isfinite(entry.weighted_tx_correction)) {
+		std::terminate();
+	}
+	if (entry.positive_tx_intervals == 0u) {
+		entry.weighted_tx_sum = 0.0L;
+		entry.weighted_tx_correction = 0.0L;
 	}
 }
 
@@ -293,12 +324,14 @@ inline telemetry_history_summary telemetry_history::summary_for_config(const std
 		return {};
 	}
 	const auto count = position->second.samples.size();
-	if (count == 0u || !std::isfinite(position->second.tx_pps_sum)) {
+	const auto &entry = position->second;
+	const long double weighted = entry.weighted_tx_sum + entry.weighted_tx_correction;
+	if (count == 0u || entry.duration_sum == 0u || !std::isfinite(weighted)) {
 		std::terminate();
 	}
 	return telemetry_history_summary{
 		.sample_count = count,
-		.mean_tx_pps = static_cast<double>(position->second.tx_pps_sum / static_cast<long double>(count)),
+		.mean_tx_pps = static_cast<double>(weighted / static_cast<long double>(entry.duration_sum)),
 	};
 }
 

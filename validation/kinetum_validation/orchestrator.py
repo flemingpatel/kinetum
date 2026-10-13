@@ -190,21 +190,26 @@ class TestOrchestrator:
                 for size in self.config.packet.sizes_to_test:
                     result = await run_packet_test(context, size)
                     results.append(result)
+                    self.reporter.print_test_result(result)
 
             # Run epoch test
             if self.config.test_type in (TestType.EPOCH, TestType.FULL):
                 epoch_result = await run_epoch_test(context)
+                self.reporter.print_test_result(epoch_result)
 
             # Run commit-confirmed test.
             if self.config.test_type in (TestType.COMMIT_CONFIRMED, TestType.FULL):
                 commit_confirmed_result = await run_commit_confirmed_test(context)
+                self.reporter.print_test_result(commit_confirmed_result)
 
             # Run rollback test.
             if self.config.test_type in (TestType.ROLLBACK, TestType.FULL):
                 rollback_result = await run_rollback_test(context)
+                self.reporter.print_test_result(rollback_result)
 
             if self.config.test_type in (TestType.GUARDRAILS, TestType.FULL):
                 guardrails_result = await run_guardrails_test(context)
+                self.reporter.print_test_result(guardrails_result)
 
             # Collect and save DP stats
             stats_validation = await self._save_dp_stats(context)
@@ -213,6 +218,7 @@ class TestOrchestrator:
                 and self.config.test_type in (TestType.STANDARD, TestType.FULL)
             ):
                 nat_result = await run_nat_exchange(context)
+                self.reporter.print_test_result(nat_result)
 
         except BaseException as exc:
             execution_failure = exc

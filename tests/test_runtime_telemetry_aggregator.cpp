@@ -460,6 +460,14 @@ TEST(runtime_telemetry_aggregator, interval_engine_and_stage_banks_merge_once)
 	EXPECT_EQ(snapshot.engine.dropped_packets, 1u);
 	EXPECT_EQ(snapshot.engine.rx_bytes, 128u);
 	EXPECT_EQ(snapshot.engine.tx_bytes, 120u);
+	ASSERT_EQ(snapshot.worker_counters.size(), 1u);
+	EXPECT_EQ(snapshot.worker_counters.front().worker_index, 0u);
+	EXPECT_EQ(snapshot.worker_counters.front().publication_generation, 1u);
+	EXPECT_EQ(snapshot.worker_counters.front().observation_epoch, TEST_BOOTSTRAP_EPOCH);
+	EXPECT_EQ(snapshot.worker_counters.front().published_monotonic_ns, 1u);
+	EXPECT_EQ(snapshot.worker_counters.front().counters.rx_packets, snapshot.engine.rx_packets);
+	EXPECT_EQ(snapshot.worker_counters.front().counters.tx_packets, snapshot.engine.tx_packets);
+	EXPECT_EQ(snapshot.worker_counters.front().counters.dropped_packets, snapshot.engine.dropped_packets);
 	ASSERT_EQ(snapshot.streams.size(), 2u);
 	EXPECT_EQ(snapshot.streams[rx_stream].packets, 1u);
 	EXPECT_EQ(snapshot.streams[rx_stream].bytes, 128u);
@@ -485,6 +493,23 @@ TEST(runtime_telemetry_aggregator, interval_engine_and_stage_banks_merge_once)
 	EXPECT_EQ(snapshot.stages[logical_index].in_packets, 1u);
 	EXPECT_EQ(snapshot.stages[logical_index].out_packets, 1u);
 	EXPECT_EQ(snapshot.stages[logical_index].dropped_packets, 1u);
+	const uint64_t module_time = fixture->worker().cadence_ns() + 2u;
+	ASSERT_EQ(module_owner->service_telemetry_cadence(module_time), runtime_telemetry_return_need::EXPECTED);
+	fixture->settle_();
+	auto module_only = fixture->aggregator().collect({});
+	ASSERT_TRUE(module_only.is_ok()) << module_only.error().message();
+	EXPECT_EQ(module_only->latest_bank_publication_monotonic_ns, module_time);
+	ASSERT_EQ(module_only->worker_counters.size(), 1u);
+	EXPECT_EQ(module_only->worker_counters.front().publication_generation, 1u);
+	EXPECT_EQ(module_only->worker_counters.front().published_monotonic_ns, 1u);
+	fixture->worker().record_drop();
+	ASSERT_EQ(fixture->worker().service_turn(module_time).return_need, runtime_telemetry_return_need::EXPECTED);
+	fixture->settle_();
+	auto next_worker = fixture->aggregator().collect({});
+	ASSERT_TRUE(next_worker.is_ok()) << next_worker.error().message();
+	EXPECT_EQ(next_worker->worker_counters.front().publication_generation, 2u);
+	EXPECT_EQ(next_worker->worker_counters.front().published_monotonic_ns, module_time);
+	EXPECT_EQ(next_worker->worker_counters.front().counters.dropped_packets, 2u);
 }
 
 /** @brief Engine transfer totals derive from the same stream rows even when detail is not selected. */
@@ -506,6 +531,12 @@ TEST(runtime_telemetry_aggregator, stream_selection_cannot_change_engine_transfe
 	ASSERT_TRUE(summary.is_ok()) << summary.error().message();
 	ASSERT_TRUE(detailed.is_ok()) << detailed.error().message();
 	EXPECT_TRUE(summary->streams.empty());
+	ASSERT_EQ(summary->worker_counters.size(), 1u);
+	ASSERT_EQ(detailed->worker_counters.size(), 1u);
+	EXPECT_EQ(summary->worker_counters.front().publication_generation,
+		  detailed->worker_counters.front().publication_generation);
+	EXPECT_EQ(summary->worker_counters.front().published_monotonic_ns,
+		  detailed->worker_counters.front().published_monotonic_ns);
 	ASSERT_EQ(detailed->streams.size(), 2u);
 	EXPECT_EQ(summary->engine.rx_packets, 7u);
 	EXPECT_EQ(summary->engine.rx_bytes, 448u);

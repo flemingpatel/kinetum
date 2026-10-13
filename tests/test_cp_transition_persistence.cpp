@@ -304,7 +304,7 @@ TEST_F(CpTransitionPersistenceTest, mutation_logs_follow_durable_outcomes)
 	server.start();
 	{
 		control_loop loop(store.get(), server.stub);
-		control_service_impl service(store.get(), server.stub, loop);
+		control_service_impl service(store.get(), server.stub, loop, nullptr);
 		kinetum::control::v1::SetConfigSnapshotRequest request;
 		request.mutable_snapshot()->CopyFrom(make_candidate("logging-target", 2));
 		request.set_idempotency_key("logging-key");
@@ -368,7 +368,7 @@ TEST_F(CpTransitionPersistenceTest, failed_transition_logs_preserve_active_snaps
 	{
 		control_loop loop(store.get(), server.stub);
 		ASSERT_TRUE(loop.start().is_ok());
-		control_service_impl service(store.get(), server.stub, loop);
+		control_service_impl service(store.get(), server.stub, loop, nullptr);
 		kinetum::control::v1::SetConfigSnapshotRequest request;
 		request.mutable_snapshot()->CopyFrom(make_candidate("logging-failed", 2));
 		request.set_idempotency_key("logging-failed-key");
@@ -1048,7 +1048,7 @@ TEST_F(CpTransitionPersistenceTest, list_snapshots_never_uses_a_stale_control_lo
 	ASSERT_TRUE(store->complete_epoch_transition(identity_or.value(), 30'000).is_ok());
 	ASSERT_EQ(loop.published_state().snapshot_id, "bootstrap");
 
-	control_service_impl service(store.get(), nullptr, loop);
+	control_service_impl service(store.get(), nullptr, loop, nullptr);
 	kinetum::control::v1::ListSnapshotsRequest request;
 	request.set_page_size(kinetum::common::MAX_SNAPSHOT_LIST_PAGE_SIZE);
 	kinetum::control::v1::ListSnapshotsResponse response;

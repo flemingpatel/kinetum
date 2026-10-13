@@ -56,6 +56,8 @@
 namespace kinetum::cp
 {
 
+class guardrails_runner;
+
 /**
  * @brief Control Plane gRPC service implementation.
  *
@@ -110,10 +112,12 @@ class control_service_impl final : public kinetum::control::v1::ControlService::
 	 * @param dp_stub Shared pointer to the Data Plane gRPC stub.
 	 * @param loop Sole control_loop; must outlive this object and serializes all
 	 *             mutations without an owned fallback.
+	 * @param guardrails Read-only evaluator source, or null without a runner.
+	 *                   A nonnull owner must outlive this service.
 	 */
 	control_service_impl(config_store *store,
 			     std::shared_ptr<kinetum::dataplane::v1::DataplaneService::Stub> dp_stub,
-			     control_loop &loop);
+			     control_loop &loop, const guardrails_runner *guardrails);
 
 	// ---------------------------------------------------------------------------
 	// Configuration Snapshot Operations
@@ -353,8 +357,9 @@ class control_service_impl final : public kinetum::control::v1::ControlService::
 	// ---------------------------------------------------------------------------
 	// All config mutations AND guardrails policy changes go through this single
 	// shared control_loop. No owned loop fallback - single mutation authority.
-	// The runner reads the loop's RCU projection; GetGuardrails reads durable truth.
-	control_loop &loop_;  ///< Sole shared semantic mutation authority.
+	// GetGuardrails fences the runner's copied evidence against durable truth.
+	control_loop &loop_;		       ///< Sole shared semantic mutation authority.
+	const guardrails_runner *guardrails_;  ///< Optional process-owned observation publisher.
 
 	// Service startup time (for uptime tracking)
 	std::chrono::steady_clock::time_point start_time_{

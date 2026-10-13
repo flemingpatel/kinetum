@@ -16,8 +16,8 @@
  * through the ordinary durable epoch-transition authority.
  *
  * Commit-confirmed deadlines share that durable intent path. They retain Unix
- * time only because the deadline must survive restart; telemetry windows and
- * boundary ages use Data Plane monotonic collection time. A wall-clock sample
+ * time only because the deadline must survive restart. Telemetry windows use
+ * worker measurement coverage; boundary ages use Data Plane collection time. A wall-clock sample
  * before durable confirmation creation is deadline-winning and cannot extend
  * the original interval.
  *
@@ -37,7 +37,10 @@
 #include <condition_variable>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <thread>
+
+#include <kinetum/algo/rcu_buffer.hpp>
 
 #include "gen/kinetum/dataplane/v1/dataplane.grpc.pb.h"
 #include "src/common/status.hpp"
@@ -95,6 +98,13 @@ class guardrails_runner {
 	 */
 	void stop() noexcept;
 
+	/**
+	 * @brief Copy the latest evaluator publication without borrowing mutable state.
+	 * @return Absent before publication or after stop; otherwise one cold coherent value.
+	 * @throws std::bad_alloc If the bounded response copy cannot be allocated.
+	 */
+	[[nodiscard]] std::optional<kinetum::control::v1::GuardrailsEvaluation> evaluation() const;
+
     private:
 	struct runtime_state;
 
@@ -109,6 +119,8 @@ class guardrails_runner {
 	std::condition_variable wait_cv_;	///< Wakes cadence immediately on stop.
 	std::thread thread_;			///< Sole evaluator worker.
 	std::unique_ptr<runtime_state> state_;	///< Worker-private bounded evaluation state.
+	kinetum::algo::rcu_buffer<kinetum::control::v1::GuardrailsEvaluation>
+		evaluation_;  ///< Runner writes; RPC copies.
 };
 
 }  // namespace kinetum::cp

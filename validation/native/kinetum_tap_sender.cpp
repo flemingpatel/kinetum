@@ -51,23 +51,23 @@
 #include <vector>
 
 #include "src/common/process_output.hpp"
+#include "validation/native/tap_packet_profile.hpp"
 
 // =============================================================================
 // Constants (must match Python CONSTANTS in config/types.py)
 // =============================================================================
 
-static constexpr uint8_t MAGIC[] = {'K', 'I', 'N', 'E', 'T', 'U', 'M'};	 ///< Exact payload magic.
-static constexpr size_t MAGIC_LEN = 7;					 ///< Bytes in `MAGIC`.
-static constexpr size_t HEADER_SIZE = 21;  ///< Magic, sequence, tag, and binary64 timestamp bytes.
-
-static constexpr size_t ETH_HDR_LEN = 14;  ///< Exact Ethernet-II header bytes.
-static constexpr size_t IP_HDR_LEN = 20;   ///< Exact option-free IPv4 header bytes.
-static constexpr size_t UDP_HDR_LEN = 8;   ///< Exact UDP header bytes.
+using kinetum::validation::tap::ETH_HDR_LEN;
+using kinetum::validation::tap::HEADER_SIZE;
+using kinetum::validation::tap::IP_HDR_LEN;
+using kinetum::validation::tap::MAGIC;
+using kinetum::validation::tap::MAGIC_LEN;
+using kinetum::validation::tap::MAX_STREAMS;
+using kinetum::validation::tap::UDP_HDR_LEN;
 static constexpr size_t MIN_PKT_SIZE = ETH_HDR_LEN + IP_HDR_LEN + UDP_HDR_LEN + HEADER_SIZE;  ///< Wire floor.
 static constexpr uint32_t MIN_CLI_PACKET_SIZE = 64;	    ///< Minimum authored Ethernet frame bytes.
 static constexpr uint32_t MAX_CLI_PACKET_SIZE = 9000;	    ///< Maximum authored Ethernet frame bytes.
 static constexpr uint32_t MAX_RATE_LIMIT_PPS = 1000000000;  ///< Maximum authored packet rate.
-static constexpr size_t MAX_TAP_INTERFACES = 64;	    ///< Maximum unique ingress interfaces.
 static constexpr uint32_t MAX_GENERATION_TAG = std::numeric_limits<uint16_t>::max();  ///< Tag ceiling.
 
 static_assert(MIN_CLI_PACKET_SIZE >= MIN_PKT_SIZE, "minimum CLI frame must contain the complete validation payload");
@@ -484,8 +484,7 @@ static sender_stats run_send_loop(const std::vector<int> &sockets, packet_templa
 	const bool generation_tagged = strcmp(spec.mode, "generation-tagged") == 0;
 	uint32_t current_tag = generation_tagged ? spec.initial_generation_tag : 0;
 	uint64_t sequence = 0;
-	size_t num_ports = sockets.size();
-	size_t port_idx = 0;
+	std::size_t port_index = 0;
 
 	stats.start_time = now_seconds();
 	const auto end_time = std::chrono::steady_clock::now() + std::chrono::duration<double>(spec.duration_s);
@@ -540,10 +539,13 @@ static sender_stats run_send_loop(const std::vector<int> &sockets, packet_templa
 		ip[10] = static_cast<uint8_t>(cksum >> 8);
 		ip[11] = static_cast<uint8_t>(cksum & 0xFF);
 
-		// Send (round-robin across ports)
-		int fd = sockets[port_idx];
+		// Advance this residue cursor only with a successful packet ID.
+		const int fd = sockets[port_index];
 		ssize_t sent = send(fd, pkt, pkt_len, 0);
 		if (sent == static_cast<ssize_t>(pkt_len)) {
+			if (++port_index == sockets.size()) {
+				port_index = 0;
+			}
 			stats.tx_count++;
 			if (!stats.record_generation_tag(current_tag)) {
 				fprintf(stderr, "kinetum_tap_sender: distinct generation-tag bound exhausted\n");
@@ -559,11 +561,6 @@ static sender_stats run_send_loop(const std::vector<int> &sockets, packet_templa
 				stats.fatal_error = true;
 				break;
 			}
-		}
-
-		++port_idx;
-		if (port_idx == num_ports) {
-			port_idx = 0;
 		}
 	}
 
@@ -754,8 +751,7 @@ static bool parse_ports(std::string_view text, std::vector<std::string> &ports, 
 					const auto byte = static_cast<unsigned char>(value);
 					return byte <= 0x20u || byte > 0x7eu || value == '/';
 				}) ||
-		    std::find(parsed.begin(), parsed.end(), token) != parsed.end() ||
-		    parsed.size() == MAX_TAP_INTERFACES) {
+		    std::find(parsed.begin(), parsed.end(), token) != parsed.end() || parsed.size() == MAX_STREAMS) {
 			error = "--ports contains an invalid, duplicate, or excessive interface name";
 			return false;
 		}

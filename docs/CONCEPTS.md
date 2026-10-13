@@ -147,7 +147,7 @@ remain separate counts.
 
 **Runtime telemetry** - One shared
 `proto/kinetum/telemetry/v1/telemetry.proto` contract consumed by both DP and
-CP. Every successful observation carries runtime, engine, transition, and
+CP. Every successful observation carries runtime, engine, worker counters, transition, and
 protocol-fault summaries; selection flags add complete stage, module, health,
 worker, region, boundary, stream, storage-domain, port, steering, and module-context
 families. The generation-scoped source reads only completed banks and coherent

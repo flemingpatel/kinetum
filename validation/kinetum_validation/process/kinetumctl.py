@@ -55,6 +55,7 @@ from .response_reader import (
     read_snapshot_id,
 )
 from .telemetry_validation import stream_totals_are_exact
+from .guardrails_observation import GuardrailsPolicyIdentity, GuardrailsRead, parse_guardrails_json
 
 
 @dataclass
@@ -1081,7 +1082,7 @@ class KinetumCtl:
         max_drop_ratio: Optional[float] = None,
         min_tx_ratio: Optional[float] = None,
         min_packets_per_window: Optional[int] = None,
-    ) -> bool:
+    ) -> Optional[GuardrailsPolicyIdentity]:
         """
         Configure guardrails policy.
 
@@ -1102,8 +1103,8 @@ class KinetumCtl:
 
         Returns
         -------
-        bool
-            True if configuration succeeded.
+        GuardrailsPolicyIdentity, optional
+            Exact configured generation/hash, or None on failure.
 
         CLI equivalent:
             kinetumctl guardrails on --poll-ms <ms> --window-ms <ms>
@@ -1129,7 +1130,7 @@ class KinetumCtl:
                     "kinetumctl",
                     f"guardrails on missing required fields: {', '.join(missing)}",
                 )
-                return False
+                return None
         elif any(
             v is not None
             for v in (
@@ -1141,7 +1142,7 @@ class KinetumCtl:
             )
         ):
             log_error("kinetumctl", "guardrails off does not accept policy fields")
-            return False
+            return None
 
         args = ["guardrails", mode]
         if poll_interval_ms is not None:
@@ -1160,7 +1161,7 @@ class KinetumCtl:
 
         if retcode != 0:
             log_error("kinetumctl", f"failed to configure guardrails: {stderr or stdout}")
-            return False
+            return None
         try:
             response = parse_cli_success(
                 stdout,
@@ -1170,11 +1171,22 @@ class KinetumCtl:
             generation = protobuf_uint64(
                 response["policy_generation"], "guardrails policy_generation"
             )
-            if generation == 0:
-                raise JsonContractError("guardrails generation is zero")
-            _wire_sha256(response["policy_hash"])
+            if generation in {0, (1 << 64) - 1}:
+                raise JsonContractError("guardrails generation is outside its domain")
+            policy_hash = _wire_sha256(response["policy_hash"])
         except (JsonContractError, TypeError, ValueError):
             log_error("kinetumctl", "guardrails returned malformed success")
-            return False
+            return None
         log_info("kinetumctl", f"guardrails configured: {mode}")
-        return True
+        return GuardrailsPolicyIdentity(generation, policy_hash)
+
+    async def get_guardrails(self) -> GuardrailsRead:
+        """Read exact policy and evaluator evidence through one native command.
+
+        Native retry remains the sole RPC retry owner. Failed or malformed
+        responses raise; missing evaluator evidence remains an ordinary absence.
+        """
+        retcode, stdout, stderr = await self._run("guardrails", "show", "--format", "json")
+        if retcode != 0:
+            raise RuntimeError(f"guardrails read failed: {stderr or stdout}")
+        return parse_guardrails_json(stdout)

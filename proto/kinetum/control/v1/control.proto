@@ -428,6 +428,76 @@ message ConfigureGuardrailsResponse {
 
 message GetGuardrailsRequest {}
 
+enum GuardrailsEvaluationState {
+  GUARDRAILS_EVALUATION_STATE_UNSPECIFIED = 0;
+  GUARDRAILS_EVALUATION_STATE_UNCONFIGURED = 1;
+  GUARDRAILS_EVALUATION_STATE_DISABLED = 2;
+  GUARDRAILS_EVALUATION_STATE_BASELINE_BUILDING = 3;
+  GUARDRAILS_EVALUATION_STATE_ARMED = 4;
+  GUARDRAILS_EVALUATION_STATE_EVALUATING = 5;
+  GUARDRAILS_EVALUATION_STATE_ROLLBACK_PENDING = 6;
+}
+
+// Exact active content at an accepted observation; revision zero is valid.
+message GuardrailsObservationIdentity {
+  uint64 runtime_generation = 1;
+  string snapshot_id = 2;
+  uint64 epoch = 3;
+  uint64 revision = 4;
+  bytes validation_hash = 5;
+  uint32 expected_workers = 6;
+}
+
+enum GuardrailsRecommendation {
+  GUARDRAILS_RECOMMENDATION_UNSPECIFIED = 0;
+  GUARDRAILS_RECOMMENDATION_AUTO_ROLLBACK = 1;
+  GUARDRAILS_RECOMMENDATION_DEFER_TO_HUMAN = 2;
+  GUARDRAILS_RECOMMENDATION_LOG_ONLY = 3;
+}
+
+// Latest actual attribution, retained across its resulting rollback. Worker
+// vectors are copied once here, never once per scalar history entry.
+message GuardrailsAttribution {
+  GuardrailsObservationIdentity candidate = 1;
+  string rollback_snapshot_id = 2;
+  repeated kinetum.telemetry.v1.WorkerCounterStats previous_workers = 3;
+  repeated kinetum.telemetry.v1.WorkerCounterStats current_workers = 4;
+  double baseline_tx_pps = 5;
+  // Absent when the attribution attempt had incomplete evidence.
+  optional double confidence = 6;
+  GuardrailsRecommendation recommendation = 7;
+  bool evidence_complete = 8;
+  bool intent_accepted = 9;
+}
+
+enum GuardrailsEvaluationOutcome {
+  GUARDRAILS_EVALUATION_OUTCOME_UNSPECIFIED = 0;
+  GUARDRAILS_EVALUATION_OUTCOME_WINDOW_COMPLETE = 1;
+  GUARDRAILS_EVALUATION_OUTCOME_HISTORY_EXHAUSTED = 2;
+  GUARDRAILS_EVALUATION_OUTCOME_INTERVAL_EXCEEDS_WINDOW = 3;
+  GUARDRAILS_EVALUATION_OUTCOME_ROLLBACK_ACCEPTED = 4;
+}
+
+// Latest completed window in this policy/runtime namespace. No time or history
+// bound permits partial-interval estimates or automatic action without proof.
+message GuardrailsCompletedEvaluation {
+  GuardrailsObservationIdentity candidate = 1;
+  uint64 valid_observation_ns = 2;
+  GuardrailsEvaluationOutcome outcome = 3;
+}
+
+// Read-only process-local evidence, present only beside matching durable policy
+// and active identity. This is neither persisted authority nor enabledness.
+message GuardrailsEvaluation {
+  GuardrailsEvaluationState state = 1;
+  uint64 policy_generation = 2;
+  GuardrailsObservationIdentity observed_identity = 3;
+  uint32 baseline_intervals = 4;
+  uint64 valid_observation_ns = 5;
+  GuardrailsCompletedEvaluation last_completed = 6;
+  GuardrailsAttribution last_attribution = 7;
+}
+
 message GetGuardrailsResponse {
   kinetum.common.v1.Status status = 1;
   // Present for both enabled and explicitly disabled durable policy.
@@ -436,6 +506,7 @@ message GetGuardrailsResponse {
   uint64 policy_generation = 3;
   // Raw SHA-256 paired with nonzero generation; absent when unconfigured.
   bytes policy_hash = 4;
+  GuardrailsEvaluation evaluation = 5;
 }
 
 // =============================================================================

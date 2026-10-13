@@ -9,7 +9,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional, TextIO
 
-from ..config.types import BackendProfile, TestSuiteResult, TransitionType
+from ..config.types import (
+    AnalysisResult, BackendProfile, PacketStats, TestSuiteResult, TrafficDriverType, TransitionType,
+)
 from ..engine.json_contract import (
     EXPECTED_TRANSITION_TYPES_BY_TEST,
     parse_exact_json_object,
@@ -18,8 +20,9 @@ from ..engine.json_contract import (
 )
 from ..process.installation import is_symlink_free_regular_file
 from ..process.telemetry import PortStatsResult, StatsResult
+from ..process.guardrails_observation import GuardrailsRead, parse_guardrails_json
 from .console import ConsoleReporter
-from ..process.telemetry_validation import boundary_transition_is_complete
+from ..process.telemetry_validation import boundary_transition_is_complete, worker_counters_are_exact
 from ..process.system_tools import RECOVERABLE_EXCEPTIONS
 
 
@@ -38,6 +41,8 @@ class RunArtifacts:
 
     def write_stats(self, stats: StatsResult) -> None:
         """Write observations or a query-failure note; only success yields JSON and a summary."""
+        if stats.success and not worker_counters_are_exact(stats):
+            raise RuntimeError("final statistics lack their exact worker-counter observations")
         stats_file = self.output_dir / "dp_stats.txt"
         with open(stats_file, "x", encoding="utf-8") as f:
             f.write("# Kinetum DP Statistics\n")
@@ -65,6 +70,18 @@ class RunArtifacts:
                 f.write("\n# Protocol Fault Counters\n")
                 for code, count in sorted(stats.protocol_fault_counts.items()):
                     f.write(f"  {code}: {count}\n")
+
+                f.write("\n# Worker Counter Observations\n")
+                for worker in stats.worker_counters:
+                    f.write(
+                        f"  worker_{worker.worker_index}: epoch={worker.observation_epoch}"
+                        f" publication={worker.publication_generation}"
+                        f" published_monotonic_ns={worker.published_monotonic_ns}"
+                        f" rx={worker.rx_packets} tx={worker.tx_packets}"
+                        f" drop={worker.dropped_packets}"
+                        f" rx_bytes={worker.rx_bytes} tx_bytes={worker.tx_bytes}"
+                        f" fanout_overflow={worker.fanout_overflow}\n"
+                    )
 
                 if stats.stage_stats:
                     f.write("\n# Stage Stats\n")
@@ -303,6 +320,7 @@ class RunArtifacts:
                 "worker_epoch_stats": [
                     asdict(row) for row in stats.worker_epoch_stats
                 ],
+                "worker_counters": [asdict(row) for row in stats.worker_counters],
                 "stream_stats": [
                     asdict(row) for row in stats.stream_stats
                 ],
@@ -601,8 +619,9 @@ class RunArtifacts:
         """
         Compute per-transition deltas and append to transition_metrics.jsonl.
 
-        Writes one JSON record only for exact boundary timing,
-        generation-cumulative counter deltas, and protocol-fault deltas.
+        Writes exact terminal boundary timing with counter deltas over their
+        recorded source endpoints. Those endpoints may span an earlier apply
+        when an automatic rollback completed before the next observation.
 
         Parameters
         ----------
@@ -796,6 +815,21 @@ class RunArtifacts:
             "to_epoch": to_epoch,
             "transition_state": post.transition_state,
             "transition_success_blocked": post.transition_success_blocked,
+            "counter_observations": {
+                "expected_workers": post.expected_workers,
+                "before": {
+                    "snapshot_id": pre.active_snapshot_id,
+                    "active_epoch": pre.active_epoch,
+                    "collection_monotonic_ns": pre.collection_monotonic_ns,
+                    "workers": [asdict(row) for row in pre.worker_counters],
+                },
+                "after": {
+                    "snapshot_id": post.active_snapshot_id,
+                    "active_epoch": post.active_epoch,
+                    "collection_monotonic_ns": post.collection_monotonic_ns,
+                    "workers": [asdict(row) for row in post.worker_counters],
+                },
+            },
             "rx_packets_delta": rx_packets_delta,
             "tx_packets_delta": delta(
                 post.tx_packets, pre.tx_packets, "engine TX packets"
@@ -839,6 +873,66 @@ class RunArtifacts:
                 self.reporter.print_progress(
                     f"  {sd['stage_id']}: drop_delta={sd['dropped_packets_delta']}"
                 )
+
+    def write_traffic_evidence(
+        self,
+        capture: Path,
+        traffic_driver: TrafficDriverType,
+        sender: PacketStats,
+        analysis: Optional[AnalysisResult],
+    ) -> None:
+        """Retain sender observations and available analysis; failed capture never becomes zero."""
+        if capture.parent != self.output_dir or capture.suffix != ".pcap":
+            raise RuntimeError("traffic evidence does not belong to the held run directory")
+        with capture.with_suffix(".traffic.json").open("x", encoding="utf-8") as output:
+            json.dump({
+                "traffic_driver": traffic_driver.value,
+                "sender": asdict(sender),
+                "analysis": None if analysis is None else {
+                    "total_rx": analysis.total_rx,
+                    "valid": analysis.valid,
+                    "invalid": analysis.invalid,
+                    "duplicates": analysis.duplicates,
+                    "out_of_order": analysis.out_of_order,
+                    "missing_count": analysis.missing_count,
+                    "max_gap": analysis.max_gap,
+                    "tag_counts": analysis.tag_counts,
+                    "transition_seq": analysis.transition_seq,
+                    "tag_transition_count": analysis.tag_transition_count,
+                    "streams": (
+                        [asdict(row) for row in analysis.streams] if analysis.streams is not None else None
+                    ),
+                    "latency": analysis.latency_stats(),
+                },
+            }, output, allow_nan=False, indent=2, sort_keys=True)
+            output.write("\n")
+
+    def write_guardrails_evaluation(
+        self, armed: GuardrailsRead, decision: GuardrailsRead, arming_elapsed_s: float,
+    ) -> None:
+        """Retain actual arming and attribution reads with the measured arming duration."""
+        parsed_armed = parse_guardrails_json(armed.raw_json)
+        parsed_decision = parse_guardrails_json(decision.raw_json)
+        if (
+            not math.isfinite(arming_elapsed_s) or arming_elapsed_s <= 0.0
+            or parsed_armed.identity != parsed_decision.identity
+            or parsed_armed.evaluation is None
+            or parsed_armed.evaluation.state != "GUARDRAILS_EVALUATION_STATE_ARMED"
+        ):
+            raise RuntimeError("guardrails artifact lacks exact policy-bound arming evidence")
+        if (
+            parsed_decision.evaluation is None
+            or parsed_decision.evaluation.last_attribution is None
+            or not parsed_decision.evaluation.last_attribution.intent_accepted
+        ):
+            raise RuntimeError("guardrails artifact lacks the accepted attribution")
+        with (self.output_dir / "guardrails_evaluation.json").open("x", encoding="utf-8") as output:
+            json.dump({
+                "arming_elapsed_s": arming_elapsed_s,
+                "armed": parse_exact_json_object(armed.raw_json, "armed guardrails response"),
+                "decision": parse_exact_json_object(decision.raw_json, "guardrails attribution response"),
+            }, output, allow_nan=False, indent=2, sort_keys=True)
+            output.write("\n")
 
     def save_test_results(self, result: TestSuiteResult, profile: BackendProfile) -> None:
         """Save test results to JSON file."""
@@ -934,6 +1028,8 @@ class RunArtifacts:
                     "confirm_success": cc.confirm_success,
                     "confirm_snapshot_id": cc.confirm_snapshot_id,
                     "confirm_time_remaining_ms": cc.confirm_time_remaining_ms,
+                    "confirmed_survived_deadline": cc.confirmed_survived_deadline,
+                    "confirmed_survival_elapsed_ms": cc.confirmed_survival_elapsed_ms,
                     "timeout_rollback_occurred": cc.timeout_rollback_occurred,
                     "timeout_rollback_snapshot_id": cc.timeout_rollback_snapshot_id,
                     "tx_count": cc.tx_count,

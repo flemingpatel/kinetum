@@ -198,8 +198,4 @@ async def run_nat_exchange(context: ScenarioContext) -> NatExchangeResult:
     with (context.config.output_dir / "nat_exchange.json").open("x", encoding="utf-8") as output:
         json.dump(evidence, output, allow_nan=False, indent=2, sort_keys=True)
         output.write("\n")
-    if result.passed:
-        context.reporter.print_progress(result.message)
-    else:
-        context.reporter.print_error("NAT exchange failed", result.message)
     return result

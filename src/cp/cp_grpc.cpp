@@ -63,6 +63,7 @@
 
 #include "src/common/application_status.hpp"
 #include "src/common/control_plane_contract.hpp"
+#include "src/common/guardrails_evaluation_contract.hpp"
 #include "src/common/epoch_transition_contract.hpp"
 #include "src/common/log.hpp"
 #include "src/common/runtime_telemetry_contract.hpp"
@@ -71,6 +72,7 @@
 #include "src/common/version.hpp"
 #include "src/common/logging_status.hpp"
 #include "src/cp/guardrails_policy.hpp"
+#include "src/cp/guardrails.hpp"
 #include "src/cp/runtime_authority_fence.hpp"
 
 namespace kinetum::cp
@@ -241,10 +243,11 @@ static kinetum::common::status map_successful_stats(const cp_published_state &cp
 
 control_service_impl::control_service_impl(config_store *store,
 					   std::shared_ptr<kinetum::dataplane::v1::DataplaneService::Stub> dp_stub,
-					   control_loop &loop)
+					   control_loop &loop, const guardrails_runner *guardrails)
 	: store_(store)
 	, dp_(std::move(dp_stub))
 	, loop_(loop)
+	, guardrails_(guardrails)
 {
 	// The single shared control_loop is injected from cp_main, ensuring one
 	// mutation authority for the entire CP. The runner consumes the loop's RCU
@@ -841,6 +844,23 @@ try {
 	auto policy_or = store_->guardrails_policy();
 	if (!policy_or.is_ok()) {
 		if (policy_or.error().code() == kinetum::common::status_code::NOT_FOUND) {
+			if (guardrails_ != nullptr) {
+				auto evaluation = guardrails_->evaluation();
+				if (evaluation.has_value() && evaluation->policy_generation() == 0u) {
+					const auto valid = kinetum::common::validate_guardrails_evaluation(*evaluation,
+													   nullptr, 0u);
+					if (!valid.is_ok()) {
+						set_application_status(
+							valid.code() == kinetum::common::status_code::INVALID_ARGUMENT ?
+								kinetum::common::status::data_loss(
+									"guardrails evaluator published invalid evidence") :
+								valid,
+							response->mutable_status());
+						return grpc::Status::OK;
+					}
+					*response->mutable_evaluation() = std::move(*evaluation);
+				}
+			}
 			set_application_status(kinetum::common::status::ok(), response->mutable_status());
 			return grpc::Status::OK;
 		}
@@ -851,6 +871,42 @@ try {
 	response->set_policy_generation(policy_or->generation);
 	response->set_policy_hash(reinterpret_cast<const char *>(policy_or->policy_hash.data()),
 				  policy_or->policy_hash.size());
+	if (guardrails_ != nullptr) {
+		auto before_or = store_->runtime_authority();
+		auto evaluation = guardrails_->evaluation();
+		auto after_or = store_->runtime_authority();
+		auto current_policy = store_->guardrails_policy();
+		bool matching = evaluation.has_value() && evaluation->policy_generation() == policy_or->generation &&
+				current_policy.is_ok() && current_policy->generation == policy_or->generation &&
+				current_policy->policy_hash == policy_or->policy_hash;
+		if (matching && evaluation->has_observed_identity()) {
+			const auto &identity = evaluation->observed_identity();
+			matching = before_or.is_ok() && after_or.is_ok() &&
+				   same_active_runtime_authority(before_or.value(), after_or.value()) &&
+				   identity.snapshot_id() == after_or->active.snapshot_id &&
+				   identity.epoch() == after_or->active.active_epoch &&
+				   identity.revision() == static_cast<uint64_t>(after_or->active.revision) &&
+				   identity.validation_hash() ==
+					   std::string(reinterpret_cast<const char *>(
+							       after_or->active.active_validation_hash.data()),
+						       after_or->active.active_validation_hash.size());
+		}
+		if (matching) {
+			const auto valid = kinetum::common::validate_guardrails_evaluation(
+				*evaluation, &policy_or->policy, policy_or->generation);
+			if (!valid.is_ok()) {
+				response->Clear();
+				set_application_status(
+					valid.code() == kinetum::common::status_code::INVALID_ARGUMENT ?
+						kinetum::common::status::data_loss(
+							"guardrails evaluator published invalid evidence") :
+						valid,
+					response->mutable_status());
+				return grpc::Status::OK;
+			}
+			*response->mutable_evaluation() = std::move(*evaluation);
+		}
+	}
 	set_application_status(kinetum::common::status::ok(), response->mutable_status());
 	return grpc::Status::OK;
 } catch (const std::bad_alloc &) {

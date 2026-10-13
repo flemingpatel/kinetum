@@ -209,13 +209,13 @@ class fake_dp_service : public kinetum::dataplane::v1::DataplaneService::Service
 	uint64_t dropped_packets{10};				 ///< Cumulative terminal packet retirements.
 	uint64_t active_epoch{5};				 ///< Exact active runtime epoch.
 	uint64_t min_retained_epoch{5};				 ///< Minimum retained runtime epoch.
-	uint64_t rx_bytes{0};					 ///< Cumulative engine RX bytes.
-	uint64_t tx_bytes{0};					 ///< Cumulative engine TX bytes.
+	uint64_t rx_bytes{64'000};				 ///< Cumulative engine RX bytes.
+	uint64_t tx_bytes{63'360};				 ///< Cumulative engine TX bytes.
 	uint64_t runtime_generation{1};				 ///< Exact process-generation identity.
 	uint64_t collection_monotonic_ns{UINT64_C(1000000000)};	 ///< Collection timestamp.
 	uint64_t latest_bank_publication_monotonic_ns{UINT64_C(999999000)};  ///< Latest merged bank time.
-	std::string plan_content_hash{32u, '\x01'};			     ///< Raw exact plan digest.
-	std::string active_validation_hash{32u, '\x02'};		     ///< Raw hash paired with active_epoch.
+	std::string plan_content_hash = std::string(32u, '\x01');	     ///< Raw exact plan digest.
+	std::string active_validation_hash = std::string(32u, '\x02');	     ///< Raw hash paired with active_epoch.
 	std::optional<uint64_t> allocated_epoch_high_watermark;	   ///< Override for an in-flight durable allocation.
 	std::optional<uint64_t> mutation_sequence_high_watermark;  ///< Override for an in-flight durable allocation.
 	std::optional<fake_completed_transition_stats> latest_completed_transition;  ///< Optional DP-ahead result.
@@ -333,6 +333,26 @@ class fake_dp_service : public kinetum::dataplane::v1::DataplaneService::Service
 		engine->set_rx_bytes(rx_bytes);
 		engine->set_tx_bytes(tx_bytes);
 		engine->set_fanout_overflow(region_fanout_overflow);
+		// The fake's authored path receives on its first worker and retires/TXs
+		// on its last. Additional participants carry explicit zero observations.
+		for (uint32_t index = 0u; index < participant_count; ++index) {
+			auto *row = telemetry->add_worker_counters();
+			row->set_worker_index(index);
+			row->set_observation_epoch(active_epoch);
+			row->set_publication_generation(1u);
+			row->set_published_monotonic_ns(latest_bank_publication_monotonic_ns);
+			auto *counts = row->mutable_counters();
+			if (index == 0u) {
+				counts->set_rx_packets(rx_packets);
+				counts->set_rx_bytes(rx_bytes);
+			}
+			if (index + 1u == participant_count) {
+				counts->set_tx_packets(tx_packets);
+				counts->set_tx_bytes(tx_bytes);
+				counts->set_dropped_packets(dropped_packets);
+				counts->set_fanout_overflow(region_fanout_overflow);
+			}
+		}
 		auto *transition = telemetry->mutable_transition();
 		transition->set_publication_generation(1u);
 		transition->set_state(kinetum::telemetry::v1::EPOCH_TRANSITION_STATE_IDLE);
