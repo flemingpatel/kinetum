@@ -332,6 +332,57 @@ def _reject_json_constant(value: str) -> NoReturn:
     raise JsonContractError(f"non-finite JSON constant: {value}")
 
 
+def _transition_counter_observations(value: Dict[str, Any]) -> None:
+    """Validate actual source endpoints independently of the named terminal transition."""
+    pair = require_object(value["counter_observations"], "counter observations")
+    require_exact_keys(pair, {"before", "after", "expected_workers"}, "counter observations")
+    expected = require_int(pair["expected_workers"], "counter worker population", minimum=1, maximum=(1 << 32) - 1)
+    counters = ("rx_packets", "tx_packets", "dropped_packets", "rx_bytes", "tx_bytes", "fanout_overflow")
+    for name in ("before", "after"):
+        endpoint = require_object(pair[name], f"{name} counter observation")
+        require_exact_keys(endpoint, {"snapshot_id", "active_epoch", "collection_monotonic_ns", "workers"}, name)
+        require_string(endpoint["snapshot_id"], "observed snapshot")
+        epoch = require_int(endpoint["active_epoch"], "observed epoch", minimum=1, maximum=_UINT64_MAX - 1)
+        collected = require_int(endpoint["collection_monotonic_ns"], "collection time", minimum=1, maximum=_UINT64_MAX)
+        workers = require_array(endpoint["workers"], "worker counter observations")
+        if len(workers) != expected:
+            raise JsonContractError("transition counter observation lacks its exact worker population")
+        for index, worker in enumerate(workers):
+            require_exact_keys(require_object(worker, "worker counters"), set(counters) | {
+                "worker_index", "observation_epoch", "publication_generation", "published_monotonic_ns",
+            }, "worker counters")
+            if require_int(worker["worker_index"], "worker index", minimum=0, maximum=(1 << 32) - 1) != index:
+                raise JsonContractError("transition counter workers are not compact")
+            require_int(worker["observation_epoch"], "worker epoch", minimum=1, maximum=epoch)
+            require_int(worker["publication_generation"], "worker generation", minimum=1, maximum=_UINT64_MAX)
+            require_int(worker["published_monotonic_ns"], "worker measurement time", minimum=1, maximum=collected)
+            for counter in counters:
+                require_int(worker[counter], counter, minimum=0, maximum=_UINT64_MAX - 1)
+            for direction in ("rx", "tx"):
+                packets = worker[f"{direction}_packets"]
+                byte_count = worker[f"{direction}_bytes"]
+                if (packets == 0) != (byte_count == 0) or byte_count < packets:
+                    raise JsonContractError("transition counter packet and byte observations disagree")
+        if any(sum(worker[counter] for worker in workers) >= _UINT64_MAX for counter in counters):
+            raise JsonContractError("transition counter source totals are exhausted")
+    before = pair["before"]["workers"]
+    after = pair["after"]["workers"]
+    if len(before) != len(after):
+        raise JsonContractError("transition counter worker membership changed")
+    for previous, current in zip(before, after):
+        compared = (*counters, "observation_epoch", "publication_generation", "published_monotonic_ns")
+        if any(current[field] < previous[field] for field in compared):
+            raise JsonContractError("transition counter observation regressed")
+        if current["publication_generation"] == previous["publication_generation"] and current != previous:
+            raise JsonContractError("transition counter observation changed without publication")
+    for counter in counters[:3]:
+        observed_delta = sum(row[counter] for row in after) - sum(row[counter] for row in before)
+        if observed_delta != value[f"{counter}_delta"]:
+            raise JsonContractError("transition counter delta contradicts its source observations")
+    if pair["before"]["active_epoch"] > value["from_epoch"] or pair["after"]["active_epoch"] != value["to_epoch"]:
+        raise JsonContractError("transition counter provenance contradicts terminal epochs")
+
+
 def validate_transition_metric_record(value: Dict[str, Any]) -> None:
     """Validate one complete successful transition evidence record."""
     require_exact_keys(
@@ -342,6 +393,7 @@ def validate_transition_metric_record(value: Dict[str, Any]) -> None:
             "transition_success_blocked", "rx_packets_delta", "tx_packets_delta",
             "dropped_packets_delta", "protocol_fault_deltas",
             "boundary_epoch_stats", "region_epoch_stats", "stage_stats",
+            "counter_observations",
         },
         "transition metric",
     )
@@ -387,6 +439,7 @@ def validate_transition_metric_record(value: Dict[str, Any]) -> None:
             maximum=_UINT64_MAX,
         )
 
+    _transition_counter_observations(value)
     faults = require_object(
         value["protocol_fault_deltas"], "transition protocol-fault deltas"
     )
@@ -717,13 +770,13 @@ def _validate_commit_confirmed_test_result(
     row: Dict[str, Any], row_passed: bool, latency_source: str | None,
 ) -> None:
     """Validate the complete commit confirmed test evidence row."""
-    for name in ("confirm_success", "timeout_rollback_occurred"):
+    for name in ("confirm_success", "confirmed_survived_deadline", "timeout_rollback_occurred"):
         require_bool(row[name], f"commit-confirmed {name}")
     for name in ("confirm_snapshot_id", "timeout_rollback_snapshot_id"):
         require_string(
             row[name], f"commit-confirmed {name}", allow_empty=True
         )
-    for name in ("confirm_time_remaining_ms", "tx_count", "rx_count"):
+    for name in ("confirm_time_remaining_ms", "confirmed_survival_elapsed_ms", "tx_count", "rx_count"):
         require_int(
             row[name], f"commit-confirmed {name}", minimum=0,
             maximum=_UINT64_MAX,
@@ -753,7 +806,13 @@ def _validate_commit_confirmed_test_result(
     confirmation_complete = (
         row["confirm_success"] and bool(row["confirm_snapshot_id"])
         and row["confirm_time_remaining_ms"] > 0
+        and row["confirmed_survived_deadline"]
+        and row["confirmed_survival_elapsed_ms"] >= row["confirm_time_remaining_ms"]
     )
+    if row["confirmed_survived_deadline"] and (
+        not confirmation_complete or row["confirmed_survival_elapsed_ms"] > row["duration_s"] * 1000.0
+    ):
+        raise JsonContractError("confirmed survival has no complete after-deadline observation")
     rollback_complete = (
         row["timeout_rollback_occurred"]
         and row["timeout_rollback_snapshot_id"] == row["confirm_snapshot_id"]
@@ -957,6 +1016,7 @@ def validate_test_suite_result(
         "commit_confirmed_test": {
             "passed", "duration_s", "confirm_success", "confirm_snapshot_id",
             "confirm_time_remaining_ms", "timeout_rollback_occurred",
+            "confirmed_survived_deadline", "confirmed_survival_elapsed_ms",
             "timeout_rollback_snapshot_id", "tx_count", "rx_count", "loss_pct",
             "avg_latency_us", "message",
         },

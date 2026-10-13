@@ -77,6 +77,29 @@ def _make_record(
         "to_epoch": to_epoch,
         "transition_state": "EPOCH_TRANSITION_STATE_IDLE",
         "transition_success_blocked": False,
+        "counter_observations": {
+            "expected_workers": 1,
+            "before": {
+                "snapshot_id": f"snapshot.{from_epoch}", "active_epoch": from_epoch,
+                "collection_monotonic_ns": 100,
+                "workers": [{
+                    "worker_index": 0, "observation_epoch": from_epoch,
+                    "publication_generation": 1, "published_monotonic_ns": 100,
+                    "rx_packets": 100, "tx_packets": 100, "dropped_packets": 0,
+                    "rx_bytes": 6400, "tx_bytes": 6400, "fanout_overflow": 0,
+                }],
+            },
+            "after": {
+                "snapshot_id": f"snapshot.{to_epoch}", "active_epoch": to_epoch,
+                "collection_monotonic_ns": 200,
+                "workers": [{
+                    "worker_index": 0, "observation_epoch": to_epoch,
+                    "publication_generation": 2, "published_monotonic_ns": 200,
+                    "rx_packets": 1100, "tx_packets": 1100, "dropped_packets": 0,
+                    "rx_bytes": 70400, "tx_bytes": 70400, "fanout_overflow": fanout_overflow,
+                }],
+            },
+        },
         "rx_packets_delta": 1000,
         "tx_packets_delta": 1000,
         "dropped_packets_delta": 0,
@@ -336,6 +359,8 @@ def _commit_confirmed_result_artifact() -> dict:
             "confirm_success": True,
             "confirm_snapshot_id": "confirmed",
             "confirm_time_remaining_ms": 1000,
+            "confirmed_survived_deadline": True,
+            "confirmed_survival_elapsed_ms": 2000,
             "timeout_rollback_occurred": True,
             "timeout_rollback_snapshot_id": "confirmed",
             "tx_count": 100,
@@ -469,6 +494,29 @@ class TestTransitionSummaryPerType(unittest.TestCase):
         with self.assertRaisesRegex(JsonContractError, "exceeds its maximum"):
             validate_transition_metric_record(record)
 
+    def test_transition_counters_preserve_their_actual_observation_window(self):
+        """A late rollback observer names its earlier baseline without fabricating candidate-only counters."""
+        record = _make_record(TransitionType.GUARDRAILS_ROLLBACK, 2, 3, ack_gate_ns=300)
+        before = record["counter_observations"]["before"]
+        before["active_epoch"] = 1
+        before["snapshot_id"] = "baseline"
+        before["workers"][0]["observation_epoch"] = 1
+        validate_transition_metric_record(record)
+        record["counter_observations"]["after"]["workers"][0]["publication_generation"] = 1
+        with self.assertRaisesRegex(JsonContractError, "changed without publication"):
+            validate_transition_metric_record(record)
+
+    def test_transition_counter_population_and_totals_are_required(self):
+        """Missing workers and deltas disconnected from their source endpoints fail admission."""
+        record = _make_record(TransitionType.EPOCH, 1, 2, ack_gate_ns=300)
+        record["counter_observations"]["expected_workers"] = 2
+        with self.assertRaisesRegex(JsonContractError, "exact worker population"):
+            validate_transition_metric_record(record)
+        record["counter_observations"]["expected_workers"] = 1
+        record["rx_packets_delta"] = 999
+        with self.assertRaisesRegex(JsonContractError, "contradicts its source observations"):
+            validate_transition_metric_record(record)
+
     def test_epoch_success_requires_both_traffic_generations_and_ordering(self):
         """Boolean success cannot replace exact traffic or content identity."""
         artifact = _epoch_test_result_artifact()
@@ -498,6 +546,19 @@ class TestTransitionSummaryPerType(unittest.TestCase):
 
         commit = _commit_confirmed_result_artifact()
         validate_test_suite_result(commit)
+        for survival in (
+            {"confirmed_survived_deadline": False, "confirmed_survival_elapsed_ms": 0},
+            {"confirmed_survival_elapsed_ms": 999},
+            {"confirmed_survival_elapsed_ms": 31000},
+        ):
+            malformed = copy.deepcopy(commit)
+            malformed["commit_confirmed_test"].update(survival)
+            with self.subTest(survival=survival), self.assertRaises(JsonContractError):
+                validate_test_suite_result(malformed)
+        malformed = copy.deepcopy(commit)
+        del malformed["commit_confirmed_test"]["confirmed_survived_deadline"]
+        with self.assertRaises(JsonContractError):
+            validate_test_suite_result(malformed)
         commit_result = require_object(
             commit["commit_confirmed_test"], "commit-confirmed fixture"
         )

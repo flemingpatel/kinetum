@@ -42,7 +42,7 @@ struct storage_domain_buffer_budget_inputs {
 	std::string storage_domain_id;		     ///< Exact plan-owned domain identity.
 	uint64_t declared_buffer_count{0};	     ///< Exact authored physical capacity.
 	uint64_t rx_descriptor_count{0};	     ///< RX descriptors retaining domain credits.
-	uint64_t tx_descriptor_count{0};	     ///< TX descriptors retaining caller credits.
+	uint64_t tx_descriptor_count{0};	     ///< TX stream native buffer reservation.
 	uint64_t worker_count{0};		     ///< Exact workers staging this domain.
 	uint64_t worker_staging_capacity{0};	     ///< Exact aggregate active worker-queue credits.
 	uint64_t handoff_staging_capacity{0};	     ///< Boundary and bounded-copy credits for this domain.

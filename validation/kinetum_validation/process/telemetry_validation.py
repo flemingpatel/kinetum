@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import List, Optional, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 from .telemetry import (
     _PROTOCOL_FAULT_CODES,
@@ -19,6 +19,7 @@ from .telemetry import (
     BoundaryEpochStatsResult,
     RegionEpochStatsResult,
     WorkerEpochStatsResult,
+    WorkerCounterStatsResult,
     StreamStatsResult,
     StorageDomainStatsResult,
     PortStatsResult,
@@ -1215,7 +1216,19 @@ def stream_totals_are_exact(result: StatsResult) -> bool:
             or packet_total != packets or byte_total != byte_count
         ):
             return False
-    return True
+    if len(result.worker_counters) != result.expected_workers:
+        return False
+    totals = [[0, 0, 0, 0] for _ in result.worker_counters]
+    for row in result.stream_stats:
+        if not 0 <= row.worker_index < len(totals):
+            return False
+        offset = 0 if row.direction == "rx" else 2
+        totals[row.worker_index][offset] += row.packets
+        totals[row.worker_index][offset + 1] += row.bytes
+    return all(
+        values == [row.rx_packets, row.rx_bytes, row.tx_packets, row.tx_bytes]
+        for row, values in zip(result.worker_counters, totals)
+    )
 
 
 def _stream_row_is_exact(row: StreamStatsResult, result: StatsResult) -> bool:
@@ -1235,6 +1248,7 @@ def _stream_row_is_exact(row: StreamStatsResult, result: StatsResult) -> bool:
         <= min(result.latest_bank_publication_monotonic_ns, result.collection_monotonic_ns)
         and (row.packets == 0) == (row.bytes == 0)
         and row.bytes >= row.packets
+        and row.published_monotonic_ns == result.worker_counters[row.worker_index].published_monotonic_ns
     )
 
 
@@ -1387,12 +1401,84 @@ def _participant_counts_are_exact(result: StatsResult) -> bool:
     )
 
 
+def worker_counter_values_are_exact(row: WorkerCounterStatsResult) -> bool:
+    """Validate a copied worker's complete nonexhausted counter tuple."""
+    return (
+        all(
+            isinstance(count, int) and not isinstance(count, bool) and 0 <= count < _UINT64_MAX
+            for count in row.counter_values()
+        )
+        and (row.rx_packets == 0) == (row.rx_bytes == 0) and row.rx_bytes >= row.rx_packets
+        and (row.tx_packets == 0) == (row.tx_bytes == 0) and row.tx_bytes >= row.tx_packets
+    )
+
+
+def worker_counters_are_exact(result: StatsResult) -> bool:
+    """Prove dense mandatory worker membership and sole derivation of engine totals."""
+    rows = result.worker_counters
+    if len(rows) != result.expected_workers or result.expected_workers != result.execution_participant_count:
+        return False
+    for index, row in enumerate(rows):
+        identity_exact = (
+            row.worker_index == index
+            and 0 < row.observation_epoch <= result.allocated_epoch_high_watermark
+            and 0 < row.publication_generation <= _UINT64_MAX
+            and 0 < row.published_monotonic_ns <= result.latest_bank_publication_monotonic_ns
+        )
+        if not identity_exact:
+            return False
+        if not worker_counter_values_are_exact(row):
+            return False
+    totals = tuple(sum(values) for values in zip(*(row.counter_values() for row in rows)))
+    return (
+        all(count < _UINT64_MAX for count in totals)
+        and totals == (
+            result.rx_packets, result.tx_packets, result.dropped_packets,
+            result.rx_bytes, result.tx_bytes, result.fanout_overflow,
+        )
+    )
+
+
+def worker_counters_advanced(
+    before: Sequence[WorkerCounterStatsResult],
+    after: Sequence[WorkerCounterStatsResult],
+) -> bool:
+    """Reject mutation/regression before classifying a complete vector's progress.
+
+    The caller admits row shape and fixes runtime identity. A valid unchanged
+    or partially advanced vector returns False; contradictory evidence raises.
+    """
+    if not before or len(before) != len(after):
+        raise ValueError("worker counter membership changed")
+    advanced = True
+    for previous, current in zip(before, after):
+        identity_regressed = (
+            current.worker_index != previous.worker_index
+            or current.observation_epoch < previous.observation_epoch
+            or current.publication_generation < previous.publication_generation
+            or current.published_monotonic_ns < previous.published_monotonic_ns
+        )
+        counters_regressed = any(new < old for old, new in zip(previous.counter_values(), current.counter_values()))
+        publication_changed = current.publication_generation == previous.publication_generation and current != previous
+        if identity_regressed or counters_regressed or publication_changed:
+            raise ValueError("worker observation regressed or changed without publication")
+        advanced = advanced and (
+            current.publication_generation > previous.publication_generation
+            and current.published_monotonic_ns > previous.published_monotonic_ns
+        )
+    return advanced and (
+        min(row.published_monotonic_ns for row in after)
+        > max(row.published_monotonic_ns for row in before)
+    )
+
+
 def stats_are_exact(result: StatsResult) -> bool:
     """Admit scalar authorities before dependent telemetry-family checks."""
     if (
         not _runtime_frame_is_exact(result)
         or not _transition_publication_is_exact(result)
         or not _participant_counts_are_exact(result)
+        or not worker_counters_are_exact(result)
     ):
         return False
     if result.stage_stats and not _unique_nonempty([row.stage_id for row in result.stage_stats]):

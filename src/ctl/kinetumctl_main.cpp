@@ -46,6 +46,7 @@
 #include "src/common/canonical_content_identity.hpp"
 #include "src/common/control_plane_contract.hpp"
 #include "src/common/control_response_contract.hpp"
+#include "src/common/guardrails_evaluation_contract.hpp"
 #include "src/common/dataplane_health_contract.hpp"
 #include "src/common/epoch_transition_contract.hpp"
 #include "src/common/file_io.hpp"
@@ -544,18 +545,27 @@ void report_contract_failure(std::string_view operation, const kinetum::common::
 [[nodiscard]] kinetum::common::status
 validate_successful_guardrails_read(const kinetum::control::v1::GetGuardrailsResponse &response)
 {
-	if ((response.policy_generation() == 0u) != !response.has_policy() ||
+	if (response.policy_generation() == UINT64_MAX ||
+	    (response.policy_generation() == 0u) != !response.has_policy() ||
 	    (response.policy_generation() == 0u) != response.policy_hash().empty() ||
 	    (response.policy_generation() != 0u &&
 	     response.policy_hash().size() != kinetum::common::SHA256_DIGEST_SIZE)) {
 		return kinetum::common::status::data_loss("guardrails read returned malformed identity");
 	}
+	if (response.has_policy() && !kinetum::cp::validate_guardrails_policy(response.policy()).is_ok()) {
+		return kinetum::common::status::data_loss("guardrails read returned malformed policy");
+	}
+	if (response.has_evaluation()) {
+		const auto valid = kinetum::common::validate_guardrails_evaluation(
+			response.evaluation(), response.has_policy() ? &response.policy() : nullptr,
+			response.policy_generation());
+		if (!valid.is_ok()) {
+			return kinetum::common::status::data_loss(
+				"guardrails read returned malformed evaluation evidence");
+		}
+	}
 	if (!response.has_policy()) {
 		return kinetum::common::status::ok();
-	}
-	const auto policy_status = kinetum::cp::validate_guardrails_policy(response.policy());
-	if (!policy_status.is_ok()) {
-		return kinetum::common::status::data_loss("guardrails read returned malformed policy");
 	}
 	auto bytes_or = kinetum::common::serialize_protobuf_deterministically(response.policy());
 	if (!bytes_or.is_ok()) {
@@ -1579,7 +1589,7 @@ int main(int argc, char **argv)
 				}
 				if (application_or.value() != kinetum::common::status_code::OK) {
 					if (response.has_policy() || response.policy_generation() != 0u ||
-					    !response.policy_hash().empty()) {
+					    !response.policy_hash().empty() || response.has_evaluation()) {
 						std::cerr << "guardrails failure retained policy state\n";
 						return 1;
 					}
@@ -1703,19 +1713,6 @@ int main(int argc, char **argv)
 				if (!saw_poll_ms || !saw_window_ms || !saw_max_drop_ratio || !saw_min_tx_ratio) {
 					std::cerr << "guardrails on requires --poll-ms, --window-ms, "
 						     "--max-drop-ratio, and --min-tx-ratio\n";
-					return 2;
-				}
-				if (p.evaluation_window_ms() < p.poll_interval_ms()) {
-					std::cerr << "--window-ms must be >= --poll-ms\n";
-					return 2;
-				}
-				const uint64_t required_intervals =
-					p.evaluation_window_ms() / p.poll_interval_ms() +
-					(p.evaluation_window_ms() % p.poll_interval_ms() != 0u ? 1u : 0u);
-				if (required_intervals > GUARDRAILS_HISTORY_CAPACITY) {
-					std::cerr << "guardrails window requires more than "
-						  << GUARDRAILS_HISTORY_CAPACITY
-						  << " retained intervals at the selected poll cadence\n";
 					return 2;
 				}
 				p.set_telemetry_history_capacity(GUARDRAILS_HISTORY_CAPACITY);

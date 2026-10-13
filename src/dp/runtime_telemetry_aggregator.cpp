@@ -268,7 +268,10 @@ common::status runtime_telemetry_aggregator::initialize_()
 		}
 	}
 	worker_aggregation_.resize(workers_.size());
-	worker_observed_.assign(workers_.size(), uint8_t{0});
+	aggregate_.worker_counters.resize(workers_.size());
+	for (std::size_t index = 0u; index < workers_.size(); ++index) {
+		aggregate_.worker_counters[index].worker_index = static_cast<uint32_t>(index);
+	}
 
 	std::size_t counter_count = 0u;
 	std::size_t histogram_count = 0u;
@@ -594,14 +597,23 @@ void runtime_telemetry_aggregator::merge_worker_(const runtime_telemetry_bank_to
 	}
 	{
 		std::lock_guard<std::mutex> lock(aggregate_mutex_);
-		add_saturating(aggregate_.engine.dropped_packets, bank.engine.dropped_packets);
-		add_saturating(aggregate_.engine.fanout_overflow, bank.engine.fanout_overflow);
-		const int32_t region_id = topology_.transition_topology.workers[token.worker_index].region_id;
-		if (region_id < 0 || static_cast<std::size_t>(region_id) >= aggregate_.regions.size()) {
+		auto &measurement = aggregate_.worker_counters[token.worker_index];
+		if (measurement.worker_index != token.worker_index || token.epoch < measurement.observation_epoch ||
+		    token.published_at_ns < measurement.published_monotonic_ns) {
 			std::terminate();
 		}
-		add_saturating(aggregate_.regions[static_cast<std::size_t>(region_id)].fanout_overflow,
-			       bank.engine.fanout_overflow);
+		add_saturating(measurement.counters.dropped_packets, bank.engine.dropped_packets);
+		add_saturating(measurement.counters.fanout_overflow, bank.engine.fanout_overflow);
+		if (measurement.publication_generation == UINT64_MAX) {
+			counter_accounting_exhausted_ = true;
+		} else {
+			++measurement.publication_generation;
+		}
+		measurement.observation_epoch = token.epoch;
+		measurement.published_monotonic_ns = token.published_at_ns;
+		counter_accounting_exhausted_ = counter_accounting_exhausted_ ||
+						measurement.counters.dropped_packets == UINT64_MAX ||
+						measurement.counters.fanout_overflow == UINT64_MAX;
 		for (std::size_t index = 0u; index < bank.protocol_faults.size(); ++index) {
 			add_saturating(aggregate_.protocol_fault_counts[index], bank.protocol_faults[index]);
 		}
@@ -629,22 +641,19 @@ void runtime_telemetry_aggregator::merge_worker_(const runtime_telemetry_bank_to
 				std::terminate();
 			}
 			auto &target = aggregate_.streams[stream_index];
-			if (target.worker_index != token.worker_index ||
-			    token.published_at_ns < target.published_monotonic_ns) {
+			if (target.worker_index != token.worker_index) {
 				std::terminate();
 			}
 			const auto &source = bank.streams[ordinal];
 			add_saturating(target.packets, source.packets);
 			add_saturating(target.bytes, source.bytes);
 			add_saturating(target.rejected_packets, source.rejected_packets);
-			target.published_monotonic_ns = token.published_at_ns;
-			stream_accounting_exhausted_ = stream_accounting_exhausted_ || target.packets == UINT64_MAX ||
-						       target.bytes == UINT64_MAX ||
-						       target.rejected_packets == UINT64_MAX;
+			counter_accounting_exhausted_ = counter_accounting_exhausted_ || target.packets == UINT64_MAX ||
+							target.bytes == UINT64_MAX ||
+							target.rejected_packets == UINT64_MAX;
 		}
 		aggregate_.latest_bank_publication_monotonic_ns =
 			std::max(aggregate_.latest_bank_publication_monotonic_ns, token.published_at_ns);
-		worker_observed_[token.worker_index] = 1u;
 	}
 	owner.complete_aggregation(token);
 	if (token.reason == runtime_telemetry_publication_reason::CADENCE) {
@@ -1178,40 +1187,54 @@ runtime_telemetry_aggregator::collect(const runtime_telemetry_request &request) 
 			defer_unavailable(
 				common::status::unavailable("runtime telemetry module-bank merge is incomplete"));
 		}
-		if (std::any_of(worker_observed_.begin(), worker_observed_.end(),
-				[](uint8_t value) { return value > 1u; })) {
-			return common::status::data_loss("runtime telemetry worker-observation state is invalid");
-		}
 		if (aggregate_.latest_bank_publication_monotonic_ns == 0u ||
-		    std::any_of(worker_observed_.begin(), worker_observed_.end(),
-				[](uint8_t value) { return value != 1u; }) ||
+		    std::any_of(aggregate_.worker_counters.begin(), aggregate_.worker_counters.end(),
+				[](const auto &row) { return row.publication_generation == 0u; }) ||
 		    std::any_of(module_bindings_.begin(), module_bindings_.end(),
 				[](const module_binding &binding) { return !binding.observed; })) {
 			defer_unavailable(
 				common::status::unavailable("runtime telemetry has no complete owner-bank baseline"));
 		}
-		if (stream_accounting_exhausted_) {
-			return common::status::data_loss("runtime stream accounting exhausted its exact counter range");
+		if (counter_accounting_exhausted_) {
+			return common::status::data_loss("runtime worker accounting exhausted its exact counter range");
 		}
 		runtime_telemetry_snapshot result = aggregate_;
-		for (const auto &stream : result.streams) {
+		for (auto &stream : result.streams) {
+			auto &worker = result.worker_counters[stream.worker_index];
+			stream.published_monotonic_ns = worker.published_monotonic_ns;
 			if (stream.published_monotonic_ns == 0u) {
 				defer_unavailable(common::status::unavailable(
 					"runtime stream accounting lacks a completed owner bank"));
 			}
 			if (stream.direction == kinetum::gluon::v1::IO_STREAM_DIRECTION_RX) {
-				add_saturating(result.engine.rx_packets, stream.packets);
-				add_saturating(result.engine.rx_bytes, stream.bytes);
+				add_saturating(worker.counters.rx_packets, stream.packets);
+				add_saturating(worker.counters.rx_bytes, stream.bytes);
 			} else if (stream.direction == kinetum::gluon::v1::IO_STREAM_DIRECTION_TX) {
-				add_saturating(result.engine.tx_packets, stream.packets);
-				add_saturating(result.engine.tx_bytes, stream.bytes);
+				add_saturating(worker.counters.tx_packets, stream.packets);
+				add_saturating(worker.counters.tx_bytes, stream.bytes);
 			} else {
 				return common::status::data_loss("runtime stream accounting lost its direction");
 			}
 		}
+		for (const auto &worker : result.worker_counters) {
+			const auto &counters = worker.counters;
+			add_saturating(result.engine.rx_packets, counters.rx_packets);
+			add_saturating(result.engine.tx_packets, counters.tx_packets);
+			add_saturating(result.engine.dropped_packets, counters.dropped_packets);
+			add_saturating(result.engine.rx_bytes, counters.rx_bytes);
+			add_saturating(result.engine.tx_bytes, counters.tx_bytes);
+			add_saturating(result.engine.fanout_overflow, counters.fanout_overflow);
+			const int32_t region_id = topology_.transition_topology.workers[worker.worker_index].region_id;
+			if (region_id < 0 || static_cast<std::size_t>(region_id) >= result.regions.size()) {
+				return common::status::data_loss("runtime worker accounting lost its region");
+			}
+			add_saturating(result.regions[static_cast<std::size_t>(region_id)].fanout_overflow,
+				       counters.fanout_overflow);
+		}
 		if (result.engine.rx_packets == UINT64_MAX || result.engine.tx_packets == UINT64_MAX ||
-		    result.engine.rx_bytes == UINT64_MAX || result.engine.tx_bytes == UINT64_MAX) {
-			return common::status::data_loss("runtime stream totals exhausted the engine counter range");
+		    result.engine.rx_bytes == UINT64_MAX || result.engine.tx_bytes == UINT64_MAX ||
+		    result.engine.dropped_packets == UINT64_MAX || result.engine.fanout_overflow == UINT64_MAX) {
+			return common::status::data_loss("runtime worker totals exhausted the engine counter range");
 		}
 		if (!request.include_stream_stats) {
 			result.streams.clear();

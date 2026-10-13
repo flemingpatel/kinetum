@@ -102,6 +102,7 @@ telemetry_snapshot make_correlator_sample(std::string snapshot_id, double drop_r
 	sample.runtime_generation = runtime_generation;
 	sample.timestamp_ms = timestamp_ms;
 	sample.timestamp_mono_ns = timestamp_ms * UINT64_C(1000000);
+	sample.covered_duration_ns = UINT64_C(1000000);
 	sample.drop_ratio = drop_ratio;
 	sample.throughput_ratio = throughput_ratio;
 	sample.module_health_count = 1u;
@@ -305,7 +306,9 @@ TEST(guardrails_policy, schema_is_nested_compact_and_has_no_removed_authority)
 	const auto *get_request = kinetum::control::v1::GetGuardrailsRequest::descriptor();
 	ASSERT_EQ(get_request->field_count(), 0);
 	const auto *get_response = kinetum::control::v1::GetGuardrailsResponse::descriptor();
-	ASSERT_EQ(get_response->field_count(), 4);
+	ASSERT_EQ(get_response->field_count(), 5);
+	ASSERT_NE(get_response->FindFieldByName("evaluation"), nullptr);
+	EXPECT_EQ(get_response->FindFieldByName("evaluation")->number(), 5);
 	EXPECT_EQ(get_response->FindFieldByName("policy_generation")->number(), 3);
 	EXPECT_EQ(get_response->FindFieldByName("policy_hash")->number(), 4);
 	const auto *confirm = kinetum::control::v1::ConfirmConfigRequest::descriptor();
@@ -365,7 +368,7 @@ TEST(guardrails_policy, schema_is_nested_compact_and_has_no_removed_authority)
  *
  * A properly configured policy should have:
  * - poll_interval_ms > 0
- * - evaluation_window_ms >= poll_interval_ms
+ * - evaluation_window_ms > 0 independently of polling cadence
  * - max_drop_ratio in [0.0, 1.0]
  * - min_tx_ratio in [0.0, 1.0]
  */
@@ -382,8 +385,7 @@ TEST(guardrails_policy, valid_policy_configuration)
 
 	// Validate derived constraints
 	EXPECT_GT(policy.poll_interval_ms(), 0) << "poll_interval_ms must be > 0";
-	EXPECT_GE(policy.evaluation_window_ms(), policy.poll_interval_ms())
-		<< "evaluation_window_ms must be >= poll_interval_ms";
+	EXPECT_GT(policy.evaluation_window_ms(), 0u) << "evaluation_window_ms must be positive";
 	EXPECT_GE(policy.threshold().max_drop_ratio(), 0.0) << "max_drop_ratio must be >= 0.0";
 	EXPECT_LE(policy.threshold().max_drop_ratio(), 1.0) << "max_drop_ratio must be <= 1.0";
 	EXPECT_GE(policy.threshold().min_tx_ratio(), 0.0) << "min_tx_ratio must be >= 0.0";
@@ -498,7 +500,7 @@ TEST(validate_guardrails_policy, rejects_invalid_poll_interval)
 TEST(validate_guardrails_policy, rejects_invalid_evaluation_window)
 {
 	auto policy = make_valid_threshold_policy();
-	policy.set_evaluation_window_ms(500);  // Invalid: less than poll_interval_ms
+	policy.set_evaluation_window_ms(0u);
 
 	auto status = validate_guardrails_policy(policy);
 	EXPECT_TRUE(status.is_error());
@@ -506,8 +508,9 @@ TEST(validate_guardrails_policy, rejects_invalid_evaluation_window)
 	policy = make_valid_threshold_policy(1u, 101u);
 	policy.set_telemetry_history_capacity(100u);
 	status = validate_guardrails_policy(policy);
-	EXPECT_EQ(status.code(), kinetum::common::status_code::INVALID_ARGUMENT)
-		<< "one complete window must fit the explicitly authored interval history";
+	EXPECT_TRUE(status.is_ok()) << "poll cadence does not bound source measurement intervals";
+	policy = make_valid_threshold_policy(1000u, 500u);
+	EXPECT_TRUE(validate_guardrails_policy(policy).is_ok());
 }
 
 /**
@@ -845,14 +848,15 @@ TEST(validate_guardrails_policy, rejects_min_samples_above_max)
 	EXPECT_EQ(s.code(), kinetum::common::status_code::INVALID_ARGUMENT);
 }
 
-/** @brief A detector sample floor cannot exceed its valid evaluation intervals. */
-TEST(validate_guardrails_policy, rejects_min_samples_unreachable_within_window)
+/** @brief Correlation sample admission depends on storage, not the number of RPC polls. */
+TEST(validate_guardrails_policy, correlation_sample_floor_is_independent_of_poll_cadence)
 {
 	auto p = make_valid_advanced_policy();
 	p.mutable_correlation()->set_min_samples(31u);
 	auto s = validate_guardrails_policy(p);
-	EXPECT_TRUE(s.is_error());
-	EXPECT_EQ(s.code(), kinetum::common::status_code::INVALID_ARGUMENT);
+	EXPECT_TRUE(s.is_ok());
+	p.mutable_correlation()->set_min_samples(p.telemetry_history_capacity() + 1u);
+	EXPECT_EQ(validate_guardrails_policy(p).code(), kinetum::common::status_code::INVALID_ARGUMENT);
 }
 
 // --- Correlator normalization bounds ---
@@ -1483,6 +1487,7 @@ TEST(telemetry_history, ring_buffer_eviction)
 	for (uint64_t i = 1; i <= 7; ++i) {
 		telemetry_snapshot sample;
 		sample.config_snapshot_id = "bounded";
+		sample.covered_duration_ns = 1u;
 		sample.timestamp_mono_ns = i;
 		sample.tx_pps = static_cast<double>(i);
 		history.record(sample);
@@ -1514,6 +1519,7 @@ TEST(telemetry_history, exact_content_queries_do_not_infer_a_baseline)
 	for (const std::string &identity : {std::string("snap_a"), std::string("snap_b")}) {
 		telemetry_snapshot sample;
 		sample.config_snapshot_id = identity;
+		sample.covered_duration_ns = 1u;
 		sample.timestamp_mono_ns = identity == "snap_a" ? 1u : 2u;
 		history.record(sample);
 	}
@@ -1533,6 +1539,7 @@ TEST(telemetry_history, exact_content_queries_do_not_infer_a_baseline)
 		{
 			telemetry_history bounded(4u);
 			telemetry_snapshot sample;
+			sample.covered_duration_ns = 1u;
 			sample.config_snapshot_id = "a";
 			bounded.record(sample);
 			sample.config_snapshot_id = "b";
@@ -1541,6 +1548,64 @@ TEST(telemetry_history, exact_content_queries_do_not_infer_a_baseline)
 			bounded.record(sample);
 		},
 		"");
+}
+
+/** @brief Duration weighting preserves small retained intervals when a dominant interval is evicted. */
+TEST(telemetry_history, weighted_mean_preserves_duration_and_eviction_precision)
+{
+	telemetry_history history(2u);
+	telemetry_snapshot sample;
+	sample.config_snapshot_id = "baseline";
+	sample.covered_duration_ns = 1'000'000'000'000u;
+	sample.tx_pps = 1'000'000'000'000'000.0;
+	history.record(sample);
+	sample.covered_duration_ns = 1u;
+	sample.tx_pps = 1.0;
+	history.record(sample);
+	sample.tx_pps = 0.0;
+	history.record(sample);
+	EXPECT_DOUBLE_EQ(history.summary_for_config("baseline").mean_tx_pps, 0.5);
+	history.record(sample);
+	EXPECT_DOUBLE_EQ(history.summary_for_config("baseline").mean_tx_pps, 0.0);
+
+	history.clear();
+	sample.covered_duration_ns = 1u;
+	sample.tx_pps = 100.0;
+	history.record(sample);
+	sample.covered_duration_ns = 9u;
+	sample.tx_pps = 10.0;
+	history.record(sample);
+	EXPECT_DOUBLE_EQ(history.summary_for_config("baseline").mean_tx_pps, 19.0);
+}
+
+/** @brief Attribution means and sample deviation use duration weights without cancellation. */
+TEST(guardrails_integration, attribution_weights_actual_covered_time)
+{
+	const attribution_config config{
+		.auto_rollback_threshold = 0.8,
+		.defer_threshold = 0.5,
+		.baseline_samples = 2u,
+		.degradation_threshold = 0.3,
+		.require_module_health = false,
+	};
+	attribution_scorer scorer(config);
+	auto healthy = make_correlator_sample("baseline", 0.0, 1.0);
+	healthy.health_score = 100.0;
+	healthy.covered_duration_ns = 9u;
+	auto poor = healthy;
+	poor.health_score = 0.0;
+	poor.covered_duration_ns = 1u;
+	auto current = make_correlator_sample("candidate", 0.0, 1.0);
+	current.health_score = 80.0;
+	auto score = scorer.compute(current, {healthy, poor}, {current});
+	ASSERT_TRUE(score.evidence_complete);
+	ASSERT_NE(score.get_factor("timing_correlation"), nullptr);
+	EXPECT_NEAR(score.get_factor("timing_correlation")->value, 0.1, 1e-12);
+	healthy.covered_duration_ns = UINT64_C(1) << 63u;
+	current.health_score = 0.0;
+	score = scorer.compute(current, {healthy, poor}, {current});
+	ASSERT_NE(score.get_factor("baseline_deviation"), nullptr);
+	EXPECT_DOUBLE_EQ(score.get_factor("baseline_deviation")->value, 0.5);
 }
 
 /**
@@ -2015,7 +2080,8 @@ class scripted_guardrails_dp_service final : public kinetum::test::fake_dp_servi
 			active.active_validation_hash.size());
 
 		uint64_t tx_packets = sample * 1'000u;
-		uint64_t dropped_packets = 0u;
+		const uint64_t previous_candidate = candidate_sequence_.load(std::memory_order_relaxed);
+		uint64_t dropped_packets = previous_candidate == 0u ? 0u : (previous_candidate - 1u) * 1'000u;
 		if (active.snapshot_id == "runner-policy-candidate") {
 			const uint64_t candidate = candidate_sequence_.fetch_add(1u, std::memory_order_relaxed) + 1u;
 			tx_packets = UINT64_C(1000000000000) + candidate;
@@ -2027,6 +2093,13 @@ class scripted_guardrails_dp_service final : public kinetum::test::fake_dp_servi
 		engine->set_tx_packets(tx_packets);
 		engine->set_dropped_packets(dropped_packets);
 		engine->set_rx_packets(tx_packets + dropped_packets);
+		engine->set_rx_bytes(engine->rx_packets());
+		engine->set_tx_bytes(tx_packets);
+		auto *worker = response->mutable_telemetry()->mutable_worker_counters(0);
+		worker->set_observation_epoch(active.active_epoch);
+		worker->set_publication_generation(sample);
+		worker->set_published_monotonic_ns(collection_ns - 1u);
+		*worker->mutable_counters() = *engine;
 		return grpc::Status::OK;
 	}
 
@@ -2346,6 +2419,29 @@ TEST(guardrails_runner_real, unconfigured_to_enabled_transition_drives_exact_att
 	// Start runner with no policy published.
 	guardrails_runner gr(store.get(), dp.stub, loop);
 	ASSERT_TRUE(gr.start().is_ok());
+	control_service_impl api(store.get(), dp.stub, loop, &gr);
+	const auto read_evaluation = [&api]() {
+		grpc::ServerContext context;
+		kinetum::control::v1::GetGuardrailsRequest request;
+		kinetum::control::v1::GetGuardrailsResponse response;
+		EXPECT_TRUE(api.GetGuardrails(&context, &request, &response).ok());
+		EXPECT_EQ(response.status().error_code(), kinetum::common::v1::ERROR_CODE_OK);
+		return response;
+	};
+	const auto await_armed = [&read_evaluation](uint64_t epoch) {
+		const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+		kinetum::control::v1::GetGuardrailsResponse response;
+		do {
+			response = read_evaluation();
+			if (response.has_evaluation() && response.evaluation().has_observed_identity() &&
+			    response.evaluation().state() == kinetum::control::v1::GUARDRAILS_EVALUATION_STATE_ARMED &&
+			    response.evaluation().observed_identity().epoch() == epoch) {
+				return response;
+			}
+			std::this_thread::sleep_for(std::chrono::milliseconds(1));
+		} while (std::chrono::steady_clock::now() < deadline);
+		return response;
+	};
 
 	// Publish enabled policy and let the evaluator begin baseline construction.
 	auto policy = make_valid_threshold_policy(10u, 100u, 0.10, 0.50, 1u);
@@ -2354,7 +2450,10 @@ TEST(guardrails_runner_real, unconfigured_to_enabled_transition_drives_exact_att
 	const auto retained = store->guardrails_policy();
 	ASSERT_TRUE(retained.is_ok());
 	EXPECT_TRUE(retained->policy.enabled());
-	ASSERT_TRUE(wait_for_guardrails_stats(service, 3)) << "runner did not build the exact healthy baseline";
+	const auto baseline = await_armed(1u);
+	ASSERT_TRUE(baseline.has_evaluation());
+	ASSERT_EQ(baseline.evaluation().state(), kinetum::control::v1::GUARDRAILS_EVALUATION_STATE_ARMED);
+	EXPECT_EQ(baseline.evaluation().policy_generation(), retained->generation);
 
 	mutation update("runner-policy-candidate-key", std::nullopt,
 			set_config_payload{make_cp_test_snapshot("runner-policy-candidate", 2), 0u});
@@ -2376,7 +2475,33 @@ TEST(guardrails_runner_real, unconfigured_to_enabled_transition_drives_exact_att
 	EXPECT_TRUE(rolled_back) << "enabled policy did not converge through the exact rollback authority";
 	EXPECT_GE(service.prepare_calls.load(std::memory_order_relaxed), 2);
 	EXPECT_GE(service.activate_calls.load(std::memory_order_relaxed), 2);
+	const auto restored = await_armed(3u);
+	ASSERT_TRUE(restored.has_evaluation());
+	ASSERT_TRUE(restored.evaluation().has_last_attribution());
+	EXPECT_TRUE(restored.evaluation().last_attribution().intent_accepted());
+	EXPECT_EQ(restored.evaluation().last_attribution().candidate().epoch(), 2u);
+	EXPECT_EQ(restored.evaluation().observed_identity().epoch(), 3u);
+	EXPECT_EQ(restored.evaluation().observed_identity().snapshot_id(), "runner-policy");
 
+	gr.stop();
+	EXPECT_FALSE(read_evaluation().has_evaluation());
+	ASSERT_TRUE(gr.start().is_ok());
+	const auto restarted = read_evaluation();
+	if (restarted.has_evaluation()) {
+		EXPECT_FALSE(restarted.evaluation().has_last_attribution());
+		EXPECT_FALSE(restarted.evaluation().has_last_completed());
+	}
+	const auto rearmed = await_armed(3u);
+	ASSERT_TRUE(rearmed.has_evaluation());
+	EXPECT_FALSE(rearmed.evaluation().has_last_attribution());
+	kinetum::control::v1::GuardrailsPolicy disabled;
+	ASSERT_TRUE(publish_policy(loop, disabled));
+	const auto changed_policy = read_evaluation();
+	EXPECT_GT(changed_policy.policy_generation(), baseline.policy_generation());
+	if (changed_policy.has_evaluation()) {
+		EXPECT_EQ(changed_policy.evaluation().policy_generation(), changed_policy.policy_generation());
+		EXPECT_FALSE(changed_policy.evaluation().has_last_attribution());
+	}
 	gr.stop();
 	loop.stop();
 	dp.shutdown();
@@ -2588,7 +2713,7 @@ TEST(control_service_set_config, reject_confirm_timeout_over_uint32)
 	control_loop loop(store.get(), dp.stub);
 	ASSERT_TRUE(loop.start().is_ok());
 
-	control_service_impl service(store.get(), dp.stub, loop);
+	control_service_impl service(store.get(), dp.stub, loop, nullptr);
 	kinetum::control::v1::SetConfigSnapshotRequest req;
 	*req.mutable_snapshot() = make_cp_test_snapshot("snap_oversized_timeout", 1);
 	req.set_confirm_timeout_ms(static_cast<uint64_t>(std::numeric_limits<uint32_t>::max()) + 1U);
@@ -2618,7 +2743,7 @@ TEST(control_service_set_config, oversized_snapshot_is_resource_exhausted_before
 	dp.start();
 	control_loop loop(store.get(), dp.stub);
 	ASSERT_TRUE(loop.start().is_ok());
-	control_service_impl service(store.get(), dp.stub, loop);
+	control_service_impl service(store.get(), dp.stub, loop, nullptr);
 
 	kinetum::control::v1::SetConfigSnapshotRequest request;
 	*request.mutable_snapshot() = make_cp_test_snapshot("oversized", 1);
@@ -2659,7 +2784,7 @@ TEST(control_service_readiness, stopped_mutation_authority_rejects_before_all_si
 	control_loop loop(store.get(), dp.stub);
 	ASSERT_FALSE(loop.is_running());
 	const uint64_t initial_guardrails_generation = loop.guardrails_state().policy.version();
-	control_service_impl service(store.get(), dp.stub, loop);
+	control_service_impl service(store.get(), dp.stub, loop, nullptr);
 
 	grpc::ServerContext set_context;
 	kinetum::control::v1::SetConfigSnapshotRequest set_request;
@@ -2740,7 +2865,7 @@ TEST(control_service_guardrails, configure_and_get_use_one_durable_retry_identit
 	ASSERT_TRUE(reconcile_cp_test_bootstrap(*store, make_cp_test_snapshot("guardrails-wire", 1)).is_ok());
 	control_loop loop(store.get(), nullptr);
 	ASSERT_TRUE(loop.start().is_ok());
-	control_service_impl service(store.get(), nullptr, loop);
+	control_service_impl service(store.get(), nullptr, loop, nullptr);
 
 	grpc::ServerContext empty_context;
 	kinetum::control::v1::GetGuardrailsRequest empty_request;
@@ -2835,7 +2960,7 @@ TEST(control_service_confirm, exact_identity_and_key_retry_map_one_terminal_resu
 	ASSERT_TRUE(store->complete_epoch_transition(transition_or->identity, kinetum::common::unix_time_ms()).is_ok());
 	control_loop loop(store.get(), nullptr);
 	ASSERT_TRUE(loop.start().is_ok());
-	control_service_impl service(store.get(), nullptr, loop);
+	control_service_impl service(store.get(), nullptr, loop, nullptr);
 
 	kinetum::control::v1::ConfirmConfigRequest request;
 	request.set_snapshot_id("confirm-wire-target");

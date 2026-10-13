@@ -152,7 +152,7 @@ _TRANSACTION_OPTIONAL_FIELDS = frozenset({
     "terminal_monotonic_ns",
 })
 _TELEMETRY_CORE_FIELDS = frozenset({
-    "runtime", "engine", "transition", "protocol_faults",
+    "runtime", "engine", "transition", "protocol_faults", "worker_counters",
 })
 _TELEMETRY_ROW_FIELDS = frozenset({
     "stages", "module_counters", "module_histograms",
@@ -751,9 +751,33 @@ class StatsResult:  # pylint: disable=too-many-instance-attributes
     boundary_epoch_stats: List[BoundaryEpochStatsResult] = field(default_factory=list)
     region_epoch_stats: List[RegionEpochStatsResult] = field(default_factory=list)
     worker_epoch_stats: List[WorkerEpochStatsResult] = field(default_factory=list)
+    worker_counters: List[WorkerCounterStatsResult] = field(default_factory=list)
     stream_stats: List[StreamStatsResult] = field(default_factory=list)
     storage_domain_stats: List[StorageDomainStatsResult] = field(default_factory=list)
     port_stats: List[PortStatsResult] = field(default_factory=list)
     traffic_steering_stats: List[TrafficSteeringStatsResult] = field(default_factory=list)
     module_context_domains: List[ModuleContextDomainResult] = field(default_factory=list)
     diagnostic: str = ""
+
+
+@dataclass(frozen=True)
+class WorkerCounterStatsResult:
+    """Retain one immutable completed worker measurement, including workers without I/O."""
+
+    worker_index: int
+    observation_epoch: int
+    publication_generation: int
+    published_monotonic_ns: int
+    rx_packets: int
+    tx_packets: int
+    dropped_packets: int
+    rx_bytes: int
+    tx_bytes: int
+    fanout_overflow: int
+
+    def counter_values(self) -> tuple[int, ...]:
+        """Return the complete semantic counter tuple in engine field order."""
+        return (
+            self.rx_packets, self.tx_packets, self.dropped_packets,
+            self.rx_bytes, self.tx_bytes, self.fanout_overflow,
+        )

@@ -45,6 +45,7 @@ from .telemetry import (
     BoundaryEpochStatsResult,
     RegionEpochStatsResult,
     WorkerEpochStatsResult,
+    WorkerCounterStatsResult,
     StreamStatsResult,
     StorageDomainStatsResult,
     PortStatsResult,
@@ -330,6 +331,22 @@ def _steering_kind(value: object) -> str:
     if parsed not in mapping:
         raise ValueError("steering kind is unspecified or undeclared")
     return mapping[parsed]
+
+
+def parse_worker_counter(row: object) -> WorkerCounterStatsResult:
+    """Decode every field of one mandatory worker measurement without defaults."""
+    row = message_shape(row, frozenset({
+        "worker_index", "observation_epoch", "publication_generation",
+        "published_monotonic_ns", "counters",
+    }))
+    counters = message_shape(row["counters"], _ENGINE_FIELDS)
+    return WorkerCounterStatsResult(
+        worker_index=wire_uint(row["worker_index"], bits=32),
+        observation_epoch=wire_uint(row["observation_epoch"]),
+        publication_generation=wire_uint(row["publication_generation"]),
+        published_monotonic_ns=wire_uint(row["published_monotonic_ns"]),
+        **{name: wire_uint(value) for name, value in counters.items()},
+    )
 
 
 def parse_stats_json(raw_json: str) -> StatsResult:
@@ -1021,6 +1038,11 @@ def parse_stats_json(raw_json: str) -> StatsResult:
                 ),
                 fanout_overflow=wire_uint(rs["fanout_overflow"]),
             ))
+
+        result.worker_counters = [
+            parse_worker_counter(row)
+            for row in _wire_object_list(telemetry["worker_counters"])
+        ]
 
         for ws in _wire_object_list(
             telemetry["workers"] if "workers" in telemetry else []

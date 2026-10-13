@@ -13,7 +13,6 @@ from typing import Dict, Optional, Tuple
 RECOVERABLE_EXCEPTIONS = (RuntimeError, OSError, ValueError)
 
 
-IP_EXECUTABLE = Path("/usr/sbin/ip")
 SSH_EXECUTABLE = Path("/usr/bin/ssh")
 TCPDUMP_EXECUTABLE = Path("/usr/bin/tcpdump")
 

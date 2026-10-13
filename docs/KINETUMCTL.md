@@ -161,7 +161,7 @@ kinetumctl --endpoint 127.0.0.1:50051 list-snapshots
 # 2. Read the complete active snapshot.
 kinetumctl --endpoint 127.0.0.1:50051 get-active
 
-# 3. Read the mandatory runtime/engine/transition/fault summaries.
+# 3. Read the mandatory runtime, worker counters, engine, transition, and fault summaries.
 kinetumctl --endpoint 127.0.0.1:50051 stats
 ```
 
@@ -723,7 +723,7 @@ flags with `off` is a usage error.
 
 | Flag | `GuardrailsPolicy` field | Meaning |
 |---|---|---|
-| `--poll-ms <ms>` | `poll_interval_ms` | How often the guardrails loop samples DP telemetry. |
+| `--poll-ms <ms>` | `poll_interval_ms` | Delay between guardrails telemetry queries. |
 | `--window-ms <ms>` | `evaluation_window_ms` | Window over which drops and TX are aggregated post-apply. |
 | `--max-drop-ratio <r>` | `threshold.max_drop_ratio` | Drop ratio above which the threshold detector fires. |
 | `--min-tx-ratio <r>` | `threshold.min_tx_ratio` | TX rate relative to frozen baseline below which it fires. |
@@ -734,12 +734,13 @@ flags with `off` is a usage error.
 enabled-but-ineffective zero-valued basic policy. The CLI validates the
 same basic ranges before RPC that the CP validator enforces later:
 poll in `[1, 3600000]`, window in `[1, 86400000]`,
-window greater than or equal to poll, and both ratios in `[0.0, 1.0]`.
+and both ratios in `[0.0, 1.0]`.
 
 The CLI also serializes explicit attribution values `0.80`, `0.50`, `10`,
 `0.30` and history capacity `100`. These are request bytes, not runner defaults.
-It requires `ceil(window / poll) <= 100` before any policy RPC, so the
-fixed authored history can retain one complete evaluation window.
+Poll cadence, covered measurement time, and history capacity are independent.
+If 100 candidate intervals fill history before the window ends, evaluation
+ends without automatic action; it does not evict required evidence.
 Before Configure it calls GetGuardrails, reads exact generation (zero when
 unconfigured), explicitly sets generation presence, generates one random key,
 and retains the request across retries.
@@ -753,8 +754,9 @@ policy_hash: "...raw SHA-256 bytes..."
 ```
 
 `guardrails show` returns exact unconfigured absence or the complete validated
-policy, generation, and matching SHA-256. It never manufactures a disabled
-policy for an unconfigured store.
+policy, generation, and matching SHA-256. Its optional `evaluation` shows the
+actual evaluator state, bound identity, baseline count, covered time, and
+retained attribution. It never manufactures disabled or armed state.
 
 #### Guardrails example
 
@@ -773,8 +775,9 @@ kinetumctl guardrails show --format json
 ```
 
 For a planned update, enable the policy while representative traffic is still
-running on the prior content and allow at least the configured baseline sample
-count to complete before `set-config`. A policy first enabled after the update
+running on the prior content and wait for `evaluation.state` to report
+`GUARDRAILS_EVALUATION_STATE_ARMED` before `set-config`. Poll replies do not
+count as baseline measurements. A policy first enabled after the update
 cannot retroactively construct the previous-content baseline.
 
 #### Policy fields without command flags
@@ -875,7 +878,7 @@ On application success, both text and JSON modes contain:
 
 1. **Aggregate counters and active snapshot** (always present in a successful
    rendering): `active_config` with revision and snapshot identity, plus mandatory
-   `telemetry.runtime`, `engine`, `transition`, and `protocol_faults`.
+   `telemetry.runtime`, `engine`, `worker_counters`, `transition`, and `protocol_faults`.
 2. **Owner detail rows**: `stages`, registered module counters/histograms,
    module epoch mismatches, typed module health, exact workers, and cold regions
    under their matching flags. Stage rows contain only packet/byte counters
@@ -943,14 +946,17 @@ telemetry {
   exact retirement, active and last-activated carry the target epoch while
   minimum-retained still carries the old epoch. Only certified old-object
   reclamation permits all three to agree on the target.
-- `telemetry.engine`: aggregate cumulative counters within one exact runtime
-  generation. RX/TX packet and byte totals derive from software stream
-  transfers; TX measures provider acceptance, not wire delivery.
-  To compute a rate, sample twice in the same generation and
-  divide; a generation replacement resets the baseline.
+- `telemetry.engine`: cumulative sums of mandatory `worker_counters` within
+  one runtime generation. Worker RX/TX derives from software stream transfers;
+  TX measures provider acceptance, not wire delivery.
+- `telemetry.worker_counters`: all workers' completed measurements. Compute
+  each worker's rate from advancing publication timestamps in the same runtime
+  and epoch, then combine the rates. Repeated publication generations add no
+  sample; a runtime replacement resets the baseline.
 - `telemetry.runtime.collection_monotonic_ns` is the cold source's final
   platform monotonic sample. `latest_bank_publication_monotonic_ns` identifies
-  the latest immutable bank included; neither is Unix wall time.
+  the latest immutable bank included, including module banks. Neither proves
+  all worker measurements advanced; neither is Unix wall time.
 - `telemetry.transition.active_epoch` and `active_validation_hash` are one
   last-globally-COMPLETE content witness. They remain on the old epoch and hash
   while runtime participant truth has active/last-activated at the target but
@@ -1029,6 +1035,32 @@ when their producer state makes them meaningful.
       "rx_bytes": "204884992",
       "tx_bytes": "204881536"
     },
+    "worker_counters": [
+      {
+        "worker_index": 0, "observation_epoch": "8",
+        "publication_generation": "35", "published_monotonic_ns": "1778446450955000",
+        "counters": {
+          "rx_packets": "1600667", "tx_packets": "0", "dropped_packets": "27",
+          "rx_bytes": "102442688", "tx_bytes": "0", "fanout_overflow": "0"
+        }
+      },
+      {
+        "worker_index": 1, "observation_epoch": "8",
+        "publication_generation": "35", "published_monotonic_ns": "1778446450955000",
+        "counters": {
+          "rx_packets": "1600661", "tx_packets": "0", "dropped_packets": "27",
+          "rx_bytes": "102442304", "tx_bytes": "0", "fanout_overflow": "0"
+        }
+      },
+      {
+        "worker_index": 2, "observation_epoch": "8",
+        "publication_generation": "35", "published_monotonic_ns": "1778446450955000",
+        "counters": {
+          "rx_packets": "0", "tx_packets": "3201274", "dropped_packets": "0",
+          "rx_bytes": "0", "tx_bytes": "204881536", "fanout_overflow": "0"
+        }
+      }
+    ],
     "transition": {
       "publication_generation": "17",
       "state": "EPOCH_TRANSITION_STATE_IDLE",
@@ -1080,12 +1112,12 @@ when their producer state makes them meaningful.
     },
     "stages": [
       {
-        "stage_id": "parse",
-        "in_packets": "3201328",
-        "out_packets": "3201274",
-        "dropped_packets": "54",
-        "in_bytes": "204884992",
-        "out_bytes": "204881536"
+        "stage_id": "parse0",
+        "in_packets": "1600667",
+        "out_packets": "1600640",
+        "dropped_packets": "27",
+        "in_bytes": "102442688",
+        "out_bytes": "102440960"
       }
     ],
     "boundaries": [

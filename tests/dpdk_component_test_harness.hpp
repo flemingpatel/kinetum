@@ -74,6 +74,8 @@ struct facility_api_state {
 	uint32_t thread_unregister_calls{0};	      ///< Number of external-thread retirements.
 	uint32_t remote_launch_calls{0};	      ///< Number of lifecycle launches.
 	uint32_t wait_lcore_calls{0};		      ///< Number of lifecycle joins.
+
+	std::string native_device_name{"0000:01:00.0"};	 ///< Exact native name resolved for the authored attachment.
 };
 
 /**
@@ -241,16 +243,16 @@ inline int current_cpu(void *opaque) noexcept
 }
 
 /**
- * @brief Resolve the fixture's sole exact PCI attachment.
- * @param opaque Unused API context.
- * @param name Candidate NUL-terminated PCI device identity.
+ * @brief Resolve the fixture's sole exact native attachment.
+ * @param opaque Fixture-owned native identity.
+ * @param name Candidate NUL-terminated PCI or TAP device identity.
  * @param port_id Resolved port output written only on success.
  * @return Zero for the fixture attachment, or -1 for mismatch.
  */
 inline int eth_port_by_name(void *opaque, const char *name, uint16_t *port_id) noexcept
 {
-	(void)opaque;
-	if (name == nullptr || port_id == nullptr || std::string_view(name) != "0000:01:00.0") {
+	const auto &state = *static_cast<const facility_api_state *>(opaque);
+	if (name == nullptr || port_id == nullptr || std::string_view(name) != state.native_device_name) {
 		return -1;
 	}
 	*port_id = 7;
@@ -271,7 +273,7 @@ inline const char *runtime_version(void *opaque) noexcept
  * @brief One exact DPDK facility request and its injected native owner.
  *
  * The process facts contain one external packet worker, one EAL-main
- * transition coordinator, one lifecycle executor, one PCI attachment, and
+ * transition coordinator, one lifecycle executor, one native attachment, and
  * one exact packet-storage requirement. All borrowed storage outlives every
  * request and dependency view produced by the fixture.
  */
@@ -438,7 +440,15 @@ class facility_fixture {
 		facts_.memory_domain_count = 2;
 	}
 
-	/** @return Borrowed mutable PCI attachment fact. */
+	/** @brief Select an exact TAP attachment before constructing the facility. */
+	void use_tap_attachment()
+	{
+		attachments_[0].kind = KINETUM_PROVIDER_ATTACHMENT_TAP;
+		attachments_[0].attachment_identity = text_view("neb_test");
+		api_state_.native_device_name = "net_tap0";
+	}
+
+	/** @return Borrowed mutable native attachment fact. */
 	[[nodiscard]] kinetum_provider_driver_attachment_fact &attachment() noexcept
 	{
 		return attachments_[0];
@@ -488,13 +498,13 @@ class facility_fixture {
     private:
 	/** Compiled instance identity shared by the request and dependency views. */
 	static constexpr std::string_view FACILITY_INSTANCE_ID = "dpdk.facility.0";
-	/** Driver-local port identity attached to the fixture PCI function. */
+	/** Driver-local port identity attached to the fixture native device. */
 	static constexpr std::string_view DRIVER_PORT_ID = "wan0";
 	/** Canonical fixture PCI function resolved by the fake native API. */
 	static constexpr std::string_view PCI_BDF = "0000:01:00.0";
 
 	std::array<kinetum_provider_cpu_assignment, 4> cpu_assignments_{};	///< Exact CPU owners.
-	std::array<kinetum_provider_driver_attachment_fact, 1> attachments_{};	///< Exact PCI attachment.
+	std::array<kinetum_provider_driver_attachment_fact, 1> attachments_{};	///< Exact native attachment.
 	std::array<kinetum_provider_memory_domain_fact, 2> memory_domains_{};	///< Exact storage rows.
 	kinetum_provider_process_facility_facts facts_{};			///< Complete borrowed facility facts.
 	kinetum_provider_factory_request request_{};				///< Exact empty-contract request.

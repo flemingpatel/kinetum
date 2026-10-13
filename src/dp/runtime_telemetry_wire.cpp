@@ -414,6 +414,20 @@ common::status populate_runtime_telemetry_wire(const runtime_telemetry_snapshot 
 		engine->set_rx_bytes(snapshot.engine.rx_bytes);
 		engine->set_tx_bytes(snapshot.engine.tx_bytes);
 		engine->set_fanout_overflow(snapshot.engine.fanout_overflow);
+		for (const auto &row : snapshot.worker_counters) {
+			auto *target = output->add_worker_counters();
+			target->set_worker_index(row.worker_index);
+			target->set_observation_epoch(row.observation_epoch);
+			target->set_publication_generation(row.publication_generation);
+			target->set_published_monotonic_ns(row.published_monotonic_ns);
+			auto *counters = target->mutable_counters();
+			counters->set_rx_packets(row.counters.rx_packets);
+			counters->set_tx_packets(row.counters.tx_packets);
+			counters->set_dropped_packets(row.counters.dropped_packets);
+			counters->set_rx_bytes(row.counters.rx_bytes);
+			counters->set_tx_bytes(row.counters.tx_bytes);
+			counters->set_fanout_overflow(row.counters.fanout_overflow);
+		}
 
 		auto plan_hash_or = common::hex_to_bytes(snapshot.plan_content_hash);
 		if (!plan_hash_or.is_ok() || plan_hash_or->size() != common::SHA256_DIGEST_SIZE) {

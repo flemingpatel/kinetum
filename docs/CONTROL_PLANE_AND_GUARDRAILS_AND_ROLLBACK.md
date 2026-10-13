@@ -1049,6 +1049,7 @@ Guardrails owns:
 - One bounded valid-interval `telemetry_history`.
 - An `attribution_scorer` over an explicit frozen baseline and current window.
 - The state machine that may emit one observation-bound desired action.
+- A read-only publication of evaluator state and retained attribution evidence.
 
 Guardrails does not own:
 
@@ -1084,13 +1085,13 @@ joins; it never cancels a context already transferred to the control loop.
 | `UNCONFIGURED` | No durable policy exists. Commit-confirmed service remains active. |
 | `DISABLED` | An explicit empty `enabled=false` policy exists. No telemetry RPC is issued. |
 | `BASELINE_BUILDING` | Valid same-generation intervals are accumulated for one stable content identity. |
-| `ARMED` | The baseline is complete; continued stable samples refresh it. |
+| `ARMED` | The retained baseline meets its sample floor and has positive mean TX; continued measurements refresh it. |
 | `EVALUATING` | New content has frozen the prior baseline and opened one valid-time window. |
 | `ROLLBACK_PENDING` | One durable safety intent exists; no second decision is emitted. |
 
 To evaluate a planned content change, enable policy while representative
 traffic still runs on the prior content and allow the evaluator to reach
-`ARMED`. A change observed during `BASELINE_BUILDING` conservatively starts a
+`ARMED`, as reported by `guardrails show`. A change observed during `BASELINE_BUILDING` conservatively starts a
 new baseline; it cannot attribute that change without prior evidence.
 
 #### 14.2 Runner service cadence
@@ -1135,12 +1136,27 @@ sticky protocol fault is returned as a safety fact: telemetry
 policy pauses, while an independently expired commit-confirm deadline may still
 create an intent that later terminally records the blocked transition.
 
-Missing transport/application data, non-IDLE transition state, unavailable
-required module health, protocol fault, or same-generation regression breaks
-interval continuity. The cumulative high watermark remains; the next valid
-nonregressing point seeds a fresh interval. Consequently the missing time is
-not added to `evaluation_elapsed_ns` and cannot expire a window or fabricate a
-healthy baseline.
+Each worker counter row identifies one completed bank observation. An unchanged
+publication adds no sample, even when the RPC collection time advances. Every
+worker must advance, with both endpoints in the evaluated epoch. Processing-only
+workers participate because they can own terminal drops.
+
+```text
+worker_tx_pps[i] = delta_tx[i] * 1e9 / delta_publication_ns[i]
+tx_pps = sum(worker_tx_pps)
+covered_ns = min(current_worker_times) - max(previous_worker_times)
+```
+
+Drop rate uses the same per-worker calculation. Only positive `covered_ns`
+advances evaluation time. These are sums of worker interval averages, not a
+simultaneous packet snapshot. Counter cursors reject regression or changed
+contents under an unchanged publication generation before testing freshness.
+
+A transient unavailable or deadline-expired read adds no sample; later exact
+endpoints may span it. Observed non-IDLE state, missing required health,
+protocol faults, and contradictions break continuity, so the next eligible
+point seeds without a delta. Collection time remains available for provenance
+and boundary-ACK age, never for packet rates.
 
 #### 14.4 Policy replacement
 
@@ -1150,6 +1166,9 @@ state, then returns to `DISABLED` or `BASELINE_BUILDING`. No weight or bound is
 defaulted, and old EWMA/history cannot cross a policy generation. A durable
 intent forces `ROLLBACK_PENDING`; after exact completion clears it, the
 evaluator rebuilds a fresh baseline against the resulting active content.
+Per-worker regression cursors survive these resets within the same runtime.
+The last attribution remains readable after its resulting rollback, but a new
+policy or runtime generation clears it.
 
 ### 15. Guardrails Policy
 
@@ -1176,7 +1195,7 @@ new complete policy generation, never a Boolean flip over hidden old values.
 | Field                                       | Required range                                    |
 | ------------------------------------------- | ------------------------------------------------- |
 | `poll_interval_ms`                          | `(0, 3,600,000]` (1 ms to 1 hour)                  |
-| `evaluation_window_ms`                      | `[poll_interval_ms, 86,400,000]` (>= poll, <= 24 hours) |
+| `evaluation_window_ms`                      | `[1, 86,400,000]` (up to 24 hours of covered measurement time) |
 | `threshold.max_drop_ratio`                  | finite `[0.0, 1.0]`                                |
 | `threshold.min_tx_ratio`                    | finite `[0.0, 1.0]`                                |
 | `threshold.min_packets_per_window`          | full `uint64`; zero is literal                      |
@@ -1187,7 +1206,7 @@ new complete policy generation, never a Boolean flip over hidden old values.
 | `correlation.ewma_alpha`                    | finite `(0.0, 1.0]`                                |
 | `correlation.degradation_threshold`         | finite `(0.0, 1.0]`                                |
 | `correlation.hysteresis_band`               | finite `[0.0, 0.5]`                                |
-| `correlation.min_samples`                   | positive, within history and reachable window intervals |
+| `correlation.min_samples`                   | positive and no greater than history capacity      |
 | `correlation.normalization_max_drop_ratio`  | finite `(0.0, 1.0]`                                |
 | `correlation.normalization_min_tx_ratio`    | finite `(0.0, 1.0)`                                |
 | `attribution.auto_rollback_threshold`       | finite `(0.0, 1.0]`                                |
@@ -1200,11 +1219,10 @@ new complete policy generation, never a Boolean flip over hidden old values.
 #### 15.3 Cross-field constraints
 
 - Exactly one detector (`threshold` or `correlation`) must be present.
-- `ceil(evaluation_window_ms / poll_interval_ms)` must fit the explicit
-  interval-history capacity. The cumulative seed is separate fixed state and
-  is not an interval row.
-- `correlation.min_samples` cannot exceed the number of valid intervals the
-  evaluation window can produce.
+- Poll cadence, evaluation time, and history capacity are independent bounds.
+  Poll counts cannot predict the number or duration of source measurements.
+- Both sample floors must fit history capacity. The cumulative seed is separate
+  state and is not an interval row.
 - At least one base correlation weight is positive, and base weights plus the
   maximum CONFIG_ISSUE boost cannot exceed 1.0.
 - `correlation.hysteresis_band < correlation.degradation_threshold`.
@@ -1249,7 +1267,7 @@ same result. The correlator owns no cumulative counters, first-sample seed,
 runtime-generation reset, elapsed-time conversion, or clock truncation. Each
 correlation update receives:
 
-- `drop_ratio_raw = dropped_delta / (tx_delta + dropped_delta)`, with exact
+- `drop_ratio_raw = drop_pps / (tx_pps + drop_pps)`, with exact
   zero-population result `0.0`.
 - `throughput_ratio_raw = tx_pps / baseline_tx_pps`. Correlation begins only
   after a positive real baseline exists.
@@ -1366,7 +1384,7 @@ to that thread, with no internal synchronization.
 
 | Group           | Fields                                                                 |
 | --------------- | ---------------------------------------------------------------------- |
-| Metadata        | `config_snapshot_id`, `epoch`, `runtime_generation`, `timestamp_ms` (audit), `timestamp_mono_ns` (behavior) |
+| Metadata        | `config_snapshot_id`, `epoch`, `runtime_generation`, `timestamp_ms` (audit), `timestamp_mono_ns` (coverage end), `covered_duration_ns` |
 | Infrastructure  | `rx_packets`, `tx_packets`, `dropped_packets`, `tx_pps`, `drop_pps`, `drop_ratio`, `throughput_ratio` |
 | Module health   | `module_health_count` (zero = unavailable), `module_health_avg`, `config_issue_count` |
 | Derived signals | `health_score`, `degradation_score`, `is_degraded`                     |
@@ -1386,13 +1404,14 @@ evidence.
 | ----------------------------------- | --------------------------------------------------------- |
 | `record(snapshot)`                  | Append to the exact content ring, then evict its oldest row if above the immutable bound. |
 | `get_for_config(config_id)`         | Return only that content's rows in oldest-first order.    |
-| `summary_for_config(config_id)`     | Read retained count and mean TX rate in constant time without copying rows. |
+| `summary_for_config(config_id)`     | Read retained count and duration-weighted mean TX rate in constant time. |
 | `take_for_config(config_id)`        | Transfer the armed baseline once, preserving order and removing its map entry. |
 | `clear()`                           | Drop all retained intervals at one evaluator reset edge.  |
 
 The history does not discover a predecessor, order configurations globally,
-or resize after construction. It maintains the stable baseline TX mean in O(1)
-per admitted interval. `guardrails_evaluator` explicitly transfers the armed
+or resize after construction. It maintains the duration-weighted baseline TX
+mean in O(1), retaining small contributions through compensated addition and
+eviction. `guardrails_evaluator` explicitly transfers the armed
 content before it adopts a different content identity; that moved vector is
 the only attribution baseline and is not duplicated in the map. Storage
 admits at most two identities for direct component use; a third without a
@@ -1410,6 +1429,12 @@ samples to process in one turn. Frozen baseline plus current history therefore
 remain bounded by twice the authored per-content capacity without keeping two
 copies of the baseline.
 
+Stable history may evict its oldest interval. An evaluation window may not:
+if its history fills, or the next complete interval exceeds its remaining time,
+evaluation ends without automatic action. Counters are never clipped to fit a
+partial interval. Worker vectors stay in cursors and the latest attribution
+record, not in each history row; total storage is O(workers + history).
+
 ### 18. Attribution Scorer
 
 `attribution_scorer` (declared in `src/cp/attribution_scorer.hpp`,
@@ -1425,8 +1450,8 @@ an explanation string. The four factors:
 
 **`timing_correlation`** (fixed weight 0.30)
 
-Compares average health and drop ratio in snapshots before vs after
-the config change.
+Compares duration-weighted health and drop ratio before and after the config
+change. Weights are the intervals' common covered durations.
 
 ```
 health_signal = clamp((health_before - health_after) / 50.0, 0, 1)
@@ -1456,8 +1481,8 @@ does not establish that severe loss has an external cause.
 
 **`baseline_deviation`** (fixed weight 0.20)
 
-Computes a z-score of `current.health_score` against the mean and
-standard deviation of the explicitly frozen baseline, after the configured
+Computes a z-score of `current.health_score` against the duration-weighted mean
+and sample deviation of the frozen baseline, after the configured
 `baseline_samples` floor is met.
 
 ```
@@ -1514,6 +1539,14 @@ For non-boundary rollback paths:
 Commit-confirmed deadline rollback is independent of these recommendations.
 It is enforced from the durable PendingConfirm record, not inferred from a
 medium attribution score.
+
+`GetGuardrails.evaluation` reports state, the bound active identity, accepted
+baseline count, covered time, and the latest completed evaluation and actual
+attribution. The latter retains both worker endpoint vectors, the frozen TX
+reference, confidence, recommendation, and whether the intent was accepted.
+CP emits this copy only beside matching durable policy and active identity.
+Absence means no matching publication is available; enabled policy does not
+imply `ARMED`. Intent acceptance is distinct from the later terminal transition.
 
 > These factors are operational heuristics, not proofs of causation or
 > transition safety. Policy selects the decision thresholds; factor formulas
@@ -1793,8 +1826,8 @@ Generated patch/selective IDs are domain-separated hashes of the required
 idempotency key, and an exact retry reuses the retained first-attempt timestamp
 and revision. Mutation ordering is deterministic for a given input sequence.
 
-Guardrails behavior windows use DP collection-monotonic time. Wall time is
-restricted to restart-stable Confirm deadlines and durable audit projection.
+Guardrails behavior windows use common coverage of worker publication intervals.
+Wall time is restricted to restart-stable Confirm deadlines and durable audit projection.
 Deterministic tests drive `guardrails_evaluator::observe()` directly with exact
 synthetic fenced observations; runner tests cover the real channel and gRPC
 boundaries.

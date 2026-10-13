@@ -4,8 +4,9 @@ import copy
 import json
 import tempfile
 import unittest
+from dataclasses import asdict, replace
 from pathlib import Path
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 from kinetum_validation.engine.json_contract import (
     JsonContractError,
@@ -14,6 +15,7 @@ from kinetum_validation.engine.json_contract import (
 from kinetum_validation.process.kinetumctl import KinetumCtl
 from kinetum_validation.process.response_reader import parse_stats_json
 from kinetum_validation.process.telemetry import StatsSelection
+from kinetum_validation.report.artifacts import RunArtifacts
 
 
 _FAULT_CODES = [
@@ -323,6 +325,24 @@ def _full_stats_object() -> dict:
                 "tx_bytes": "3168000",
                 "fanout_overflow": "2",
             },
+            "worker_counters": [
+                {
+                    "worker_index": 0, "observation_epoch": "7",
+                    "publication_generation": "4", "published_monotonic_ns": "19000",
+                    "counters": {
+                        "rx_packets": "50000", "tx_packets": "0", "dropped_packets": "100",
+                        "rx_bytes": "3200000", "tx_bytes": "0", "fanout_overflow": "1",
+                    },
+                },
+                {
+                    "worker_index": 1, "observation_epoch": "7",
+                    "publication_generation": "5", "published_monotonic_ns": "19000",
+                    "counters": {
+                        "rx_packets": "0", "tx_packets": "49500", "dropped_packets": "400",
+                        "rx_bytes": "0", "tx_bytes": "3168000", "fanout_overflow": "1",
+                    },
+                },
+            ],
             "transition": {
                 "publication_generation": "8",
                 "state": "EPOCH_TRANSITION_STATE_IDLE",
@@ -752,6 +772,47 @@ class TestKinetumctlStatsParsing(unittest.TestCase):
         self.assertEqual(stream.bytes, 3168000)
         self.assertEqual(stream.rejected_packets, 0)
 
+    def test_worker_counter_population_is_required_without_selection(self):
+        """Missing, duplicate, foreign, mistimed, or inconsistent worker rows invalidate the whole response."""
+        for fault in ("absent", "empty", "duplicate", "foreign", "time", "totals", "epoch"):
+            with self.subTest(fault=fault):
+                payload = _full_stats_object()
+                telemetry = payload["telemetry"]
+                rows = telemetry["worker_counters"]
+                if fault == "absent":
+                    del telemetry["worker_counters"]
+                elif fault == "empty":
+                    rows.clear()
+                elif fault == "duplicate":
+                    rows[1] = copy.deepcopy(rows[0])
+                elif fault == "foreign":
+                    rows[1]["worker_index"] = 2
+                elif fault == "time":
+                    rows[0]["published_monotonic_ns"] = "20001"
+                elif fault == "totals":
+                    rows[0]["counters"]["dropped_packets"] = "101"
+                else:
+                    rows[0]["observation_epoch"] = "8"
+                self.assertFalse(parse_stats_json(json.dumps(payload)).success)
+
+    def test_worker_rows_survive_export_and_absence_rejects_before_publication(self) -> None:
+        """A validated final record preserves the exact worker observations behind its totals."""
+        stats = parse_stats_json(_full_stats_json())
+        self.assertTrue(stats.success, stats.diagnostic)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            artifacts = RunArtifacts(root, MagicMock())
+            with self.assertRaisesRegex(RuntimeError, "exact worker-counter"):
+                artifacts.write_stats(replace(stats, worker_counters=[]))
+            self.assertFalse(tuple(root.iterdir()))
+            artifacts.write_stats(stats)
+            retained = json.loads((root / "dp_stats.json").read_text())
+            self.assertEqual(retained["worker_counters"], [asdict(row) for row in stats.worker_counters])
+            self.assertIn(
+                f"publication={stats.worker_counters[0].publication_generation}",
+                (root / "dp_stats.txt").read_text(),
+            )
+
     def test_stream_counters_require_explicit_zero_presence(self):
         """Zero is valid only when all required stream counter fields are present."""
         payload = _full_stats_object()
@@ -760,6 +821,8 @@ class TestKinetumctlStatsParsing(unittest.TestCase):
                 row[field] = "0"
         for field in ("rx_packets", "tx_packets", "rx_bytes", "tx_bytes"):
             payload["telemetry"]["engine"][field] = "0"
+            for row in payload["telemetry"]["worker_counters"]:
+                row["counters"][field] = "0"
         self.assertTrue(parse_stats_json(json.dumps(payload)).success)
         for field in ("packets", "bytes", "rejected_packets"):
             with self.subTest(field=field):
@@ -776,6 +839,9 @@ class TestKinetumctlStatsParsing(unittest.TestCase):
                 del payload["telemetry"]["streams"]
                 for counter in fields:
                     payload["telemetry"]["engine"][counter] = str((1 << 64) - 2)
+                    for index, row in enumerate(payload["telemetry"]["worker_counters"]):
+                        owner = 0 if counter.startswith("rx_") else 1
+                        row["counters"][counter] = str((1 << 64) - 2) if index == owner else "0"
                 self.assertTrue(parse_stats_json(json.dumps(payload)).success)
                 payload["telemetry"]["engine"][field] = str((1 << 64) - 1)
                 self.assertFalse(parse_stats_json(json.dumps(payload)).success)

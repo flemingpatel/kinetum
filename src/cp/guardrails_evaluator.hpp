@@ -100,8 +100,11 @@ class guardrails_evaluator {
 	 */
 	void pause_observation() noexcept;
 
-	/** @brief Enter ROLLBACK_PENDING after the intent is durably accepted. */
-	void mark_rollback_pending() noexcept;
+	/**
+	 * @brief Enter ROLLBACK_PENDING after durable intent acceptance.
+	 * @param attribution_accepted True only for the evaluator's just-submitted attribution intent.
+	 */
+	void mark_rollback_pending(bool attribution_accepted) noexcept;
 
 	/** @brief Rebuild baseline after the one durable intent disappears. */
 	void resume_after_intent() noexcept;
@@ -134,23 +137,51 @@ class guardrails_evaluator {
 	/** @return Enabled policy cadence, or zero while unconfigured/disabled. */
 	[[nodiscard]] std::chrono::milliseconds poll_interval() const noexcept;
 
+	/** @return Cold copy of current state and retained decision evidence, with no live bank borrow. */
+	[[nodiscard]] kinetum::control::v1::GuardrailsEvaluation evaluation() const;
+
     private:
 	/**
-	 * @brief Clear all evidence while preserving the configured policy.
+	 * @brief Clear the current window while retaining runtime regression cursors and completed evidence.
 	 * @param state Exact post-reset evaluator phase.
 	 */
 	void reset_evidence_(guardrails_evaluator_state state) noexcept;
 
 	/** @brief Last accepted cumulative point used for exact interval deltas. */
 	struct cumulative_point {
-		std::string snapshot_id;	 ///< Exact durable active content.
-		uint64_t epoch{0};		 ///< Last globally COMPLETE epoch.
-		uint64_t runtime_generation{0};	 ///< Exact cumulative-counter namespace.
-		uint64_t collection_ns{0};	 ///< Data Plane monotonic collection time.
-		uint64_t rx_packets{0};		 ///< Cumulative admitted ingress.
-		uint64_t tx_packets{0};		 ///< Cumulative accepted egress.
-		uint64_t dropped_packets{0};	 ///< Cumulative terminal drop.
+		std::string snapshot_id;			   ///< Exact durable active content.
+		uint64_t epoch{0};				   ///< Last globally COMPLETE epoch.
+		uint64_t runtime_generation{0};			   ///< Exact cumulative-counter namespace.
+		uint64_t revision{0};				   ///< Exact durable revision, including zero.
+		kinetum::common::sha256_digest validation_hash{};  ///< Exact durable content hash.
+		uint64_t rx_packets{0};				   ///< Cumulative admitted ingress.
+		uint64_t tx_packets{0};				   ///< Cumulative accepted egress.
+		uint64_t dropped_packets{0};			   ///< Cumulative terminal drop.
+		std::vector<kinetum::telemetry::v1::WorkerCounterStats>
+			workers;  ///< One complete compact observation vector.
 	};
+
+	/**
+	 * @brief Validate every worker before advancing the persistent regression cursor.
+	 * @param point Candidate complete vector from one intrinsically validated response.
+	 * @return OK for nonregressing immutable publication identities, or DATA_LOSS without cursor mutation.
+	 */
+	[[nodiscard]] kinetum::common::status accept_cursors_(const cumulative_point &point);
+
+	/**
+	 * @param point Complete fenced content/runtime identity.
+	 * @return Exact identity projection with no collection-time measurement claim.
+	 */
+	[[nodiscard]] static kinetum::control::v1::GuardrailsObservationIdentity
+	identity_from_(const cumulative_point &point);
+
+	/**
+	 * @brief Retain the actual terminal window outcome before clearing its scalar history.
+	 * @param point Exact candidate identity.
+	 * @param outcome Reason the candidate window ended.
+	 */
+	void complete_evaluation_(const cumulative_point &point,
+				  kinetum::control::v1::GuardrailsEvaluationOutcome outcome);
 
 	/**
 	 * @brief Bind one cumulative seed and reset correlation to that content.
@@ -173,25 +204,28 @@ class guardrails_evaluator {
 	 * @param baseline_tx_pps Positive stable baseline, or zero while building it.
 	 * @return One real interval sample or exact identity/regression failure.
 	 */
-	[[nodiscard]] static kinetum::common::status_or<telemetry_snapshot>
+	[[nodiscard]] static kinetum::common::status_or<std::optional<telemetry_snapshot>>
 	interval_sample_(const cumulative_point &previous, const cumulative_point &point,
 			 const guardrails_runtime_observation &current, double baseline_tx_pps);
 
 	guardrails_evaluator_state state_{guardrails_evaluator_state::UNCONFIGURED};  ///< Sole phase.
-	uint64_t policy_generation_{0};			   ///< Exact durable policy generation.
-	kinetum::control::v1::GuardrailsPolicy policy_;	   ///< Current complete policy.
-	std::unique_ptr<health_correlator> correlator_;	   ///< Correlation detector, when selected.
-	std::unique_ptr<telemetry_history> history_;	   ///< Bounded valid interval history.
-	std::unique_ptr<attribution_scorer> scorer_;	   ///< Explicit previous/current attribution.
-	std::optional<cumulative_point> previous_;	   ///< Last valid cumulative high-watermark.
-	std::vector<telemetry_snapshot> frozen_baseline_;  ///< Previous-content evidence.
-	std::string current_snapshot_id_;		   ///< Current active content identity.
-	uint64_t current_epoch_{0};			   ///< Exact epoch paired with current_snapshot_id_.
-	std::string rollback_snapshot_id_;		   ///< Frozen prior content during evaluation.
-	uint64_t runtime_generation_{0};		   ///< Current cumulative-counter namespace.
-	double baseline_tx_pps_{0.0};			   ///< Mean valid stable throughput.
-	uint64_t evaluation_elapsed_ns_{0};		   ///< Sum of contiguous valid intervals only.
-	bool interval_contiguous_{false};		   ///< Whether next valid point may produce a delta.
+	uint64_t policy_generation_{0};			 ///< Exact durable policy generation.
+	kinetum::control::v1::GuardrailsPolicy policy_;	 ///< Current complete policy.
+	std::unique_ptr<health_correlator> correlator_;	 ///< Correlation detector, when selected.
+	std::unique_ptr<telemetry_history> history_;	 ///< Bounded valid interval history.
+	std::unique_ptr<attribution_scorer> scorer_;	 ///< Explicit previous/current attribution.
+	std::optional<cumulative_point> previous_;	 ///< Last complete current-content interval endpoint.
+	std::optional<cumulative_point>
+		observed_;  ///< Runtime-scoped high-watermark, retained across policy/content changes.
+	std::optional<kinetum::control::v1::GuardrailsCompletedEvaluation> last_completed_;  ///< Latest terminal window.
+	std::optional<kinetum::control::v1::GuardrailsAttribution> last_attribution_;  ///< Latest actual scored proof.
+	std::vector<telemetry_snapshot> frozen_baseline_;			       ///< Previous-content evidence.
+	std::optional<kinetum::control::v1::GuardrailsObservationIdentity>
+		current_identity_;	     ///< Evaluator binding, distinct from raw counter cursors.
+	std::string rollback_snapshot_id_;   ///< Frozen prior content during evaluation.
+	double baseline_tx_pps_{0.0};	     ///< Mean valid stable throughput.
+	uint64_t evaluation_elapsed_ns_{0};  ///< Sum of contiguous valid intervals only.
+	bool interval_contiguous_{false};    ///< Whether next valid point may produce a delta.
 };
 
 }  // namespace kinetum::cp

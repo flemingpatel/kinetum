@@ -298,7 +298,6 @@ class runtime_telemetry_aggregator final : public epoch_transition_telemetry_com
 	std::vector<worker_telemetry_channel *> channels_;	   ///< Compact bank-token channels.
 	std::vector<worker_runtime_telemetry *> workers_;	   ///< Compact worker bank owners.
 	std::vector<owner_aggregation_state> worker_aggregation_;  ///< Coordinator-owned worker-bank truth.
-	std::vector<uint8_t> worker_observed_;			   ///< One after each worker's first complete bank.
 	module::module_runtime_generation &modules_;		   ///< Exact module telemetry lookup.
 	const runtime_status_publication &runtime_status_;	   ///< Sole readiness/epoch observation.
 	mutable std::mutex aggregate_mutex_;			   ///< Cold aggregate copy/merge serialization.
@@ -315,8 +314,8 @@ class runtime_telemetry_aggregator final : public epoch_transition_telemetry_com
 	bool pending_histogram_started_{false};	      ///< Whether summary metadata merged once.
 	bool pending_histogram_replace_{false};	      ///< Whether prefixes overwrite a prior epoch's buckets.
 	bool module_commit_in_progress_{false};	      ///< Aggregate lock guards a partially merged module bank.
-	bool stream_accounting_exhausted_{false};     ///< Aggregate lock guards permanent loss of exact counter range.
-	bool workers_quiesced_{false};		      ///< Whether all bank producers have exited.
+	bool counter_accounting_exhausted_{false};  ///< Aggregate lock guards exhausted counts or observation identity.
+	bool workers_quiesced_{false};		    ///< Whether all bank producers have exited.
 };
 
 }  // namespace kinetum::dp

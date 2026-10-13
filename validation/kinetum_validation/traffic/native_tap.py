@@ -12,6 +12,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import fcntl
+import json
+import re
 import socket
 import struct
 from pathlib import Path
@@ -41,6 +43,15 @@ _SIOCGIFHWADDR = 0x8927
 _SOL_PACKET = 263
 _PACKET_ADD_MEMBERSHIP = 1
 _PACKET_MR_PROMISC = 1
+_CAPTURE_STATISTIC_NAMES = {
+    "captured": "captured",
+    "received by filter": "received_by_filter",
+    "dropped by kernel": "dropped_by_kernel",
+    "dropped by interface": "dropped_by_interface",
+}
+_CAPTURE_STATISTIC = re.compile(
+    r"([0-9]+) packets? (captured|received by filter|dropped by kernel|dropped by interface)"
+)
 
 
 class NativeTapTrafficDriver(TrafficDriver):
@@ -71,6 +82,8 @@ class NativeTapTrafficDriver(TrafficDriver):
         self._capture_task: Optional[asyncio.Task] = None
         self._pcap_file: Optional[Path] = None
         self._capture_ready: Optional[asyncio.Event] = None
+        self._capture_statistics: dict[str, int] = {}
+        self._completed_capture: Optional[Tuple[Path, int]] = None
 
     @property
     def requires_sustained_generation_overlap(self) -> bool:
@@ -93,9 +106,10 @@ class NativeTapTrafficDriver(TrafficDriver):
         )
 
     async def teardown(self) -> None:
-        """Stop capture if still running."""
+        """Retire capture ownership and discard any unconsumed analysis identity."""
         if self._capture_proc:
             await self.stop_capture()
+        self._completed_capture = None
         log_info("native_tap", "traffic driver torn down")
 
     async def exchange_udp_packets(
@@ -159,16 +173,25 @@ class NativeTapTrafficDriver(TrafficDriver):
         """
         if self._capture_proc:
             raise RuntimeError("capture already running")
-        if pcap_file.exists() or pcap_file.is_symlink():
-            raise RuntimeError(f"capture output already exists: {pcap_file}")
+        if not pcap_file.is_absolute() or pcap_file.suffix != ".pcap":
+            raise RuntimeError("capture requires an absolute .pcap output path")
+        for output in (pcap_file, pcap_file.with_suffix(".capture.json")):
+            if output.exists() or output.is_symlink():
+                raise RuntimeError(f"capture output already exists: {output}")
 
         tcpdump = require_system_executable(TCPDUMP_EXECUTABLE, "tcpdump")
+        # Immediate Linux capture reserves fixed-size slots. Bound each slot by
+        # every frame this run can send, including transition and size-sweep traffic.
+        capture_bytes = max(self.config.packet.packet_size, *self.config.packet.sizes_to_test)
+        if capture_bytes <= 0:
+            raise RuntimeError("native capture requires a positive frame-size bound")
         cmd = [
             tcpdump,
             "-i", self._capture_iface,
             "-w", str(pcap_file),
+            "--immediate-mode",
             "-B", "131072",  # 128 MB capture buffer.
-            "-s", "0",  # Full packet capture.
+            "-s", str(capture_bytes),
             filter_expr,
         ]
 
@@ -177,10 +200,12 @@ class NativeTapTrafficDriver(TrafficDriver):
             *cmd,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,
-            env=exact_subprocess_environment(),
+            env={**exact_subprocess_environment(), "LC_ALL": "C"},
         )
         self._capture_proc = process
         self._pcap_file = pcap_file
+        self._capture_statistics = {}
+        self._completed_capture = None
         ready_waiter: Optional[asyncio.Task] = None
         exit_waiter: Optional[asyncio.Task] = None
         try:
@@ -259,9 +284,12 @@ class NativeTapTrafficDriver(TrafficDriver):
                             "tcpdump process ownership did not retire after forced exit"
                         ) from exc
             if task is not None:
-                await asyncio.wait_for(
-                    task, timeout=_CAPTURE_RETIRE_TIMEOUT_S
-                )
+                if not task.done():
+                    await asyncio.wait_for(task, timeout=_CAPTURE_RETIRE_TIMEOUT_S)
+                elif not task.cancelled():
+                    # The caller retains the original reader failure. A finished
+                    # reader owns no remaining work to retire a second time.
+                    task.exception()
         finally:
             process_retired = process is None or process.returncode is not None
             task_retired = task is None or task.done()
@@ -270,14 +298,23 @@ class NativeTapTrafficDriver(TrafficDriver):
                 self._capture_task = None
                 self._capture_ready = None
                 self._pcap_file = None
+                self._capture_statistics = {}
 
     async def stop_capture(self) -> None:
-        """Stop packet capture and settle child plus output-task ownership."""
+        """Retire tcpdump and require complete delivery into its savefile.
+
+        Retain final counters beside the PCAP even when completion fails. A clean
+        Linux capture has equal captured/filter counts and no reported drops;
+        the native analyzer independently checks the saved record count later.
+        """
         if not self._capture_proc:
             return
 
         log_info("native_tap", "stopping capture...")
         process = self._capture_proc
+        pcap_file = self._pcap_file
+        statistics = self._capture_statistics
+        capture_error = None
         exited_before_stop = process.returncode is not None
         output_ended_before_stop = (
             self._capture_task is not None and self._capture_task.done()
@@ -314,8 +351,23 @@ class NativeTapTrafficDriver(TrafficDriver):
                 raise RuntimeError(
                     f"tcpdump capture exited uncleanly: {process.returncode}"
                 )
-            log_info("native_tap", "capture stopped; analyzer owns packet count")
+            missing = {"captured", "received_by_filter", "dropped_by_kernel"} - statistics.keys()
+            if missing:
+                raise RuntimeError("tcpdump omitted capture counters: " + ", ".join(sorted(missing)))
+            if statistics["dropped_by_kernel"] or statistics.get("dropped_by_interface", 0):
+                raise RuntimeError(
+                    "tcpdump reported packet drops during capture: "
+                    f"captured={statistics['captured']}, received={statistics['received_by_filter']}, "
+                    f"kernel={statistics['dropped_by_kernel']}, "
+                    f"interface={statistics.get('dropped_by_interface', 'not reported')}"
+                )
+            if statistics["captured"] != statistics["received_by_filter"]:
+                raise RuntimeError(
+                    "tcpdump capture is incomplete: "
+                    f"captured={statistics['captured']} received_by_filter={statistics['received_by_filter']}"
+                )
         except BaseException as stop_error:
+            capture_error = str(stop_error) or type(stop_error).__name__
             try:
                 await self._retire_failed_capture_start()
             except BaseException as cleanup_error:
@@ -333,19 +385,51 @@ class NativeTapTrafficDriver(TrafficDriver):
                 self._capture_task = None
                 self._capture_ready = None
                 self._pcap_file = None
+                self._capture_statistics = {}
+                if pcap_file is not None:
+                    try:
+                        with pcap_file.with_suffix(".capture.json").open("x", encoding="utf-8") as output:
+                            json.dump({
+                                "returncode": process.returncode,
+                                "statistics": statistics,
+                                "error": capture_error,
+                            }, output, allow_nan=False, indent=2, sort_keys=True)
+                            output.write("\n")
+                    except OSError as exc:
+                        raise RuntimeError(
+                            "tcpdump evidence could not be retained: "
+                            f"capture_error={capture_error}; output_error={exc}"
+                        ) from exc
+        if pcap_file is None:
+            raise RuntimeError("tcpdump completion lost its capture identity")
+        self._completed_capture = (pcap_file, statistics["captured"])
+        log_info("native_tap", "capture stopped with complete delivery; analyzer will verify the saved count")
 
     async def analyze_capture(
         self,
         pcap_file: Path,
         expected_count: int,
     ) -> AnalysisResult:
-        """Analyze one exact native capture with mandatory latency evidence."""
-        analyzer = PacketAnalyzer(
-            pcap_file=pcap_file,
-            analyzer_bin=self.analyzer_bin,
-            expected_count=expected_count,
-        )
-        return analyzer.analyze()
+        """Consume the completed capture and cross-check its count before returning evidence."""
+        completed = self._completed_capture
+        if self._capture_proc is not None or completed is None or completed[0] != pcap_file:
+            raise RuntimeError("native analysis does not own the completed capture window")
+        try:
+            analyzer = PacketAnalyzer(
+                pcap_file=pcap_file,
+                analyzer_bin=self.analyzer_bin,
+                expected_count=expected_count,
+                stream_count=len(self._ingress_ifaces),
+            )
+            result = analyzer.analyze()
+            if result.total_rx != completed[1]:
+                raise RuntimeError(
+                    "native PCAP record count disagrees with tcpdump: "
+                    f"pcap={result.total_rx} captured={completed[1]}"
+                )
+            return result
+        finally:
+            self._completed_capture = None
 
     def make_sender(self, packet_config: PacketConfig) -> NativeSender:
         """Create a native sender bound to TAP ingress interfaces."""
@@ -373,3 +457,12 @@ class NativeTapTrafficDriver(TrafficDriver):
                 log_info("capture", text)
                 if self._capture_ready is not None and "listening on " in text:
                     self._capture_ready.set()
+                if any(text.endswith(name) for name in _CAPTURE_STATISTIC_NAMES):
+                    statistic = _CAPTURE_STATISTIC.fullmatch(text)
+                    if statistic is None or int(statistic[1]) > (1 << 32) - 1:
+                        raise RuntimeError("tcpdump emitted a malformed capture count")
+                    name = _CAPTURE_STATISTIC_NAMES[statistic[2]]
+                    count = int(statistic[1])
+                    if name in self._capture_statistics and count < self._capture_statistics[name]:
+                        raise RuntimeError("tcpdump capture count regressed: " + name)
+                    self._capture_statistics[name] = count

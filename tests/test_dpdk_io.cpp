@@ -446,7 +446,14 @@ class storage_fixture {
 
 /** @brief Observable state behind one injected ethdev API. */
 struct ethdev_state {
-	std::vector<std::string> events;    ///< Ordered native ownership trace.
+	std::vector<std::string> events;  ///< Ordered native ownership trace.
+
+	bool require_queue_pairs{false};	       ///< Enforce the TAP PMD's native RX/TX count equality.
+	uint16_t maximum_rx_queues{TEST_QUEUE_LIMIT};  ///< Native RX queue population limit.
+	uint16_t maximum_tx_queues{TEST_QUEUE_LIMIT};  ///< Native TX queue population limit.
+	uint16_t maximum_rx_descriptors{1024};	       ///< Native RX descriptor limit.
+	uint16_t maximum_tx_descriptors{1024};	       ///< Native TX descriptor limit.
+
 	uint64_t tx_offloads{0};	    ///< Native default TX mode exposed during preflight.
 	int configure_result{0};	    ///< Configured ethdev configure result.
 	int mtu_result{0};		    ///< Configured MTU result.
@@ -471,13 +478,15 @@ struct ethdev_state {
 	uint16_t configured_rx_queues{0};   ///< Exact configured RX queue count.
 	uint16_t configured_tx_queues{0};   ///< Exact configured TX queue count.
 	uint16_t configured_mtu{0};	    ///< Exact configured MTU.
-	std::array<rte_mempool *, TEST_QUEUE_LIMIT> rx_pools{};	 ///< Pool supplied to each native RX queue.
-	uint16_t programmed_reta_size{0};			 ///< Exact RETA population.
-	std::vector<uint16_t> programmed_reta;			 ///< Complete observed RETA queue mapping.
-	std::vector<uint8_t> configured_rss_key;		 ///< Exact configured RSS key.
-	std::vector<uint16_t> flow_queues;			 ///< Exact symmetric-flow queue set.
-	uint32_t flow_key_length{0};				 ///< Exact symmetric-flow key length.
-	rte_eth_stats statistics{};				 ///< Exact injected native counter snapshot.
+	std::array<rte_mempool *, TEST_QUEUE_LIMIT> rx_pools{};	  ///< Pool supplied to each native RX queue.
+	std::array<uint16_t, TEST_QUEUE_LIMIT> rx_descriptors{};  ///< Descriptor bound supplied to each native RX queue.
+	std::array<uint16_t, TEST_QUEUE_LIMIT> tx_descriptors{};  ///< Descriptor bound supplied to each native TX queue.
+	uint16_t programmed_reta_size{0};			  ///< Exact RETA population.
+	std::vector<uint16_t> programmed_reta;			  ///< Complete observed RETA queue mapping.
+	std::vector<uint8_t> configured_rss_key;		  ///< Exact configured RSS key.
+	std::vector<uint16_t> flow_queues;			  ///< Exact symmetric-flow queue set.
+	uint32_t flow_key_length{0};				  ///< Exact symmetric-flow key length.
+	rte_eth_stats statistics{};				  ///< Exact injected native counter snapshot.
 };
 
 /**
@@ -494,13 +503,13 @@ int device_info(void *opaque, uint16_t port_id, rte_eth_dev_info *info) noexcept
 		return -1;
 	}
 	*info = rte_eth_dev_info{};
-	info->max_rx_queues = TEST_QUEUE_LIMIT;
-	info->max_tx_queues = TEST_QUEUE_LIMIT;
+	info->max_rx_queues = state.maximum_rx_queues;
+	info->max_tx_queues = state.maximum_tx_queues;
 	info->rx_desc_lim.nb_min = 64;
-	info->rx_desc_lim.nb_max = 1024;
+	info->rx_desc_lim.nb_max = state.maximum_rx_descriptors;
 	info->rx_desc_lim.nb_align = 64;
 	info->tx_desc_lim.nb_min = 64;
-	info->tx_desc_lim.nb_max = 1024;
+	info->tx_desc_lim.nb_max = state.maximum_tx_descriptors;
 	info->tx_desc_lim.nb_align = 64;
 	info->hash_key_size = static_cast<uint8_t>(TEST_RSS_KEY_SIZE);
 	info->reta_size = 128;
@@ -541,6 +550,9 @@ int configure_port(void *opaque, uint16_t port_id, uint16_t rx_queues, uint16_t 
 	}
 	state.configured_rx_queues = rx_queues;
 	state.configured_tx_queues = tx_queues;
+	if (state.require_queue_pairs && rx_queues != tx_queues) {
+		return -1;
+	}
 	const auto &rss = configuration->rx_adv_conf.rss_conf;
 	if (rss.rss_key_len != 0 && rss.rss_key != nullptr) {
 		state.configured_rss_key.assign(rss.rss_key, rss.rss_key + rss.rss_key_len);
@@ -579,10 +591,11 @@ int setup_rx_queue(void *opaque, uint16_t port_id, uint16_t queue_id, uint16_t d
 {
 	auto &state = *static_cast<ethdev_state *>(opaque);
 	state.events.push_back("rx" + std::to_string(queue_id));
-	if (queue_id >= state.rx_pools.size()) {
+	if (queue_id >= state.rx_pools.size() || queue_id >= state.configured_rx_queues) {
 		return -1;
 	}
 	state.rx_pools[queue_id] = pool;
+	state.rx_descriptors[queue_id] = descriptors;
 	return port_id == TEST_PHYSICAL_PORT && descriptors == TEST_DESCRIPTOR_COUNT && socket_id == 0 &&
 			       configuration != nullptr && pool != nullptr ?
 		       state.rx_setup_result :
@@ -604,6 +617,10 @@ int setup_tx_queue(void *opaque, uint16_t port_id, uint16_t queue_id, uint16_t d
 {
 	auto &state = *static_cast<ethdev_state *>(opaque);
 	state.events.push_back("tx" + std::to_string(queue_id));
+	if (queue_id >= state.tx_descriptors.size() || queue_id >= state.configured_tx_queues) {
+		return -1;
+	}
+	state.tx_descriptors[queue_id] = descriptors;
 	return port_id == TEST_PHYSICAL_PORT && descriptors == TEST_DESCRIPTOR_COUNT && socket_id == 0 &&
 			       configuration != nullptr ?
 		       state.tx_setup_result :
@@ -939,6 +956,13 @@ class io_driver_fixture {
 		facts_.steering_profile_count = 0;
 	}
 
+	/** @brief Add an unmatched TX queue to exercise population rejection. */
+	void add_tx_queue() noexcept
+	{
+		streams_[2] = stream(2, 1, KINETUM_PROVIDER_IO_DIRECTION_TX);
+		facts_.stream_count = 3;
+	}
+
 	/**
 	 * @brief Admit one additional exact pool to every TX queue without changing RX ownership.
 	 * @param storage Second live pool retained through driver retirement.
@@ -973,6 +997,7 @@ class io_driver_fixture {
 		streams_[2] = stream(2, 1, KINETUM_PROVIDER_IO_DIRECTION_RX);
 		streams_[2].has_steering_profile = 1;
 		streams_[2].steering_profile_index = 0;
+		streams_[3] = stream(3, 1, KINETUM_PROVIDER_IO_DIRECTION_TX);
 		steering_streams_[0] = 0;
 		steering_streams_[1] = 2;
 		steering_[0] = kinetum_provider_steering_fact{
@@ -988,7 +1013,7 @@ class io_driver_fixture {
 			.io_stream_count = static_cast<uint32_t>(steering_streams_.size()),
 			.padding = {0},
 		};
-		facts_.stream_count = 3;
+		facts_.stream_count = 4;
 		facts_.steering_profiles = steering_.data();
 		facts_.steering_profile_count = 1;
 	}
@@ -1043,12 +1068,18 @@ class io_driver_fixture {
 
 	/**
 	 * @brief Return mutable exact stream facts for malformed-input cases.
-	 * @param index Index below the fixture's fixed three-row storage size.
+	 * @param index Index below the fixture's fixed four-row storage size.
 	 * @return Borrowed mutable stream row.
 	 */
 	[[nodiscard]] kinetum_provider_io_stream_fact &stream_fact(std::size_t index) noexcept
 	{
 		return streams_[index];
+	}
+
+	/** @return Mutable driver facts for explicit malformed-population cases. */
+	[[nodiscard]] kinetum_provider_io_driver_facts &facts() noexcept
+	{
+		return facts_;
 	}
 
 	/** @return Reference to the fixture's retained native driver owner. */
@@ -1091,7 +1122,7 @@ class io_driver_fixture {
 
 	std::array<kinetum_provider_driver_attachment_fact, 1> attachments_{};	///< Exact native port.
 	std::array<kinetum_provider_io_port_fact, 1> ports_{};			///< Exact logical port.
-	std::array<kinetum_provider_io_stream_fact, 3> streams_{};		///< Bounded RX/TX queues.
+	std::array<kinetum_provider_io_stream_fact, 4> streams_{};		///< Bounded RX/TX queues.
 	std::array<kinetum_provider_text_view, 2> hash_fields_{};		///< Exact RSS field order.
 	std::array<uint8_t, TEST_RSS_KEY_SIZE> rss_key_{};			///< Exact deterministic PMD key.
 	std::array<uint32_t, 2> steering_streams_{};				///< Exact governed RX stream set.
@@ -1172,6 +1203,7 @@ TEST(dpdk_io, rss_receive_queues_materialize_distinct_allocation_pools)
 {
 	constexpr std::array<uint32_t, 1> SECOND_STORAGE{1};
 	facility_fixture facility;
+	facility.add_packet_worker(1, 4);
 	facility.add_memory_domain(1);
 	ASSERT_EQ(facility.create(), KINETUM_PROVIDER_STATUS_OK);
 	mempool_state first_pool;
@@ -1187,6 +1219,7 @@ TEST(dpdk_io, rss_receive_queues_materialize_distinct_allocation_pools)
 	driver.stream_fact(2).storage_domain_indices = SECOND_STORAGE.data();
 	ASSERT_EQ(driver.create(native), KINETUM_PROVIDER_STATUS_OK);
 	EXPECT_EQ(native.configured_rx_queues, 2u);
+	EXPECT_EQ(native.configured_tx_queues, 2u);
 	EXPECT_EQ(native.rx_pools[0], &first_pool.pool);
 	EXPECT_EQ(native.rx_pools[1], &second_pool.pool);
 	EXPECT_EQ(driver.driver()->operations().rx_queue_count, 2u);
@@ -1529,6 +1562,8 @@ TEST(dpdk_io, one_sided_driver_operation_tables_obey_zero_count_nullability)
 		EXPECT_NE(operations.rx_queues, nullptr);
 		EXPECT_EQ(operations.tx_queue_count, 0u);
 		EXPECT_EQ(operations.tx_queues, nullptr);
+		EXPECT_EQ(native.configured_rx_queues, 1u);
+		EXPECT_EQ(native.configured_tx_queues, 0u);
 		EXPECT_EQ(kinetum_provider_io_driver_operations_are_valid(&operations), 1u);
 	}
 
@@ -1548,7 +1583,254 @@ TEST(dpdk_io, one_sided_driver_operation_tables_obey_zero_count_nullability)
 		EXPECT_EQ(operations.rx_queues, nullptr);
 		EXPECT_EQ(operations.tx_queue_count, 1u);
 		EXPECT_NE(operations.tx_queues, nullptr);
+		EXPECT_EQ(native.configured_rx_queues, 0u);
+		EXPECT_EQ(native.configured_tx_queues, 1u);
 		EXPECT_EQ(kinetum_provider_io_driver_operations_are_valid(&operations), 1u);
+	}
+}
+
+/** @brief TAP pairs native queues while publishing only the authored packet directions. */
+TEST(dpdk_io, tap_queue_pairs_preserve_authored_operation_directions)
+{
+	for (const auto direction : {KINETUM_PROVIDER_IO_DIRECTION_RX, KINETUM_PROVIDER_IO_DIRECTION_TX,
+				     KINETUM_PROVIDER_IO_DIRECTION_BIDIRECTIONAL}) {
+		SCOPED_TRACE(static_cast<uint32_t>(direction));
+		facility_fixture facility;
+		facility.use_tap_attachment();
+		ASSERT_EQ(facility.create(), KINETUM_PROVIDER_STATUS_OK);
+		mempool_state pool;
+		storage_fixture storage(facility);
+		ASSERT_EQ(storage.create(pool), KINETUM_PROVIDER_STATUS_OK);
+		ethdev_state native;
+		native.require_queue_pairs = true;
+		io_driver_fixture driver(facility, storage);
+		if (direction == KINETUM_PROVIDER_IO_DIRECTION_RX) {
+			driver.retain_rx_only();
+		} else if (direction == KINETUM_PROVIDER_IO_DIRECTION_TX) {
+			driver.retain_tx_only();
+		}
+
+		ASSERT_EQ(driver.create(native), KINETUM_PROVIDER_STATUS_OK);
+		const auto &operations = driver.driver()->operations();
+		EXPECT_EQ(operations.rx_queue_count, direction == KINETUM_PROVIDER_IO_DIRECTION_TX ? 0u : 1u);
+		EXPECT_EQ(operations.tx_queue_count, direction == KINETUM_PROVIDER_IO_DIRECTION_RX ? 0u : 1u);
+		EXPECT_EQ(operations.rx_queues == nullptr, direction == KINETUM_PROVIDER_IO_DIRECTION_TX);
+		EXPECT_EQ(operations.tx_queues == nullptr, direction == KINETUM_PROVIDER_IO_DIRECTION_RX);
+		EXPECT_EQ(kinetum_provider_io_driver_operations_are_valid(&operations), 1u);
+		EXPECT_EQ(native.configured_rx_queues, 1u);
+		EXPECT_EQ(native.configured_tx_queues, 1u);
+		EXPECT_EQ(native.rx_pools[0], &pool.pool);
+		EXPECT_EQ(native.rx_descriptors[0], TEST_DESCRIPTOR_COUNT);
+		EXPECT_EQ(native.tx_descriptors[0], TEST_DESCRIPTOR_COUNT);
+		EXPECT_LT(event_index(native.events, "rx0"), event_index(native.events, "tx0"));
+		ASSERT_EQ(driver.activate(), KINETUM_PROVIDER_STATUS_OK);
+		ASSERT_EQ(driver.deactivate(), KINETUM_PROVIDER_STATUS_OK);
+		driver.driver().reset();
+		EXPECT_EQ(native.stop_calls, 1u);
+		EXPECT_EQ(native.close_calls, 1u);
+	}
+}
+
+/** @brief TAP queue setup follows native queue IDs even when stream order differs. */
+TEST(dpdk_io, tap_queue_pairs_follow_native_queue_order)
+{
+	facility_fixture facility;
+	facility.use_tap_attachment();
+	facility.add_packet_worker(1, 4);
+	ASSERT_EQ(facility.create(), KINETUM_PROVIDER_STATUS_OK);
+	mempool_state pool;
+	storage_fixture storage(facility);
+	ASSERT_EQ(storage.create(pool), KINETUM_PROVIDER_STATUS_OK);
+	ethdev_state native;
+	native.require_queue_pairs = true;
+	io_driver_fixture driver(facility, storage);
+	driver.enable_symmetric_rss();
+	std::swap(driver.stream_fact(0).driver_queue_id, driver.stream_fact(2).driver_queue_id);
+	std::swap(driver.stream_fact(1).driver_queue_id, driver.stream_fact(3).driver_queue_id);
+
+	ASSERT_EQ(driver.create(native), KINETUM_PROVIDER_STATUS_OK);
+	EXPECT_EQ(native.configured_rx_queues, 2u);
+	EXPECT_EQ(native.configured_tx_queues, 2u);
+	EXPECT_EQ(driver.driver()->operations().rx_queue_count, 2u);
+	EXPECT_EQ(driver.driver()->operations().tx_queue_count, 2u);
+	for (std::size_t queue = 0; queue < 2u; ++queue) {
+		EXPECT_EQ(native.rx_pools[queue], &pool.pool);
+		EXPECT_EQ(native.rx_descriptors[queue], TEST_DESCRIPTOR_COUNT);
+		EXPECT_EQ(native.tx_descriptors[queue], TEST_DESCRIPTOR_COUNT);
+	}
+	EXPECT_LT(event_index(native.events, "rx0"), event_index(native.events, "rx1"));
+	EXPECT_LT(event_index(native.events, "rx1"), event_index(native.events, "tx0"));
+	EXPECT_LT(event_index(native.events, "tx0"), event_index(native.events, "tx1"));
+}
+
+/** @brief Every bidirectional port requires the compiled equal RX/TX populations. */
+TEST(dpdk_io, unequal_bidirectional_queue_populations_reject_before_native_configuration)
+{
+	for (const bool tap : {false, true}) {
+		for (const bool more_rx : {false, true}) {
+			SCOPED_TRACE(tap);
+			SCOPED_TRACE(more_rx);
+			facility_fixture facility;
+			if (tap) {
+				facility.use_tap_attachment();
+			}
+			facility.add_packet_worker(1, 4);
+			ASSERT_EQ(facility.create(), KINETUM_PROVIDER_STATUS_OK);
+			mempool_state pool;
+			storage_fixture storage(facility);
+			ASSERT_EQ(storage.create(pool), KINETUM_PROVIDER_STATUS_OK);
+			ethdev_state native;
+			native.require_queue_pairs = tap;
+			io_driver_fixture driver(facility, storage);
+			if (more_rx) {
+				driver.enable_symmetric_rss();
+				driver.facts().stream_count = 3;
+			} else {
+				driver.add_tx_queue();
+			}
+			EXPECT_EQ(driver.create(native), KINETUM_PROVIDER_STATUS_INVALID_ARGUMENT);
+			EXPECT_EQ(driver.driver(), nullptr);
+			EXPECT_EQ(native.configure_calls, 0u);
+			EXPECT_EQ(native.close_calls, 0u);
+		}
+	}
+}
+
+/** @brief Queue populations cannot wrap into the native sixteen-bit count. */
+TEST(dpdk_io, oversized_queue_population_rejects_before_native_narrowing)
+{
+	constexpr uint32_t QUEUE_COUNT = static_cast<uint32_t>(UINT16_MAX) + 1u;
+	for (const bool tap : {false, true}) {
+		SCOPED_TRACE(tap);
+		facility_fixture facility;
+		if (tap) {
+			facility.use_tap_attachment();
+		}
+		ASSERT_EQ(facility.create(), KINETUM_PROVIDER_STATUS_OK);
+		mempool_state pool;
+		storage_fixture storage(facility);
+		ASSERT_EQ(storage.create(pool), KINETUM_PROVIDER_STATUS_OK);
+		ethdev_state native;
+		native.require_queue_pairs = tap;
+		native.maximum_rx_queues = UINT16_MAX;
+		native.maximum_tx_queues = UINT16_MAX;
+		io_driver_fixture driver(facility, storage);
+		driver.retain_tx_only();
+		std::vector<kinetum_provider_io_stream_fact> streams(QUEUE_COUNT, driver.stream_fact(0));
+		for (uint32_t index = 0; index < QUEUE_COUNT; ++index) {
+			streams[index].io_stream_index = index;
+			streams[index].stage_instance_index = index;
+			streams[index].driver_queue_id = index;
+		}
+		driver.facts().streams = streams.data();
+		driver.facts().stream_count = QUEUE_COUNT;
+		EXPECT_EQ(driver.create(native), KINETUM_PROVIDER_STATUS_FAILED_PRECONDITION);
+		EXPECT_EQ(driver.driver(), nullptr);
+		EXPECT_EQ(native.configure_calls, 0u);
+		EXPECT_EQ(native.close_calls, 0u);
+	}
+}
+
+/** @brief A TX-only TAP pair uses a canonical admitted pool without inventing domain zero. */
+TEST(dpdk_io, tap_tx_pair_uses_first_admitted_storage_domain)
+{
+	constexpr std::array<uint32_t, 2> ADMITTED_DOMAINS{1, 3};
+	facility_fixture facility;
+	facility.use_tap_attachment();
+	facility.memory_domain().storage_domain_index = ADMITTED_DOMAINS[0];
+	facility.add_memory_domain(ADMITTED_DOMAINS[1]);
+	ASSERT_EQ(facility.create(), KINETUM_PROVIDER_STATUS_OK);
+	mempool_state first_pool;
+	mempool_state second_pool;
+	storage_fixture first(facility, ADMITTED_DOMAINS[0]);
+	storage_fixture second(facility, ADMITTED_DOMAINS[1]);
+	ASSERT_EQ(first.create(first_pool), KINETUM_PROVIDER_STATUS_OK);
+	ASSERT_EQ(second.create(second_pool), KINETUM_PROVIDER_STATUS_OK);
+	ethdev_state native;
+	native.require_queue_pairs = true;
+	io_driver_fixture driver(facility, first);
+	driver.retain_tx_only();
+	driver.admit_tx_storage(second);
+	driver.stream_fact(0).storage_domain_indices = ADMITTED_DOMAINS.data();
+
+	ASSERT_EQ(driver.create(native), KINETUM_PROVIDER_STATUS_OK);
+	EXPECT_EQ(native.rx_pools[0], &first_pool.pool);
+	EXPECT_EQ(native.rx_descriptors[0], driver.stream_fact(0).descriptor_count);
+	EXPECT_EQ(native.tx_descriptors[0], driver.stream_fact(0).descriptor_count);
+	EXPECT_EQ(driver.driver()->operations().rx_queue_count, 0u);
+	EXPECT_EQ(driver.driver()->operations().rx_queues, nullptr);
+	EXPECT_EQ(driver.driver()->operations().tx_queue_count, 1u);
+}
+
+/** @brief TAP counterpart queue and descriptor limits reject before native configuration. */
+TEST(dpdk_io, tap_counterpart_limits_reject_before_ethdev_configuration)
+{
+	for (const bool receive_only : {false, true}) {
+		for (const bool descriptor_limit : {false, true}) {
+			SCOPED_TRACE(receive_only);
+			SCOPED_TRACE(descriptor_limit);
+			facility_fixture facility;
+			facility.use_tap_attachment();
+			ASSERT_EQ(facility.create(), KINETUM_PROVIDER_STATUS_OK);
+			mempool_state pool;
+			storage_fixture storage(facility);
+			ASSERT_EQ(storage.create(pool), KINETUM_PROVIDER_STATUS_OK);
+			ethdev_state native;
+			native.require_queue_pairs = true;
+			io_driver_fixture driver(facility, storage);
+			if (receive_only) {
+				driver.retain_rx_only();
+			} else {
+				driver.retain_tx_only();
+			}
+			auto &maximum_descriptors = receive_only ? native.maximum_tx_descriptors :
+								   native.maximum_rx_descriptors;
+			auto &maximum_queues = receive_only ? native.maximum_tx_queues : native.maximum_rx_queues;
+			if (descriptor_limit) {
+				maximum_descriptors = TEST_DESCRIPTOR_COUNT / 2u;
+			} else {
+				maximum_queues = 0;
+			}
+
+			EXPECT_EQ(driver.create(native), KINETUM_PROVIDER_STATUS_FAILED_PRECONDITION);
+			EXPECT_EQ(driver.driver(), nullptr);
+			EXPECT_EQ(native.configure_calls, 0u);
+			EXPECT_EQ(native.close_calls, 0u);
+		}
+	}
+}
+
+/** @brief Failed TAP counterpart setup closes the native port before its pool can retire. */
+TEST(dpdk_io, tap_counterpart_setup_failure_retires_configured_port)
+{
+	for (const bool receive_only : {false, true}) {
+		SCOPED_TRACE(receive_only);
+		facility_fixture facility;
+		facility.use_tap_attachment();
+		ASSERT_EQ(facility.create(), KINETUM_PROVIDER_STATUS_OK);
+		mempool_state pool;
+		storage_fixture storage(facility);
+		ASSERT_EQ(storage.create(pool), KINETUM_PROVIDER_STATUS_OK);
+		ethdev_state native;
+		native.require_queue_pairs = true;
+		io_driver_fixture driver(facility, storage);
+		if (receive_only) {
+			driver.retain_rx_only();
+			native.tx_setup_result = -1;
+		} else {
+			driver.retain_tx_only();
+			native.rx_setup_result = -1;
+		}
+
+		EXPECT_EQ(driver.create(native), KINETUM_PROVIDER_STATUS_IMPLEMENTATION_ERROR);
+		EXPECT_EQ(driver.driver(), nullptr);
+		EXPECT_EQ(native.configure_calls, 1u);
+		EXPECT_EQ(native.stop_calls, 0u);
+		EXPECT_EQ(native.close_calls, 1u);
+		EXPECT_EQ(native.events.back(), "close");
+		EXPECT_EQ(pool.free_calls, 0u);
+		storage.storage().reset();
+		EXPECT_EQ(pool.free_calls, 1u);
 	}
 }
 
@@ -1712,6 +1994,7 @@ TEST(dpdk_io, activation_start_failure_preserves_cold_configured_ownership)
 TEST(dpdk_io, activation_reta_failure_restores_cold_configured_ownership)
 {
 	facility_fixture facility;
+	facility.add_packet_worker(1, 4);
 	ASSERT_EQ(facility.create(), KINETUM_PROVIDER_STATUS_OK);
 	mempool_state pool;
 	storage_fixture storage(facility);
@@ -1735,6 +2018,7 @@ TEST(dpdk_io, activation_reta_failure_restores_cold_configured_ownership)
 TEST(dpdk_io, activation_flow_creation_failure_restores_cold_configured_ownership)
 {
 	facility_fixture facility;
+	facility.add_packet_worker(1, 4);
 	ASSERT_EQ(facility.create(), KINETUM_PROVIDER_STATUS_OK);
 	mempool_state pool;
 	storage_fixture storage(facility);
@@ -1758,6 +2042,7 @@ TEST(dpdk_io, activation_flow_creation_failure_restores_cold_configured_ownershi
 TEST(dpdk_io, symmetric_rss_materializes_exact_reta_and_toeplitz_flow)
 {
 	facility_fixture facility;
+	facility.add_packet_worker(1, 4);
 	ASSERT_EQ(facility.create(), KINETUM_PROVIDER_STATUS_OK);
 	mempool_state pool;
 	storage_fixture storage(facility);
@@ -1769,6 +2054,7 @@ TEST(dpdk_io, symmetric_rss_materializes_exact_reta_and_toeplitz_flow)
 	ASSERT_EQ(driver.create(native), KINETUM_PROVIDER_STATUS_OK);
 	ASSERT_NE(driver.driver(), nullptr);
 	EXPECT_EQ(driver.driver()->operations().rx_queue_count, 2u);
+	EXPECT_EQ(driver.driver()->operations().tx_queue_count, 2u);
 	EXPECT_EQ(native.configured_rss_key.size(), TEST_RSS_KEY_SIZE);
 	EXPECT_EQ(native.programmed_reta_size, 0u);
 	EXPECT_EQ(native.flow_validate_calls, 0u);
@@ -1793,6 +2079,7 @@ TEST(dpdk_io, symmetric_rss_materializes_exact_reta_and_toeplitz_flow)
 TEST(dpdk_io, symmetric_rss_flow_retirement_failure_retains_live_ownership)
 {
 	facility_fixture facility;
+	facility.add_packet_worker(1, 4);
 	ASSERT_EQ(facility.create(), KINETUM_PROVIDER_STATUS_OK);
 	mempool_state pool;
 	storage_fixture storage(facility);
@@ -1819,6 +2106,7 @@ TEST(dpdk_io, symmetric_rss_flow_retirement_failure_retains_live_ownership)
 TEST(dpdk_io, symmetric_rss_capability_failure_stops_and_closes_without_flow_ownership)
 {
 	facility_fixture facility;
+	facility.add_packet_worker(1, 4);
 	ASSERT_EQ(facility.create(), KINETUM_PROVIDER_STATUS_OK);
 	mempool_state pool;
 	storage_fixture storage(facility);

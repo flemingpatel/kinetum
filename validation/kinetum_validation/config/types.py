@@ -35,15 +35,13 @@ from typing import Dict, List, Optional, Tuple
 class CONSTANTS:
     """Fixed physical-validation bounds and shared defaults."""
 
-    # Standard packet sizes for testing (DPDK standard sizes)
-    PACKET_SIZES: Tuple[int, ...] = (64, 128, 256, 512, 1024, 1518)
+    # Supplied Ethernet frame bytes, excluding FCS; 1514 fits a 1500-byte IP MTU.
+    PACKET_SIZES: Tuple[int, ...] = (64, 128, 256, 512, 1024, 1514)
 
     # Process management
     PROCESS_READY_TIMEOUT_S: int = 30
     # Photon owns two child termination graces and its final logging drain.
     PROCESS_SHUTDOWN_TIMEOUT_S: int = 30
-
-    TAP_MTU: int = 9000     # Jumbo frame support
 
     # gRPC endpoints
     DP_ENDPOINT: str = "127.0.0.1:50052"
@@ -54,10 +52,8 @@ class CONSTANTS:
     RX_RSS_2_MIN_NUM_FLOWS: int = 64
     MAX_PACKET_RATE_PPS: int = 1_000_000_000
 
-    # Epoch boundary-ordering test tolerance
-    # TAP interfaces may drop a few packets at test boundaries (timing variance)
-    # This characterizes kernel/capture timing, not epoch inconsistency.
-    # Allow up to 0.1% loss while still validating the epoch mechanism.
+    # External forwarding-loss bound. Source/capture integrity and exact
+    # transition evidence remain mandatory regardless of this tolerance.
     EPOCH_LOSS_TOLERANCE_PCT: float = 0.1
 
 
@@ -521,7 +517,7 @@ class PacketConfig:
     packet_size : int
         Packet size in bytes.
     all_sizes : bool
-        Test all standard sizes (64, 128, 256, 512, 1024, 1518).
+        Test all standard sizes (64, 128, 256, 512, 1024, 1514).
     num_flows : int
         Number of flows for RSS testing.
     src_ip : str
@@ -881,6 +877,23 @@ class PacketStats:
         return self.tx_count / self.duration_s if self.duration_s > 0 else 0.0
 
 
+@dataclass(frozen=True)
+class StreamAnalysisResult:
+    """Exact membership and ordering evidence for one authored TAP ingress."""
+
+    stream_index: int
+    expected_count: int
+    valid: int
+    duplicates: int
+    out_of_order: int
+    missing_count: int
+    transition_seq: int
+    tag_transition_count: int
+    first_tag: Optional[int]
+    last_tag: Optional[int]
+    tag_counts: Dict[int, int]
+
+
 @dataclass
 class AnalysisResult:
     """
@@ -890,11 +903,30 @@ class AnalysisResult:
     valid: int = 0
     invalid: int = 0
     duplicates: int = 0
-    out_of_order: int = 0
     missing_count: int = 0
+    max_gap: Optional[int] = None
     tag_counts: Dict[int, int] = field(default_factory=dict)
-    transition_seq: int = -1
-    tag_transition_count: int = 0
+    streams: Optional[Tuple[StreamAnalysisResult, ...]] = None
+
+    @property
+    def out_of_order(self) -> Optional[int]:
+        """Return measured within-input reversals, or None for counter-only evidence."""
+        return None if self.streams is None else sum(row.out_of_order for row in self.streams)
+
+    @property
+    def transition_seq(self) -> int:
+        """Return the lowest observed input tag-change packet ID, or -1 when absent."""
+        if self.streams is None:
+            return -1
+        return min(
+            (row.transition_seq for row in self.streams if row.transition_seq >= 0),
+            default=-1,
+        )
+
+    @property
+    def tag_transition_count(self) -> Optional[int]:
+        """Return measured tag changes summed across inputs, or None when unmeasured."""
+        return None if self.streams is None else sum(row.tag_transition_count for row in self.streams)
 
     def loss_pct(self, expected: int) -> float:
         """Return nonnegative loss; excess observations remain duplicates."""
@@ -1020,6 +1052,8 @@ class CommitConfirmedTestResult:
     confirm_success: bool = False
     confirm_snapshot_id: str = ""
     confirm_time_remaining_ms: int = 0
+    confirmed_survived_deadline: bool = False
+    confirmed_survival_elapsed_ms: int = 0
     # Timeout scenario (optional - if we test auto-rollback)
     timeout_rollback_occurred: bool = False
     timeout_rollback_snapshot_id: str = ""

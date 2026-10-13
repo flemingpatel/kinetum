@@ -81,6 +81,15 @@ struct runtime_engine_statistics {
 	uint64_t fanout_overflow{0};  ///< Refused additional fan-out branches.
 };
 
+/** @brief One immutable worker measurement in the enclosing runtime generation. */
+struct runtime_worker_counter_statistics {
+	uint32_t worker_index{0};	       ///< Exact compact owner, including processing-only workers.
+	uint64_t observation_epoch{0};	       ///< Epoch carried by the completed worker bank.
+	uint64_t publication_generation{0};    ///< Cold owner sequence; zero until the first bank.
+	uint64_t published_monotonic_ns{0};    ///< Owner's cached measurement timestamp.
+	runtime_engine_statistics counters{};  ///< Cumulative counts; RX/TX derive from owned streams.
+};
+
 /** @brief Latest absolute registered module counter/gauge observation. */
 struct runtime_module_counter_statistics {
 	std::string module_id{};	    ///< Exact module-image identity.
@@ -268,13 +277,14 @@ struct runtime_telemetry_snapshot {
 	std::vector<runtime_module_counter_statistics> module_counters{};      ///< Registered absolute module values.
 	std::vector<runtime_module_histogram_statistics> module_histograms{};  ///< Registered distributions.
 	std::vector<runtime_module_epoch_mismatch_statistics> module_epoch_mismatches{};  ///< Exact mismatch rows.
-	std::vector<runtime_module_health_statistics> module_health{};	       ///< Context-scoped coherent health rows.
-	std::vector<runtime_worker_epoch_statistics> workers{};		       ///< Requested worker rows.
-	std::vector<runtime_region_epoch_statistics> regions{};		       ///< Requested region rows.
-	std::vector<runtime_boundary_epoch_statistics> boundaries{};	       ///< Requested boundary rows.
-	std::vector<runtime_io_stream_statistics> streams{};		       ///< Requested stream rows.
-	std::vector<runtime_storage_domain_statistics> storage_domains{};      ///< Requested storage rows.
-	std::vector<runtime_io_port_statistics> ports{};		       ///< Requested port rows.
+	std::vector<runtime_module_health_statistics> module_health{};	   ///< Context-scoped coherent health rows.
+	std::vector<runtime_worker_epoch_statistics> workers{};		   ///< Requested worker rows.
+	std::vector<runtime_worker_counter_statistics> worker_counters{};  ///< Mandatory completed worker measurements.
+	std::vector<runtime_region_epoch_statistics> regions{};		   ///< Requested region rows.
+	std::vector<runtime_boundary_epoch_statistics> boundaries{};	   ///< Requested boundary rows.
+	std::vector<runtime_io_stream_statistics> streams{};		   ///< Requested stream rows.
+	std::vector<runtime_storage_domain_statistics> storage_domains{};  ///< Requested storage rows.
+	std::vector<runtime_io_port_statistics> ports{};		   ///< Requested port rows.
 	std::vector<runtime_traffic_steering_statistics> steering_profiles{};  ///< Requested steering rows.
 	std::vector<runtime_module_context_domain> module_context_domains{};   ///< Requested context populations.
 };

@@ -404,7 +404,7 @@ atomically.
 | RPC                   | Request -> Response                                                                  |
 | --------------------- | ------------------------------------------------------------------------------------ |
 | `ConfigureGuardrails` | `ConfigureGuardrailsRequest` -> `ConfigureGuardrailsResponse`. Push a new policy.    |
-| `GetGuardrails`       | `GetGuardrailsRequest` -> `GetGuardrailsResponse`. Retrieve the current policy.      |
+| `GetGuardrails`       | `GetGuardrailsRequest` -> `GetGuardrailsResponse`. Retrieve policy and matching evaluator evidence. |
 
 `ConfigureGuardrailsRequest` carries the complete `policy`, a required bounded
 `idempotency_key`, and presence-qualified `expected_policy_generation` (zero
@@ -421,6 +421,11 @@ policy is present with nonzero generation and exact 32-byte hash. The runner
 reads a coherent RCU projection published only after that durable write. See
 [`CONTROL_PLANE_AND_GUARDRAILS_AND_ROLLBACK.md`](CONTROL_PLANE_AND_GUARDRAILS_AND_ROLLBACK.md)
 for the runner state machine.
+
+Field 5, `evaluation`, is an optional read-only publication from the runner.
+CP includes it only when policy generation and any bound active identity match
+durable authority. It exposes actual readiness and retained attribution, not
+another policy or mutation authority. See [evaluation observations](#86-evaluation-observations).
 
 #### 4.4 Observability
 
@@ -857,8 +862,8 @@ families do not need selection flags.
 
 #### 7.2 Mandatory runtime and engine summaries
 
-`RuntimeTelemetry` always carries `runtime`, `engine`, `transition`, and
-`protocol_faults`. `RuntimeObservation` contains exact runtime/status
+`RuntimeTelemetry` always carries `runtime`, `engine`, `worker_counters`,
+`transition`, and `protocol_faults`. `RuntimeObservation` contains exact runtime/status
 publication generations, active/minimum-retained/last-activated epochs,
 active/expected worker counts, collection time, latest completed-bank time,
 and cumulative skipped-publication count. A successful row requires packet
@@ -875,6 +880,22 @@ readiness, all expected workers, and causal timestamps.
 
 All are cumulative within `runtime_generation`. A generation change resets a
 consumer's delta baseline; regression inside one generation is malformed.
+
+`worker_counters[]` (field 19) contains one `WorkerCounterStats` per worker in
+compact index order, independently of optional ledger or stream selection:
+
+| Field | Number | Type | Meaning |
+|---|---|---|---|
+| `worker_index` | 1 | `uint32` | Exact compact owner, including workers without I/O. |
+| `observation_epoch` | 2 | `uint64` | Epoch of the most recently merged worker bank; cumulative counters do not reset here. |
+| `publication_generation` | 3 | `uint64` | Nonzero cold sequence advanced only by a completed worker bank. |
+| `published_monotonic_ns` | 4 | `uint64` | That bank's owner-stamped measurement time. |
+| `counters` | 5 | `EngineStats` | Worker RX/TX derived from owned streams, plus its terminal drops and fan-out refusals. |
+
+Engine totals must equal the worker sums. Missing, duplicate, or foreign-owner
+rows reject. An unchanged sequence identifies unchanged row contents; a newer
+RPC timestamp alone is not a new measurement. The latest-bank maximum may
+advance through module activity while worker measurements remain unchanged.
 
 #### 7.3 Transition, certificate, and grace summaries
 
@@ -1144,7 +1165,7 @@ and correlation modes never compute competing deltas.
 | Field | Type | Purpose |
 | ----- | ---- | ------- |
 | `enabled` | `bool` | False is valid only with every other field absent/zero. |
-| `poll_interval_ms` | `uint64` | Exact monotonic observation cadence. |
+| `poll_interval_ms` | `uint64` | Delay between guardrails telemetry queries. |
 | `evaluation_window_ms` | `uint64` | Valid-observation time allowed after content change. |
 | `telemetry_history_capacity` | `uint32` | Explicit bounded interval-history capacity. |
 | `threshold` | `GuardrailsThresholdPolicy` | One simple interval detector (oneof). |
@@ -1168,7 +1189,7 @@ policy is explicitly empty; fields cannot be staged behind `enabled=false`.
 | `ewma_alpha` | `double` | Smoothing factor in `(0,1]`. |
 | `degradation_threshold` | `double` | Hysteresis entry threshold in `(0,1]`. |
 | `hysteresis_band` | `double` | Band in `[0,0.5]`, strictly below threshold. |
-| `min_samples` | `uint32` | Positive valid-sample floor reachable within the window. |
+| `min_samples` | `uint32` | Positive source-interval floor no greater than history capacity. |
 | `normalization_max_drop_ratio` | `double` | Positive drop ratio mapped to full degradation. |
 | `normalization_min_tx_ratio` | `double` | Throughput ratio in `(0,1)` mapped to full degradation. |
 
@@ -1214,6 +1235,56 @@ spans the full confidence range.
 The nested policy messages above are the complete accepted field set. Recursive
 unknown-field admission rejects any other active wire data; no alias or
 defaulting reader changes that policy.
+
+#### 8.6 Evaluation observations
+
+`GetGuardrailsResponse.evaluation` is a process-local `GuardrailsEvaluation`:
+
+| Field | Number | Type | Meaning |
+|---|---|---|---|
+| `state` | 1 | `GuardrailsEvaluationState` | UNCONFIGURED, DISABLED, BASELINE_BUILDING, ARMED, EVALUATING, or ROLLBACK_PENDING. |
+| `policy_generation` | 2 | `uint64` | Exact enclosing durable policy generation. |
+| `observed_identity` | 3 | `GuardrailsObservationIdentity` | Optional evaluator binding; absent before a content observation. |
+| `baseline_intervals` | 4 | `uint32` | Retained accepted baseline count, or frozen count during evaluation. |
+| `valid_observation_ns` | 5 | `uint64` | Covered source time in the current evaluation window. |
+| `last_completed` | 6 | `GuardrailsCompletedEvaluation` | Optional latest completed evaluation in this policy/runtime namespace. |
+| `last_attribution` | 7 | `GuardrailsAttribution` | Optional latest actual attribution, retained through its resulting rollback. |
+
+`GuardrailsObservationIdentity` contains `runtime_generation` (1),
+`snapshot_id` (2), `epoch` (3), `revision` (4), raw `validation_hash` (5), and
+`expected_workers` (6). Revision zero remains valid. A retained candidate may
+precede the active epoch but must belong to the same runtime and worker set.
+Identity integers are `uint64` except `uint32 expected_workers`; the snapshot ID
+is a string and the validation hash is 32 raw bytes.
+
+`GuardrailsCompletedEvaluation` contains `candidate` (1),
+`valid_observation_ns` (2), and `outcome` (3): `WINDOW_COMPLETE`,
+`HISTORY_EXHAUSTED`, `INTERVAL_EXCEEDS_WINDOW`, or `ROLLBACK_ACCEPTED`.
+The last value means durable intent acceptance, not completed DP rollback.
+Its candidate is a `GuardrailsObservationIdentity`, time is `uint64`, and
+outcome is `GuardrailsEvaluationOutcome`.
+
+`GuardrailsAttribution` carries:
+
+| Field | Number | Type | Meaning |
+|---|---|---|---|
+| `candidate` | 1 | `GuardrailsObservationIdentity` | Exact evaluated content/runtime identity. |
+| `rollback_snapshot_id` | 2 | `string` | Distinct frozen prior content. |
+| `previous_workers`, `current_workers` | 3, 4 | repeated `WorkerCounterStats` | Complete vectors used for the scored interval. |
+| `baseline_tx_pps` | 5 | `double` | Positive frozen duration-weighted TX reference. |
+| `confidence` | 6 | optional `double` | Actual finite score in `[0,1]`; absent when evidence is incomplete. |
+| `recommendation` | 7 | `GuardrailsRecommendation` | AUTO_ROLLBACK, DEFER_TO_HUMAN, or LOG_ONLY. |
+| `evidence_complete` | 8 | `bool` | Whether required attribution inputs were present. |
+| `intent_accepted` | 9 | `bool` | Whether the writer accepted that attributed intent. |
+
+The endpoints' common covered duration must fit the policy window and the
+recorded time of any matching current or completed evaluation.
+
+Enum values use their `GUARDRAILS_EVALUATION_STATE_`,
+`GUARDRAILS_EVALUATION_OUTCOME_`, or `GUARDRAILS_RECOMMENDATION_` prefix.
+Each enum rejects its zero `UNSPECIFIED` sentinel when present. These records
+contain copied observations; they retain no worker-bank ownership and do not
+replace the ordinary transition's terminal result.
 
 ## Part 4: Cross-Cutting
 

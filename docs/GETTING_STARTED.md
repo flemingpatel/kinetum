@@ -607,7 +607,7 @@ complete optional row families. A missing, changing, malformed, or failed
 selected observation returns exit status 1 with no partial stdout payload.
 
 ```bash
-# Mandatory runtime, engine, transition, and fault summaries
+# Mandatory runtime, worker counters, engine, transition, and fault summaries
 /opt/kinetum/bin/kinetumctl stats
 
 # Logical stages plus registered module metrics and typed health

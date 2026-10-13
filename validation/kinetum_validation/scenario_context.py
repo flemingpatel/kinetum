@@ -4,23 +4,22 @@ from __future__ import annotations
 
 import asyncio
 import math
-import sys
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Awaitable, Callable, List, Optional, Tuple, TypeVar
 
 from .config.types import (
     AnalysisResult,
-    CommitConfirmedTestResult,
     EpochTestResult,
     PacketStats,
-    RollbackTestResult,
     TestConfig,
+    TrafficDriverType,
 )
 from .engine.plan_metadata import PlanTopologyMetadata
 from .process.kinetumctl import ActiveSnapshot, KinetumCtl
 from .process.telemetry import StatsResult, StatsSelection
+from .process.telemetry_validation import worker_counters_are_exact, worker_counters_advanced
 from .report.console import ConsoleReporter
 from .traffic import TrafficDriver
 from .traffic.base import TrafficSender
@@ -44,11 +43,7 @@ CONTROL_OBSERVATION_POLL_S = 0.1
 
 CONTROL_OBSERVATION_TIMEOUT_S = 20.0
 
-GUARDRAILS_CANDIDATE_TRAFFIC_S = 3.0
-
-GUARDRAILS_MAX_DROP_RATIO = 0.01
-
-GUARDRAILS_MIN_TX_RATIO = 0.99
+_Observation = TypeVar("_Observation")
 
 
 @dataclass(frozen=True)
@@ -72,8 +67,8 @@ class ScenarioContext:
             raise RuntimeError("traffic driver is not initialized")
         return self.traffic
 
-    @staticmethod
     def traffic_observation_is_clean(
+        self,
         stats: PacketStats,
         analysis: AnalysisResult,
     ) -> bool:
@@ -89,7 +84,8 @@ class ScenarioContext:
             or analysis.total_rx != analysis.valid
             or analysis.invalid != 0
             or analysis.duplicates != 0
-            or analysis.out_of_order != 0
+            or analysis.out_of_order not in (None, 0)
+            or analysis.missing_count != stats.tx_count - analysis.valid
         )
         tags_exact = (
             sum(stats.generation_tag_counts.values()) == stats.tx_count
@@ -97,6 +93,23 @@ class ScenarioContext:
             and set(analysis.tag_counts).issubset(stats.generation_tag_counts)
         )
         if not counters_exact or not tags_exact:
+            return False
+        if self.config.backend_profile.traffic_driver == TrafficDriverType.NATIVE_TAP:
+            streams = analysis.streams
+            stream_count = len(self.config.backend.rx_ports)
+            if streams is None or len(streams) != stream_count:
+                return False
+            for index, row in enumerate(streams):
+                expected = stats.tx_count // stream_count + int(index < stats.tx_count % stream_count)
+                if (
+                    row.stream_index != index or row.expected_count != expected
+                    or not 0 < row.valid <= expected or row.duplicates != 0
+                    or row.missing_count != expected - row.valid
+                ):
+                    return False
+            if sum(row.valid for row in streams) != analysis.valid:
+                return False
+        elif self.config.backend_profile.traffic_driver != TrafficDriverType.TREX or analysis.streams is not None:
             return False
         return all(
             count <= stats.generation_tag_counts[generation_tag]
@@ -140,6 +153,98 @@ class ScenarioContext:
         if time.monotonic() >= deadline:
             raise RuntimeError(f"{operation} observation exceeded its authored deadline")
         return result
+
+    async def wait_for_observation(
+        self,
+        read: Callable[[], Awaitable[_Observation]],
+        ready: Callable[[_Observation], bool],
+        deadline: float,
+        operation: str,
+        required_live_task: Optional[asyncio.Task] = None,
+    ) -> _Observation:
+        """Wait within one authored bound for evidence, never for elapsed-time readiness.
+
+        The predicate returns False for valid unfinished observations and raises
+        for invalid evidence. Native commands retain RPC retry ownership. Caller
+        cancellation propagates through the in-flight command's exact cleanup.
+        """
+        while True:
+            remaining = deadline - time.monotonic()
+            if not math.isfinite(remaining) or remaining <= 0:
+                raise RuntimeError(f"{operation} exhausted its observation window")
+            if required_live_task is not None:
+                self.require_live_traffic_task(required_live_task, operation)
+            try:
+                observed = await asyncio.wait_for(read(), timeout=remaining)
+            except asyncio.TimeoutError as exc:
+                raise RuntimeError(f"{operation} exceeded its observation deadline") from exc
+            if time.monotonic() >= deadline:
+                raise RuntimeError(f"{operation} exceeded its observation deadline")
+            if required_live_task is not None:
+                self.require_live_traffic_task(required_live_task, operation)
+            if ready(observed):
+                return observed
+            await asyncio.sleep(min(CONTROL_OBSERVATION_POLL_S, max(0.0, deadline - time.monotonic())))
+
+    async def wait_for_traffic_progress(
+        self,
+        before: StatsResult,
+        deadline: float,
+        operation: str,
+        required_live_task: Optional[asyncio.Task],
+        selection: StatsSelection = TRANSITION_STATS,
+    ) -> StatsResult:
+        """Require current-epoch source measurements and positive ingress before mutation.
+
+        Timed traffic supplies its live task. A generation-tag session instead
+        owns liveness through its acknowledged overlap and finish operations.
+        """
+        self.require_active_snapshot_observation(before, operation)
+        if before.transition_success_blocked or before.retirement_frozen or not worker_counters_are_exact(before):
+            raise RuntimeError(f"{operation} has invalid initial worker observations")
+        cursor = before.worker_counters
+        seed = before if (
+            before.transition_state == "EPOCH_TRANSITION_STATE_IDLE"
+            and all(row.observation_epoch == before.active_epoch for row in cursor)
+        ) else None
+
+        async def read() -> StatsResult:
+            """Obtain one native observation with the requested diagnostic families."""
+            return await self.get_stats_snapshot(selection)
+
+        def ready(observed: StatsResult) -> bool:
+            """Retain partial progress while rejecting any worker or content contradiction."""
+            nonlocal cursor, seed
+            self.require_active_snapshot_observation(observed, operation, before.active_snapshot_id)
+            identity_changed = (
+                observed.runtime_generation != before.runtime_generation
+                or observed.active_epoch != before.active_epoch
+                or observed.active_revision != before.active_revision
+                or observed.transition_plan_content_hash != before.transition_plan_content_hash
+                or observed.transition_active_validation_hash != before.transition_active_validation_hash
+            )
+            if (
+                identity_changed
+                or observed.transition_success_blocked or observed.retirement_frozen
+                or not worker_counters_are_exact(observed)
+            ):
+                raise RuntimeError(f"{operation} crossed runtime/config identity or invalid evidence")
+            worker_counters_advanced(cursor, observed.worker_counters)
+            cursor = observed.worker_counters
+            if observed.transition_state != "EPOCH_TRANSITION_STATE_IDLE":
+                seed = None
+                return False
+            if any(row.observation_epoch != observed.active_epoch for row in cursor):
+                return False
+            if seed is None:
+                seed = observed
+                return False
+            if not worker_counters_advanced(seed.worker_counters, cursor) or observed.rx_packets == seed.rx_packets:
+                return False
+            self.require_traffic_progress(seed, observed, operation)
+            return True
+
+        return await self.wait_for_observation(read, ready, deadline, operation, required_live_task)
 
     @staticmethod
     def require_active_snapshot_observation(
@@ -357,166 +462,25 @@ class ScenarioContext:
             If evidence contradicts, traffic ends early, or the bound expires.
         """
         deadline = min(observation_deadline, time.monotonic() + CONTROL_OBSERVATION_TIMEOUT_S)
-        last_failure = "no observation"
-        while time.monotonic() < deadline:
-            if required_live_task is not None and required_live_task.done():
-                try:
-                    required_live_task.result()
-                except RECOVERABLE_EXCEPTIONS as exc:
-                    raise RuntimeError(
-                        "required traffic failed before control convergence"
-                    ) from exc
-                raise RuntimeError(
-                    "required traffic ended before control convergence"
-                )
-            observed = await self.get_stats_before_deadline(deadline, "control convergence")
-            if not observed.success:
-                raise RuntimeError(
-                    "control convergence received invalid telemetry: "
-                    + (observed.diagnostic or "unavailable")
-                )
+
+        def ready(observed: StatsResult) -> bool:
+            """Check only control identity and terminal completion, without counter freshness."""
+            self.require_active_snapshot_observation(observed, "control convergence")
             if observed.runtime_generation != runtime_generation:
                 raise RuntimeError("runtime generation changed during control convergence")
             if observed.transition_success_blocked or observed.retirement_frozen:
                 raise RuntimeError("control convergence encountered blocked transition truth")
-            if (
+            return (
                 observed.active_snapshot_id == snapshot_id
                 and observed.active_epoch > after_epoch
                 and observed.latest_terminal is not None
-                and observed.latest_terminal.outcome
-                == "EPOCH_TRANSITION_OUTCOME_COMPLETE"
+                and observed.latest_terminal.outcome == "EPOCH_TRANSITION_OUTCOME_COMPLETE"
                 and observed.latest_terminal.to_epoch == observed.active_epoch
-            ):
-                if required_live_task is not None and required_live_task.done():
-                    raise RuntimeError(
-                        "required traffic ended before convergence observation"
-                    )
-                return observed
-            last_failure = (
-                f"active={observed.active_snapshot_id}@{observed.active_epoch}"
             )
-            await asyncio.sleep(CONTROL_OBSERVATION_POLL_S)
-        raise RuntimeError(
-            f"timed out waiting for exact active snapshot {snapshot_id}: {last_failure}"
-        )
 
-    async def wait_for_guardrails_degradation(
-        self,
-        baseline_tx_rate: float,
-        candidate_start: StatsResult,
-        candidate_snapshot_id: str,
-        candidate_epoch: int,
-        candidate_task: asyncio.Task,
-        observation_deadline: float,
-    ) -> StatsResult:
-        """Observe both configured threshold legs before automatic rollback.
-
-        The dedicated candidate denies the exact traffic envelope. This gate
-        proves that the DP observed a positive candidate population, terminal
-        drops exceeded policy, and accepted-TX rate fell below the frozen
-        positive baseline before accepting rollback as guardrails evidence.
-
-        Parameters
-        ----------
-        baseline_tx_rate : float
-            Positive accepted-TX packets per monotonic nanosecond from the
-            frozen baseline interval.
-        candidate_start : StatsResult
-            Exact candidate observation before degradation traffic.
-        candidate_snapshot_id : str
-            Exact candidate content identity.
-        candidate_epoch : int
-            Exact candidate activation epoch.
-        candidate_task : asyncio.Task
-            One owned candidate-traffic operation that must remain valid until
-            degradation is observed.
-        observation_deadline : float
-            Monotonic deadline established when candidate traffic starts.
-
-        Returns
-        -------
-        StatsResult
-            First candidate observation proving both threshold legs.
-
-        Raises
-        ------
-        RuntimeError
-            If identity/counters regress, rollback wins the evidence race, or
-            the bounded candidate window never proves degradation.
-        """
-        if baseline_tx_rate <= 0.0 or not math.isfinite(baseline_tx_rate):
-            raise RuntimeError("guardrails baseline TX rate is not exact")
-
-        deadline = observation_deadline
-        while time.monotonic() < deadline:
-            observed = await self.get_stats_before_deadline(
-                deadline, "guardrails degradation",
-                selection=replace(TRANSITION_STATS, include_module_health=True),
-            )
-            self.require_active_snapshot_observation(
-                observed, "guardrails degradation observation"
-            )
-            if observed.runtime_generation != candidate_start.runtime_generation:
-                raise RuntimeError(
-                    "runtime generation changed during guardrails degradation"
-                )
-            if observed.active_snapshot_id != candidate_snapshot_id:
-                if observed.active_epoch > candidate_epoch:
-                    raise RuntimeError(
-                        "guardrails rollback preceded deterministic degradation proof"
-                    )
-                await asyncio.sleep(CONTROL_OBSERVATION_POLL_S)
-                continue
-            if observed.active_epoch != candidate_epoch:
-                raise RuntimeError("guardrails candidate epoch is contradictory")
-            if (
-                observed.collection_monotonic_ns
-                <= candidate_start.collection_monotonic_ns
-                or observed.rx_packets < candidate_start.rx_packets
-                or observed.tx_packets < candidate_start.tx_packets
-                or observed.dropped_packets < candidate_start.dropped_packets
-            ):
-                raise RuntimeError("guardrails candidate counters regressed")
-
-            elapsed = (
-                observed.collection_monotonic_ns
-                - candidate_start.collection_monotonic_ns
-            )
-            rx_delta = observed.rx_packets - candidate_start.rx_packets
-            tx_delta = observed.tx_packets - candidate_start.tx_packets
-            drop_delta = (
-                observed.dropped_packets - candidate_start.dropped_packets
-            )
-            population = tx_delta + drop_delta
-            drop_ratio = drop_delta / population if population > 0 else 0.0
-            candidate_tx_rate = tx_delta / elapsed
-            tx_ratio = candidate_tx_rate / baseline_tx_rate
-            health_exact = bool(observed.module_health_stats) and all(
-                row.state == "MODULE_HEALTH_STATE_SIGNAL_AVAILABLE"
-                and row.observation_epoch == candidate_epoch
-                for row in observed.module_health_stats
-            )
-            if (
-                rx_delta > 0
-                and population > 0
-                and drop_ratio > GUARDRAILS_MAX_DROP_RATIO
-                and tx_ratio < GUARDRAILS_MIN_TX_RATIO
-                and health_exact
-            ):
-                return observed
-            if candidate_task.done():
-                try:
-                    candidate_task.result()
-                except RECOVERABLE_EXCEPTIONS as exc:
-                    raise RuntimeError(
-                        "guardrails candidate traffic failed before evidence"
-                    ) from exc
-                raise RuntimeError(
-                    "guardrails candidate traffic ended before degradation proof"
-                )
-            await asyncio.sleep(CONTROL_OBSERVATION_POLL_S)
-        raise RuntimeError(
-            "guardrails candidate lacked deterministic drop/throughput evidence"
+        return await self.wait_for_observation(
+            self.get_stats_snapshot, ready, deadline,
+            f"exact active snapshot {snapshot_id}", required_live_task,
         )
 
     async def stop_capture_if_running(self) -> None:
@@ -605,16 +569,43 @@ class ScenarioContext:
                 raise first_error
             raise RuntimeError(message) from first_error
 
-    async def analyze_capture(
+    async def complete_capture(
         self,
         pcap_file: Path,
-        expected_count: int,
+        sender: PacketStats,
     ) -> AnalysisResult:
-        """Analyze a capture window through the active traffic driver."""
-        return await self.require_traffic().analyze_capture(
-            pcap_file=pcap_file,
-            expected_count=expected_count,
-        )
+        """Retire capture and retain sender evidence even when capture or analysis fails.
+
+        An unavailable analysis remains absent. Cancellation and failed ownership
+        retirement propagate; writing diagnostics never authorizes a traffic pass.
+        """
+        analysis = None
+        completion_error = None
+        try:
+            await self.require_traffic().stop_capture()
+            analysis = await self.require_traffic().analyze_capture(
+                pcap_file=pcap_file, expected_count=sender.tx_count,
+            )
+            return analysis
+        except BaseException as exc:
+            completion_error = exc
+            raise
+        finally:
+            try:
+                self.artifacts.write_traffic_evidence(
+                    pcap_file, self.config.backend_profile.traffic_driver, sender, analysis,
+                )
+            except RECOVERABLE_EXCEPTIONS as exc:
+                if completion_error is not None:
+                    message = (
+                        "traffic completion and evidence retention failed: "
+                        f"completion={completion_error}; evidence={exc}"
+                    )
+                    if not isinstance(completion_error, Exception):
+                        self.reporter.print_warning(message)
+                        raise completion_error from None
+                    raise RuntimeError(message) from exc
+                raise
 
     def measured_average_latency(
         self, analysis: AnalysisResult
@@ -660,170 +651,40 @@ class ScenarioContext:
             sender.cleanup()
         return stats
 
+    @staticmethod
     def epoch_result_message(
-        self, traffic_within_tolerance: bool, protocol_faults: int,
-        completed_boundaries: int, boundary_count: int, transitions: int,
-        tx: int, rx: int, dp_epoch: int = 0,
+        result: EpochTestResult, traffic_within_tolerance: bool, generation_tags_valid: bool,
     ) -> str:
-        """Generate epoch test result message."""
-        exact_zero_loss = tx > 0 and tx == rx
-        loss_pct = max(0, tx - rx) / tx * 100.0 if tx > 0 else 0.0
-        if (
-            traffic_within_tolerance
-            and protocol_faults == 0
-            and transitions > 0
-            and boundary_count > 0
-            and completed_boundaries == boundary_count
-        ):
-            epoch_info = f" (DP epoch={dp_epoch})" if dp_epoch > 0 else ""
+        """Explain the complete verdict without reconstructing a weaker success predicate."""
+        tx, rx = result.total_sent, result.total_received
+        if result.passed:
             traffic_result = (
                 f"Zero loss ({tx} TX = {rx} RX)"
-                if exact_zero_loss
-                else f"Loss {loss_pct:.2f}% within the admitted validation tolerance"
+                if result.zero_loss
+                else f"Loss {result.loss_pct:.2f}% within the admitted validation tolerance"
             )
             return (
                 "BOUNDARY ORDERING VALIDATED: "
                 f"{traffic_result}, "
-                f"{completed_boundaries}/{boundary_count} exact CUT/ACK rows, "
-                f"zero protocol faults{epoch_info}"
+                f"{result.completed_boundaries}/{result.boundary_count} exact CUT/ACK rows, "
+                "zero protocol faults"
             )
         if not traffic_within_tolerance:
             return (
                 f"TRAFFIC EVIDENCE FAILED: {tx} TX, {rx} RX, "
-                f"loss {loss_pct:.2f}%"
+                f"loss {result.loss_pct:.2f}%"
             )
-        if protocol_faults != 0:
+        if not generation_tags_valid:
+            return "GENERATION-TAG EVIDENCE FAILED: observed tags disagree with the authored traffic profile"
+        if result.protocol_faults_observed != 0:
             return (
                 "BOUNDARY ORDERING VIOLATION: "
-                f"{protocol_faults} typed protocol faults detected "
+                f"{result.protocol_faults_observed} typed protocol faults detected "
                 f"({tx} TX, {rx} RX)"
             )
-        if transitions == 0:
+        if result.transitions_observed == 0:
             return "TRANSITION NOT CONFIRMED: Config apply succeeded but epoch advance not detected"
-        if completed_boundaries != boundary_count or boundary_count == 0:
-            return (
-                "BOUNDARY ORDERING INCONCLUSIVE: "
-                "exact CUT/ACK boundary evidence is incomplete"
-            )
-        return "UNKNOWN"
-
-    def print_epoch_results(
-        self, result: EpochTestResult, _stats: PacketStats, _analysis: AnalysisResult
-    ) -> None:
-        """Print detailed epoch test results."""
-        self.reporter.print_step("EPOCH TEST RESULTS")
-
-        if result.passed and result.boundary_ordering_validated:
-            print(
-                "  PASS BOUNDARY ORDERING VALIDATED: "
-                + (
-                    "zero-loss configuration transition"
-                    if result.zero_loss
-                    else "configuration transition within validation loss tolerance"
-                ),
-                file=sys.stderr,
-            )
-        else:
-            print("  FAIL BOUNDARY ORDERING VALIDATION FAILED", file=sys.stderr)
-
-        print("  ==============================================", file=sys.stderr)
-        print("  CORE EPOCH METRIC: exact sender/capture accounting", file=sys.stderr)
-        print("  ----------------------------------------------", file=sys.stderr)
-        print(f"  TX: {result.total_sent}  RX: {result.total_received}", file=sys.stderr)
-        traffic_exact = self.traffic_observation_is_clean(_stats, _analysis)
-        if traffic_exact and result.total_sent == result.total_received:
-            print("  PASS ZERO LOSS ACHIEVED", file=sys.stderr)
-        elif result.total_received > result.total_sent:
-            print(
-                "  DUPLICATE OR FOREIGN RX OBSERVED: "
-                f"{result.total_received - result.total_sent} packets",
-                file=sys.stderr,
-            )
-        elif not traffic_exact:
-            print(
-                "  FAIL TRAFFIC EVIDENCE: "
-                f"invalid={_analysis.invalid} duplicates={_analysis.duplicates} "
-                f"out_of_order={_analysis.out_of_order} sender_errors={_stats.errors}",
-                file=sys.stderr,
-            )
-        else:
-            lost = result.total_sent - result.total_received
-            print(
-                f"  LOSS OBSERVED: {lost} packets ({result.loss_pct:.2f}%)",
-                file=sys.stderr,
-            )
-        print("  ----------------------------------------------", file=sys.stderr)
-
-        triggered = "Yes" if result.transitions_observed > 0 else "No"
-        print(f"  Transition Triggered: {triggered}", file=sys.stderr)
-
-        if result.boundary_ordering_validated:
-            print(
-                "  PASS BOUNDARY ORDERING VALIDATED: "
-                f"boundaries={result.completed_boundaries}/"
-                f"{result.boundary_count}, "
-                f"backpressure={result.backpressure_events}, faults=0",
-                file=sys.stderr,
-            )
-        if result.initial_generation_sent > 0 or result.next_generation_sent > 0:
-            print("  ----------------------------------------------", file=sys.stderr)
-            print("  Packet-profile generation tags:", file=sys.stderr)
-            print(
-                f"    Tag {INITIAL_GENERATION_TAG}: "
-                f"TX={result.initial_generation_sent} "
-                f"RX={result.initial_generation_received}",
-                file=sys.stderr,
-            )
-            print(
-                f"    Tag {NEXT_GENERATION_TAG}: "
-                f"TX={result.next_generation_sent} "
-                f"RX={result.next_generation_received}",
-                file=sys.stderr,
-            )
-            if result.generation_tag_transition_seq >= 0:
-                print(
-                    "    Generation-tag transition at seq: "
-                    f"{result.generation_tag_transition_seq}",
-                    file=sys.stderr,
-                )
-
-        print("  ==============================================", file=sys.stderr)
-        print(f"  Duration: {result.duration_s:.2f}s", file=sys.stderr)
-        print(f"  Message: {result.message}", file=sys.stderr)
-
-    def print_commit_confirmed_results(self, result: CommitConfirmedTestResult) -> None:
-        """Print commit-confirmed test results."""
-        self.reporter.print_step("COMMIT-CONFIRMED TEST RESULTS")
-
-        if result.passed:
-            print("  PASS COMMIT-CONFIRMED VALIDATED", file=sys.stderr)
-        else:
-            print("  FAIL COMMIT-CONFIRMED FAILED", file=sys.stderr)
-
-        print("  ==============================================", file=sys.stderr)
-        print(f"  Snapshot ID: {result.confirm_snapshot_id}", file=sys.stderr)
-        print(f"  Confirm Success: {result.confirm_success}", file=sys.stderr)
-        if result.confirm_time_remaining_ms > 0:
-            print(f"  Time Remaining: {result.confirm_time_remaining_ms}ms", file=sys.stderr)
-        print(
-            "  Timeout Rollback: "
-            f"{result.timeout_rollback_occurred} "
-            f"({result.timeout_rollback_snapshot_id})",
-            file=sys.stderr,
-        )
-        print("  ----------------------------------------------", file=sys.stderr)
-        print("  Traffic-Under-Transition:", file=sys.stderr)
-        print(f"    TX: {result.tx_count}  RX: {result.rx_count}", file=sys.stderr)
-        print(f"    Loss: {result.loss_pct:.2f}%", file=sys.stderr)
-        latency_text = (
-            f"{result.avg_latency_us:.1f} us"
-            if result.avg_latency_us is not None
-            else "unavailable"
-        )
-        print(f"    Avg Latency: {latency_text}", file=sys.stderr)
-        print("  ==============================================", file=sys.stderr)
-        print(f"  Duration: {result.duration_s:.2f}s", file=sys.stderr)
-        print(f"  Message: {result.message}", file=sys.stderr)
+        return "BOUNDARY ORDERING INCONCLUSIVE: exact completion or CUT/ACK evidence is incomplete"
 
     def rollback_result_message(
         self, full_success: bool, selective_success: bool,
@@ -848,39 +709,6 @@ class ScenarioContext:
         if selective_success:
             return "ROLLBACK PARTIAL: selective rollback completed; full rollback failed"
         return "ROLLBACK FAILED: full and selective rollback failed"
-
-    def print_rollback_results(self, result: RollbackTestResult) -> None:
-        """Print rollback test results."""
-        self.reporter.print_step("ROLLBACK TEST RESULTS")
-
-        if result.passed:
-            print("  PASS ROLLBACK VALIDATED", file=sys.stderr)
-        else:
-            print("  FAIL ROLLBACK FAILED", file=sys.stderr)
-
-        print("  ==============================================", file=sys.stderr)
-        full_text = "PASS" if result.full_rollback_success else "FAIL"
-        print(f"  Full Rollback: {full_text}", file=sys.stderr)
-        if result.full_rollback_snapshot_id:
-            print(f"    New Snapshot: {result.full_rollback_snapshot_id}", file=sys.stderr)
-        selective_text = "PASS" if result.selective_rollback_success else "FAIL"
-        print(f"  Selective Rollback: {selective_text}", file=sys.stderr)
-        if result.selective_rollback_modules:
-            print(f"    Modules: {', '.join(result.selective_rollback_modules)}", file=sys.stderr)
-            print(f"    New Snapshot: {result.selective_rollback_snapshot_id}", file=sys.stderr)
-        print("  ----------------------------------------------", file=sys.stderr)
-        print("  Traffic-Under-Transition:", file=sys.stderr)
-        print(f"    TX: {result.tx_count}  RX: {result.rx_count}", file=sys.stderr)
-        print(f"    Loss: {result.loss_pct:.2f}%", file=sys.stderr)
-        latency_text = (
-            f"{result.avg_latency_us:.1f} us"
-            if result.avg_latency_us is not None
-            else "unavailable"
-        )
-        print(f"    Avg Latency: {latency_text}", file=sys.stderr)
-        print("  ==============================================", file=sys.stderr)
-        print(f"  Duration: {result.duration_s:.2f}s", file=sys.stderr)
-        print(f"  Message: {result.message}", file=sys.stderr)
 
     async def get_final_stats_snapshot(self) -> StatsResult:
         """Wait within the observation deadline for post-traffic owner publications.
@@ -909,22 +737,31 @@ class ScenarioContext:
         if (
             baseline.collection_monotonic_ns <= 0
             or baseline.runtime_generation <= 0 or not baseline.transition_plan_content_hash
+            or not worker_counters_are_exact(baseline)
         ):
             raise RuntimeError("final stream evidence lacks a valid baseline")
         barrier = baseline.collection_monotonic_ns
         identity = (baseline.runtime_generation, baseline.transition_plan_content_hash)
         previous = {}
-        current = baseline
+        cursor = baseline.worker_counters
         last_collection = barrier
-        while True:
-            if time.monotonic() >= deadline:
-                raise RuntimeError("final stream publication observation deadline expired")
+
+        def ready(current: StatsResult) -> bool:
+            """Validate every source identity before testing the post-traffic barrier."""
+            nonlocal cursor, last_collection
             if not current.success:
                 raise RuntimeError(f"final stream observation failed: {current.diagnostic}")
             if (current.runtime_generation, current.transition_plan_content_hash) != identity:
                 raise RuntimeError("final stream observation changed runtime/plan identity")
             if current.collection_monotonic_ns < last_collection:
                 raise RuntimeError("final stream collection timestamp regressed")
+            if not worker_counters_are_exact(current):
+                raise RuntimeError("final stream observation has invalid worker counters")
+            try:
+                worker_counters_advanced(cursor, current.worker_counters)
+            except ValueError as exc:
+                raise RuntimeError(f"final stream worker observation is invalid: {exc}") from exc
+            cursor = current.worker_counters
             last_collection = current.collection_monotonic_ns
             rows = {row.io_stream_id: row for row in current.stream_stats}
             if set(rows) != expected_ids or len(rows) != len(current.stream_stats):
@@ -933,38 +770,28 @@ class ScenarioContext:
                 counters = (row.published_monotonic_ns, row.packets, row.bytes, row.rejected_packets)
                 if (
                     any(value is None for value in counters)
+                    or not 0 <= row.worker_index < len(cursor)
                     or row.published_monotonic_ns <= 0
                     or row.published_monotonic_ns > current.collection_monotonic_ns
-                    or (stream_id in previous and any(
-                        after < before for before, after in zip(previous[stream_id], counters)
-                    ))
                 ):
-                    raise RuntimeError(f"final stream observation is incomplete or regressed: {stream_id}")
-                previous[stream_id] = counters
-            if all(row.published_monotonic_ns > barrier for row in rows.values()):
-                return current
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise RuntimeError("final stream publication observation deadline expired")
-            await asyncio.sleep(min(CONTROL_OBSERVATION_POLL_S, remaining))
-            current = await self.get_stats_before_deadline(deadline, "final stream publication", selection=selection)
+                    raise RuntimeError(f"final stream observation is incomplete: {stream_id}")
+                worker = cursor[row.worker_index]
+                observed = (row.worker_index, worker.publication_generation, *counters)
+                prior = previous.get(stream_id)
+                if prior is not None and observed[1] == prior[1] and observed != prior:
+                    raise RuntimeError(f"final stream observation changed without publication: {stream_id}")
+                regressed = prior is not None and (
+                    observed[0] != prior[0] or any(after < before for before, after in zip(prior[1:], observed[1:]))
+                )
+                if row.published_monotonic_ns != worker.published_monotonic_ns or regressed:
+                    raise RuntimeError(f"final stream observation has contradictory owner or counters: {stream_id}")
+                previous[stream_id] = observed
+            return all(row.published_monotonic_ns > barrier for row in rows.values())
 
-    def print_boundary_ordering(
-        self, protocol_faults_observed: int, boundary_ordering_validated: bool,
-        completed_boundaries: int, boundary_count: int, total_backpressure: int,
-    ) -> None:
-        """Report the measured boundary result without changing its verdict."""
-        if protocol_faults_observed > 0:
-            self.reporter.print_warning(
-                "BOUNDARY ORDERING VIOLATION: "
-                f"{protocol_faults_observed} protocol faults"
-            )
-        elif boundary_ordering_validated:
-            self.reporter.print_progress(
-                "Boundary ordering verified: "
-                f"{completed_boundaries}/{boundary_count} exact CUT/ACK rows, "
-                f"backpressure_delta={total_backpressure}, 0 protocol faults"
-            )
-        else:
-            warning = "Boundary ordering inconclusive: exact transition evidence is incomplete"
-            self.reporter.print_warning(warning)
+        ready(baseline)
+
+        async def read() -> StatsResult:
+            """Query the complete final diagnostic selection under the shared wait's deadline."""
+            return await self.get_stats_snapshot(selection)
+
+        return await self.wait_for_observation(read, ready, deadline, "final stream publication")

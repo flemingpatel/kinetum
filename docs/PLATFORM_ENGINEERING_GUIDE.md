@@ -948,13 +948,21 @@ policy; the authored pipeline determines packet disposition.
   evidence. It does not drop a packet, alter routing, fail stop, or authorize a
   transition decision.
 - The CP guardrails runner samples published signals plus DP-side telemetry
-  through one active-content fence. Missing, stale, unavailable, faulted, or
-  regressing evidence pauses valid-observation time and never contributes a
-  zero or neutral sample.
+  through one active-content fence. Re-reading a worker publication creates no
+  measurement. Every worker, including workers without I/O, must advance before
+  an interval is accepted. A fresh unchanged counter is a real zero interval;
+  unavailable evidence never becomes zero or healthy.
 - Cumulative counter identity and monotonic elapsed time are reduced to one
-  exact interval before detector selection. Threshold and correlation modes
-  consume that same delta; a correlator does not keep another counter seed or
-  truncate the behavior clock.
+  interval before detector selection. Rates use each worker's publication
+  times; only the positive intersection of their intervals advances valid time.
+  Collection time is provenance and liveness information. No extrapolation or
+  fabricated simultaneous snapshot is permitted. Threshold and correlation
+  consume the same reduction; a correlator owns no second counter seed.
+- A missed read contributes no sample. Later cumulative endpoints may cover
+  the gap only within the same runtime, content, and epoch. Observed faults,
+  non-IDLE state, missing required health, and contradictions break interval
+  continuity. Regression cursors survive policy and content changes; only a
+  new runtime generation resets their namespace.
 - Auto-rollback is a CP decision based on explicit attribution confidence, not
   a DP-side reaction. The desired action is persisted with its observed
   content/policy/runtime identity before the existing transition authority

@@ -41,7 +41,7 @@ class Backend(ABC):
 
         Called before any I/O operations. Should:
         - Wait for interfaces to be created (if needed)
-        - Configure MTU, bring interfaces up
+        - Verify provider-owned interface readiness
         - Validate profile-owned metadata and local resources
 
         Raises

@@ -1635,9 +1635,10 @@ the request; no service owns a field-by-field duplicate schema or mapper.
   provider-accepted prefix, using lengths saved before ownership transfer.
   RX `rejected_packets` counts input consumed and discarded before admission;
   TX `rejected_packets` counts the unaccepted suffix actually retired by core.
-  Rejected-only RX is work without a record or epoch-credit transfer. Engine
-  RX/TX totals are cold sums of these stream rows, with no duplicate packet-path
-  accumulator. Terminal release counts one engine drop; stage input/output/drop
+  Rejected-only RX is work without a record or epoch-credit transfer. Worker
+  RX/TX totals derive from their stream rows; engine totals derive from the
+  worker rows. No duplicate packet-path accumulator exists. Terminal release
+  counts one worker drop; stage input/output/drop
   follows the exact ownership-transfer sites, including fan-out, active origins,
   retained resolution, async restoration, and recirculation. Logical-stage
   aggregation is cold only. TX acceptance is not wire delivery: UDP can retain an accepted
@@ -1683,6 +1684,11 @@ the request; no service owns a field-by-field duplicate schema or mapper.
   token while publication or return ownership is live, so no consumer can
   reconstruct or alter reason, companion, timestamp, or owner identity from
   partial bank metadata. The coordinator never reads a live owner line.
+  Each completed worker bank advances one cold per-worker observation sequence.
+  `worker_counters[]` is mandatory, including workers without I/O; its epoch and
+  timestamp come from that bank. Module updates, reads, and returned-bank
+  acknowledgments cannot advance this sequence. Repeated sequences retain
+  identical row contents within the runtime generation.
   Incremental histogram inputs are pre-resolved before workers launch. The cold
   owner merges and clears one 64-bucket prefix at a time, proves each interval's
   bucket mass equals its summary count, and keeps a module bank unavailable to
@@ -1690,10 +1696,12 @@ the request; no service owns a field-by-field duplicate schema or mapper.
   together. Retained epoch is tracked per
   physical bank, so two old E banks and one final N bank coexist exactly during
   RETIRING shutdown.
-  Stream rows retain their own worker's last publication timestamp and
+  Stream rows project their own worker's last publication timestamp and retain
   cumulative values across configuration epochs. They are available only after
-  a complete initial owner-bank baseline. Exhausted stream counters or engine
-  transfer sums produce `DATA_LOSS`; bank return and retirement still complete.
+  a complete initial owner-bank baseline. Exhausted counters, totals, or worker
+  observation sequences produce `DATA_LOSS`; bank return and retirement still
+  complete. Collection time describes response assembly. The newest-bank time
+  is a descriptive maximum, not proof that every worker has a new measurement.
   Final E banks must be aggregated before the first retirement claim. Their
   storage remains retained through the existing certificate and reader grace,
   and is reclaimed by that exact retirement path. Telemetry authorizes no CUT,
@@ -1854,7 +1862,7 @@ teardown attempt is terminate-class.
 | --- | --- |
 | `BootstrapConfigSnapshot` | Transport `OK`; exact runtime result in application status. A successful first bootstrap returns restored epoch/hash/high-watermarks and `COMPLETE`, after publishing `PACKET_READY`. Pre-commit failures publish no partial success; a different retry rejects; every call after `PACKET_READY` returns application `UNAVAILABLE`. |
 | Prepare/Activate/Abort/Status | Transport `OK` with canonical application status plus explicit identity-resolution and failure-code enums. Prepare returns PREPARED identity/lease only after complete cold staging. Activate commits one exact PREPARED transaction and its first caller waits through COMPLETE or update-frozen RETIRING; exact retries never retrigger workers. Abort can mutate only PREPARING/PREPARED. Status returns exact identity, plan hash, produced durations, and bounded diagnostic only for active/terminal truth. |
-| `GetStats` | Transport `OK` plus either canonical application success and one complete selected `RuntimeTelemetry`, or a status-only failure. Mandatory runtime/engine/transition/protocol-fault summaries are always present on success; optional row families are selected explicitly. See [Section 15](#15-stats-collection). |
+| `GetStats` | Transport `OK` plus either canonical application success and one complete selected `RuntimeTelemetry`, or a status-only failure. Runtime, engine, worker counters, transition, and protocol faults are mandatory; optional row families are selected explicitly. See [Section 15](#15-stats-collection). |
 | `Health` | Reads readiness from the immutable runtime-status publication and adds independent logging observations. Reports application success with exact `STATE_CONTROL_READY` or `STATE_PACKET_READY`, last activated epoch, and active/expected workers. An unavailable read reports `STATE_ERROR` plus `UNAVAILABLE`; invalid published contents report `STATE_ERROR` plus `DATA_LOSS`. |
 | `Drain`, `DrainStatus`, `Shutdown`, `DumpState` | Transport `OK` plus application `UNAVAILABLE`; responses are cleared and carry no synthetic lifecycle, packet, NAT, or ACL state. |
 

@@ -260,7 +260,14 @@ TEST(telemetry_schema, core_message_fields_are_compact_and_exact)
 		{"tx_bytes", 5, field_descriptor::TYPE_UINT64, false, false, nullptr},
 		{"fanout_overflow", 6, field_descriptor::TYPE_UINT64, false, false, nullptr},
 	}};
-	constexpr std::array<expected_field, 17> COMPLETE{{
+	constexpr std::array<expected_field, 5> WORKER_COUNTERS{{
+		{"worker_index", 1, field_descriptor::TYPE_UINT32, false, false, nullptr},
+		{"observation_epoch", 2, field_descriptor::TYPE_UINT64, false, false, nullptr},
+		{"publication_generation", 3, field_descriptor::TYPE_UINT64, false, false, nullptr},
+		{"published_monotonic_ns", 4, field_descriptor::TYPE_UINT64, false, false, nullptr},
+		{"counters", 5, field_descriptor::TYPE_MESSAGE, false, true, "kinetum.telemetry.v1.EngineStats"},
+	}};
+	constexpr std::array<expected_field, 18> COMPLETE{{
 		{"runtime", 1, field_descriptor::TYPE_MESSAGE, false, true, "kinetum.telemetry.v1.RuntimeObservation"},
 		{"engine", 2, field_descriptor::TYPE_MESSAGE, false, true, "kinetum.telemetry.v1.EngineStats"},
 		{"transition", 3, field_descriptor::TYPE_MESSAGE, false, true,
@@ -288,11 +295,102 @@ TEST(telemetry_schema, core_message_fields_are_compact_and_exact)
 		 "kinetum.telemetry.v1.TrafficSteeringStats"},
 		{"module_context_domains", 18, field_descriptor::TYPE_MESSAGE, true, false,
 		 "kinetum.gluon.v1.ModuleContextDomain"},
+		{"worker_counters", 19, field_descriptor::TYPE_MESSAGE, true, false,
+		 "kinetum.telemetry.v1.WorkerCounterStats"},
 	}};
 	expect_message(v1::TelemetrySelection::descriptor(), SELECTION);
 	expect_message(v1::RuntimeObservation::descriptor(), RUNTIME);
 	expect_message(v1::EngineStats::descriptor(), ENGINE);
+	expect_message(v1::WorkerCounterStats::descriptor(), WORKER_COUNTERS);
 	expect_message(v1::RuntimeTelemetry::descriptor(), COMPLETE);
+	EXPECT_EQ(v1::RuntimeTelemetry::descriptor()->FindFieldByNumber(17), nullptr);
+}
+
+/** @brief Pin the read-only guardrails contract and every retained measurement reference. */
+TEST(telemetry_schema, guardrails_evaluation_fields_and_enums_are_exact)
+{
+	namespace control = kinetum::control::v1;
+	constexpr std::array<expected_field, 6> IDENTITY{{
+		{"runtime_generation", 1, field_descriptor::TYPE_UINT64, false, false, nullptr},
+		{"snapshot_id", 2, field_descriptor::TYPE_STRING, false, false, nullptr},
+		{"epoch", 3, field_descriptor::TYPE_UINT64, false, false, nullptr},
+		{"revision", 4, field_descriptor::TYPE_UINT64, false, false, nullptr},
+		{"validation_hash", 5, field_descriptor::TYPE_BYTES, false, false, nullptr},
+		{"expected_workers", 6, field_descriptor::TYPE_UINT32, false, false, nullptr},
+	}};
+	constexpr std::array<expected_field, 9> ATTRIBUTION{{
+		{"candidate", 1, field_descriptor::TYPE_MESSAGE, false, true,
+		 "kinetum.control.v1.GuardrailsObservationIdentity"},
+		{"rollback_snapshot_id", 2, field_descriptor::TYPE_STRING, false, false, nullptr},
+		{"previous_workers", 3, field_descriptor::TYPE_MESSAGE, true, false,
+		 "kinetum.telemetry.v1.WorkerCounterStats"},
+		{"current_workers", 4, field_descriptor::TYPE_MESSAGE, true, false,
+		 "kinetum.telemetry.v1.WorkerCounterStats"},
+		{"baseline_tx_pps", 5, field_descriptor::TYPE_DOUBLE, false, false, nullptr},
+		{"confidence", 6, field_descriptor::TYPE_DOUBLE, false, true, nullptr},
+		{"recommendation", 7, field_descriptor::TYPE_ENUM, false, false,
+		 "kinetum.control.v1.GuardrailsRecommendation"},
+		{"evidence_complete", 8, field_descriptor::TYPE_BOOL, false, false, nullptr},
+		{"intent_accepted", 9, field_descriptor::TYPE_BOOL, false, false, nullptr},
+	}};
+	constexpr std::array<expected_field, 3> COMPLETED{{
+		{"candidate", 1, field_descriptor::TYPE_MESSAGE, false, true,
+		 "kinetum.control.v1.GuardrailsObservationIdentity"},
+		{"valid_observation_ns", 2, field_descriptor::TYPE_UINT64, false, false, nullptr},
+		{"outcome", 3, field_descriptor::TYPE_ENUM, false, false,
+		 "kinetum.control.v1.GuardrailsEvaluationOutcome"},
+	}};
+	constexpr std::array<expected_field, 7> EVALUATION{{
+		{"state", 1, field_descriptor::TYPE_ENUM, false, false, "kinetum.control.v1.GuardrailsEvaluationState"},
+		{"policy_generation", 2, field_descriptor::TYPE_UINT64, false, false, nullptr},
+		{"observed_identity", 3, field_descriptor::TYPE_MESSAGE, false, true,
+		 "kinetum.control.v1.GuardrailsObservationIdentity"},
+		{"baseline_intervals", 4, field_descriptor::TYPE_UINT32, false, false, nullptr},
+		{"valid_observation_ns", 5, field_descriptor::TYPE_UINT64, false, false, nullptr},
+		{"last_completed", 6, field_descriptor::TYPE_MESSAGE, false, true,
+		 "kinetum.control.v1.GuardrailsCompletedEvaluation"},
+		{"last_attribution", 7, field_descriptor::TYPE_MESSAGE, false, true,
+		 "kinetum.control.v1.GuardrailsAttribution"},
+	}};
+	constexpr std::array<expected_field, 5> RESPONSE{{
+		{"status", 1, field_descriptor::TYPE_MESSAGE, false, true, "kinetum.common.v1.Status"},
+		{"policy", 2, field_descriptor::TYPE_MESSAGE, false, true, "kinetum.control.v1.GuardrailsPolicy"},
+		{"policy_generation", 3, field_descriptor::TYPE_UINT64, false, false, nullptr},
+		{"policy_hash", 4, field_descriptor::TYPE_BYTES, false, false, nullptr},
+		{"evaluation", 5, field_descriptor::TYPE_MESSAGE, false, true,
+		 "kinetum.control.v1.GuardrailsEvaluation"},
+	}};
+	expect_message(control::GuardrailsObservationIdentity::descriptor(), IDENTITY);
+	expect_message(control::GuardrailsAttribution::descriptor(), ATTRIBUTION);
+	expect_message(control::GuardrailsCompletedEvaluation::descriptor(), COMPLETED);
+	expect_message(control::GuardrailsEvaluation::descriptor(), EVALUATION);
+	expect_message(control::GetGuardrailsResponse::descriptor(), RESPONSE);
+	constexpr std::array<expected_enum_value, 7> STATES{{
+		{"GUARDRAILS_EVALUATION_STATE_UNSPECIFIED", 0},
+		{"GUARDRAILS_EVALUATION_STATE_UNCONFIGURED", 1},
+		{"GUARDRAILS_EVALUATION_STATE_DISABLED", 2},
+		{"GUARDRAILS_EVALUATION_STATE_BASELINE_BUILDING", 3},
+		{"GUARDRAILS_EVALUATION_STATE_ARMED", 4},
+		{"GUARDRAILS_EVALUATION_STATE_EVALUATING", 5},
+		{"GUARDRAILS_EVALUATION_STATE_ROLLBACK_PENDING", 6},
+	}};
+	constexpr std::array<expected_enum_value, 4> RECOMMENDATIONS{{
+		{"GUARDRAILS_RECOMMENDATION_UNSPECIFIED", 0},
+		{"GUARDRAILS_RECOMMENDATION_AUTO_ROLLBACK", 1},
+		{"GUARDRAILS_RECOMMENDATION_DEFER_TO_HUMAN", 2},
+		{"GUARDRAILS_RECOMMENDATION_LOG_ONLY", 3},
+	}};
+	constexpr std::array<expected_enum_value, 5> OUTCOMES{{
+		{"GUARDRAILS_EVALUATION_OUTCOME_UNSPECIFIED", 0},
+		{"GUARDRAILS_EVALUATION_OUTCOME_WINDOW_COMPLETE", 1},
+		{"GUARDRAILS_EVALUATION_OUTCOME_HISTORY_EXHAUSTED", 2},
+		{"GUARDRAILS_EVALUATION_OUTCOME_INTERVAL_EXCEEDS_WINDOW", 3},
+		{"GUARDRAILS_EVALUATION_OUTCOME_ROLLBACK_ACCEPTED", 4},
+	}};
+	const auto *file = control::GuardrailsEvaluation::descriptor()->file();
+	expect_enum(file->FindEnumTypeByName("GuardrailsEvaluationState"), STATES);
+	expect_enum(file->FindEnumTypeByName("GuardrailsRecommendation"), RECOMMENDATIONS);
+	expect_enum(file->FindEnumTypeByName("GuardrailsEvaluationOutcome"), OUTCOMES);
 }
 
 /** @brief Pin exact transaction, certificate, grace, and fault field presence. */

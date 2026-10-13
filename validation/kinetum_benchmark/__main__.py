@@ -181,7 +181,7 @@ def _add_run_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--packet-size", type=int, default=64,
                         help="Packet size in bytes (default: 64)")
     parser.add_argument("--no-all-sizes", action="store_true",
-                        help="Test single packet size only (default: all sizes 64-1518)")
+                        help="Test single packet size only (default: all sizes 64-1514)")
     parser.add_argument(
         "--num-flows",
         type=int,

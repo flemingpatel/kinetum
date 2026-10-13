@@ -357,7 +357,7 @@ packer is the sole bundle/plan producer and
 Photon is the sole owner of the DP/CP process pair. The DPDK
 TAP PMD is responsible for creating the kernel-visible `neb_*`
 interfaces; the runner waits for them to appear in `/sys/class/net/`
-before configuring them.
+before checking their link state.
 
 There is exactly one packet path on the wire: AF_PACKET into the RX TAP,
 DPDK in `kinetum_dp` processes it through the pipeline, the egress
@@ -412,7 +412,7 @@ short option is accepted.
 | `--count` | `1000` | Positive count-based packet target in the uint32 sequence domain. |
 | `--duration` | `0.0` | Finite test duration in seconds. `0.0` selects count-based mode using `--count`; a positive duration must schedule at least one packet and keep `pps * duration` inside uint32. |
 | `--packet-size` | `64` | Bytes. Validated to `[64, 9000]`. |
-| `--all-sizes` | off | Run packet test for `(64, 128, 256, 512, 1024, 1518)`. |
+| `--all-sizes` | off | Run packet test for `(64, 128, 256, 512, 1024, 1514)`. |
 | `--num-flows` | `1` | Number of traffic-generator flows per ingress port. TRex varies UDP source port per flow; `rx-rss-2` requires at least 64 flows so RSS steering has enough diversity for stream-balance evidence. A transition run also rejects before SSH when the conservative flow/PGID result bound would exceed the shared 16 MiB JSON contract. The native TAP sender is single-flow. |
 | `--src-ip` | `10.0.0.100` | Source IP of generated UDP flow. |
 | `--dst-ip` | `192.168.1.1` | Destination IP. |
@@ -495,7 +495,7 @@ otherwise the selected scenario runs against one packet-ready generation.
         Sup->PH: spawn ~--bundle
         PH-->Sup: pair reaches PACKET_READY
         Orc->Bck: setup() (wait for neb_rx/neb_tx)
-        Bck->Bck: set MTU + UP, disable kernel forwarding
+        Bck->Bck: verify link UP, disable kernel forwarding
         Bck-->Orc: backend ready
         Orc->Trf: setup() (validate send/capture surfaces)
         Trf-->Orc: traffic driver ready
@@ -533,7 +533,7 @@ can supply release metadata or bundle construction can begin.
    and enables the existing console mirror. It passes no runtime provider selector, EAL
    override, UDP endpoint override, plan path, module path, or repair mode.
 4. `_backend.setup()` polls `/sys/class/net/<iface>` until each TAP
-   appears (30 s deadline), then sets MTU and link state up, disables
+   appears (30 s deadline), then verifies the link is up and disables
    kernel IP forwarding and `accept_local` on each TAP. The backend does
    not own packet generation or capture.
 5. `make_traffic_driver()` creates the selected traffic driver. For
@@ -622,7 +622,7 @@ The profile's traffic driver owns generation, capture, timestamps, and rate
 control.
 
 `DPDKTapBackend` is the live local resource profile: it waits for TAP
-interfaces, configures them, and prevents Linux from forwarding around
+interfaces, verifies their link state, and prevents Linux from forwarding around
 the data plane. `NativeTapTrafficDriver` is the live local packet path: it
 invokes the native sender against TAP ingress and captures TAP egress
 with tcpdump. `DPDKPCIBackend` is a physical-port descriptor used for
@@ -646,9 +646,9 @@ Setup steps, in order:
    `config.backend.ports`. Deadline is
    30 s; timeout raises `RuntimeError`. DP must start first because DPDK creates
    the TAPs during initialization.
-2. **Configure interfaces.** For each TAP iface, run
-   `ip link set <iface> mtu 9000` using `CONSTANTS.TAP_MTU`, then
-   `ip link set <iface> up`.
+2. **Verify link activation.** Require `IFF_UP` in
+   `/sys/class/net/<iface>/flags`. The provider applies the plan's MTU and
+   starts each link before `PACKET_READY`; the harness does not alter either.
 3. **Disable kernel forwarding.** Write `0` to
    `/proc/sys/net/ipv4/conf/<iface>/forwarding` and
    `/proc/sys/net/ipv4/conf/<iface>/accept_local` for each TAP. This
@@ -674,22 +674,8 @@ TAP or the exact TRex endpoint protocol.
 RX-direction TAP interface in the selected backend profile. Multi-ingress
 deployments such as `fan-in-edge-gateway` are sent round-robin by the native
 sender. Capture is delegated to `tcpdump` against the first TX-direction
-TAP. The runner uses these tcpdump flags:
-
-- `-i <egress-tap>` (always `neb_tx` for the shipped deployments).
-- `-w <pcap-file>` to write a raw pcap.
-- `-B 131072` to request a 128 MiB kernel capture buffer. It reduces capture
-  pressure; tcpdump-reported drops still fail the evidence.
-- `-s 0` to capture full packets, not snipped headers.
-- A BPF filter expression provided by the orchestrator. The standard
-  test uses `udp dst port <base_dport>` (`9999` by default) so NAT
-  rewrites of the source port do not exclude the packet.
-
-The capture process starts before the sender and must publish its own tcpdump
-listening line within five seconds. Stop is a
-SIGTERM with a 5 s grace, then SIGKILL with one final 5 s process-retirement
-bound. Any child that still cannot be retired remains explicitly owned, and
-the run fails.
+TAP (`neb_tx` in the shipped deployments). [Section 15](#15-tcpdump-capture-and-kinetum_tap_analyzer)
+owns the capture flags, readiness, completion checks, and packet analysis.
 
 `TRexTrafficDriver` controls a prepared stateless endpoint over SSH. Operators
 install TRex, bind NICs, configure ports, and start `t-rex-64 -i`. The kit's
@@ -903,16 +889,17 @@ to end with loss within threshold, while recording the achieved rate.
 2. Invoke the selected traffic sender with the resolved port list and packet
    config. Native TAP uses `NativeSender.run_standard`; physical PCI uses one
    TRex stateless counter session. If `--all-sizes` is set, run one iteration
-   per size in `(64, 128, 256, 512, 1024, 1518)`.
+   per size in `(64, 128, 256, 512, 1024, 1514)`.
 3. Sleep 2 s after the sender returns to let in-flight packets drain.
 4. Stop capture.
 5. Analyze the completed driver evidence. Native TAP runs the native analyzer
-   on the pcap with `--expected <tx_count>`; standard TRex validates its port
+   on the pcap with `--expected <tx_count>` and `--stream-count <ingress_count>`;
+   standard TRex validates its port
    counter sidecar without manufacturing a pcap or latency sample.
 6. Compute nonnegative `loss_pct = max(0, expected - valid) / expected * 100`.
 7. Require positive TX/RX, zero sender errors, exact counter/tag membership,
    and no RX count above TX. Native pcap evidence additionally requires zero
-   invalid, duplicate, and out-of-order frames; TRex supplies counter evidence
+   invalid, duplicate, and within-input out-of-order frames; TRex supplies counter evidence
    and makes no packet-order claim. Then compare loss to `--max-loss`. Build a
    `TestResult` with `passed`,
    `tx_count`, `rx_count`, `loss_pct`, nullable `avg_latency_us`, and
@@ -932,7 +919,8 @@ throughput qualification belongs to the benchmark campaign.
 **Pass criteria.** Exact evidence for the selected driver and
 `loss_pct <= max_loss`. Loss percentage alone can never hide a sender error or
 counter disagreement; native pcap evidence also rejects a foreign, duplicate,
-or reordered frame.
+or within-input reordered frame. Independent fan-in inputs may interleave;
+the pipeline does not promise one global packet order across them.
 
 The canonical fan-in `standard` and `full` runs also perform a bounded NAT
 exchange after the measured scenarios and their statistics are saved. Each
@@ -1044,6 +1032,11 @@ protocol-fault delta. The `zero_loss` artifact field remains literal
 recorded but is not itself a failure; capacity/performance evaluation remains
 part of separate performance qualification.
 
+Native TAP also requires each ingress to retain initial-tag then next-tag
+packets with exactly one tag change in that input. Their merged capture may
+contain several adjacent tag changes. TRex uses its separate PGID populations
+and the exact boundary observations, with no packet-order claim.
+
 **Artifacts.** `epoch_capture.pcap` or its TRex generation/PGID sidecar,
 `photon.log`, the `epoch_test` block
 in `test_results.json`, and exactly one `transition_metrics.jsonl` record
@@ -1067,7 +1060,7 @@ traffic is flowing.
   commit-confirmed before the test starts.
 - The runner uses `epoch.pps` for one continuous 30 s traffic window spanning
   both measured transitions (default `1000` PPS).
-- The scenario owns a fixed 30,000 ms confirmation timeout.
+- The scenario owns a fixed 5,000 ms confirmation timeout.
 
 **Driver.** `scenarios.run_commit_confirmed_test(context)`.
 
@@ -1078,23 +1071,34 @@ traffic is flowing.
    This normalization is setup choreography, not one of the two measured
    commit-confirmed records.
 2. Start the selected capture abstraction and launch continuous traffic for
-   30 s through its sender's `run_timed(30.0)`. Allow 1 s of baseline.
-3. Take a pre-transition stats snapshot and require positive DP RX since the
-   normalized baseline observation from step 1.
-4. Call `KinetumCtl.apply_config_with_confirm(snapshot, 30000, expected_revision)`.
+   30 s through its sender's `run_timed(30.0)`.
+3. Within that window, wait for advancing current-epoch worker measurements
+   and positive DP RX. A fixed delay or repeated cached reply cannot establish
+   traffic readiness.
+4. Call `KinetumCtl.apply_config_with_confirm(snapshot, 5000, expected_revision)`.
    Success must carry snapshot ID, revision, and epoch; CP
-   creates pending-confirm state only with exact COMPLETE promotion.
-5. Take a post-transition stats snapshot. If both snapshots succeeded,
-   append a `transition_metrics.jsonl` record tagged
-   `"commit_confirmed"`.
+   starts the confirmation period at exact COMPLETE promotion. Apply, Confirm,
+   and observations remain bounded by the 30 s traffic window; request start
+   does not establish CP's deadline.
+5. Take a post-transition stats snapshot and require the exact apply identity.
 6. Call `KinetumCtl.confirm(snapshot_id, epoch, revision)` with that exact
    apply identity. The CLI adds one retained random retry key. Record
    `time_remaining_ms` reported by CP.
-7. Take a stats snapshot to verify the confirmed snapshot remains active.
+7. Observe that exact runtime, snapshot, revision, hash, and epoch through the
+   remaining interval measured from receipt of Confirm. Any intervening change
+   fails. After the deadline, require fresh worker publications and positive
+   traffic, then append the `"commit_confirmed"` transition record. Elapsed time
+   alone cannot prove survival or traffic readiness.
 8. Apply the baseline with a 1500 ms confirmation timeout, do not confirm, and
    require one exact later automatic rollback to the confirmed candidate.
-   Append a `commit_confirmed_timeout_rollback` record from complete pre/post
-   stage, region, boundary, terminal, fault, and positive-RX evidence.
+   Wait through retirement, then match runtime, plan, restored content, and
+   the terminal record from the unconfirmed epoch to the restored epoch.
+   These identity checks do not wait for another counter publication. If rollback
+   completes before the first read, the successful apply reply identifies the
+   unconfirmed epoch; counter deltas retain their actual earlier observation.
+   After restoration, require fresh traffic before appending the
+   `commit_confirmed_timeout_rollback` record with exact terminal/boundary
+   evidence and the recorded counter endpoints.
 9. Only after both measured transitions complete, wait for the traffic task,
    stop capture, analyze the selected driver's evidence, and record `tx_count`,
    `rx_count`, `loss_pct`, and available-or-null `avg_latency_us`.
@@ -1102,10 +1106,10 @@ traffic is flowing.
     traffic-window evidence.
 
 **What this proves.** That the commit-confirmed RPCs work
-end-to-end (apply, confirm), that the apply takes effect under live
-traffic, and that loss stays within threshold across the transition.
+end-to-end (apply, confirm), that confirmed content remains active beyond its
+deadline with continued traffic, and that an unconfirmed update rolls back.
 
-**Pass criteria.** Confirmation, exact timeout rollback, exact sender/capture
+**Pass criteria.** Confirmed survival beyond the deadline, exact timeout rollback, exact sender/capture
 accounting, and `cc_loss_pct <= max_loss` must hold. The result message includes either
 `COMMIT-CONFIRMED VALIDATED` or `COMMIT-CONFIRMED FAILED` with the
 reason.
@@ -1115,7 +1119,7 @@ reason.
 `transition_metrics.jsonl` records tagged `"commit_confirmed"` and
 `"commit_confirmed_timeout_rollback"`.
 
-The timeout result fields are mandatory success evidence.
+The survival and timeout-rollback result fields are mandatory success evidence.
 
 ## 12. rollback
 
@@ -1189,31 +1193,36 @@ change.
 The guardrails scenario proves one telemetry-attributed durable automatic
 rollback through the ordinary transition authority:
 
-1. Read exact baseline content, runtime generation, counters, and current
-   module-health rows.
-2. Configure an explicit threshold policy (100 ms cadence, 1000 ms valid-time
+1. Read exact baseline content, runtime generation, and worker counters.
+2. Configure an explicit threshold policy (100 ms polling, 10,000 ms valid-time
    window, 1% drop bound, 0.99 TX ratio, and minimum population one).
-3. Run baseline traffic long enough to build a valid prior-content window and
-   require positive accepted TX plus current health for every module context.
+3. Start one continuous 60 s traffic source. Within 30 s, require fresh positive
+   ingress and the exact policy's `ARMED` publication from `guardrails show`.
+   CP must have accepted at least ten real source intervals and a positive TX
+   baseline. The bound never substitutes for this predicate.
 4. Apply the deployment's explicit
    `config_snapshot_guardrails_degradation.pbtxt` with exact active-revision
    CAS. This snapshot differs from v2 only in snapshot identity/description and
    the ACL entry whose recomputed hash binds a rule denying the exact
    `10.0.0.100 -> 192.168.1.1 UDP/9999` validation flow.
-5. Run candidate traffic and observe positive DP RX, a drop ratio above the
-   configured threshold, and accepted-TX rate below the frozen positive
-   baseline before accepting a later automatic rollback.
-6. While the candidate source remains live, wait boundedly for a later exact
+5. Keep that source running. Read the retained attribution and verify its exact
+   candidate identity, positive ingress, source-timed drop/TX rates crossing
+   both thresholds, and accepted intent. This proof remains usable if rollback
+   finishes before the next poll.
+6. While the same source remains live, wait boundedly for a later exact
    COMPLETE transition restoring the baseline snapshot. Runtime generation
    must not change.
-7. Require unchanged protocol-fault membership, zero fault delta, and write one
-   exact `guardrails_rollback` transition record.
+7. Require unchanged protocol-fault membership and zero fault delta. Retain the
+   armed read, measured arming duration, and attributed decision in
+   `guardrails_evaluation.json`, plus one `guardrails_rollback` transition record.
 8. Disable the policy through the same keyed generation-CAS command. Failure
    cleanup retries this disable before runtime teardown, and unproved policy or
    sender cleanup makes the scenario fail.
 
 Success records baseline/candidate/rollback snapshot IDs, strictly increasing
 candidate and rollback epochs, zero protocol faults, and policy convergence.
+The cumulative drop count includes the deliberately denied ACL traffic and
+does not reset when rollback restores forwarding.
 `full` includes this scenario after rollback has restored the authored
 baseline. The harness consumes policy behavior; it does not redefine it.
 
@@ -1255,7 +1264,10 @@ fallback survives.
 
 Each generated packet is an Ethernet + IPv4 + UDP frame followed by a
 fixed Kinetum payload header. `--packet-size` counts these supplied frame bytes,
-excluding NIC-added FCS, preamble/SFD, and inter-frame gap. The constants are:
+excluding NIC-added FCS, preamble/SFD, and inter-frame gap. The default sweep
+ends at 1514 bytes: a 14-byte Ethernet header plus the examples' 1500-byte IP
+MTU. Larger explicit sizes require bindings with a sufficient MTU and packet
+storage capacity. The constants are:
 
 | Constant | Value | Notes |
 |----------|-------|-------|
@@ -1271,7 +1283,9 @@ Payload layout, byte-by-byte from the start of UDP payload:
 
 - bytes 0..6: `MAGIC` (`K I N E T U M`).
 - bytes 7..10: big-endian uint32 process-wide sequence number, monotonically
-  increasing from 0 across the complete round-robin port set.
+  increasing from 0 across successful sends. With `N` ordered ingress ports,
+  packet `q` belongs to input `q % N`; a failed send advances neither identity
+  nor port. The analyzer receives the same `N` explicitly.
 - bytes 11..12: big-endian uint16 generation tag.
 - bytes 13..20: big-endian double TX timestamp (seconds from
   `std::chrono::system_clock`).
@@ -1363,12 +1377,16 @@ capture process or private pcap parser.
 The native TAP traffic driver wraps tcpdump with:
 
 ```text
-tcpdump -i <egress-tap> -w <pcap-file> -B 131072 -s 0 <bpf-filter>
+tcpdump -i <egress-tap> -w <pcap-file> --immediate-mode -B 131072 -s <frame-bound> <bpf-filter>
 ```
 
 - `-B 131072` requests a 128 MiB kernel capture buffer. It reduces capture
   pressure; observed kernel drops still invalidate evidence.
-- `-s 0` keeps full frames.
+- `--immediate-mode` delivers packets without waiting for a capture block to
+  fill or time out. It does not replace the completion checks below.
+- `<frame-bound>` covers both `--packet-size` and the largest selected sweep
+  size. It keeps every configured frame in full while bounding Linux's fixed
+  capture slots; an oversized or truncated frame fails native analysis.
 - The BPF filter for forwarding tests is
   `udp dst port <base_dport>` (default `9999`). The runner picks the
   filter so that NAT-rewritten source ports do not exclude packets.
@@ -1381,15 +1399,22 @@ tcpdump -i <egress-tap> -w <pcap-file> -B 131072 -s 0 <bpf-filter>
    failure under one five-second bound; elapsed sleep is not readiness
    evidence.
 3. The sender runs.
-4. Sleep 2 s after the sender to let in-flight packets drain into the
-   pcap.
+4. Allow the scenario's bounded post-send drain (1-2 s) for in-flight packets.
+   Elapsed time alone does not prove that capture is complete.
 5. SIGTERM tcpdump. Wait up to 5 s. SIGKILL on timeout. A nonzero exit or an
-   output task that cannot drain after process exit fails the capture.
-6. Preserve the completed pcap for one native-analyzer pass. The stop path does
-   not run a second line-producing `tcpdump -r` scan merely to compute an
-   ignored count; `kinetum_tap_analyzer` is the sole packet-count authority.
+   output task that cannot drain after process exit fails the capture. After
+   retirement, retain the exit code, parsed counters, and any completion error
+   in `<capture-stem>.capture.json`, including on failure.
+6. Require valid captured, received-by-filter, and kernel-drop counts. Captured
+   must equal received-by-filter, and any reported kernel or interface drop
+   fails independently of packet-loss tolerance. Missing, malformed, or
+   regressing counts fail; zero kernel drops alone cannot prove completion.
+7. Consume that exact completed capture through one native-analyzer pass.
+   Its `total_rx` must equal tcpdump's captured count before packet-loss,
+   ordering, tag, or latency evidence can be accepted. The driver cannot analyze
+   a running, failed, unrelated, or already-consumed capture.
 
-The readiness bound and 2 s post-send drain are not CLI tuning.
+Readiness, retirement, and post-send drain bounds are not CLI tuning.
 
 ### 15.3 kinetum_tap_analyzer
 
@@ -1402,7 +1427,8 @@ CLI:
 | Flag | Notes |
 |------|-------|
 | `--pcap` | Required absolute exact regular-file path. |
-| `--expected` | Expected packet count in the uint32 sequence domain. |
+| `--expected` | Required exact successful-send count in the uint32 sequence domain. |
+| `--stream-count` | Required ordered ingress population, 1 through 64, matching the sender's `--ports`. |
 | `--no-latency` | Skip latency computation. |
 | `--help` | Print native analyzer usage. |
 
@@ -1420,18 +1446,22 @@ Behaviour:
   nonmatching packet increments `invalid` and is skipped.
 - Read the sequence, tag, and TX timestamp; a sequence outside the supplied
   expected population is invalid.
-- Detect duplicates with a seen-sequence set.
-- Detect out-of-order frames and sequence gaps by comparing each
-  sequence number to the previous sequence number.
+- Count unique valid IDs in `valid` and repeated IDs in `duplicates`.
+  `total_rx = valid + invalid + duplicates`.
+- Recover each packet's input from `sequence % stream_count`. A unique arrival
+  below that input's highest received ID is out of order. Other inputs do not
+  advance its ordering reference.
+- After capture, compute `missing_count = expected - valid` and `max_gap`, the
+  longest actually absent ID interval, including missing prefixes and suffixes.
+  A gap filled by a later arrival is not loss.
 - Unless the standalone `--no-latency` diagnostic mode is selected, require
   one finite positive TX timestamp and one finite positive bounded latency for
-  every valid frame, then compute
+  every unique valid frame, then compute
   `latency_us = (capture_time - tx_time) * 1e6`. Track avg, min, max, p50, and
   p99. The validation harness always uses this measured native mode.
-- Track per-tag counts.
-- Count every adjacent tag change and report the first sequence as
-  `transition_seq`. Native transition evidence requires exactly one change;
-  TRex overlap uses independent PGID classes instead of capture order.
+- Track unique per-tag counts, first/last tags, and adjacent tag changes per
+  input. Root counts sum those rows; root `transition_seq` is the lowest observed
+  input-change ID, or `-1` when absent. Empty inputs remain explicit rows.
 - Compute nonnegative `loss_pct` from the supplied expected count; excess
   observations remain duplicate/error evidence rather than negative loss.
 - Emit a single JSON object to stdout. Malformed CLI arguments return
@@ -1460,6 +1490,19 @@ The analyzer emits one JSON object with this field layout (type placeholders):
   "transition_seq": <int>,
   "tag_transition_count": <int>,
   "tag_counts": { "<tag>": <count>, ... },
+  "streams": [{
+    "stream_index": <int>,
+    "expected_count": <int>,
+    "valid": <int>,
+    "duplicates": <int>,
+    "out_of_order": <int>,
+    "missing_count": <int>,
+    "transition_seq": <int>,
+    "tag_transition_count": <int>,
+    "first_tag": <int or null>,
+    "last_tag": <int or null>,
+    "tag_counts": { "<tag>": <count>, ... }
+  }, ...],
   "latency": {
     "count": <int>,
     "avg": <double>,
@@ -1475,6 +1518,8 @@ Latency values are in microseconds. The Python `AnalysisResult` accepts one
 validated native-analyzer latency publication in `_latency_stats_cache` and
 returns copies of that cache. Without such a publication, `latency_stats()`
 returns unavailable; it neither recomputes nor manufactures zeros.
+The wrapper requires all declared input rows and reconciles their totals with
+the root. Counter-only TRex results have no input-order or tag-change measurement.
 
 ---
 
@@ -1498,6 +1543,8 @@ possible artifact.
 | `epoch_capture.pcap` or `epoch_capture.trex_stats.json` | `epoch` test | Native-TAP pcap or generation/PGID TRex sidecar. |
 | `commit_confirmed_capture.pcap` or matching TRex sidecar | `commit_confirmed` test | Traffic-window evidence. |
 | `rollback_capture.pcap` or matching TRex sidecar | `rollback` test | Traffic-window evidence. |
+| `<capture-stem>.capture.json` | each stopped native-TAP capture, including failed completion | tcpdump exit code, reported captured/filter/drop counters, and nullable completion error. Missing counters remain absent. |
+| `<capture-stem>.traffic.json` | each capture completion attempt with a completed sender result | Driver identity and sender counts/errors/times survive capture or analysis failure; `analysis` is then `null`. Successful analysis retains counts, gaps, per-input ordering/tags, and nullable latency. TRex input rows and packet-order measurements are `null`. |
 | `test_results.json` | setup rejection, dry-run completion, or completed scenario collection | `RunArtifacts.save_test_results`; an exception or unretired cleanup owner can prevent final publication. |
 | `dp_stats.txt` | every completed non-dry packet run | Human-readable projection of one exact successful stats response, or bounded status-only failure evidence. |
 | `dp_stats.json` | successful final telemetry collection | Structured final telemetry projection parsed from validated protobuf JSON; unsupported provider values remain absent. A failed query writes status-only `dp_stats.txt` and no JSON. |
@@ -1514,6 +1561,10 @@ manifest completion, aggregation, and initial CSV publication.
 ## 17. Artifact Schemas
 
 Artifact readers must follow these field contracts.
+
+Each returned scenario verdict has one `[RESULT - <name>]` console banner,
+including failures. Verified confirmation and rollback steps remain recorded
+when a later traffic measurement fails; they do not make the overall test pass.
 
 `run_metadata.json` is validated before its first byte is written. It binds the
 internal deployment/profile spellings, resolved driver, exact runtime and
@@ -1609,7 +1660,9 @@ The `commit_confirmed_test` block:
   "duration_s": 31.10,
   "confirm_success": true,
   "confirm_snapshot_id": "snap-...",
-  "confirm_time_remaining_ms": 29473,
+  "confirm_time_remaining_ms": 4473,
+  "confirmed_survived_deadline": true,
+  "confirmed_survival_elapsed_ms": 5520,
   "timeout_rollback_occurred": true,
   "timeout_rollback_snapshot_id": "snap-...",
   "tx_count": 30000,
@@ -1645,13 +1698,22 @@ protocol-fault delta; duration; and verdict message. A successful row requires
 the rollback ID to equal the baseline, a strictly later rollback epoch, and
 zero protocol faults.
 
+`guardrails_evaluation.json` retains the actual `armed` and `decision`
+GetGuardrails responses plus `arming_elapsed_s`. It makes the source-sample
+floor and authored arming bound reviewable without treating polling frequency
+as measurement frequency.
+
 ### 17.2 dp_stats.json
 
 Written once at the end of a non-dry-run after the Photon-owned pair is ready
 and the final telemetry query succeeds.
+After traffic stops, a bounded wait requires every stream's owner publication
+to postdate the initial collection. Repeated responses cannot satisfy that
+barrier; changed contents under the same publication generation fail.
 The harness requests stage, module metric/health, worker, region, boundary,
 stream, storage, port, steering, and module-context rows in one call and records
-the validated result. A failed query writes a bounded status-only `dp_stats.txt`,
+the validated result. Both final projections retain the mandatory worker-counter
+rows; success cannot be exported without them. A failed query writes a bounded status-only `dp_stats.txt`,
 marks required stats evidence failed, and does not create `dp_stats.json`.
 
 The artifact is a dataclass projection of the validated protobuf JSON, not a
@@ -1687,6 +1749,7 @@ Top-level fields:
 | `stage_stats` | array | One entry per pipeline stage. |
 | `module_counter_stats`, `module_histogram_stats`, `module_epoch_mismatch_stats`, `module_health_stats` | array | Complete selected module observations. |
 | `worker_epoch_stats`, `region_epoch_stats`, `boundary_epoch_stats` | array | Exact ownership, cold aggregation, and protocol evidence. |
+| `worker_counters` | array | Mandatory compact worker observations: epoch, sequence, measurement time, and cumulative counters. |
 | `stream_stats` | array | One entry per compiled executable I/O stream with `published_monotonic_ns`, transferred `packets`/`bytes`, and `rejected_packets`. |
 | `storage_domain_stats` | array | Compiled capacity plus typed optional occupancy. |
 | `port_stats` | array | Exact logical/driver identity plus typed optional native counter tuple. |
@@ -1768,6 +1831,11 @@ transition requires a positive same-runtime `rx_packets_delta`, proving that
 the dataplane admitted traffic during its evidence interval. They make no
 marker-derived settlement claim; exact sequence-CUT convergence, terminal
 outcome, and fault deltas come from the final telemetry contract.
+`counter_observations` records the actual before/after snapshot identities,
+collection provenance, worker population, and worker measurement endpoints.
+Counter deltas describe that recorded interval, which may include an earlier
+apply when automatic rollback wins the observation race. Boundary timings
+remain bound to the exact named terminal transition.
 Summary and benchmark readers require identical fault, boundary, region, and
 stage membership across every record, including stable boundary ID/index
 pairs. All three row families are nonempty for an admitted transition scenario.
@@ -1798,6 +1866,7 @@ Per record:
 | `transition_generation` | uint64 | Exact terminal mutation sequence shared by every boundary row. |
 | `from_epoch`, `to_epoch` | uint64 | Exact transition endpoints. |
 | `transition_state`, `transition_success_blocked` | typed/string + bool | Terminal coordinator and safety-latch truth. |
+| `counter_observations` | object | Expected worker count and exact before/after source endpoints. |
 | `rx_packets_delta` | positive uint64 | DP ingress observed across the measured transition interval. |
 | `tx_packets_delta` | uint64 | |
 | `dropped_packets_delta` | uint64 | Exactly-once terminal retirement delta. |
@@ -2202,7 +2271,7 @@ and platform role files under `logs/` to locate faults.
 | `validation output root already exists` | The requested run root is not fresh. | Choose a new exact output path; the harness never removes prior evidence. |
 | `kinetum_pack failed` | Axiom, Gluon, module closure, plan/snapshot identity, or completed-manifest admission rejected. | The bounded packer diagnostic included in setup output. |
 | `another physical-validation run owns the global lock` | Another live run holds `/run/kinetum_validation.lock`. | Wait for that owner to finish; process death releases the lock. |
-| `Failed to set MTU` / `Failed to bring up` or forwarding-control failure | TAP host-resource setup lacks root privileges, the required per-interface kernel controls are absent, or the interface is not owned by this run. | `DPDKTapBackend._configure_interfaces`; both `forwarding` and `accept_local` must read back as zero. |
+| TAP link-state or forwarding-control failure | A provider-created TAP is not up, its flags cannot be read, or kernel forwarding controls cannot be set. | `DPDKTapBackend._verify_interfaces` and `_disable_kernel_forwarding`; the link must be up, and `forwarding` and `accept_local` must read back as zero. |
 | `Timeout waiting for interfaces: neb_rx, ...` | The pair reached readiness but the expected TAP surface is absent or mismatched. | `photon.log` for materialization/EAL evidence and `DPDKTapBackend._wait_for_interfaces`. |
 | `kinetum_photon failed to reach ready state` | The pair did not complete typed readiness within 30 seconds. | `logs/` and `photon.log`; inspect CP serving and DP packet-ready health at their configured endpoints. |
 | Runtime rejects its installation root or signed provider inventory | A loose build-tree image, package indirection, unsigned candidate, wrong owner/mode, or incomplete finalized root was launched. | Use the release prepare/finalize/install ceremony. There is no root, inventory, key, or unsigned override. |
@@ -2212,7 +2281,7 @@ and platform role files under `logs/` to locate faults.
 | Symptom | Likely cause | Where to look |
 |---------|--------------|---------------|
 | Standard test: high `loss_pct` on `neb_tx` | Dataplane loss, sender shortfall, or tcpdump capture drops. | Sender/analyzer counters, DP stats, and tcpdump stderr for "dropped by kernel". |
-| Standard test: `missing_count`, `duplicates`, or `out_of_order` nonzero | Sequence gaps, duplicate sequence numbers, or reordering in the captured stream. | Analyzer JSON plus the pcap. |
+| Standard test: `missing_count`, `duplicates`, or `out_of_order` nonzero | Absent IDs, repeated IDs, or reordering within one ingress. | Per-input rows in `<capture-stem>.traffic.json` plus the pcap. |
 | Standard test: `invalid` count high | Frames fail the complete Ethernet/IPv4/UDP generation-envelope contract: protocol/fragment/length coherence, magic, bounded sequence/tag, or valid timestamp evidence. ARP, ICMP, truncated packets, and foreign UDP all fail this gate. | Tighten the BPF filter and inspect the egress pcap for non-test or malformed traffic. |
 | Native TAP: `latency.count` is zero | No valid timestamped Kinetum frames were accepted, `--no-latency` was used when invoking the analyzer directly, or timestamp samples were filtered because capture time was not after TX time. | Check `valid`, `invalid`, and the pcap timestamps in analyzer output. |
 | Epoch test: `transitions_observed == 0` | CP apply failed, the bounded tag did not switch, or exact pre/post epochs agree. | `photon.log` and the `kinetumctl` result. |

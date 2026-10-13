@@ -518,6 +518,7 @@ target_link_libraries(kinetum_packet_thread_log_guard PRIVATE Threads::Threads)
 add_library(kinetum_common STATIC
   src/common/bootstrap_config_snapshot.cpp
   src/common/control_response_contract.cpp
+  src/common/guardrails_evaluation_contract.cpp
   src/common/dataplane_health_contract.cpp
   src/common/linux_cpu_set.cpp
   src/common/pbtxt.cpp
@@ -1571,6 +1572,7 @@ if(KINETUM_ENABLE_TESTS)
     tests/test_control_api_schema.cpp
     tests/test_guardrails.cpp
     tests/test_guardrails_evaluator.cpp
+    tests/test_guardrails_evaluation_contract.cpp
     tests/test_boundary_epoch_channel.cpp
     tests/test_partitioned_runtime_construction.cpp
     tests/test_runtime_io_backend.cpp
