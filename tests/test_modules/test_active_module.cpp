@@ -98,6 +98,16 @@ uint64_t test_active_ingest(kinetum_ctx *ctx, kinetum_active_ctx *active_ctx, ki
 	}
 	state.ingest_total_packets.fetch_add(batch->count, std::memory_order_relaxed);
 	state.last_ingest_epoch.store(batch->epoch, std::memory_order_relaxed);
+	if (active_ctx == nullptr || active_ctx->now_ns != batch->now_ns) {
+		std::terminate();
+	}
+	state.last_ingest_now_ns.store(batch->now_ns, std::memory_order_relaxed);
+	const auto corrupt_time = state.corrupt_ingest_time.exchange(0u, std::memory_order_relaxed);
+	if (corrupt_time == 1u) {
+		++batch->now_ns;
+	} else if (corrupt_time == 2u) {
+		++active_ctx->now_ns;
+	}
 	state.last_ingest_packet_config.store(reinterpret_cast<std::uintptr_t>(batch->epoch_config),
 					      std::memory_order_relaxed);
 	const uint64_t requested = state.retain_batch_mask.exchange(0u, std::memory_order_relaxed);

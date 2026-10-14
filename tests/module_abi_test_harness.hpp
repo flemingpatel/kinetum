@@ -441,19 +441,21 @@ class exact_module_test_context {
 	 * @brief Execute one packet through the production exact-module entry point.
 	 *
 	 * @param packet Exact packet record updated from exact module output.
+	 * @param now_ns Processing time supplied by this serialized test owner.
 	 * @return true only when the production engine forwards the packet.
 	 */
-	[[nodiscard]] bool process(dp::packet_record &packet) noexcept
+	[[nodiscard]] bool process(dp::packet_record &packet, uint64_t now_ns) noexcept
 	{
-		return process_batch(std::array{&packet}) == UINT64_C(1);
+		return process_batch(std::array{&packet}, now_ns) == UINT64_C(1);
 	}
 
 	/**
 	 * @brief Execute a borrowed occupied prefix through the production batch bridge.
 	 * @param packets Exact caller-owned records in callback-lane order.
+	 * @param now_ns Processing time shared by every callback lane.
 	 * @return Sole forward mask; incomplete fixture ownership rejects before execution.
 	 */
-	[[nodiscard]] uint64_t process_batch(std::span<dp::packet_record *const> packets) noexcept
+	[[nodiscard]] uint64_t process_batch(std::span<dp::packet_record *const> packets, uint64_t now_ns) noexcept
 	{
 		if (context_ == nullptr || context_->epoch_store == nullptr ||
 		    context_->epoch_store->active_view() == nullptr ||
@@ -461,8 +463,8 @@ class exact_module_test_context {
 			return 0u;
 		}
 		return packet_engine_.execute_module_stage(*context_->epoch_store,
-							   static_cast<uint16_t>(context_->context_index), 0, packets,
-							   packet_batch_);
+							   static_cast<uint16_t>(context_->context_index), 0, now_ns,
+							   packets, packet_batch_);
 	}
 
 	/** @return Borrowed admitted context; an absent context fails stop. */

@@ -421,6 +421,20 @@ TEST(module_config_parsing, qos_validation_rejects_invalid_numeric_values)
 	EXPECT_EQ(compile_qos_for_test(blob), nullptr);
 
 	profile->set_cbs_kb(64);
+	profile->set_cir_kbps(kinetum::modules::qos::QOS_MAX_CIR_KBPS + 1);
+	blob = module_config_json(qos_cfg);
+	EXPECT_EQ(compile_qos_for_test(blob), nullptr);
+	profile->set_cir_kbps(kinetum::modules::qos::QOS_MAX_CIR_KBPS);
+	profile->set_cbs_kb(kinetum::modules::qos::QOS_MAX_CBS_KB);
+	blob = module_config_json(qos_cfg);
+	const auto largest = compile_qos_for_test(blob);
+	ASSERT_NE(largest, nullptr);
+	EXPECT_EQ(largest->profiles[0].cir_bytes_per_s,
+		  static_cast<uint64_t>(kinetum::modules::qos::QOS_MAX_CIR_KBPS) * 125u);
+	EXPECT_EQ(largest->profiles[0].burst_bytes,
+		  static_cast<uint64_t>(kinetum::modules::qos::QOS_MAX_CBS_KB) * 1024u);
+	profile->set_cir_kbps(1000);
+	profile->set_cbs_kb(64);
 	qos_cfg.set_gc_max_evictions(kinetum::modules::qos::DEFAULT_QOS_GC_SCAN_LIMIT);
 	blob = module_config_json(qos_cfg);
 	EXPECT_NE(compile_qos_for_test(blob), nullptr);

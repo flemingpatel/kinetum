@@ -169,6 +169,14 @@ class qos_module : public sdk::module_base<qos_module> {
 	sdk::counter bytes_dropped_;
 	/** @brief Context-local active-flow gauge. */
 	sdk::counter active_flows_;
+	/** @brief Packets denied because no exact policy view is supplied. */
+	sdk::counter unconfigured_drops_;
+	/** @brief Packets denied by the selected byte-credit limit. */
+	sdk::counter rate_limit_drops_;
+	/** @brief Packets denied by bounded flow-state capacity. */
+	sdk::counter flow_capacity_drops_;
+	/** @brief Packets whose required identity or remarking facts are invalid. */
+	sdk::counter invalid_input_drops_;
 	/** @brief Preallocated mutable flow policer owned by the sole worker. */
 	qos::qos_policer policer_;
 };

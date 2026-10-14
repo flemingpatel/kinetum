@@ -14,8 +14,8 @@ The harness exercises Kinetum under two evidence profiles:
 `--backend` selects validation infrastructure; the plan alone selects runtime
 providers. Photon owns the DP/CP pair. The harness drives epoch, commit-confirmed,
 rollback, guardrails, and `full` scenarios through the public CLI; `standard`
-makes no mutation. Transition verdicts require agreement among mutation results,
-telemetry, generation tags, boundaries, and protocol faults.
+makes no mutation. Each transition scenario combines its traffic observations
+with exact mutation results, boundary completion, and protocol-fault evidence.
 
 > **Evidence boundary:** Dry runs and unit/package checks establish their
 > respective authoring, integrity, and implementation contracts. Packet claims
@@ -87,38 +87,15 @@ orchestrator that lives alongside the platform sources, plus its two local-TAP
 native helpers (`validation/native/kinetum_tap_sender.cpp`,
 `validation/native/kinetum_tap_analyzer.cpp`) and the multi-run benchmark
 package (`validation/kinetum_benchmark/`).
-Together they provide:
+The runner owns scenario choreography and verdicts; the selected traffic
+driver owns generation and external observation. The benchmark package repeats
+those scenarios and aggregates their recorded evidence.
 
-- End-to-end packet forwarding validation for development, CI, and physical
-  PCI labs.
-- Live evidence contracts for boundary ordering, epoch transition,
-  commit-confirmed, selective rollback, and telemetry-attributed guardrails.
-- A local-TAP pcap pipeline for loss, local kernel-path latency, and packet
-  ordering, plus physical TRex counters for loss and stream ownership and DP
-  telemetry for protocol evidence.
-- A multi-run benchmark loop with deterministic per-run isolation.
-
-The private kit stays outside the finalized runtime prefix. Installed
-`kinetum_pack` builds a real-file bundle; installed Photon owns DP/CP image
-selection, bootstrap, pair restart, and teardown. The harness verifies child
-ownership and typed CP serving/DP `PACKET_READY` health, never a log line.
-Every scenario uses the same admission, with no loose-source, build-symlink,
-direct-DP, or module-symlink bypass. A successful dry run checks the bundle but
-measures no traffic.
-
-Three concerns are deliberately out of scope here:
-
-- **Production operation.** The harness can validate real DPDK PCI bindings,
-  but it does not replace the deployment lifecycle, host preparation, or
-  operator commands in `GETTING_STARTED.md` and `KINETUMCTL.md`.
-- **Component reference detail.** When this guide names a control plane
-  RPC, a snapshot field, or a guardrails trigger, treat it as a pointer
-  to the canonical doc (`CONTROL_PLANE_AND_GUARDRAILS_AND_ROLLBACK.md`,
-  `DATA_PLANE.md`, `GRPC_API.md`, `KINETUMCTL.md`). The validation runner only
-  exercises these surfaces; it does not define them.
-- **Operator workflows.** Validation is an evidence loop. Operator runbooks for
-  applying snapshots, confirming, and rolling back live under
-  `KINETUMCTL.md`.
+The private kit stays outside the finalized runtime prefix. It uses installed
+`kinetum_pack` to construct a bundle and installed Photon to supervise DP/CP.
+[Section 6](#6-test-lifecycle) defines the shared run lifecycle. RPC, snapshot,
+provider, and module contracts remain with their
+[component references](#23-where-to-go-next).
 
 ## 2. Background and Audience
 
@@ -128,11 +105,6 @@ Use this guide for:
 - Checking deployment fixtures after module or snapshot changes.
 - Repeated performance measurements under matched conditions (Section 18).
 - Integrating physical-I/O validation into CI gates.
-
-For other workflows:
-
-- Production operation: `GETTING_STARTED.md`, `KINETUMCTL.md`.
-- SDK and embedding APIs: `MODULE_SDK.md`, `AXIOM.md`, `GLUON.md`.
 
 Familiarity with the following is assumed: DPDK EAL invocation, AF_PACKET
 sockets, tcpdump/pcap format, Python asyncio, and the platform vocabulary
@@ -224,33 +196,10 @@ sudo /var/tmp/kinetum-validation/bin/python3 -I -B -X utf8 -m kinetum_validation
     --test-type standard --duration 10
 ```
 
-Illustrative live output excerpts (rates and counters are measured, not
-guaranteed values):
-
-```
-Kinetum Physical-I/O Validation
-===============================
-  Runtime:    /opt/kinetum
-  Validation: /var/tmp/kinetum-validation/lib/python3.12/site-packages/kinetum_validation/data
-  Deployment: fan-in-edge-gateway
-  Test Type:  standard
-  PPS:        1000
-  Duration:   10s
-===============================
-
-2026-09-27T14:20:03.421000Z [INFO] dut kinetum_validation[1000:1000] validation.info - supervisor/_start_process: starting kinetum_photon: /opt/kinetum/bin/kinetum_photon --bundle ...
-2026-09-27T14:20:13.421000Z [INFO] dut kinetum_photon[1001:1001] photon.ready - photon/main: supervisor running, press Ctrl+C to stop
-2026-09-27T14:20:13.522000Z [INFO] dut kinetum_validation[1000:1000] validation.info - supervisor/_start_process: kinetum_photon is ready
-
-PACKET TEST (64B):  PASSED  loss 0.00%
-```
-
 Outputs land in `/tmp/kinetum_validation/` by default. The key files are
-`photon.log`, the platform's role files under `logs/`, `capture_64.pcap`, `test_results.json`, and
-`dp_stats.json` on exact final collection (one complete validated observation;
-a failure leaves status-only `dp_stats.txt`). Transition runs also write
-artifacts such as
-`transition_summary.json`.
+`photon.log`, the platform's role files under `logs/`, `capture_64.pcap`,
+`test_results.json`, and final DP statistics. [Section 16](#16-per-run-files)
+lists each artifact and its publication conditions.
 
 The equivalent bundle-only check for the minimal RX-to-TX baseline is:
 
@@ -277,24 +226,9 @@ sudo /var/tmp/kinetum-validation/bin/python3 -I -B -X utf8 -m kinetum_validation
     --dry-run
 ```
 
-The wheel contains the Python packages, regular native helpers, and example inputs;
-runtime binaries and modules remain owned by the finalized runtime. Source
-unit tests and Python bytecode caches are excluded. This is internal transport
-for lab work, with no public installer, compatibility manifest, or kit
-attestation. Only runtime and SDK are public products.
-
-The harness admits disjoint exact runtime/kit roots and selected inputs before
-bundle construction. Run admission executes the protected runtime's
-`kinetum-info --check --json` through a held information-image descriptor. It
-rejects verification or metadata failure and requires runtime, kit, and
-information-image versions to agree. The information root, `bin/`, and held
-executable must share one protected owner: root or the invoking UID, with no
-group/world write access. This permits an unprivileged reader of a root-owned
-installation; the native check still owns the complete production-runtime
-policy. VERSION files are direct regular files
-of at most 256 bytes, containing one ASCII product version and one final LF.
-The private kit remains an owner-selected test instrument; it does not
-acquire provider-image admission machinery.
+The wheel is a private lab instrument. It excludes runtime binaries, modules,
+source unit tests, and bytecode caches; only runtime and SDK are public
+release products. Every run uses the [shared admission checks](#6-test-lifecycle).
 
 ## 4. Architecture Overview
 
@@ -347,17 +281,9 @@ PCAP -[norank]-> OUT
 @enduml
 ```
 
-This diagram shows the fan-in local TAP profile. One crash-evident run owner serializes
-physical execution and owns a fresh artifact root. Before acquiring that lock
-or creating the root, the runner admits the exact installed runtime/validation
-roots and every selected pipeline, hardware, binding, bootstrap, transition,
-and degradation input. The runner owns the validation profile, deployment
-inputs, and pass/fail verdict. The installed
-packer is the sole bundle/plan producer and
-Photon is the sole owner of the DP/CP process pair. The DPDK
-TAP PMD is responsible for creating the kernel-visible `neb_*`
-interfaces; the runner waits for them to appear in `/sys/class/net/`
-before checking their link state.
+This diagram shows the fan-in local TAP profile. The installed packer produces
+the bundle and plan; Photon owns the DP/CP pair. The DPDK TAP PMD creates the
+kernel-visible `neb_*` interfaces, which the backend verifies before traffic.
 
 There is exactly one packet path on the wire: AF_PACKET into the RX TAP,
 DPDK in `kinetum_dp` processes it through the pipeline, the egress
@@ -408,31 +334,31 @@ short option is accepted.
 | `--trex-server` | `127.0.0.1` | TRex stateless server address as seen from the traffic endpoint. |
 | `--trex-api-path` | empty | Optional path prepended before importing `trex_stl_lib.api` on the traffic endpoint. |
 | `--trex-port` | profile default | Ordered TRex port override. Repeat once per selected deployment port. |
-| `--pps` | `1000` | Positive target packets per second, bounded to `1..1000000000`. |
-| `--count` | `1000` | Positive count-based packet target in the uint32 sequence domain. |
-| `--duration` | `0.0` | Finite test duration in seconds. `0.0` selects count-based mode using `--count`; a positive duration must schedule at least one packet and keep `pps * duration` inside uint32. |
+| `--pps` | `1000` | Aggregate target PPS for standard and guardrails traffic, divided across ingress ports/flows. Bounded to `1..1000000000`. |
+| `--count` | `1000` | Standard-test packet target in the positive uint32 domain; converted to a duration using `count / pps`. |
+| `--duration` | `0.0` | Standard-test traffic duration in seconds. `0.0` uses `--count`; a positive duration must schedule at least one packet and keep `pps * duration` inside uint32. |
 | `--packet-size` | `64` | Bytes. Validated to `[64, 9000]`. |
 | `--all-sizes` | off | Run packet test for `(64, 128, 256, 512, 1024, 1514)`. |
-| `--num-flows` | `1` | Number of traffic-generator flows per ingress port. TRex varies UDP source port per flow; `rx-rss-2` requires at least 64 flows so RSS steering has enough diversity for stream-balance evidence. A transition run also rejects before SSH when the conservative flow/PGID result bound would exceed the shared 16 MiB JSON contract. The native TAP sender is single-flow. |
+| `--num-flows` | `1` | TRex flows per ingress port, `1..55536`, varying UDP source port from 10000. `rx-rss-2` requires at least 64. Generation-session admission also requires the flow/PGID result to fit the shared 16 MiB JSON limit. Native TAP remains single-flow. |
 | `--src-ip` | `10.0.0.100` | Source IP of generated UDP flow. |
 | `--dst-ip` | `192.168.1.1` | Destination IP. |
 | `--runtime-root` | required | Explicit finalized installed runtime root. It and every consumed `bin/` or `lib/` path component must be absolute and symlink-free. Exact regular runtime executables and, for module deployments, `lib/modules/` are required. |
 | `--validation-root` | installed package's `data/` directory | Validation resources containing `VERSION`, `bin/`, and `examples/`. An explicit selection must be absolute, symlink-free, and disjoint from the runtime root in both containment directions. |
 | `--dp-endpoint` | `127.0.0.1:50052` | DP gRPC listen address. |
 | `--cp-endpoint` | `127.0.0.1:50051` | CP gRPC listen address. |
-| `--epoch-duration` | `15.0` | Seconds. Total epoch test duration. |
-| `--epoch-pps` | `1000` | Positive epoch-test PPS in `1..1000000000`; rate times duration must schedule at least one packet and fit uint32. |
+| `--epoch-duration` | `15.0` | Requested epoch traffic window in seconds, excluding setup, drain, and analysis. |
+| `--epoch-pps` | `1000` | Aggregate PPS for epoch, commit-confirmed, and rollback traffic, in `1..1000000000`. Epoch rate times duration must schedule at least one packet and fit uint32. |
 | `--epoch-transition-time` | `5.0` | Seconds of baseline epoch traffic before the transition. |
 | `--epoch-overlap-ms` | `500` | TRex sustained initial/next generation-tag overlap in the positive uint32 millisecond domain. Native TAP requests one pre-authored tag transition. |
 | `--output-dir` | `/tmp/kinetum_validation` | Absent absolute final path created once for CP state, logs, captures, and JSON artifacts. Existing output rejects. |
 | `--verbose`, `-v` | off | Uses `ConsoleReporter.log_callback` formatting for the Photon ownership-tree stream. Without it, the same stream uses the generic logger. |
 | `--no-color` | off | Disables ANSI output in `ConsoleReporter`. |
-| `--max-loss` | `1.0` | Pass/fail threshold in percent. |
+| `--max-loss` | `1.0` | Loss threshold in percent (`0..100`) for standard, commit-confirmed, and rollback. Epoch uses its fixed 0.1% bound; guardrails checks deliberate degradation and recovery. |
 
-`--duration 0.0` is the default and selects count-based mode: the
-sender runs for `count / pps` seconds after both values pass positive bounded
-admission. A positive `--duration`
-overrides `--count` and runs for the specified number of seconds.
+For standard traffic, `--duration 0.0` selects `count / pps` seconds of
+generation. `--count` is therefore a pacing target; successful sends are
+measured. A positive `--duration` overrides that calculation. Scenario-specific
+traffic windows are defined in Sections 10-13.
 
 ### 5.2 Shell Wrapper Entry
 
@@ -463,12 +389,23 @@ existing privilege checks.
 
 ## 6. Test Lifecycle
 
-The lifecycle is implemented in `TestOrchestrator._setup` and
-`TestOrchestrator.run` in `validation/kinetum_validation/orchestrator.py`.
-Scenario functions live in `validation/kinetum_validation/scenarios.py` and
-use the resources prepared by that coordinator.
-The setup order is fixed. `--dry-run` stops after complete bundle production;
-otherwise the selected scenario runs against one packet-ready generation.
+`run_test_suite`, `TestOrchestrator._setup`, and `TestOrchestrator.run` in
+`validation/kinetum_validation/orchestrator.py` own this lifecycle. Direct and
+benchmark runs admit disjoint runtime/kit roots and the complete selected
+example-file set before acquiring the [run lock and output root](#16-per-run-files).
+
+Admission then executes the protected runtime's `kinetum-info --check --json`
+through a held image descriptor. Runtime, kit, and information-image versions
+must agree. The runtime root, `bin/`, and held executable must share one
+protected owner: root or the invoking UID, with no group/world write access.
+VERSION files are direct regular files of at most 256 bytes containing one
+ASCII product version and a final LF. Verification or metadata failure rejects
+before bundle construction. The private kit remains an operator-selected
+instrument, separate from installed-provider authentication.
+
+The sequence below shows TAP setup; the PCI backend instead verifies its peer
+port metadata at the backend step. Both use the same scenario dispatcher and
+final-observation path.
 
 ```{uml}
 @startuml
@@ -501,6 +438,7 @@ otherwise the selected scenario runs against one packet-ready generation.
         Trf-->Orc: traffic driver ready
         Orc->Orc: publish run metadata with observed traffic identity
         note over Orc: dispatch selected packet/transition scenario
+        note over Orc: collect final statistics; then NAT exchange\nfor gateway standard/full
         Orc->Trf: teardown()
         Orc->Bck: teardown()
         Orc->Sup: stop_all()
@@ -508,59 +446,59 @@ otherwise the selected scenario runs against one packet-ready generation.
 @enduml
 ```
 
-The lifecycle order in code is exactly:
+1. `_create_runtime_bundle()` passes the selected pipeline, inventory,
+   bindings, bootstrap snapshot, region count, and required module directory to
+   the installed packer. [Section 20.3](#203-bundle-and-module-ownership) owns
+   bundle construction and verification details.
+2. Read `runtime_bundle/configs/plan.pbtxt` for port, stream, storage, and module
+   identities used by traffic and evidence checks. A dry run writes metadata
+   and returns here without starting runtime or traffic processes.
+3. Start installed Photon and require its DP/CP pair to reach typed readiness.
+   [Section 20.1](#201-start) defines the process and health checks.
+4. Set up the selected [backend and traffic driver](#8-validation-profiles-and-traffic-drivers).
+   Publish live metadata only after both succeed, including observed TRex
+   identity when applicable.
+5. Run the selected scenario. `full` runs standard packet sizes, epoch,
+   commit-confirmed, rollback, then guardrails, in that order.
+6. Collect and save final statistics using the shared checks below. For gateway
+   `standard` and `full`, then run the [NAT exchange](#9-standard), keeping its
+   probe packets outside the saved measurements.
+7. Attempt traffic, backend, and Photon cleanup in that order. Every leg runs
+   even if another fails; [Section 20.2](#202-stop) defines process retirement.
+   Unresolved cleanup fails the invocation.
+8. Publish the final suite result after cleanup. Setup rejection and dry-run
+   completion publish their zero-scenario result before the common cleanup path.
 
-Before step 1, direct and benchmark entrances validate the complete selected
-example-file set through one shared symlink-free path authority, then acquire
-the global run lock and create only the absent final output component. The
-held runtime information image must pass `--check --json` before its response
-can supply release metadata or bundle construction can begin.
+### 6.1 Final Statistics
 
-1. `_create_runtime_bundle()` revalidates its immediate inputs and invokes the installed regular
-   `kinetum_pack` with the selected pipeline, hardware inventory, exact
-   deployment bindings, mandatory bootstrap snapshot, region count, and, when
-   required, the installed real-file module directory. The packer runs Axiom,
-   Gluon, plan/snapshot canonicalization, manifest construction, and its own
-   completed-output verification. The harness has no detached planner path.
-2. The runner parses `runtime_bundle/configs/plan.pbtxt` only for traffic-side
-   port correlation. With `--dry-run`, it writes metadata with no TRex identity
-   and returns here, without starting Photon, DP, CP, or traffic.
-3. `_supervisor.start_runtime(bundle_root)` launches only the installed
-   `kinetum_photon --bundle <absolute-root>`. Photon resolves its exact DP/CP
-   siblings, repeats bundle admission, orders durable CP bootstrap and DP
-   activation. The harness waits for both installed child roles and typed CP
-   serving/DP `PACKET_READY` observations. It supplies a run-owned log directory
-   and enables the existing console mirror. It passes no runtime provider selector, EAL
-   override, UDP endpoint override, plan path, module path, or repair mode.
-4. `_backend.setup()` polls `/sys/class/net/<iface>` until each TAP
-   appears (30 s deadline), then verifies the link is up and disables
-   kernel IP forwarding and `accept_local` on each TAP. The backend does
-   not own packet generation or capture.
-5. `make_traffic_driver()` creates the selected traffic driver. For
-   TAP live tests this is `NativeTapTrafficDriver`, which owns
-   `kinetum_tap_sender` invocation and tcpdump capture. For PCI live tests,
-   `TRexTrafficDriver` controls the explicitly prepared external endpoint;
-   A PCI dry run compiles and inspects the plan without constructing a traffic
-   driver. After successful live driver setup, the runner publishes metadata
-   with the observed TRex identity when applicable; failed setup cannot publish
-   a completed live metadata record.
-6. The dispatcher runs `standard`, exact epoch ordering, commit-confirmed,
-   rollback, guardrails, or their `full` composition. Every mutation consumes
-   exact CLI result identity and a post-transition coherent observation.
-7. `_cleanup()` tears down the traffic driver and backend, then terminates the
-   one supervised Photon ownership tree. Photon tears down the DP/CP pair;
-   the harness escalates Photon to SIGKILL after
-   `PROCESS_SHUTDOWN_TIMEOUT_S = 30` seconds. Every cleanup leg is attempted;
-   any unretired owner makes the run fail rather than leaving a successful
-   verdict beside uncertain process, capture, or remote-session state.
+All live profiles use one 20-second observation window with 100-ms polling.
+The first successful DP collection supplies a monotonic time barrier. Every
+worker must later publish beyond that barrier under the same runtime generation
+and plan; stream rows must match their worker's publication. Repeated responses
+cannot establish freshness. Contradictory evidence, failed queries, cancellation,
+or expiry fail the final-statistics check.
 
-The supervisor checks direct-child image ownership through Linux `/proc` and
-polls the installed CLI's `health --service cp|dp` commands. CP must report
-serving and DP must report a complete `PACKET_READY` tuple. Log text never
-satisfies readiness, and a valid logging outage does not revoke packet
-readiness. The timeout is
-`PROCESS_READY_TIMEOUT_S = 30` seconds; process exit or timeout is a hard setup
-failure.
+The fan-in gateway also requires all nine [QoS counters](../src/modules/README.md#qos-telemetry)
+for every planned context. The four causes must sum to dropped packets within
+each context. Module and worker banks publish independently, so the same wait
+requires active-epoch QoS packet/byte totals to agree with their logical-stage
+totals. Missing, duplicate, foreign, or contradictory rows fail immediately;
+valid but unequal bank totals may wait until the deadline. Other deployments
+acquire no built-in QoS requirement. Policy drops retain their ordinary scenario
+meaning and loss tolerance.
+
+The [RSS and per-queue profiles](#83-dpdkpcibackend) add their topology checks.
+`stats_validation` records the required final verdict. A collection failure
+before artifact writing can leave neither `dp_stats.txt` nor `dp_stats.json`;
+the result message records the reason. A stats file is an observation, not by
+itself a passing topology verdict.
+
+Each query invokes `kinetumctl` once; the native client owns transport and
+application retries. Its default retry budget is 127 seconds within the 150-second
+subprocess limit. Timed observations, including final statistics, cap that
+allowance to their remaining window, retire the child on expiry, and reject
+late results. Worker banks and native port counters do not constitute one
+simultaneous hardware snapshot.
 
 ## 7. Deployments
 
@@ -679,9 +617,10 @@ owns the capture flags, readiness, completion checks, and packet analysis.
 
 `TRexTrafficDriver` controls a prepared stateless endpoint over SSH. Operators
 install TRex, bind NICs, configure ports, and start `t-rex-64 -i`. The kit's
-`scripts/install_trex_ubuntu.sh` downloads/extracts TRex; use 3.08 for Ubuntu
-24.04/Python 3.12. On controlled CloudLab hosts with an untrusted Cisco server
-chain, `--insecure-download` disables download certificate verification.
+`scripts/install_trex_ubuntu.sh` downloads and extracts TRex; `--version v3.08`
+selects that release explicitly, while the helper defaults to `latest`.
+Its explicit `--insecure-download` option disables download certificate
+verification for lab hosts with broken CA chains.
 
 The setup probe requires stateless mode and records server version/mode in run
 metadata, sidecars, and benchmark summaries. This is provenance, not a version
@@ -705,16 +644,11 @@ and `port_rx_count` must equal PGID aggregates, with zero new ingress `oerrors`
 and egress `ierrors`; mismatch reports both pairs. Abort retires capture without
 completed evidence. Analysis requires a completed run.
 
-**Epoch traffic.** The endpoint creates both generation-tag stream sets and
+**Epoch evidence.** The endpoint creates both generation-tag stream sets and
 starts only the initial set. Stream IDs are port-local; PGIDs are session-wide.
-Requests and receipts preserve both identities. TRex pause/resume requires a
-session without fixed duration, so the orchestrator owns `--epoch-duration`
-and shutdown. It applies configuration and resumes next-tag streams at the
-transition point, then pauses initial-tag streams after `--epoch-overlap-ms`.
-
-The verdict requires every DP boundary's exact generation/from/to/cut identity,
-OPEN/OPEN completion, no pending control, complete timing, and no new protocol
-fault. The sidecar retains raw PGIDs, requested overlap, its lower bound from
+Requests and receipts preserve both identities. The
+[epoch scenario](#10-epoch) owns apply, overlap, and shutdown timing. Its sidecar
+retains raw PGIDs, requested overlap, its lower bound from
 post-resume/pre-pause samples, both generation-active intervals, target
 achievement, and endpoint-monotonic time provenance. Exactly two tag classes
 must have nonzero TX/RX. Every nonzero-target PGID must reach 95 percent of its
@@ -736,7 +670,9 @@ SSH starts. Per-flow rate divides the requested aggregate by ingress-stream
 and flow count, with no one-PPS floor. One-shot requests reject transition,
 overlap, and second-tag fields.
 
-Remote Python runs isolated and imports TRex only from `--trex-api-path`.
+Remote Python runs isolated. A nonempty `--trex-api-path` must name an exact
+existing directory and is prepended to the import path; otherwise the selected
+interpreter must already provide the TRex API.
 Local subprocesses strip all `LD_*` variables; other environment, including SSH
 agent access, remains caller policy. The endpoint runs in `--traffic-work-dir`.
 Ingress destination MACs come from Gluon's six-byte
@@ -752,28 +688,11 @@ until finish or abort. Teardown retries abort before releasing that ownership.
 
 ### 8.3 DPDKPCIBackend
 
-The `DPDKPCIBackend` is the physical-NIC profile. It does not inject or
-capture packets locally. Instead, it validates that the selected backend
-profile has peer interfaces, records traffic-driver metadata, and relies
-on Gluon to emit all runtime truth into the plan:
-
-- One exact DPDK process-facility instance shared by the DPDK driver and
-  storage instances.
-- One I/O-driver instance whose canonical typed configuration binds every
-  `driver_port_id` to an exact PCI BDF.
-- Bounded packet-storage domains with exact population, data room,
-  headroom, alignment, cache policy, and optional proven host NUMA node.
-- Exact `plan.ports[]` rows carrying logical/I/O-driver/driver-port identity,
-  direction, MTU, optional NUMA, and resolved six-byte MAC facts.
-- Exact `io_streams[]` carrying every driver queue, descriptor count, owner
-  worker, RX allocation domain or TX accepted-domain set, and steering profile.
-- Explicit CPU execution-provider bindings for every stage.
-- Exact `traffic_steering_profiles[]`: NONE for one RX queue, or RSS with
-  authored fields and key bytes. `module_context_domains[]` separately names
-  each module's complete context population and ordinal order.
-- Exact worker and runtime-service placements from hardware inventory and
-  deterministic planning. Native facility arguments are derived later from
-  those generic facts; they are not authored or reconstructed by the harness.
+The `DPDKPCIBackend` checks that every traffic-side port has peer-interface
+metadata. `TRexTrafficDriver` owns external injection and observation; Gluon
+and the runtime own the [provider graph](PROVIDERS.md). The harness reads the
+emitted port, queue, worker, storage, steering, and module-context identities
+to correlate traffic with the authored topology.
 
 Use `--backend dpdk-pci --dry-run` to validate physical bindings, canonical
 provider-plan identity, and reproducibility metadata without starting DP/CP. Use
@@ -811,9 +730,9 @@ At the end of an RSS live run, the harness fails closed unless
 `dp_stats.json` proves every requested RX/TX stream was materialized, every RX
 stream saw traffic, software stream rejections remained zero, the
 matching RSS steering profiles and module-context populations were
-admitted, both lanes carried a material packet share for each ingress, and the
-exact packet-storage domains retained headroom. This validates queue-level RSS
-stream evidence and runtime worker ownership; physical
+admitted, each RX queue carried at least 25% of its ingress port's packets, and
+each final storage-domain observation reported available buffers. This validates
+queue-level RSS stream evidence and runtime worker ownership; physical
 scale-out still depends on the corresponding on-target throughput run. Use
 `--num-flows >= 64`; TRex varies UDP source port per flow so the RSS key has
 enough 5-tuple diversity to distribute.
@@ -824,33 +743,9 @@ RX-port evidence, without RSS balance or steering predicates. Run metadata recor
 and aggregation require the same exact selection. Stream TX counts measure
 provider acceptance; external capture remains the delivery check.
 
-All live runs collect final statistics using a DP timestamp taken after
-traffic completion and the existing drain interval. The harness then waits for
-every stream owner's publication to advance beyond that timestamp, with the same runtime
-generation and plan. The wait is bounded to 20 seconds with 100-ms polling;
-failed queries, contradictory evidence, cancellation, or expiry fail the run.
-Each query invokes `kinetumctl` once; the native client owns transport and
-application retries. Its default allowance is 127 seconds within the
-150-second subprocess limit. Timed scenario reads use their remaining traffic,
-confirmation, or observation window instead, cancel and retire the child on
-expiry, and reject late results. These reads never extend a scenario window.
-Completed worker banks and native port counters do not imply one simultaneous
-hardware snapshot.
-
-`run_metadata.json` records release metadata only from the exact installed
-`<runtime-root>/bin/kinetum-info --check --json` invocation. Runtime verification
-and build facts come from the same response; SDK metadata is not consumed.
-There is no DP-help, build-cache, source-tree, or guessed-feature fallback.
-The current `build_features` object must contain exactly the two MLIR booleans, and
-`platform_capabilities` must be the exact sorted descriptive set. Missing,
-malformed, extra, or partial metadata rejects. Capabilities describe the one
-complete build; they never select runtime admission or relax evidence. The
-image composes one complete response before emission and returns zero only
-after complete stdout and stderr delivery. JSON output also requires valid
-UTF-8; invalid path or diagnostic bytes produce an error instead of malformed
-JSON. The metadata reader gates on that
-exit status before parsing, so an output-device failure cannot turn a JSON
-prefix into run evidence.
+These topology checks consume the [shared final observation](#61-final-statistics).
+They add requirements to that observation without changing its freshness or
+QoS accounting rules.
 
 ### 8.4 Traffic-driver choreography
 
@@ -967,9 +862,10 @@ complete edge timing, and zero new typed protocol faults.
 - Snapshots `config_snapshot.pbtxt` (already applied during setup) and
   `config_snapshot_v2.pbtxt` (applied during the transition).
 
-Both gateway snapshots retain a 10 Gb/s per-flow QoS rate. With TRex, the
-aggregate target PPS doubles during generation overlap; size the workload for
-that peak as well as the egress link capacity.
+Both gateway snapshots retain a 10 Gb/s per-flow QoS rate and a 4096 KiB burst
+allowance; v2 changes DSCP marking from 10 to 20. With TRex, the aggregate
+target PPS doubles during generation overlap. Size the workload for both the
+rate and burst allowance, as well as the egress link capacity.
 
 **Driver.** `scenarios.run_epoch_test(context)`.
 
@@ -987,7 +883,8 @@ that peak as well as the egress link capacity.
    with both tags pre-authored and `SIGUSR1` blocked across spawn. TRex starts
    initial-tag PGID streams and keeps next-tag streams paused on the traffic
    endpoint.
-5. Let baseline traffic run for `transition_time_s = 5.0` s.
+5. Let baseline traffic run until `--epoch-transition-time` (default 5.0 s),
+   reserving the final part of that interval for the pre-transition observation.
 6. Take one pre-transition snapshot with stage, worker, region, and boundary
    rows plus mandatory transition/fault summaries. Runtime/config identity
    must still match step 1 and DP RX must have increased, proving that traffic
@@ -1041,9 +938,6 @@ and the exact boundary observations, with no packet-order claim.
 `photon.log`, the `epoch_test` block
 in `test_results.json`, and exactly one `transition_metrics.jsonl` record
 tagged `"epoch"`.
-
-**Variants.** None at the CLI level. Use the benchmark harness to run
-N iterations with the same parameters.
 
 ## 11. commit-confirmed
 
@@ -1133,8 +1027,8 @@ the hybrid snapshot creation behaviour.
 
 - Deployment with both `config_snapshot` and `config_snapshot_v2`
   (`fan-in-edge-gateway`).
-- The runner uses `epoch.pps` for traffic and tracks per-transition
-  stats deltas across four transitions.
+- The runner uses `--epoch-pps` for one fixed 20 s traffic window and tracks
+  per-transition stats deltas across four transitions.
 
 **Driver.** `scenarios.run_rollback_test(context)`.
 
@@ -1191,7 +1085,12 @@ change.
 ## 13. guardrails
 
 The guardrails scenario proves one telemetry-attributed durable automatic
-rollback through the ordinary transition authority:
+rollback through the ordinary transition authority.
+
+Traffic uses `--pps` and the configured packet size in a fixed 60 s window.
+This scenario checks the sender result and DP measurements; it does not run
+the forwarding capture/analyzer or apply the ordinary packet-loss threshold
+to deliberately denied traffic.
 
 1. Read exact baseline content, runtime generation, and worker counters.
 2. Configure an explicit threshold policy (100 ms polling, 10,000 ms valid-time
@@ -1546,10 +1445,12 @@ possible artifact.
 | `<capture-stem>.capture.json` | each stopped native-TAP capture, including failed completion | tcpdump exit code, reported captured/filter/drop counters, and nullable completion error. Missing counters remain absent. |
 | `<capture-stem>.traffic.json` | each capture completion attempt with a completed sender result | Driver identity and sender counts/errors/times survive capture or analysis failure; `analysis` is then `null`. Successful analysis retains counts, gaps, per-input ordering/tags, and nullable latency. TRex input rows and packet-order measurements are `null`. |
 | `test_results.json` | setup rejection, dry-run completion, or completed scenario collection | `RunArtifacts.save_test_results`; an exception or unretired cleanup owner can prevent final publication. |
-| `dp_stats.txt` | every completed non-dry packet run | Human-readable projection of one exact successful stats response, or bounded status-only failure evidence. |
-| `dp_stats.json` | successful final telemetry collection | Structured final telemetry projection parsed from validated protobuf JSON; unsupported provider values remain absent. A failed query writes status-only `dp_stats.txt` and no JSON. |
+| `guardrails_evaluation.json` | after exact arming, accepted attribution, and baseline restoration are observed | Retained `armed` and `decision` responses plus measured arming duration; see Section 17.1. |
+| `nat_exchange.json` | after a canonical NAT exchange returns its verdict, including failure | Sent/captured packet bytes, observed context/snapshot identity when available, and the exchange verdict. |
+| `dp_stats.txt` | when final observations reach the artifact writer | Human-readable statistics, or a status-only note if the writer receives an unsuccessful result. Collection failure before writing can leave this file absent. |
+| `dp_stats.json` | successful final telemetry collection and serialization | Validated final observations with unavailable values represented as null. Collection failure produces no JSON. |
 | `transition_metrics.jsonl` | per measured transition step | One exact newline-terminated JSON record per scenario-owned transition; appended. Successful scenarios require the exact type multiset below. |
-| `transition_summary.json` | after stats save | Per-`transition_type` distributions (min, p50, p95, max). |
+| `transition_summary.json` | after successful stats save, when transition records exist | Overall metric distributions and the per-type subsets defined in Section 17.4. |
 
 No stale-cleanup target or recursive delete exists. Direct runs own exactly the
 requested fresh root. Failed final descriptor admission removes only the exact
@@ -1575,6 +1476,13 @@ endpoint (including the exact remote Python path). Duplicate JSON keys,
 unknown/missing fields, indirect paths,
 foreign capabilities, conflicting port identities, and scalar coercion reject.
 
+Release metadata comes from the successful held `kinetum-info --check --json`
+response admitted in [Section 6](#6-test-lifecycle). Its `build_features` must
+contain exactly the two MLIR booleans, and `platform_capabilities` must match
+the sorted descriptive set. Capabilities never select runtime admission or
+relax evidence. The reader requires successful command completion and strict
+UTF-8 JSON before consuming the response.
+
 ### 17.1 test_results.json
 
 Written by `RunArtifacts.save_test_results` for a completed suite result.
@@ -1594,10 +1502,10 @@ An interrupted or failed cleanup can leave only partial run evidence. Top-level 
 | `setup_failed` | bool | `true` if setup raised before any test ran. |
 | `dry_run` | bool | `true` when bundle construction/verification completed without process startup. |
 | `all_passed` | bool | Aggregate verdict; a dry-run passes when setup completed even though it executes zero packet tests. |
-| `total_tests` | int | Count of executed tests. |
+| `total_tests` | int | Scenario results plus the final-statistics check when required. |
 | `passed_tests` | int | |
 | `failed_tests` | int | |
-| `stats_validation` | object | Whether topology statistics are required, their verdict, and a bounded message. |
+| `stats_validation` | object | Required topology and built-in QoS accounting evidence, its verdict, and a bounded message. |
 | `packet_tests` | array | One entry per packet size that ran. |
 | `nat_exchange` | object or null | Canonical standard/full NAT verdict, mapping/return/context counts, duration, and message. |
 | `epoch_test` | object or null | Present if epoch test ran. |
@@ -1605,7 +1513,8 @@ An interrupted or failed cleanup can leave only partial run evidence. Top-level 
 | `rollback_test` | object or null | Present if rollback test ran. |
 | `guardrails_test` | object or null | Present if guardrails test ran. |
 
-The examples below show a native-TAP result. For TRex,
+The examples below illustrate native-TAP result fields; their numbers are not
+benchmark measurements. For TRex,
 `latency_source` and every `avg_latency_us` value are JSON null. A successful
 native-TAP row requires a positive measured average; a numeric TRex value is a
 contract violation. Missing latency never becomes zero.
@@ -1705,16 +1614,13 @@ as measurement frequency.
 
 ### 17.2 dp_stats.json
 
-Written once at the end of a non-dry-run after the Photon-owned pair is ready
-and the final telemetry query succeeds.
-After traffic stops, a bounded wait requires every stream's owner publication
-to postdate the initial collection. Repeated responses cannot satisfy that
-barrier; changed contents under the same publication generation fail.
+Written after the [final-observation checks](#61-final-statistics) succeed,
+before the optional NAT exchange and runtime shutdown.
 The harness requests stage, module metric/health, worker, region, boundary,
 stream, storage, port, steering, and module-context rows in one call and records
 the validated result. Both final projections retain the mandatory worker-counter
-rows; success cannot be exported without them. A failed query writes a bounded status-only `dp_stats.txt`,
-marks required stats evidence failed, and does not create `dp_stats.json`.
+rows. Required topology checks are reported separately in `stats_validation`;
+the presence of `dp_stats.json` alone does not establish their verdict.
 
 The artifact is a dataclass projection of the validated protobuf JSON, not a
 second wire schema. Optional wire values become JSON `null` when absent so
@@ -1735,7 +1641,7 @@ Top-level fields:
 | `error` | string | Empty on the only writable success path. |
 | `rx_packets` | uint64 | DP total RX from the data path. |
 | `tx_packets` | uint64 | Records whose ownership the TX provider accepted; not wire delivery. |
-| `dropped_packets` | uint64 | Exactly-once terminal record retirements. |
+| `dropped_packets` | uint64 | Packets retired as drops, counted once. |
 | `rx_bytes`, `tx_bytes`, `fanout_overflow` | uint64 | Exact engine byte totals and refused fan-out branches. |
 | `runtime_generation`, `status_publication_generation` | uint64 | Exact counter/status namespace. |
 | `collection_monotonic_ns`, `latest_bank_publication_monotonic_ns` | uint64 | Cold collection and newest included bank times. |
@@ -1749,12 +1655,14 @@ Top-level fields:
 | `stage_stats` | array | One entry per pipeline stage. |
 | `module_counter_stats`, `module_histogram_stats`, `module_epoch_mismatch_stats`, `module_health_stats` | array | Complete selected module observations. |
 | `worker_epoch_stats`, `region_epoch_stats`, `boundary_epoch_stats` | array | Exact ownership, cold aggregation, and protocol evidence. |
-| `worker_counters` | array | Mandatory compact worker observations: epoch, sequence, measurement time, and cumulative counters. |
+| `worker_counters` | array | Mandatory observations with `worker_index`, `observation_epoch`, `publication_generation`, `published_monotonic_ns`, and cumulative counters. |
 | `stream_stats` | array | One entry per compiled executable I/O stream with `published_monotonic_ns`, transferred `packets`/`bytes`, and `rejected_packets`. |
 | `storage_domain_stats` | array | Compiled capacity plus typed optional occupancy. |
 | `port_stats` | array | Exact logical/driver identity plus typed optional native counter tuple. |
 | `traffic_steering_stats` | array | One entry per compiled traffic-steering profile. |
 | `module_context_domains` | array | Exact module ID and ordered context IDs for each compiled population. |
+
+The following excerpts show selected row fields.
 
 Stage entry:
 
@@ -1809,12 +1717,13 @@ Region entry:
 {
   "region_id": 0,
   "worker_count": 1,
-  "minimum_active_epoch": 3,
-  "maximum_active_epoch": 3,
-  "minimum_source_epoch": 3,
-  "maximum_source_epoch": 3,
+  "minimum_active_epoch": 8,
+  "maximum_active_epoch": 8,
+  "minimum_source_epoch": 8,
+  "maximum_source_epoch": 8,
   "active_unretired": 0,
   "future_unretired": 0,
+  "activated_participants": 1,
   "fanout_overflow": 0
 }
 ```
@@ -1901,10 +1810,10 @@ Region delta:
 ```json
 {
   "region_id": 0,
-  "minimum_active_epoch": 3,
-  "maximum_active_epoch": 3,
-  "minimum_source_epoch": 3,
-  "maximum_source_epoch": 3,
+  "minimum_active_epoch": 8,
+  "maximum_active_epoch": 8,
+  "minimum_source_epoch": 8,
+  "maximum_source_epoch": 8,
   "active_unretired": 0,
   "future_unretired": 0,
   "activated_participants": 1,
@@ -1926,15 +1835,23 @@ Stage delta:
 
 ### 17.4 transition_summary.json
 
-Computed at the end of every run with at least one transition record.
-The runner reads `transition_metrics.jsonl` and emits per-
-`transition_type` distributions (min, p50, p95, max) for the key
-deltas. This is consumed by the benchmark aggregator alongside the
-raw JSONL.
+`RunArtifacts.write_transition_summary` reads validated transition records after
+the final statistics are written. It checks stable fault, boundary, region,
+and stage membership, then emits this derived summary when records exist:
 
-The exact shape mirrors the JSONL but with `{min, p50, p95, max, count}` in
-place of each scalar delta. Treat the JSONL as the immutable raw
-record and the summary as a convenience.
+| Field | Content |
+|-------|---------|
+| `transition_count` | Number of validated records. |
+| `boundary_cut_delivery_ns`, `boundary_cut_drain_ns`, `boundary_ack_gate_ns` | Timing distributions keyed by boundary ID. |
+| `boundary_backpressure_events` | Backpressure-delta distributions keyed by boundary ID. |
+| `region_fanout_overflow` | Overflow-delta distributions keyed by decimal region ID. |
+| `stage_drops` | Drop-delta distributions keyed by stage ID. |
+| `per_type` | Each transition type's record `count`, `boundary_ack_gate_ns`, and `region_fanout_overflow` distributions. |
+
+Each distribution contains `{min, p50, p95, max, count}`; percentiles use
+nearest rank. The benchmark aggregator reads the raw JSONL and computes its own
+distributions across runs. This file is a run-local summary, not a replacement
+for the original transition records.
 
 ---
 
@@ -1972,37 +1889,33 @@ Subcommands:
 
 ### 18.2 run
 
-Flags:
+Benchmark-specific options:
 
 | Flag | Default | Notes |
 |------|---------|-------|
 | `--runs`, `-n` | `30` | Number of iterations in `1..999`. |
 | `--variant` | `default` | Required printable UTF-8 manifest label, at most 128 bytes. |
 | `--inclusion-policy` | `passed-only` | `passed-only` or `all-runs`. Drives which runs are included in the aggregated distributions. |
-| `--deployment`, `-d` | `fan-in-edge-gateway` | Same deployment default as the validation runner. |
-| `--test-type`, `-t` | `standard` | `standard`, `epoch`, `commit-confirmed`, `rollback`, `guardrails`, or `full`. |
-| `--backend` | `dpdk-tap` | Physical profile only; `dpdk-pci` is not propagated as runtime provider identity. |
-| `--stream-topology` | `default` | Use `rx-rss-2` with the fan-in d430 PCI profile and `--num-flows >= 64` for RSS evidence. |
-| `--storage-profile` | `shared` | Select `per-rx-queue` with either fan-in d430 PCI topology; see the binding matrix in Section 8.3. |
-| `--traffic-host` | empty | Required for `dpdk-pci` plus TRex benchmark runs. |
-| `--traffic-ssh-port` | `0` | SSH port override; zero uses SSH configuration or its default port. |
-| `--traffic-python` | `/usr/bin/python3` | Exact absolute Python image on the traffic endpoint. |
-| `--traffic-work-dir` | `/tmp/kinetum_traffic` | Exact existing endpoint directory for remote traffic actions. |
-| `--trex-server` | `127.0.0.1` | TRex stateless server address as seen from the traffic endpoint. |
-| `--trex-api-path` | empty | Optional path prepended before importing TRex APIs on the traffic endpoint. |
-| `--trex-port` | profile default | Ordered TRex port override; repeat once per selected deployment port. |
-| `--epoch-transition-time` | `5.0` | Seconds of baseline epoch traffic before transition. |
-| `--epoch-overlap-ms` | `500` | TRex sustained initial/next generation-tag overlap in positive uint32 milliseconds. |
-| `--pps` | `1000` | Positive value in `1..1000000000`. |
-| `--count` | `1000` | Positive value in the uint32 sequence domain. |
-| `--packet-size` | `64` | Exact frame size in `64..9000`. |
 | `--no-all-sizes` | off | The benchmark default is **all sizes on**. Pass `--no-all-sizes` to limit to a single size. |
-| `--runtime-root` | required for `run` | Explicit finalized absolute symlink-free runtime root. Reporting operations do not consume it. |
-| `--validation-root` | installed package's `data/` directory | Validation resources with regular helpers and example inputs, disjoint from the runtime prefix. |
-| `--epoch-duration` | `15.0` | |
-| `--epoch-pps` | `1000` | Positive value in `1..1000000000`; rate times duration must schedule at least one packet and fit uint32. |
 | `--output-dir` | `/tmp/kinetum_benchmark` | Must be an absent absolute final path. |
-| `--verbose`, `-v` | off | |
+
+These options use the defaults and meanings from
+[Section 5.1](#51-python-module-entry):
+
+| Group | Options |
+|-------|---------|
+| Scenario | `--deployment` (`-d`), `--test-type` (`-t`) |
+| Profile | `--backend`, `--stream-topology`, `--storage-profile` |
+| Traffic endpoint | `--traffic-host`, `--traffic-ssh-port`, `--traffic-python`, `--traffic-work-dir` |
+| TRex | `--trex-server`, `--trex-api-path`, `--trex-port` |
+| Packet generation | `--pps`, `--count`, `--packet-size`, `--num-flows` |
+| Epoch traffic | `--epoch-duration`, `--epoch-pps`, `--epoch-transition-time`, `--epoch-overlap-ms` |
+| Installation | `--runtime-root` (required), `--validation-root` |
+| Output detail | `--verbose` (`-v`) |
+
+Standard benchmark traffic is count-based; `run` has no `--duration` option.
+It uses the default source/destination IPs and loss threshold from the
+validation configuration.
 
 The benchmark admits the complete selected example-file set before acquiring
 its run owner. That owner then holds the global lock from fresh batch-root creation through all
@@ -2015,6 +1928,10 @@ code is 0 if every run passed, 1 otherwise, and 130 if the loop was
 interrupted by SIGINT.
 
 ### 18.3 aggregate
+
+`--input-dir` (`-i`) defaults to `/tmp/kinetum_benchmark` for `aggregate`,
+`export-csv`, and `report`. `aggregate` and `report` also accept
+`--inclusion-policy`, default `passed-only`.
 
 Reads `<input-dir>/run_NNN/transition_metrics.jsonl` and
 `<input-dir>/run_NNN/test_results.json` across the exact terminal-manifest
@@ -2070,10 +1987,9 @@ underscore-delimited value stored in the immutable manifest and summary:
   `all_passed == true` contribute to the aggregated distributions.
   This is the right policy when the goal is to characterize the
   platform's normal-operation distribution.
-- **`all-runs`** (artifact value `all_runs`). Every run contributes regardless
-  of pass/fail.
-  Useful for failure analysis and for audits where the inclusion
-  criterion itself is part of the protocol.
+- **`all-runs`** (artifact value `all_runs`). Include valid observations from
+  both passing and failing runs. Missing measurements remain absent; they do
+  not become zero samples. Use this policy for failure analysis.
 
 The policy is stamped into the aggregated output so downstream
 consumers cannot mix policies by accident.
@@ -2124,8 +2040,8 @@ The key deltas:
 
 | Concern | Local TAP validation | Physical DPDK PCI validation |
 |---------|-----|---------------------|
-| Ingress | AF_PACKET write into TAP, copy through TAP PMD | NIC RX poll mode, zero-copy mbufs |
-| Egress | TAP PMD write into kernel TAP, tcpdump copy | NIC TX poll mode, zero-copy mbufs |
+| Ingress | AF_PACKET write into TAP, copy through TAP PMD | NIC RX through the configured provider queues |
+| Egress | TAP PMD write into kernel TAP, tcpdump copy | NIC TX through the configured provider queues |
 | Capture | tcpdump pcap on kernel TAP | TRex PGID and port-counter sidecar |
 | Latency evidence | Measured local sender-to-kernel-capture path; includes scheduling and copies | Unavailable; no TRex latency stream is implemented in 0.1.0 |
 | Throughput ceiling | bounded by AF_PACKET, tcpdump, kernel ring | bounded by NIC line rate and CPU |
@@ -2141,7 +2057,7 @@ What is **the same**:
   inside the installed `kinetum_pack` process.
 - The same provider-contract, compiled-topology, materialization, packet-record,
   snapshot, module-hosting, and Ordered-CUT Boundary Protocol authorities.
-  Only the typed driver attachment and physical evidence differ.
+  Different bindings can change attachments, queues, storage, and worker placement.
 - The CP RPC surface and the snapshot file schema.
 - The module ABI and the SDK contract.
 - The stats schema and the boundary telemetry counters.
@@ -2217,11 +2133,8 @@ warning-and-continue path.
 
 ### 20.4 Provider Plan and Native Facility Composition
 
-The Photon command line carries the complete bundle, CP listen endpoint,
-DP endpoint, fresh CP-store directory, and explicit logging settings. Photon passes the complete bundle
-to DP; neither supervisor passes a loose plan, runtime provider identity,
-native argument list, UDP endpoint, storage override, or repair mode. The
-canonical plan inside the verified bundle is the runtime contract.
+The canonical plan inside the verified bundle owns runtime wiring. Photon
+passes that bundle to DP; the harness selects deployment inputs before planning.
 
 Changing cores, storage, TAP interfaces, or PCI attachments means changing the
 owning inventory or deployment bindings and recompiling the plan. The harness
@@ -2280,16 +2193,17 @@ and platform role files under `logs/` to locate faults.
 
 | Symptom | Likely cause | Where to look |
 |---------|--------------|---------------|
-| Standard test: high `loss_pct` on `neb_tx` | Dataplane loss, sender shortfall, or tcpdump capture drops. | Sender/analyzer counters, DP stats, and tcpdump stderr for "dropped by kernel". |
+| Standard test: high `loss_pct` on `neb_tx` | Sender/receiver deficit; the percentage alone does not locate it. | Check sender and capture integrity first, then DP port, stage, and module counters. Capture drops invalidate the evidence independently of the loss tolerance. |
 | Standard test: `missing_count`, `duplicates`, or `out_of_order` nonzero | Absent IDs, repeated IDs, or reordering within one ingress. | Per-input rows in `<capture-stem>.traffic.json` plus the pcap. |
 | Standard test: `invalid` count high | Frames fail the complete Ethernet/IPv4/UDP generation-envelope contract: protocol/fragment/length coherence, magic, bounded sequence/tag, or valid timestamp evidence. ARP, ICMP, truncated packets, and foreign UDP all fail this gate. | Tighten the BPF filter and inspect the egress pcap for non-test or malformed traffic. |
 | Native TAP: `latency.count` is zero | No valid timestamped Kinetum frames were accepted, `--no-latency` was used when invoking the analyzer directly, or timestamp samples were filtered because capture time was not after TX time. | Check `valid`, `invalid`, and the pcap timestamps in analyzer output. |
 | Epoch test: `transitions_observed == 0` | CP apply failed, the bounded tag did not switch, or exact pre/post epochs agree. | `photon.log` and the `kinetumctl` result. |
-| Epoch test: `loss_pct > 0.1%` | Real loss during transition. | Boundary telemetry deltas in `transition_metrics.jsonl`. |
+| Epoch test: `loss_pct > 0.1%` | Observed loss exceeded the epoch tolerance. | Check driver evidence, port errors, stage drops, QoS causes, and boundary deltas; a loss total alone does not identify a protocol fault. |
 | Epoch test: incomplete boundary rows or nonzero protocol-fault delta | CUT/ACK identity, drain, timing, or ownership safety did not converge exactly. | Inspect `boundary_epoch_stats`, `protocol_fault_deltas`, and the first-fault record; never infer success from packet loss alone. |
 | Commit-confirmed test: `confirm_success == false` | CP rejected snapshot/epoch/revision/key identity or the durable deadline won. | `photon.log` and the exact CLI result. |
 | Rollback test: `selective_rollback_success == false` | CP rejected target, module membership, CAS, or transition identity. | `photon.log` and the exact CLI result. |
-| Guardrails test did not restore baseline | Valid-time evidence was insufficient, attribution suppressed action, or the durable transition failed. | Policy result, module health, transition metrics, and `photon.log`. |
+| Guardrails test did not restore baseline | Valid-time evidence was insufficient, attribution suppressed action, or the durable transition failed. | Policy result, `guardrails_evaluation.json` when present, transition metrics, and `photon.log`. |
+| Final statistics failed or `dp_stats.json` is absent | Collection failed, worker publications did not advance, or required accounting contradicted the plan. | `stats_validation.message`, console diagnostics, and the final-observation rules in Section 6.1. |
 
 ### 21.3 Cleanup Failures
 
@@ -2306,19 +2220,16 @@ and platform role files under `logs/` to locate faults.
 
 This section summarizes the exact validation-profile and evidence boundaries.
 
-| Surface | Status | Notes |
-|---------|--------|-------|
-| `--test-type standard` | **Implemented live and in dry-run.** | Live execution builds one verified bundle, starts installed Photon through pair-wide `PACKET_READY`, and runs baseline forwarding without mutation. Dry-run stops after bundle and metadata production. |
-| `--test-type epoch`, `commit-confirmed`, `rollback`, `guardrails`, `full` | **Implemented scenario choreography.** | Each uses exact public CLI results and coherent telemetry. Physical claims require complete live traffic evidence under the recorded runtime/profile/environment identity. |
-| `--backend dpdk-pci` | **Implemented for dry-run and TRex-backed physical tests.** | Selects physical bindings only; it is never sent to Gluon or DP. |
-| Profile-selected TRex traffic | **Implemented for standard and transition scenarios.** | The `dpdk-pci` profile selects TRex and requires `--traffic-host`; strict remote JSON and PGID evidence fail closed, and setup records one bounded server-reported version in stateless mode. |
-| Packet-latency evidence | **Native TAP local characterization only; TRex unsupported.** | Artifacts carry `latency_source = null` and `avg_latency_us = null` for TRex. Aggregation omits latency distributions, tables render `n/a`, and no latency figure is emitted. |
-| Runtime cores, facilities, and storage policy | **Plan-owned.** | No validation CLI flag overrides these values. Deployment bindings and hardware inventory provide exact facts; the shared compiler and owning facility materializer validate and render native configuration without a harness-side EAL authority. |
-| `--num-flows` | **TRex implemented; native TAP single-flow.** | TRex varies UDP source port per flow and records the value in run specs/manifests. `rx-rss-2` requires `--num-flows >= 64`; transition admission also requires the conservative flow/PGID result to fit the shared bounded JSON contract. The native TAP sender does not vary source port by flow ID. |
-| `--no-color` | **Implemented.** | Propagates into `ConsoleReporter`; no ANSI sequence is emitted when disabled. |
-| `CommitConfirmedTestResult.timeout_rollback_*` fields | **Implemented evidence.** | Success requires an unconfirmed candidate to roll back to the exact prior content at a later epoch. |
-| Live process launch | **Implemented through installed Photon only.** | Exact installed roots admit before bundle effects; the installed packer creates a real-file verified bundle; `start_runtime()` spawns only `kinetum_photon --bundle` and verifies child ownership plus typed CP serving/DP `PACKET_READY` health. Direct DP/CP, build-tree, loose-plan, and module-symlink launch paths do not exist. |
-| DP statistics | **Implemented all-or-none.** | DP maps the shared final telemetry schema from coherent banks, transition/certificate/fault publications, compiled topology, and typed provider observations; CP validates active identity and forwards it unchanged. `dp_stats.json` preserves the parsed final fields. RSS and per-queue storage runs require every requested stream/storage/provider row; RSS additionally requires steering and lane-balance evidence. |
+| Surface | Evidence and limits |
+|---------|---------------------|
+| Dry run | Bundle construction, verification, and metadata only; no live packet or transition evidence. |
+| Standard and transition scenarios | The recipes in Sections 9-13 define each verdict. `full` composes them under the shared lifecycle; a successful run qualifies only its recorded workload and environment. |
+| Local TAP | Packet identity, loss, per-input ordering, and local sender-to-capture latency. Native generation is single-flow. |
+| Physical PCI/TRex | Port counters and, for epoch traffic, generation-separated PGIDs. Multiple flows vary UDP source ports. No per-packet ordering or packet-latency measurement is produced. |
+| Unavailable latency | TRex artifacts carry null latency, aggregation omits its distributions, tables show `n/a`, and no latency figure is emitted. |
+| RSS and per-queue storage | [Section 8.3](#83-dpdkpcibackend) requires exact topology and final stream/pool/port evidence. This does not establish a throughput ceiling. |
+| Runtime wiring and launch | The verified plan owns runtime resources; installed Photon owns DP/CP. [Section 20](#20-process-lifecycle) defines the harness's process ownership. |
+| Final DP statistics | One complete validated observation, subject to [freshness and accounting checks](#61-final-statistics). Optional provider values retain their availability state. |
 
 ---
 

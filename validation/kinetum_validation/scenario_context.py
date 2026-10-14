@@ -11,12 +11,14 @@ from typing import Awaitable, Callable, List, Optional, Tuple, TypeVar
 
 from .config.types import (
     AnalysisResult,
+    DeploymentMode,
     EpochTestResult,
     PacketStats,
     TestConfig,
     TrafficDriverType,
 )
 from .engine.plan_metadata import PlanTopologyMetadata
+from .engine.qos_accounting import qos_accounting_complete
 from .process.kinetumctl import ActiveSnapshot, KinetumCtl
 from .process.telemetry import StatsResult, StatsSelection
 from .process.telemetry_validation import worker_counters_are_exact, worker_counters_advanced
@@ -786,7 +788,11 @@ class ScenarioContext:
                 if row.published_monotonic_ns != worker.published_monotonic_ns or regressed:
                     raise RuntimeError(f"final stream observation has contradictory owner or counters: {stream_id}")
                 previous[stream_id] = observed
-            return all(row.published_monotonic_ns > barrier for row in rows.values())
+            qos_complete = (
+                qos_accounting_complete(current, self.plan_topology)
+                if self.config.deployment == DeploymentMode.FAN_IN_EDGE_GATEWAY else True
+            )
+            return qos_complete and all(row.published_monotonic_ns > barrier for row in cursor)
 
         ready(baseline)
 

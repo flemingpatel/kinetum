@@ -818,8 +818,10 @@ body gate. Each iteration then:
    level-triggered on every drain turn;
 2. services required telemetry-bank returns before any owner can reuse them and
    suppresses unfinished cadence sweeps when stopping;
-3. refreshes the one worker-cached timestamp. During an existing module sweep,
-   at most one context may run its due owner-health callback and only an actual
+3. refreshes and stores the one worker-cached timestamp for passive and active
+   workers. Packet callbacks receive it as immutable `batch.now_ns`; active
+   callbacks receive the same value in their active context. During an existing
+   module sweep, at most one context may run its due owner-health callback and only an actual
    callback return permits the one additional budget/publication sample;
 4. on a transition turn, services receiver then sender control; then services
    the selected synchronous or tracked-async scheduler when present;
@@ -914,7 +916,7 @@ while bounded local work is available:
             masks = scheduler.ingest_synchronous(..., records, ..., cached_time)
         else:
             forward_mask = execute_module_batch_mechanism(
-                *stage.module_store, stage_instance, region, records, worker_scratch)
+                *stage.module_store, stage_instance, region, cached_time, records, worker_scratch)
         resolve each lane's forward, retained, or drop ownership
     else:
         execute the platform mechanism or resume the already-selected delivery
@@ -1268,7 +1270,7 @@ INGEST preserves that allowance per input, bounded by the 64-record batch;
 packet/byte and token quotas still apply to the complete context population.
 The [loop selected at worker entry](#stage-modes-and-worker-loops) determines
 which active mechanisms are present. The passive specialization contains no
-active-stage scheduler branch, active context construction, or active timestamp store;
+active-stage scheduler branch or active context construction;
 the synchronous-active form contains no completion poll, cancellation atomic, token
 slot operation, or completion scan; the tracked-async form polls one bounded
 completion prefix once per turn. That prefix is derived as half the shared
@@ -1290,7 +1292,7 @@ Packet-bound begin may consume the provisional retained handle in the same
 INGEST callback; the existing whole-batch validation remains the sole commit
 gate and publishes either that exact token ownership or nothing.
 
-The public ABI is the exact `0.1.0` contract. INGEST and
+The public module ABI is the exact `0.2.0` contract. INGEST and
 on_control receive the same runtime-written `kinetum_active_ctx` as run. The
 module sees opaque handles only; no service exposes `packet_record`, provider
 storage, route tables, or a mutable epoch selector. Retaining an input preserves

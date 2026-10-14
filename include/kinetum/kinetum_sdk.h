@@ -67,7 +67,7 @@ extern "C" {
 #define KINETUM_MODULE_ABI_VERSION_MAJOR 0u
 
 /** Module ABI minor version component. */
-#define KINETUM_MODULE_ABI_VERSION_MINOR 1u
+#define KINETUM_MODULE_ABI_VERSION_MINOR 2u
 
 /** Module ABI patch version component. */
 #define KINETUM_MODULE_ABI_VERSION_PATCH 0u
@@ -320,7 +320,7 @@ static inline const char *kinetum_strerror(kinetum_error error)
  * mutates bytes must update every parsed field invalidated by that mutation.
  * The runtime never reparses a packet between module stages.
  * `data`, `len`, `input_port`, `ts_ns`, `count`, `region_id`, `epoch`,
- * `epoch_config`, and `ctx` are borrowed runtime authority and must not be
+ * `epoch_config`, `ctx`, and `now_ns` are borrowed runtime authority and must not be
  * changed. The payload bytes referenced by `data` are writable, but this ABI
  * does not permit replacing the backing, resizing a packet, or changing
  * structural packet facts that have no mutable lane. Parsed addresses, ports,
@@ -355,7 +355,7 @@ typedef struct KINETUM_ALIGNED kinetum_batch {
 	KINETUM_ALIGNAS(64) uint16_t input_port[KINETUM_MAX_BURST];	 ///< Immutable ingress ports.
 	KINETUM_ALIGNAS(64) uint16_t output_port[KINETUM_MAX_BURST];	 ///< Mutable egress ports.
 	KINETUM_ALIGNAS(64) uint16_t next_stage[KINETUM_MAX_BURST];	 ///< Mutable logical next stages.
-	KINETUM_ALIGNAS(64) uint64_t ts_ns[KINETUM_MAX_BURST];		 ///< Immutable packet timestamps.
+	KINETUM_ALIGNAS(64) uint64_t ts_ns[KINETUM_MAX_BURST];		 ///< Immutable packet-origin timestamps.
 	KINETUM_ALIGNAS(64) uint64_t user_meta[KINETUM_MAX_BURST];	 ///< Mutable persistent user words.
 	KINETUM_ALIGNAS(64) uint8_t user_meta_valid[KINETUM_MAX_BURST];	 ///< Mutable presence bits.
 	uint16_t count;							 ///< Immutable occupied prefix length.
@@ -364,6 +364,10 @@ typedef struct KINETUM_ALIGNED kinetum_batch {
 	uint64_t epoch;							 ///< Immutable packet/executable epoch.
 	const void *epoch_config;					 ///< Immutable exact packet configuration.
 	struct kinetum_ctx *ctx;					 ///< Immutable exact context pointer.
+	/** @brief Owner-worker monotonic processing time shared by every lane and callback in this turn.
+	 * Zero and repeated values are ordinary input, never a clock-read request.
+	 */
+	uint64_t now_ns;
 } kinetum_batch_t;
 
 /**
@@ -1952,6 +1956,7 @@ KINETUM_ABI_ASSERT_OFFSET(kinetum_batch_t, padding, 4164);
 KINETUM_ABI_ASSERT_OFFSET(kinetum_batch_t, epoch, 4168);
 KINETUM_ABI_ASSERT_OFFSET(kinetum_batch_t, epoch_config, 4176);
 KINETUM_ABI_ASSERT_OFFSET(kinetum_batch_t, ctx, 4184);
+KINETUM_ABI_ASSERT_OFFSET(kinetum_batch_t, now_ns, 4192);
 
 KINETUM_ABI_ASSERT_LAYOUT(kinetum_emit_batch_t, 64, 4224);
 KINETUM_ABI_ASSERT_OFFSET(kinetum_emit_batch_t, data, 0);

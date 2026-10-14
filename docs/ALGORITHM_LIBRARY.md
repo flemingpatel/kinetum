@@ -66,7 +66,7 @@ C++ algorithm surface or in exact module-owned implementations.
 | `cache.hpp` | Intrusive LRU list, heap-backed LRU cache, cache-line allocation. | `lru_list` can be allocation-free; `lru_cache` is cold/read-mostly only. | Available through C++ SDK; no packet hot-path production dependency. |
 | `queue.hpp` | Static, owning-runtime, and caller-storage SPSC rings; static/runtime-capacity MPMC queues; caller-storage single-owner work queues. | All queue operations are allocation-free after construction under their exact ownership model. | NUMA-composed DATA boundaries, worker active/future staging, active control mailboxes, boundary future holds, lifecycle channels, fixed host packet-pool credits, and UDP/development queues. |
 | `bounded_service_order.hpp` | Caller-storage fair service with bounded carried allowances. | Single owner; O(1) order updates and input-count-bounded turns. | Worker RX and inbound DATA admission. |
-| `ratelimit.hpp` | Exact-rational token bucket, leaky bucket, and sliding window. | Hot-path safe after construction. | Available to modules; built-in QoS uses one context-local module policer. |
+| `ratelimit.hpp` | Exact byte credit, token bucket, leaky bucket, and sliding window. | Hot-path safe after construction. | `byte_credit` supplies both generic token buckets and built-in QoS slab entries. |
 | `net.hpp` | Big-endian reads/writes, protocol constants, and RFC 1918 classification. | Hot-path safe. | DP IPv4 parsing and NAT44/QoS packet work. |
 | `cidr.hpp` | Header-owned IPv4/CIDR parsing, formatting, and matching. | `match_cidr` is hot-path safe; parsing/formatting are cold path. | ACL and NAT44 config parsing; ACL matching; installed C++ SDK. |
 | `condition_parse.hpp` | Shared parser for `field op decimal_uint32` edge-condition syntax. | Cold path. | Axiom authoring-time validation and DP route compilation. |
@@ -448,13 +448,14 @@ reserved cursors cannot roll back. Batch pointers may be null only at count zero
 
 ### `ratelimit.hpp`
 
-`ratelimit.hpp` provides standalone rate-limiting helpers:
+`ratelimit.hpp` provides shared credit arithmetic and standalone rate limiters:
 
+- `byte_credit`
 - `token_bucket`
 - `leaky_bucket`
 - `sliding_window`
 
-All public rate limiter APIs take explicit monotonic nanosecond timestamps
+The standalone rate limiter APIs take explicit monotonic nanosecond timestamps
 (`now_ns`). They do not read a clock internally. Token and leak balances retain
 an exact unsigned numerator with denominator 1,000,000,000: elapsed nanoseconds
 times integer bytes per second therefore preserves every fractional byte
@@ -463,8 +464,21 @@ costs remain distinct rather than saturating to one representation. Timestamp
 zero is valid; regression rejects the operation without changing credit. A
 positive sliding-window duration is required, and reconfiguration cannot apply
 a new rate retroactively.
-Built-in QoS uses one context-local module-specific policer, not the generic
-`token_bucket`, because it needs preallocated per-flow bucket storage.
+
+`byte_credit` owns only the exact unsigned 128-bit balance. Its
+`consume(elapsed_ns, rate_bytes_per_sec, capacity_bytes, bytes)` first caps the
+retained balance, adds earned credit up to the remaining capacity, and consumes
+the cost only if sufficient. Comparing with remaining capacity before addition
+prevents overflow even for full-width rates and intervals. The caller validates
+time and owns policy; this operation divides nothing and reads no clock.
+`tokens()` observes whole bytes without discarding the fraction, while `reset()`
+explicitly replaces the balance.
+
+Both `token_bucket` and built-in QoS compose `byte_credit`. QoS keeps its
+preallocated per-flow slab and context-wide runtime-clock contract. The generic
+`token_bucket` instead owns its own clock cursor; its `reconfigure()` retains
+capped whole-byte credit, discards the old fraction, and rebinds time on the
+next call. QoS activation retains exact credit and does not call `reconfigure()`.
 
 ### `net.hpp`
 
@@ -643,7 +657,7 @@ wraparound per pool slot.
 | Ordered-CUT Boundary Protocol | `queue.hpp`, `platform.hpp`, `single_writer_snapshot.hpp` | `boundary_epoch_channel` composes one plan-sized receiver-NUMA DATA ring with per-worker exact-NUMA endpoint slabs: CUT lives with its receiver poller, ACK with its sender poller, and mutable endpoint state/publication with its owner. The channel alone owns successful DATA sequences, bounded pending control, and coherent observation. `worker_boundary_sender` composes exact sealing/gating with the ledger and sender-NUMA hold; `worker_boundary_receiver` composes exact CUT drain/fan-in/ACK policy without wrapping DATA receive; `worker_epoch_activation` preflights module stores and swappable queue roles before whole ledger promotion. Their disjoint event-edge policy publications and one-shot activation publication feed the immutable certificate; fixed Bootstrap publishes only baselines and keeps both endpoint policies OPEN. |
 | ACL module | `cidr.hpp`, `hash.hpp`, `simd_classify.hpp`, `platform.hpp`, `prefetch.hpp` | Rule parsing, FNV constants, SIMD batch path, and hot-path hints. |
 | NAT44 module | `bounded_index_pool.hpp`, `net.hpp`, `hash.hpp`, `cuckoo.hpp`, `platform.hpp`, `prefetch.hpp` | Fixed slab-index recycling, packet edits, FNV constants, session maps, and hot-path hints. |
-| QoS module | `bounded_index_pool.hpp`, `net.hpp`, `cuckoo.hpp`, `platform.hpp`, `prefetch.hpp` | Fixed slab-index recycling, packet parsing/editing, explicit scalar flow identity, bucket map, and hot-path hints. |
+| QoS module | `bounded_index_pool.hpp`, `net.hpp`, `cuckoo.hpp`, `ratelimit.hpp`, `hash.hpp`, `platform.hpp`, `prefetch.hpp` | Fixed slab-index recycling, bounded packet facts, semantic flow keys, exact byte credit, and hot-path hints. |
 | C++ SDK | `algo.hpp`, `aligned_atomic.hpp`, `quiescence.hpp`, `rcu_buffer.hpp`, `signal.hpp` | Module-facing convenience include and shared algorithms; the staged SDK carries the complete byte-identical public header tree, while exact module config comes from the batch view. |
 
 ## Module Linking Notes

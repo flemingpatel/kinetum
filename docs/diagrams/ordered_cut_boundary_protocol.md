@@ -1,8 +1,8 @@
 # Ordered-CUT Boundary Protocol
 
-Kinetum changes live configuration by draining each worker's old work before
-activating its new view. These diagrams show the boundary and reclamation
-proof. Data-plane and wire contracts are in
+The Ordered-CUT Boundary Protocol coordinates configuration-epoch transitions
+across packet-processing workers. These diagrams show the boundary and
+reclamation proof. Data-plane and wire contracts are in
 [`DATA_PLANE.md`](../DATA_PLANE.md) and [`GRPC_API.md`](../GRPC_API.md).
 
 ## 1. What the Ordered-CUT Boundary Protocol Is

@@ -37,11 +37,11 @@ bool dp_engine::execute_stage(const kinetum::axiom::v1::Stage *stage, packet_rec
 }
 
 uint64_t dp_engine::execute_module_stage(module::module_epoch_store &store, uint16_t stage_instance_index,
-					 int32_t region_id, std::span<packet_record *const> packets,
+					 int32_t region_id, uint64_t now_ns, std::span<packet_record *const> packets,
 					 module_batch_scratch &scratch) noexcept
 {
 	const uint64_t forwarded =
-		execute_module_batch_mechanism(store, stage_instance_index, region_id, packets, scratch);
+		execute_module_batch_mechanism(store, stage_instance_index, region_id, now_ns, packets, scratch);
 	counters_.dropped_packets +=
 		static_cast<uint64_t>(packets.size()) - static_cast<uint64_t>(std::popcount(forwarded));
 	return forwarded;

@@ -430,7 +430,7 @@ informational JSON file at `modules/modules.json`:
 
 ```json
 {
-  "abi_version": 65536,
+  "abi_version": 131072,
   "modules": [
     { "module_id": "kinetum.acl", "so": "modules/kinetum.acl.so" },
     { "module_id": "kinetum.qos", "so": "modules/kinetum.qos.so" }
@@ -447,7 +447,7 @@ self-contained, as the three built-ins are. Generated host-authoring schemas
 do not appear in it.
 
 `abi_version` is the exact integer `KINETUM_MODULE_ABI_VERSION`; version
-0.1.0 is encoded as `0x00010000`, or `65536` in JSON. It is metadata for
+0.2.0 is encoded as `0x00020000`, or `131072` in JSON. It is metadata for
 the ABI against which the bundled images were built, not a compatibility
 range. Failure to write this required file aborts publication. **No tool in the
 current source tree consumes `modules.json`.** It is documented here as an

@@ -30,8 +30,8 @@ namespace
 {
 
 #if KINETUM_TEST_INCOMPATIBLE_ABI_DIRECTION < 0
-/** Lower incompatible revision used by the below-host fixture. */
-inline constexpr uint32_t TEST_ABI_VERSION = KINETUM_MODULE_ABI_VERSION - 1u;
+/** Released packet ABI lacks the required processing-time authority. */
+inline constexpr uint32_t TEST_ABI_VERSION = 0x00010000u;
 #elif KINETUM_TEST_INCOMPATIBLE_ABI_DIRECTION > 0
 /** Higher incompatible revision used by the above-host fixture. */
 inline constexpr uint32_t TEST_ABI_VERSION = KINETUM_MODULE_ABI_VERSION + 1u;

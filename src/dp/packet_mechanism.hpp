@@ -100,12 +100,14 @@ static_assert(std::is_trivially_copyable_v<module_batch_scratch>, "module batch 
  * @param store Exact context-local slot and executable-view authority.
  * @param stage_instance_index Exact executable stage-instance index.
  * @param region_id Sole-owner runtime region.
+ * @param now_ns Exact cached monotonic time supplied by the serialized owner.
  * @param packets Borrowed prefix of caller-owned records, at most KINETUM_MAX_BURST.
  * @param scratch Owner-worker reusable ABI batch.
  * @return Sole forward mask. Empty or invalid input rejects before callback effects.
  */
 [[nodiscard]] uint64_t execute_module_batch_mechanism(module::module_epoch_store &store, uint16_t stage_instance_index,
-						      int32_t region_id, std::span<packet_record *const> packets,
+						      int32_t region_id, uint64_t now_ns,
+						      std::span<packet_record *const> packets,
 						      module_batch_scratch &scratch) noexcept;
 
 /**
@@ -118,7 +120,7 @@ static_assert(std::is_trivially_copyable_v<module_batch_scratch>, "module batch 
  * @param stage_instance_index Exact executable stage-instance index.
  * @param region_id Sole-owner runtime region.
  * @param packets Borrowed prefix of caller-owned records for this exact invocation.
- * @param active_ctx Exact callback-borrowed active services.
+ * @param active_ctx Exact callback-borrowed active services and owner turn time.
  * @param scratch Owner-worker reusable ABI batch.
  * @return Sole forward mask; the scheduler resolves each clear lane's retention or drop.
  */

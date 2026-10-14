@@ -19,9 +19,8 @@
  * - If tokens >= packet_size: allow and consume
  * - If tokens < packet_size: drop (rate limited)
  *
- * The primitives are reusable SDK mechanisms. The built-in QoS module keeps a
- * separate context-local policer whose state layout is part of that module's
- * packet-path contract.
+ * The primitives are reusable SDK mechanisms. Token buckets and the built-in
+ * QoS module share byte_credit; QoS owns its context-local flow slab and clock.
  */
 
 #include <cstddef>
@@ -72,6 +71,62 @@ accrued_numerator(uint64_t elapsed_ns, uint64_t rate_bytes_per_sec) noexcept
 }  // namespace detail
 /** @endcond */
 
+/**
+ * @brief Exact byte credit with caller-owned time and policy.
+ *
+ * One owner supplies nonnegative elapsed intervals after validating its clock.
+ * Refill retains fractional bytes over the nanosecond denominator and saturates
+ * before addition. Consumption is bounded arithmetic with no division, clock
+ * read, allocation, or synchronization.
+ */
+class byte_credit {
+    public:
+	/** @brief Construct an empty balance. */
+	constexpr byte_credit() noexcept = default;
+	/** @brief Construct an exact whole-byte balance. @param bytes Initial credit. */
+	explicit constexpr byte_credit(uint64_t bytes) noexcept
+		: numerator_(detail::byte_numerator(bytes))
+	{
+	}
+
+	/**
+	 * @brief Cap, refill, and conditionally consume exact byte credit.
+	 * @param elapsed_ns Validated elapsed interval; zero earns no new credit.
+	 * @param rate_bytes_per_sec Exact current refill rate.
+	 * @param capacity_bytes Current ceiling, including after a policy change.
+	 * @param bytes Exact packet or operation cost.
+	 * @return true after consuming the cost; false retains capped, accrued credit.
+	 */
+	[[nodiscard]] KINETUM_ALWAYS_INLINE constexpr bool consume(uint64_t elapsed_ns, uint64_t rate_bytes_per_sec,
+								   uint64_t capacity_bytes, uint64_t bytes) noexcept
+	{
+		const auto capacity = detail::byte_numerator(capacity_bytes);
+		const auto retained = numerator_ < capacity ? numerator_ : capacity;
+		const auto earned = detail::accrued_numerator(elapsed_ns, rate_bytes_per_sec);
+		numerator_ = earned >= capacity - retained ? capacity : retained + earned;
+		const auto cost = detail::byte_numerator(bytes);
+		if (cost > numerator_) {
+			return false;
+		}
+		numerator_ -= cost;
+		return true;
+	}
+
+	/** @return Whole available bytes without discarding the retained fraction. */
+	[[nodiscard]] constexpr uint64_t tokens() const noexcept
+	{
+		return static_cast<uint64_t>(numerator_ / detail::RATE_DENOMINATOR);
+	}
+	/** @brief Explicitly replace credit. @param bytes Exact whole-byte balance. */
+	constexpr void reset(uint64_t bytes) noexcept
+	{
+		numerator_ = detail::byte_numerator(bytes);
+	}
+
+    private:
+	detail::rate_numerator numerator_{0};  ///< Sole exact balance; bounded by the last supplied capacity.
+};
+
 // =============================================================================
 // Token Bucket
 // =============================================================================
@@ -101,7 +156,7 @@ class token_bucket {
 	constexpr token_bucket(uint64_t rate_bytes_per_sec, uint64_t burst_bytes) noexcept
 		: rate_bytes_per_sec_(rate_bytes_per_sec)
 		, burst_bytes_(burst_bytes)
-		, token_numerator_(detail::byte_numerator(burst_bytes))
+		, credit_(burst_bytes)
 		, last_ns_(0)
 		, initialized_(false)
 	{
@@ -121,39 +176,25 @@ class token_bucket {
 	[[nodiscard]]
 	KINETUM_ALWAYS_INLINE bool allow(uint64_t now_ns, std::size_t bytes) noexcept
 	{
+		uint64_t elapsed_ns = 0u;
 		if (KINETUM_UNLIKELY(!initialized_)) {
 			last_ns_ = now_ns;
 			initialized_ = true;
 		} else if (KINETUM_UNLIKELY(now_ns < last_ns_)) {
 			return false;
-		} else if (now_ns > last_ns_) {
-			const uint64_t elapsed_ns = now_ns - last_ns_;
-			const detail::rate_numerator generated =
-				detail::accrued_numerator(elapsed_ns, rate_bytes_per_sec_);
-			const detail::rate_numerator capacity = detail::byte_numerator(burst_bytes_);
-			const detail::rate_numerator available = capacity - token_numerator_;
-			if (generated >= available) {
-				token_numerator_ = capacity;
-			} else {
-				token_numerator_ += generated;
-			}
+		} else {
+			elapsed_ns = now_ns - last_ns_;
 			last_ns_ = now_ns;
 		}
 
 		static_assert(sizeof(std::size_t) <= sizeof(uint64_t));
-		const detail::rate_numerator cost = detail::byte_numerator(static_cast<uint64_t>(bytes));
-		if (token_numerator_ >= cost) {
-			token_numerator_ -= cost;
-			return true;
-		}
-
-		return false;  // Rate limited
+		return credit_.consume(elapsed_ns, rate_bytes_per_sec_, burst_bytes_, static_cast<uint64_t>(bytes));
 	}
 
 	/** @return Whole available bytes, excluding retained fractional credit. */
 	[[nodiscard]] constexpr uint64_t tokens() const noexcept
 	{
-		return static_cast<uint64_t>(token_numerator_ / detail::RATE_DENOMINATOR);
+		return credit_.tokens();
 	}
 
 	/** @return Exact configured whole-byte capacity. */
@@ -165,7 +206,7 @@ class token_bucket {
 	/** @brief Reset to full capacity with an unbound timestamp baseline. */
 	void reset() noexcept
 	{
-		token_numerator_ = detail::byte_numerator(burst_bytes_);
+		credit_.reset(burst_bytes_);
 		last_ns_ = 0;
 		initialized_ = false;
 	}
@@ -184,7 +225,7 @@ class token_bucket {
 	{
 		const uint64_t current_tokens = tokens();
 		const uint64_t retained_bytes = current_tokens < burst_bytes ? current_tokens : burst_bytes;
-		token_numerator_ = detail::byte_numerator(retained_bytes);
+		credit_.reset(retained_bytes);
 		rate_bytes_per_sec_ = rate_bytes_per_sec;
 		burst_bytes_ = burst_bytes;
 		last_ns_ = 0u;
@@ -192,11 +233,11 @@ class token_bucket {
 	}
 
     private:
-	uint64_t rate_bytes_per_sec_;		  ///< Exact configured whole-byte rate.
-	uint64_t burst_bytes_;			  ///< Exact maximum whole-byte capacity.
-	detail::rate_numerator token_numerator_;  ///< Exact balance over the shared denominator.
-	uint64_t last_ns_;			  ///< Last accepted timestamp.
-	bool initialized_;			  ///< Whether the timestamp baseline is bound, including zero.
+	uint64_t rate_bytes_per_sec_;  ///< Exact configured whole-byte rate.
+	uint64_t burst_bytes_;	       ///< Exact maximum whole-byte capacity.
+	byte_credit credit_;	       ///< Exact balance shared with policy-owned policers.
+	uint64_t last_ns_;	       ///< Last accepted timestamp.
+	bool initialized_;	       ///< Whether the timestamp baseline is bound, including zero.
 };
 
 // =============================================================================

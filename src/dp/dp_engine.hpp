@@ -89,12 +89,14 @@ class dp_engine {
 	 * @param store Exact context-local slot and executable-view authority.
 	 * @param stage_instance_index Exact executable stage-instance index.
 	 * @param region_id Sole-owner runtime region.
+	 * @param now_ns Explicit monotonic time supplied by this serialized component-test owner.
 	 * @param packets Borrowed occupied prefix of caller-owned packet records.
 	 * @param scratch Owner-worker reusable ABI batch.
 	 * @return Sole callback forward mask over the occupied prefix.
 	 */
 	[[nodiscard]] uint64_t execute_module_stage(module::module_epoch_store &store, uint16_t stage_instance_index,
-						    int32_t region_id, std::span<packet_record *const> packets,
+						    int32_t region_id, uint64_t now_ns,
+						    std::span<packet_record *const> packets,
 						    module_batch_scratch &scratch) noexcept;
 
 	/**

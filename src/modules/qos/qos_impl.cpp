@@ -9,8 +9,8 @@
  * Self-contained token bucket policer using strict module-owned JSON.
  *
  * Hot-Path Optimizations:
- * - Lock-free design (no mutex in allow() function)
- * - Fixed-point arithmetic (Q20) for precision without floating point
+ * - Lock-free design (no mutex in police() function)
+ * - Exact byte-credit arithmetic shared with the public token bucket
  * - Cache-line aligned buckets to prevent false sharing
  * - Context-local ownership gives zero-contention mutable state
  *
@@ -21,6 +21,7 @@
 #include "qos_impl.hpp"
 
 #include <algorithm>
+#include <exception>
 #include <limits>
 #include <string_view>
 
@@ -128,7 +129,7 @@ namespace
 	    conform_dscp >= 64) {
 		return false;
 	}
-	candidate.cir_bytes_per_s = static_cast<uint64_t>(cir_kbps) * 1000u / 8u;
+	candidate.cir_bytes_per_s = static_cast<uint64_t>(cir_kbps) * 125u;
 	candidate.burst_bytes = static_cast<uint64_t>(cbs_kb) * 1024u;
 	candidate.conform_dscp = static_cast<uint8_t>(conform_dscp);
 	output->name.swap(candidate.name);
@@ -247,6 +248,14 @@ uint64_t qos_policer::active_flows() const noexcept
 	return free_indices_.in_use();
 }
 
+void qos_policer::observe_time(uint64_t now_ns) noexcept
+{
+	if (now_ns < last_observed_ns_) {
+		std::terminate();
+	}
+	last_observed_ns_ = now_ns;
+}
+
 void qos_policer::maybe_gc_(uint64_t now_ns, const qos_runtime_tuning &runtime) noexcept
 {
 	// Sole-owner GC needs no synchronization. The cursor scans one bounded
@@ -277,7 +286,7 @@ void qos_policer::maybe_gc_(uint64_t now_ns, const qos_runtime_tuning &runtime) 
 
 		const bucket &entry = slab_[cursor];
 		if (entry.occupied && now_ns > entry.last_ns && now_ns - entry.last_ns > runtime.idle_timeout_ns) {
-			if (!map_.erase(entry.flow_key)) {
+			if (!map_.erase(entry.key)) {
 				std::terminate();
 			}
 			slab_[cursor].occupied = false;
@@ -292,13 +301,13 @@ void qos_policer::maybe_gc_(uint64_t now_ns, const qos_runtime_tuning &runtime) 
 	gc_cursor_ = (cursor >= max_flows_) ? 0 : cursor;
 }
 
-bool qos_policer::allow(uint64_t now_ns, const qos_profile_compiled &profile, const qos_runtime_tuning &runtime,
-			uint64_t flow_key, std::size_t bytes) noexcept
+policer_result qos_policer::police(uint64_t now_ns, const qos_profile_compiled &profile,
+				   const qos_runtime_tuning &runtime, const flow_key &key, std::size_t bytes) noexcept
 {
-	// LOCK-FREE HOT PATH - zero heap allocation
-	// - No mutex, no shared_mutex, no malloc
-	// - Sole context-owner access; routing keeps each flow with its owner
-	// - Follows Platform Engineering Guide hot-path rules
+	observe_time(now_ns);
+	if (profile.cir_bytes_per_s != 0u && !key.valid()) {
+		return policer_result::INVALID_INPUT;
+	}
 
 	// Even an unlimited replacement policy must retire stale state retained from
 	// an earlier bounded profile.
@@ -306,20 +315,11 @@ bool qos_policer::allow(uint64_t now_ns, const qos_profile_compiled &profile, co
 
 	// Unlimited rate: allow all.
 	if (KINETUM_UNLIKELY(profile.cir_bytes_per_s == 0)) {
-		return true;
+		return policer_result::ALLOWED;
 	}
-
-	if (KINETUM_UNLIKELY(profile.burst_bytes > QOS_MAX_BURST_BYTES ||
-			     bytes > static_cast<std::size_t>(QOS_MAX_BURST_BYTES))) {
-		return false;
-	}
-
-	// Fixed-point representation of bytes
-	const int64_t bytes_fp = static_cast<int64_t>(bytes) << FP_SHIFT;
-	const int64_t burst_fp = static_cast<int64_t>(profile.burst_bytes) << FP_SHIFT;
 
 	// O(1) cuckoo lookup -> slab dereference (zero heap allocation)
-	uint32_t *idx_ptr = map_.find(flow_key);
+	uint32_t *idx_ptr = map_.find(key);
 
 	bucket *b;
 
@@ -329,7 +329,7 @@ bool qos_policer::allow(uint64_t now_ns, const qos_profile_compiled &profile, co
 	} else {
 		// New flow: acquire one fixed slab index (fail-closed on exhaustion).
 		if (KINETUM_UNLIKELY(free_indices_.available() == 0u)) {
-			return false;
+			return policer_result::FLOW_CAPACITY;
 		}
 
 		uint32_t idx = 0u;
@@ -341,60 +341,28 @@ bool qos_policer::allow(uint64_t now_ns, const qos_profile_compiled &profile, co
 			std::terminate();
 		}
 
-		if (KINETUM_UNLIKELY(!map_.insert(flow_key, idx))) {
+		if (KINETUM_UNLIKELY(!map_.insert(key, idx))) {
 			// Cuckoo table full after max displacement - rollback
 			free_indices_.release(idx);
-			return false;
+			return policer_result::FLOW_CAPACITY;
 		}
 
 		b = acquired;
-		b->tokens_fp = burst_fp;
+		b->credit.reset(profile.burst_bytes);
 		b->last_ns = now_ns;
-		b->flow_key = flow_key;
+		b->key = key;
 		b->occupied = true;
 	}
 
-	// A retained flow can outlive a configuration activation. Enforce the
-	// exact profile's current burst ceiling before granting or refilling credit
-	// so a smaller replacement policy cannot inherit excess old-epoch tokens.
-	if (KINETUM_UNLIKELY(b->tokens_fp > burst_fp)) {
-		b->tokens_fp = burst_fp;
-	}
-
-	// A delayed packet may carry an older arrival timestamp. Never move a
-	// bucket's time authority backward or mint refill credit from underflow.
-	const uint64_t effective_now_ns = now_ns > b->last_ns ? now_ns : b->last_ns;
-	const uint64_t delta_ns = effective_now_ns - b->last_ns;
-
-	const int64_t room_fp = burst_fp > b->tokens_fp ? burst_fp - b->tokens_fp : 0;
-	int64_t refill_delta_fp = 0;
-	if (room_fp > 0 && delta_ns != 0) {
-		// Split elapsed time before multiplication. With uint64_t inputs,
-		// whole seconds are below 2^35 and the Q20 rate is below 2^84, so
-		// every intermediate remains below 2^120.
-		using wide_uint = unsigned __int128;
-		constexpr uint64_t NS_PER_SECOND = 1000000000ull;
-		const wide_uint rate_fp = static_cast<wide_uint>(profile.cir_bytes_per_s) << FP_SHIFT;
-		const wide_uint whole_seconds = static_cast<wide_uint>(delta_ns / NS_PER_SECOND);
-		const wide_uint remainder_ns = static_cast<wide_uint>(delta_ns % NS_PER_SECOND);
-		const wide_uint refill_fp =
-			whole_seconds * rate_fp + (remainder_ns * rate_fp) / static_cast<wide_uint>(NS_PER_SECOND);
-		refill_delta_fp = refill_fp > static_cast<wide_uint>(room_fp) ? room_fp :
-										static_cast<int64_t>(refill_fp);
-	}
-	const int64_t new_tokens = b->tokens_fp + refill_delta_fp;
-
-	b->last_ns = effective_now_ns;
-
-	// Check if enough tokens
-	if (KINETUM_LIKELY(new_tokens >= bytes_fp)) {
-		b->tokens_fp = new_tokens - bytes_fp;
-		return true;
-	}
-
-	// Not enough tokens: drop
-	b->tokens_fp = new_tokens;
-	return false;
+	// The active profile governs this observation. Shared arithmetic caps retained
+	// credit before refill, including when configuration lowers the burst limit.
+	const uint64_t elapsed_ns = now_ns - b->last_ns;
+	b->last_ns = now_ns;
+	static_assert(sizeof(std::size_t) <= sizeof(uint64_t));
+	return b->credit.consume(elapsed_ns, profile.cir_bytes_per_s, profile.burst_bytes,
+				 static_cast<uint64_t>(bytes)) ?
+		       policer_result::ALLOWED :
+		       policer_result::RATE_LIMIT;
 }
 
 }  // namespace kinetum::modules::qos

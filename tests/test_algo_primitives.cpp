@@ -1066,6 +1066,32 @@ TEST(algo_ratelimit, regression_and_reconfiguration_preserve_exact_credit)
 	EXPECT_EQ(leaky.level(), 1u);
 }
 
+/** @brief Exact credit retains every subdivision and caps before a full-width refill. */
+TEST(algo_ratelimit, byte_credit_preserves_subdivisions_and_saturates_before_addition)
+{
+	byte_credit divided;
+	byte_credit combined;
+	// 512,000 microseconds at 125 bytes/s earn exactly 64 bytes.
+	for (uint32_t interval = 0; interval < 512000u; ++interval) {
+		ASSERT_TRUE(divided.consume(1000u, 125u, 1024u, 0u));
+	}
+	ASSERT_TRUE(combined.consume(512000000u, 125u, 1024u, 0u));
+	EXPECT_EQ(divided.tokens(), 64u);
+	EXPECT_EQ(combined.tokens(), 64u);
+	EXPECT_TRUE(divided.consume(0u, 125u, 1024u, 64u));
+	EXPECT_TRUE(combined.consume(0u, 125u, 1024u, 64u));
+	EXPECT_FALSE(divided.consume(0u, 125u, 1024u, 1u));
+
+	constexpr uint64_t MAX = std::numeric_limits<uint64_t>::max();
+	byte_credit full(MAX);
+	EXPECT_TRUE(full.consume(MAX, MAX, MAX, MAX));
+	EXPECT_EQ(full.tokens(), 0u);
+	full.reset(1024u);
+	EXPECT_FALSE(full.consume(0u, MAX, 100u, 101u));
+	EXPECT_EQ(full.tokens(), 100u);
+	EXPECT_TRUE(full.consume(0u, 0u, 100u, 100u));
+}
+
 /** @brief Sliding windows reject zero duration and never reset on regressing time. */
 TEST(algo_ratelimit, sliding_window_requires_positive_monotonic_time)
 {

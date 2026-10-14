@@ -224,7 +224,7 @@ void test_fini(const kinetum_lifecycle_ctx *lifecycle, void *state) noexcept
 	    !parse_optional_bool(payload, "\"rewrite_metadata\"", candidate.rewrite_metadata) ||
 	    !parse_optional_bool(payload, "\"corrupt_packet_facts\"", candidate.corrupt_packet_facts) ||
 	    !parse_optional_unsigned(payload, "\"dscp_drop\"", static_cast<uint8_t>(63), candidate.dscp_drop) ||
-	    !parse_optional_unsigned(payload, "\"corrupt_authority\"", static_cast<uint8_t>(11),
+	    !parse_optional_unsigned(payload, "\"corrupt_authority\"", static_cast<uint8_t>(12),
 				     candidate.corrupt_authority) ||
 	    !parse_optional_unsigned(payload, "\"route_to_stage\"", static_cast<uint16_t>(KINETUM_NEXT_STAGE_UNSET - 1),
 				     candidate.route_to_stage) ||
@@ -366,6 +366,9 @@ KINETUM_HOT uint64_t test_process(kinetum_batch_t *batch) noexcept
 			break;
 		case 10:
 			batch->ctx = nullptr;
+			break;
+		case 12:
+			++batch->now_ns;
 			break;
 		case 11:
 			if (count < KINETUM_MAX_BURST) {

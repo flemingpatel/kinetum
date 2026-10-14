@@ -1147,7 +1147,7 @@ async def run_rollback_test(context: ScenarioContext) -> RollbackTestResult:
         # -----------------------------------------------------------------
         # ACL: 1 rule "allow_all", default=permit
         # NAT44: timeout=300s
-        # QoS: 10 Gbps, DSCP 10, 1000 KiB burst
+        # QoS: DSCP 10; rate and burst allowance are shared by both snapshots.
         # -----------------------------------------------------------------
         context.reporter.print_progress("Applying v1 config (baseline)...")
 
@@ -1197,7 +1197,7 @@ async def run_rollback_test(context: ScenarioContext) -> RollbackTestResult:
         # -----------------------------------------------------------------
         # ACL: 2 rules "deny_ssh + allow_rest", default=deny
         # NAT44: timeout=600s
-        # QoS: 10 Gbps, DSCP 20, 500 KiB burst
+        # QoS: DSCP 20; rate and burst allowance are unchanged.
         # -----------------------------------------------------------------
         context.reporter.print_progress("Applying v2 config (different settings)...")
 
@@ -1247,7 +1247,7 @@ async def run_rollback_test(context: ScenarioContext) -> RollbackTestResult:
         # Expected result: Hybrid snapshot with:
         #   - ACL from v1 (1 rule, permit)
         #   - NAT44 from v2 (600s) - NOT rolled back
-        #   - QoS from v2 (DSCP 20, 500 KiB burst) - NOT rolled back
+        #   - QoS from v2 (DSCP 20) - NOT rolled back
         # -----------------------------------------------------------------
         context.reporter.print_progress(
             "Testing selective rollback (ACL only to v1)..."

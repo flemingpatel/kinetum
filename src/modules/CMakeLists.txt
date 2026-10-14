@@ -35,7 +35,7 @@ add_subdirectory(acl)
 # NAT44 Module - Stateful NAT with one context-local session table
 add_subdirectory(nat44)
 
-# QoS Module - Token bucket rate limiting with fixed-point arithmetic
+# QoS Module - Token bucket rate limiting with exact fractional-byte credit
 add_subdirectory(qos)
 
 # Print build summary

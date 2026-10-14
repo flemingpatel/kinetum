@@ -42,5 +42,5 @@ modules {
   module_id: "kinetum.qos"
   revision: 1
   content_type: "application/json"
-  config_blob: "{ \"default_profile\": \"default\", \"profiles\": [ { \"name\": \"default\", \"cir_kbps\": 10000000, \"cbs_kb\": 1000, \"conform_dscp\": 10 } ] }"
+  config_blob: "{ \"default_profile\": \"default\", \"profiles\": [ { \"name\": \"default\", \"cir_kbps\": 10000000, \"cbs_kb\": 4096, \"conform_dscp\": 10 } ] }"
 }
