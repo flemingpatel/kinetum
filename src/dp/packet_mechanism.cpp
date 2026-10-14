@@ -113,14 +113,17 @@ KINETUM_ALWAYS_INLINE void project_record_to_batch(const packet_record &packet, 
  * @param packets Exact input records, in the original occupied-lane order.
  * @param region_id Immutable owner-worker region.
  * @param view Executable view that supplied this callback.
+ * @param now_ns Immutable owner time supplied before the callback.
  * @return true only when the header and complete occupied prefix remain valid.
  */
 [[nodiscard]] bool validate_module_batch_after_callback(const kinetum_batch_t &batch,
 							std::span<packet_record *const> packets, uint16_t region_id,
-							const module::module_executable_view &view) noexcept
+							const module::module_executable_view &view,
+							uint64_t now_ns) noexcept
 {
 	if (batch.count != packets.size() || batch.region_id != region_id || batch.padding != 0u ||
-	    batch.epoch != view.epoch || batch.epoch_config != view.packet_config || batch.ctx != view.context) {
+	    batch.epoch != view.epoch || batch.epoch_config != view.packet_config || batch.ctx != view.context ||
+	    batch.now_ns != now_ns) {
 		return false;
 	}
 	for (std::size_t index = 0u; index < packets.size(); ++index) {
@@ -315,6 +318,7 @@ namespace
  * @param store Exact context-local executable-view authority.
  * @param stage_instance_index Exact executable stage-instance index.
  * @param region_id Sole-owner runtime region.
+ * @param now_ns Exact owner-worker turn time, independent of packet-origin timestamps.
  * @param packets Borrowed occupied prefix of caller-owned records.
  * @param active_ctx Exact active services, or null in the passive instantiation.
  * @param scratch Owner-worker reusable ABI batch.
@@ -322,7 +326,7 @@ namespace
  */
 template <bool active>
 [[nodiscard]] KINETUM_ALWAYS_INLINE uint64_t execute_module_batch_mechanism_impl(
-	module::module_epoch_store &store, uint16_t stage_instance_index, int32_t region_id,
+	module::module_epoch_store &store, uint16_t stage_instance_index, int32_t region_id, uint64_t now_ns,
 	std::span<packet_record *const> packets, kinetum_active_ctx *active_ctx, module_batch_scratch &scratch) noexcept
 {
 	if (KINETUM_UNLIKELY(packets.empty() || packets.size() > KINETUM_MAX_BURST || region_id < 0 ||
@@ -355,13 +359,19 @@ template <bool active>
 	batch.epoch = view.epoch;
 	batch.epoch_config = view.packet_config;
 	batch.ctx = view.context;
+	batch.now_ns = now_ns;
 	const uint64_t forward_mask = invoke_module_packet<active>(view, active_ctx, batch);
+	if constexpr (active) {
+		if (KINETUM_UNLIKELY(active_ctx->now_ns != now_ns)) {
+			std::terminate();
+		}
+	}
 	if (KINETUM_UNLIKELY((forward_mask & ~KINETUM_FORWARD_MASK(count)) != 0u)) {
 		// An out-of-prefix bit is a foreign ABI violation, not another disposition.
 		std::terminate();
 	}
-	if (KINETUM_UNLIKELY(
-		    !validate_module_batch_after_callback(batch, packets, static_cast<uint16_t>(region_id), view))) {
+	if (KINETUM_UNLIKELY(!validate_module_batch_after_callback(batch, packets, static_cast<uint16_t>(region_id),
+								   view, now_ns))) {
 		// Validate the complete prefix before publishing any foreign metadata.
 		// Storage, provenance, and executable identity cannot be reconstructed
 		// after a callback replaces their authority.
@@ -376,19 +386,19 @@ template <bool active>
 }  // namespace
 
 uint64_t execute_module_batch_mechanism(module::module_epoch_store &store, uint16_t stage_instance_index,
-					int32_t region_id, std::span<packet_record *const> packets,
+					int32_t region_id, uint64_t now_ns, std::span<packet_record *const> packets,
 					module_batch_scratch &scratch) noexcept
 {
-	return execute_module_batch_mechanism_impl<false>(store, stage_instance_index, region_id, packets, nullptr,
-							  scratch);
+	return execute_module_batch_mechanism_impl<false>(store, stage_instance_index, region_id, now_ns, packets,
+							  nullptr, scratch);
 }
 
 uint64_t execute_active_module_batch_mechanism(module::module_epoch_store &store, uint16_t stage_instance_index,
 					       int32_t region_id, std::span<packet_record *const> packets,
 					       kinetum_active_ctx &active_ctx, module_batch_scratch &scratch) noexcept
 {
-	return execute_module_batch_mechanism_impl<true>(store, stage_instance_index, region_id, packets, &active_ctx,
-							 scratch);
+	return execute_module_batch_mechanism_impl<true>(store, stage_instance_index, region_id, active_ctx.now_ns,
+							 packets, &active_ctx, scratch);
 }
 
 }  // namespace kinetum::dp

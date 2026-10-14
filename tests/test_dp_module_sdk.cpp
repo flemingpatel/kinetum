@@ -239,7 +239,7 @@ TEST(module_sdk, admits_exact_image_context_and_processes_packet)
 	test::packet_record_test_owner packet(std::vector<uint8_t>(64, 0));
 	ASSERT_TRUE(packet.valid()) << packet.error();
 	initialize_module_packet(*packet.get());
-	EXPECT_TRUE(module->process(*packet.get()));
+	EXPECT_TRUE(module->process(*packet.get(), 0u));
 }
 
 /** @brief Prove the exact drop policy clears every packet disposition. */
@@ -252,7 +252,7 @@ TEST(module_sdk, exact_drop_policy_drops_every_packet)
 	test::packet_record_test_owner packet(std::vector<uint8_t>(64, 0));
 	ASSERT_TRUE(packet.valid()) << packet.error();
 	initialize_module_packet(*packet.get());
-	EXPECT_FALSE(module->process(*packet.get()));
+	EXPECT_FALSE(module->process(*packet.get(), 0u));
 }
 
 /** @brief Prove the DSCP policy drops only its exact configured value. */
@@ -268,8 +268,8 @@ TEST(module_sdk, exact_dscp_policy_drops_only_matching_value)
 	ASSERT_TRUE(permitted.valid()) << permitted.error();
 	initialize_module_packet(*denied.get(), 46);
 	initialize_module_packet(*permitted.get(), 10);
-	EXPECT_FALSE(module->process(*denied.get()));
-	EXPECT_TRUE(module->process(*permitted.get()));
+	EXPECT_FALSE(module->process(*denied.get(), 0u));
+	EXPECT_TRUE(module->process(*permitted.get(), 0u));
 }
 
 /** @brief Prove route policy publishes its exact compiled next-stage index. */
@@ -282,7 +282,7 @@ TEST(module_sdk, exact_route_policy_publishes_next_stage)
 	test::packet_record_test_owner packet(std::vector<uint8_t>(64, 0));
 	ASSERT_TRUE(packet.valid()) << packet.error();
 	initialize_module_packet(*packet.get());
-	ASSERT_TRUE(module->process(*packet.get()));
+	ASSERT_TRUE(module->process(*packet.get(), 0u));
 	EXPECT_EQ(packet.metadata().module_next_stage, 9u);
 }
 
@@ -526,6 +526,8 @@ TEST(dp_module_sdk, older_abi_version_is_rejected)
 	auto descriptor = valid_passive_descriptor();
 	descriptor.abi_version = KINETUM_MODULE_ABI_VERSION - 1u;
 	EXPECT_FALSE(module::validate_module_descriptor(&descriptor).is_ok());
+	descriptor.abi_version = 0x00010000u;
+	EXPECT_FALSE(module::validate_module_descriptor(&descriptor).is_ok());
 }
 
 /** @brief Prove a newer module ABI identity is rejected. */
@@ -732,7 +734,7 @@ TEST(module_sdk, batch_masks_and_metadata_cover_every_occupied_lane)
 	}
 	for (const uint16_t count : std::array<uint16_t, 6>{1u, 7u, 31u, 32u, 63u, 64u}) {
 		const uint64_t occupied = count == 64u ? UINT64_MAX : (UINT64_C(1) << count) - 1u;
-		EXPECT_EQ(module->process_batch({records.data(), count}), expected & occupied) << count;
+		EXPECT_EQ(module->process_batch({records.data(), count}, 123u), expected & occupied) << count;
 		for (uint16_t lane = 0u; lane < count; ++lane) {
 			EXPECT_EQ(records[lane]->metadata.ingress_port, lane % KINETUM_MAX_PORTS);
 			EXPECT_EQ(records[lane]->metadata.timestamp_ns, 1000u + lane);
@@ -742,7 +744,7 @@ TEST(module_sdk, batch_masks_and_metadata_cover_every_occupied_lane)
 	}
 	// A mismatched last lane rejects the whole prefix before the callback.
 	records.back()->metadata.epoch = 2u;
-	EXPECT_EQ(module->process_batch(records), 0u);
+	EXPECT_EQ(module->process_batch(records, 123u), 0u);
 	EXPECT_EQ(module->context().epoch_store->diagnostics_after_quiescence().mismatch_count, 1u);
 	bool found_batches = false;
 	const auto &lifecycle_owner = *module->context().lifecycle_owner;
@@ -832,8 +834,8 @@ TEST(stage_counter, passthrough_stage)
 	initialize_module_packet(*packet.get());
 	packet.metadata().epoch = 7;
 	ASSERT_NE(module->context().epoch_store, nullptr);
-	ASSERT_TRUE(
-		engine.execute_module_stage(*module->context().epoch_store, 0, 3, std::array{packet.get()}, scratch));
+	ASSERT_TRUE(engine.execute_module_stage(*module->context().epoch_store, 0, 3, 123u, std::array{packet.get()},
+						scratch));
 
 	const auto observed = engine.stats();
 	EXPECT_EQ(observed.rx_packets, 0u);
@@ -856,8 +858,8 @@ TEST(stage_counter, filtering_stage)
 	initialize_module_packet(*packet.get());
 	packet.metadata().epoch = 7;
 	ASSERT_NE(module->context().epoch_store, nullptr);
-	EXPECT_FALSE(
-		engine.execute_module_stage(*module->context().epoch_store, 0, 3, std::array{packet.get()}, scratch));
+	EXPECT_FALSE(engine.execute_module_stage(*module->context().epoch_store, 0, 3, 123u, std::array{packet.get()},
+						 scratch));
 
 	const auto observed = engine.stats();
 	EXPECT_EQ(observed.rx_packets, 0u);
@@ -881,10 +883,15 @@ TEST(dp_module_sdk, engine_executes_matching_exact_module_view)
 	packet.metadata().epoch = 7;
 	packet.metadata().timestamp_ns = 1234;
 	ASSERT_NE(module->context().epoch_store, nullptr);
-	EXPECT_TRUE(
-		engine.execute_module_stage(*module->context().epoch_store, 0, 3, std::array{packet.get()}, scratch));
+	EXPECT_TRUE(engine.execute_module_stage(*module->context().epoch_store, 0, 3, 123u, std::array{packet.get()},
+						scratch));
 	EXPECT_EQ(packet.metadata().module_next_stage, 9u);
 	EXPECT_EQ(scratch.batch.epoch, 7u);
+	EXPECT_EQ(scratch.batch.ts_ns[0], 1234u);
+	EXPECT_EQ(scratch.batch.now_ns, 123u);
+	EXPECT_TRUE(engine.execute_module_stage(*module->context().epoch_store, 0, 3, 456u, std::array{packet.get()},
+						scratch));
+	EXPECT_EQ(scratch.batch.now_ns, 456u);
 	EXPECT_EQ(scratch.batch.ts_ns[0], 1234u);
 }
 
@@ -905,8 +912,8 @@ TEST(dp_module_sdk, engine_publishes_mutable_module_metadata_to_exact_record)
 	packet.metadata().timestamp_ns = 1234;
 	packet.metadata().ingress_port = 5;
 	ASSERT_NE(module->context().epoch_store, nullptr);
-	ASSERT_TRUE(
-		engine.execute_module_stage(*module->context().epoch_store, 0, 3, std::array{packet.get()}, scratch));
+	ASSERT_TRUE(engine.execute_module_stage(*module->context().epoch_store, 0, 3, 123u, std::array{packet.get()},
+						scratch));
 
 	EXPECT_EQ(packet.metadata().ip_offset, 14u);
 	EXPECT_EQ(packet.metadata().l4_offset, 34u);
@@ -931,7 +938,7 @@ TEST(dp_module_sdk, engine_rejects_module_batch_authority_corruption)
 {
 	using packet_owners = std::array<std::unique_ptr<test::packet_record_test_owner>, 64u>;
 	using packet_records = std::array<packet_record *, 64u>;
-	for (uint32_t corruption = 1; corruption <= 11; ++corruption) {
+	for (uint32_t corruption = 1; corruption <= 12; ++corruption) {
 		for (const uint16_t size : std::array<uint16_t, 2>{1u, 64u}) {
 			// A full uint64 mask has no out-of-prefix bit; use 63 for that fault.
 			const uint16_t count = corruption == 11u && size == 64u ? 63u : size;
@@ -965,7 +972,7 @@ TEST(dp_module_sdk, engine_rejects_module_batch_authority_corruption)
 					dp_engine engine;
 					module_batch_scratch scratch{};
 					(void)engine.execute_module_stage(
-						*module->context().epoch_store, 0u, 3,
+						*module->context().epoch_store, 0u, 3, 123u,
 						std::span<packet_record *const>(records.data(), count), scratch);
 					std::_Exit(0);
 				},
@@ -989,8 +996,8 @@ TEST(dp_module_sdk, engine_rejects_incoherent_module_packet_facts)
 	initialize_module_packet(*packet.get());
 	packet.metadata().epoch = 7;
 	ASSERT_NE(module->context().epoch_store, nullptr);
-	EXPECT_DEATH((void)engine.execute_module_stage(*module->context().epoch_store, 0, 3, std::array{packet.get()},
-						       scratch),
+	EXPECT_DEATH((void)engine.execute_module_stage(*module->context().epoch_store, 0, 3, 123u,
+						       std::array{packet.get()}, scratch),
 		     "");
 }
 
@@ -1011,8 +1018,8 @@ TEST(dp_module_sdk, engine_reuse_overwrites_every_index_zero_batch_field)
 	packet.metadata().epoch = 7;
 	packet.metadata().timestamp_ns = 4321;
 	ASSERT_NE(module->context().epoch_store, nullptr);
-	ASSERT_TRUE(
-		engine.execute_module_stage(*module->context().epoch_store, 0, 3, std::array{packet.get()}, scratch));
+	ASSERT_TRUE(engine.execute_module_stage(*module->context().epoch_store, 0, 3, 123u, std::array{packet.get()},
+						scratch));
 
 	ASSERT_NE(module->context().epoch_store->active_view(), nullptr);
 	EXPECT_EQ(scratch.batch.data[0], packet.data());
@@ -1065,40 +1072,40 @@ TEST(dp_module_sdk, engine_rejects_unmaterialized_cpu_record_shapes)
 
 	module_batch_scratch scratch{};
 	ASSERT_NE(module->context().epoch_store, nullptr);
-	EXPECT_FALSE(
-		engine.execute_module_stage(*module->context().epoch_store, 0, 3, std::array{packet.get()}, scratch));
+	EXPECT_FALSE(engine.execute_module_stage(*module->context().epoch_store, 0, 3, 123u, std::array{packet.get()},
+						 scratch));
 
 	packet.get()->storage.segment_count = 1;
 	packet.get()->storage.contiguous_length = 32;
 	EXPECT_FALSE(engine.execute_stage(&parse, packet.get()));
-	EXPECT_FALSE(
-		engine.execute_module_stage(*module->context().epoch_store, 0, 3, std::array{packet.get()}, scratch));
+	EXPECT_FALSE(engine.execute_module_stage(*module->context().epoch_store, 0, 3, 123u, std::array{packet.get()},
+						 scratch));
 
 	packet.get()->storage.contiguous_length = 64;
 	packet.get()->storage.data = nullptr;
 	EXPECT_FALSE(engine.execute_stage(&parse, packet.get()));
-	EXPECT_FALSE(
-		engine.execute_module_stage(*module->context().epoch_store, 0, 3, std::array{packet.get()}, scratch));
+	EXPECT_FALSE(engine.execute_module_stage(*module->context().epoch_store, 0, 3, 123u, std::array{packet.get()},
+						 scratch));
 
 	packet.get()->storage.data = storage_data;
 	const uint32_t storage_capabilities = packet.get()->storage.capabilities;
 	packet.get()->storage.capabilities &= ~packet_storage_capabilities::CPU_CONTIGUOUS_READ;
 	EXPECT_FALSE(engine.execute_stage(&parse, packet.get()));
-	EXPECT_FALSE(
-		engine.execute_module_stage(*module->context().epoch_store, 0, 3, std::array{packet.get()}, scratch));
+	EXPECT_FALSE(engine.execute_module_stage(*module->context().epoch_store, 0, 3, 123u, std::array{packet.get()},
+						 scratch));
 
 	packet.get()->storage.capabilities = storage_capabilities & ~packet_storage_capabilities::CPU_CONTIGUOUS_WRITE;
 	EXPECT_FALSE(engine.execute_stage(&parse, packet.get()));
-	EXPECT_FALSE(
-		engine.execute_module_stage(*module->context().epoch_store, 0, 3, std::array{packet.get()}, scratch));
+	EXPECT_FALSE(engine.execute_module_stage(*module->context().epoch_store, 0, 3, 123u, std::array{packet.get()},
+						 scratch));
 
 	packet.get()->storage.capabilities = storage_capabilities & ~packet_storage_capabilities::WRITABLE_CLONE;
 	EXPECT_TRUE(packet_record_has_current_cpu_shape(packet.get()));
 
 	packet.get()->storage.capabilities = storage_capabilities | (UINT32_C(1) << 31);
 	EXPECT_FALSE(engine.execute_stage(&parse, packet.get()));
-	EXPECT_FALSE(
-		engine.execute_module_stage(*module->context().epoch_store, 0, 3, std::array{packet.get()}, scratch));
+	EXPECT_FALSE(engine.execute_module_stage(*module->context().epoch_store, 0, 3, 123u, std::array{packet.get()},
+						 scratch));
 	EXPECT_EQ(packet.metadata().module_next_stage, KINETUM_NEXT_STAGE_UNSET);
 	EXPECT_EQ(module->context().epoch_store->diagnostics_after_quiescence().mismatch_count, 0u);
 	EXPECT_EQ(engine.stats().rx_packets, 0u);
@@ -1132,7 +1139,7 @@ TEST(dp_module_sdk, engine_rejects_exact_epoch_mismatch_with_bounded_evidence)
 	ASSERT_NE(module->context().epoch_store, nullptr);
 	auto *record = packet.take();
 	ASSERT_NE(record, nullptr);
-	EXPECT_FALSE(engine.execute_module_stage(*module->context().epoch_store, STAGE_INSTANCE_INDEX, 2,
+	EXPECT_FALSE(engine.execute_module_stage(*module->context().epoch_store, STAGE_INSTANCE_INDEX, 2, 123u,
 						 std::array{record}, scratch));
 	EXPECT_EQ(record->metadata.module_next_stage, KINETUM_NEXT_STAGE_UNSET);
 	const auto *operations = record->storage.operations;

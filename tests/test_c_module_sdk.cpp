@@ -56,8 +56,8 @@ TEST(c_module_sdk, plain_c_image_admits_prepares_executes_and_retires)
 	forwarded.metadata().dscp = 31;
 	dropped.metadata().platform_flags |= kinetum::dp::packet_platform_flags::L3_IPV4;
 	dropped.metadata().dscp = 32;
-	EXPECT_TRUE(module->process(*forwarded.get()));
-	EXPECT_FALSE(module->process(*dropped.get()));
+	EXPECT_TRUE(module->process(*forwarded.get(), 0u));
+	EXPECT_FALSE(module->process(*dropped.get(), 0u));
 	EXPECT_TRUE(module->retire().is_ok());
 }
 

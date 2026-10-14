@@ -501,6 +501,7 @@ TEST(worker_active_stage_scheduler, full_ingest_batch_retains_each_lane_once)
 	EXPECT_EQ(result, (active_ingest_result{0u, UINT64_MAX}));
 	EXPECT_EQ(fixture->state->ingest_call_count.load(std::memory_order_relaxed), 1u);
 	EXPECT_EQ(fixture->state->ingest_total_packets.load(std::memory_order_relaxed), 64u);
+	EXPECT_EQ(fixture->state->last_ingest_now_ns.load(std::memory_order_relaxed), 1000000u);
 	for (std::size_t lane = 0u; lane < records.size(); ++lane) {
 		if ((result.retained_mask & (UINT64_C(1) << lane)) == 0u) {
 			fixture->ledger->retire(TEST_ACTIVE_EPOCH);
@@ -666,6 +667,31 @@ TEST(worker_active_stage_scheduler, retained_packet_drain_preserves_one_credit_a
 	fixture->scheduler->service_turn_synchronous(UINT64_C(6000000));
 	EXPECT_EQ(fixture->packets.retained_drops, 2u);
 	EXPECT_TRUE(fixture->scheduler->empty());
+}
+
+/** @brief Both callback time views are immutable even when the callback invokes no active service. */
+TEST(worker_active_stage_scheduler, ingest_time_authorities_are_immutable)
+{
+	auto fixture_or = scheduler_fixture::create();
+	ASSERT_TRUE(fixture_or.is_ok()) << fixture_or.error().message();
+	auto fixture = std::move(fixture_or).value();
+	fixture->state->retain_on_next_ingest.store(false, std::memory_order_relaxed);
+	kinetum::test::packet_record_test_owner packet(std::vector<uint8_t>(64u, 0u), TEST_ACTIVE_EPOCH);
+	ASSERT_TRUE(packet.valid()) << packet.error();
+	packet.metadata().current_stage = 0u;
+	packet.metadata().current_stage_instance = 0u;
+	module_batch_scratch scratch{};
+	for (uint8_t fault : {uint8_t{1}, uint8_t{2}}) {
+		fixture->state->corrupt_ingest_time.store(fault, std::memory_order_relaxed);
+		EXPECT_DEATH(
+			{
+				fixture->ledger->acquire(TEST_ACTIVE_EPOCH);
+				(void)fixture->scheduler->ingest_synchronous(0u, std::array{packet.get()}, 0, scratch,
+									     0u);
+				std::_Exit(0);
+			},
+			"");
+	}
 }
 
 /** @brief Prove a second retain of one ingest lane is a module-contract violation. */

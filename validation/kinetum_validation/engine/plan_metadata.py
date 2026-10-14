@@ -104,6 +104,14 @@ class PlanModuleContextDomainMetadata:
 
 
 @dataclass(frozen=True)
+class PlanModuleContextMetadata:
+    """One emitted context-to-logical-stage relation, without inferred ID parsing."""
+
+    context_instance_id: str
+    logical_stage_id: str
+
+
+@dataclass(frozen=True)
 class PlanStorageTransitionMetadata:
     """Exact storage-domain change declared on one compiled packet edge."""
 
@@ -121,6 +129,7 @@ class PlanTopologyMetadata:
     storage_domains: Tuple[PlanStorageDomainMetadata, ...]
     steering_profiles: Tuple[PlanSteeringProfileMetadata, ...]
     module_context_domains: Tuple[PlanModuleContextDomainMetadata, ...]
+    module_contexts: Tuple[PlanModuleContextMetadata, ...]
     storage_transitions: Tuple[PlanStorageTransitionMetadata, ...]
 
 
@@ -292,6 +301,14 @@ def parse_plan_topology(plan_file: Path) -> PlanTopologyMetadata:
         storage_domains=storage_domains,
         steering_profiles=steering_profiles,
         module_context_domains=module_context_domains,
+        module_contexts=tuple(
+            PlanModuleContextMetadata(
+                context_instance_id=_required_scalar(record, "context_instance_id", "stage_instances"),
+                logical_stage_id=_required_scalar(record, "logical_stage_id", "stage_instances"),
+            )
+            for record in _parse_top_level_records(lines, "stage_instances")
+            if record.scalars.get("context_instance_id")
+        ),
         storage_transitions=tuple(
             PlanStorageTransitionMetadata(
                 transition_id=_required_scalar(record, "transition_id", "storage_transitions"),

@@ -394,18 +394,13 @@ class packet_worker_kernel::implementation final {
 	/** @return OK after binding every RX stream and inbound boundary to one fair service order. */
 	[[nodiscard]] common::status initialize_input_scheduler_();
 	/**
-	 * @brief Refresh the sole turn timestamp and active-scheduler cache.
-	 * @tparam has_active_scheduler Whether this loop owns active callback state.
+	 * @brief Refresh and retain the sole timestamp for all work in this turn.
 	 * @return Exact platform monotonic turn timestamp.
 	 */
-	template <bool has_active_scheduler>
 	[[nodiscard]] KINETUM_ALWAYS_INLINE uint64_t refresh_turn_time_() noexcept
 	{
-		const uint64_t now_ns = common::update_cached_ns();
-		if constexpr (has_active_scheduler) {
-			cached_turn_time_ns_ = now_ns;
-		}
-		return now_ns;
+		cached_turn_time_ns_ = common::update_cached_ns();
+		return cached_turn_time_ns_;
 	}
 	/** @return OK after selecting one source polling kernel from callback identity. */
 	[[nodiscard]] common::status select_source_kernel_() noexcept;
@@ -850,10 +845,10 @@ class packet_worker_kernel::implementation final {
 	receive_burst_function homogeneous_receive_burst_{nullptr};	    ///< Sole homogeneous callback target.
 	bool outbound_closed_{false};					    ///< Exact-once shutdown publication.
 	bool run_started_{false};					    ///< Sole owner entered the loop once.
-	bool run_finished_{false};			     ///< Complete drain and final flush succeeded.
-	uint64_t cached_turn_time_ns_{0};		     ///< Sole timestamp observed by active services this turn.
-	std::size_t module_telemetry_cursor_{0};	     ///< Bounded round-robin context publication cursor.
-	std::size_t module_telemetry_remaining_{0};	     ///< Contexts left in the current cadence sweep.
+	bool run_finished_{false};		     ///< Complete drain and final flush succeeded.
+	uint64_t cached_turn_time_ns_{0};	     ///< Sole turn timestamp for packet callbacks and active services.
+	std::size_t module_telemetry_cursor_{0};     ///< Bounded round-robin context publication cursor.
+	std::size_t module_telemetry_remaining_{0};  ///< Contexts left in the current cadence sweep.
 	std::size_t telemetry_cadence_returns_expected_{0};  ///< Ordinary completed banks awaiting return.
 	bool module_telemetry_sweep_queued_{false};	     ///< One coalesced cadence behind the active sweep.
 	bool telemetry_return_poll_requested_{false};	     ///< One bounded reclaimed-return probe is due.
@@ -2608,7 +2603,8 @@ void packet_worker_kernel::implementation::execute_module_batch_(std::span<packe
 	const auto execute_passive = [&]() noexcept {
 		return execute_module_batch_mechanism(*stage.module_store,
 						      static_cast<uint16_t>(stage.facts->stage_instance_index),
-						      stage.region_id, occupied, scratch_->module);
+						      stage.region_id, cached_turn_time_ns_, occupied,
+						      scratch_->module);
 	};
 	active_ingest_result result;
 	if constexpr (has_active_scheduler) {
@@ -3785,7 +3781,7 @@ void packet_worker_kernel::implementation::run_loop_(poll_source_type poll_sourc
 		}
 		uint64_t cached_time = 0u;
 		if (KINETUM_LIKELY(module_telemetry_remaining_ == 0u)) {
-			cached_time = refresh_turn_time_<has_active_scheduler>();
+			cached_time = refresh_turn_time_();
 		} else {
 			if (module_telemetry_.empty() || module_health_ == nullptr) {
 				std::terminate();
@@ -3799,7 +3795,7 @@ void packet_worker_kernel::implementation::run_loop_(poll_source_type poll_sourc
 				std::terminate();
 			}
 			auto health_invocation = module_health_->begin(context_ordinal);
-			cached_time = refresh_turn_time_<has_active_scheduler>();
+			cached_time = refresh_turn_time_();
 			uint64_t publication_time = cached_time;
 			if (health_invocation.has_value()) {
 				health_invocation->invoke(cached_time);

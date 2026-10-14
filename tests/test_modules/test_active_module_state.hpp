@@ -28,9 +28,11 @@ namespace kinetum::test
 
 /** @brief Context-local observation and action state for the exact active test module. */
 struct test_active_state {
-	std::atomic<uint32_t> ingest_call_count{0};		   ///< Ingest callback invocations.
-	std::atomic<uint32_t> ingest_total_packets{0};		   ///< Total ingested packet records.
-	std::atomic<uint64_t> last_ingest_epoch{0};		   ///< Most recent exact packet epoch.
+	std::atomic<uint32_t> ingest_call_count{0};	///< Ingest callback invocations.
+	std::atomic<uint32_t> ingest_total_packets{0};	///< Total ingested packet records.
+	std::atomic<uint64_t> last_ingest_epoch{0};	///< Most recent exact packet epoch.
+	std::atomic<uint64_t> last_ingest_now_ns{0};	///< Most recent batch processing time.
+	std::atomic<uint8_t> corrupt_ingest_time{0};	///< Fault selector: 1=batch time, 2=active-context time.
 	std::atomic<std::uintptr_t> last_ingest_packet_config{0};  ///< Most recent packet-config identity.
 	std::atomic<uint32_t> run_call_count{0};		   ///< Active run callback invocations.
 	std::atomic<uint32_t> last_triggers{0};			   ///< Most recent trigger mask.

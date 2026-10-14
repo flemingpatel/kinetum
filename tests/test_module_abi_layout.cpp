@@ -53,6 +53,7 @@ TEST(module_abi_layout, packet_batch)
 	EXPECT_EQ(offsetof(kinetum_batch_t, epoch), 4168u);
 	EXPECT_EQ(offsetof(kinetum_batch_t, epoch_config), 4176u);
 	EXPECT_EQ(offsetof(kinetum_batch_t, ctx), 4184u);
+	EXPECT_EQ(offsetof(kinetum_batch_t, now_ns), 4192u);
 	uint32_t mask_count = 1;
 	EXPECT_EQ(KINETUM_FORWARD_MASK(mask_count++), UINT64_C(1));
 	EXPECT_EQ(mask_count, 2u);
@@ -398,7 +399,7 @@ TEST(module_abi_layout, scalar_version_and_flag_contract)
 	EXPECT_EQ(sizeof(kinetum_error), 4u);
 	EXPECT_EQ(sizeof(kinetum_module_mode), 4u);
 	EXPECT_EQ(KINETUM_PKT_F_PLATFORM_MASK, 0x4du);
-	EXPECT_EQ(KINETUM_MODULE_ABI_VERSION, 0x00010000u);
+	EXPECT_EQ(KINETUM_MODULE_ABI_VERSION, 0x00020000u);
 	EXPECT_EQ(KINETUM_MOD_F_KNOWN_MASK, 0xfu);
 	EXPECT_EQ(KINETUM_MOD_F_CONTEXT_SELECTION, 0x8u);
 	EXPECT_EQ(KINETUM_MOD_F_TRACKED_ASYNC_EPOCH_WORK, 0x4u);

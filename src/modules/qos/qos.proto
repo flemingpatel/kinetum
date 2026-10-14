@@ -11,7 +11,7 @@
 //
 // Ownership model:
 //   - Platform provides MECHANISM (epoch transitions, blob routing)
-//   - Module provides POLICY (rate limiting, traffic shaping)
+//   - Module provides POLICY (per-flow policing and DSCP remarking)
 //   - Platform does NOT parse this proto - it routes opaque bytes to module
 //
 // Usage:
@@ -30,15 +30,15 @@ option cc_enable_arenas = true;
 // QoS Profile Definition
 // =============================================================================
 
-// QosProfile defines a traffic class with rate limits.
+// QosProfile defines rate and burst limits applied to each metered flow.
 message QosProfile {
   // Profile name
   string name = 1;
 
-  // Committed Information Rate (kbps)
+  // Committed Information Rate (kilobits/s, 1000 bits per kilobit; 0 = unlimited).
   int64 cir_kbps = 2;
 
-  // Committed Burst Size (KB)
+  // Committed Burst Size (KiB, 1024 bytes per unit).
   int64 cbs_kb = 3;
 
   // DSCP remarking for conforming packets (0 = no remark)
@@ -58,11 +58,11 @@ message QosProfiles {
   // Available profiles
   repeated QosProfile profiles = 1;
 
-  // Default profile name for unclassified traffic
+  // Default profile name when no DSCP-specific profile matches.
   string default_profile = 2;
 
-  // GC trigger mask (run GC when (counter & mask) == 0).
-  // Default: 0xffff (every 65536 packets)
+  // GC trigger mask over valid policing operations (run GC when (counter & mask) == 0).
+  // Default: 0xffff (every 65536 operations).
   uint64 gc_trigger_mask = 3;
 
   // Maximum flow buckets to evict per GC cycle (1..1024 when authored).

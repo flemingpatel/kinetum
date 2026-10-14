@@ -20,7 +20,7 @@
  * Hot-Path Optimization (Context-Owner Design):
  * - Each admitted module context owns one preallocated policer
  * - NO LOCKS in hot path - one packet worker is the sole writer
- * - RSS keeps each flow on the same owner worker
+ * - The admitted pipeline keeps each metered flow with its context owner
  * - One bounded index pool recycles preallocated slab entries without growth
  * - Follows Platform Engineering Guide: "No locks on hot path"
  */
@@ -35,6 +35,8 @@
 
 #include <kinetum/algo/bounded_index_pool.hpp>
 #include <kinetum/algo/cuckoo.hpp>
+#include <kinetum/algo/hash.hpp>
+#include <kinetum/algo/ratelimit.hpp>
 #include "src/modules/module_config_json.hpp"
 
 namespace kinetum::modules::qos
@@ -44,7 +46,7 @@ namespace kinetum::modules::qos
 // Constants
 // =============================================================================
 
-/** @brief Default mask that schedules one GC cycle per 65,536 packets. */
+/** @brief Default mask that schedules one GC cycle per 65,536 valid policing operations. */
 inline constexpr uint64_t DEFAULT_QOS_GC_TRIGGER_MASK = 0xffffull;
 
 /** @brief Default maximum number of flows reclaimed by one GC cycle. */
@@ -59,18 +61,64 @@ inline constexpr uint32_t QOS_DEFAULT_MAX_FLOWS = 65536;
 /** @brief Maximum slab entries inspected by one bounded GC cycle. */
 inline constexpr uint32_t DEFAULT_QOS_GC_SCAN_LIMIT = 1024;
 
-/** @brief Fractional bit count used by fixed-point token accounting. */
-inline constexpr int QOS_FIXED_POINT_SHIFT = 20;
-
-/** @brief Largest burst representable by the signed fixed-point accumulator. */
-inline constexpr uint64_t QOS_MAX_BURST_BYTES =
-	static_cast<uint64_t>(std::numeric_limits<int64_t>::max() >> QOS_FIXED_POINT_SHIFT);
-
 /** @brief Largest `cbs_kb` accepted by the QoS config compiler. */
-inline constexpr int64_t QOS_MAX_CBS_KB = static_cast<int64_t>(QOS_MAX_BURST_BYTES / 1024);
+inline constexpr int64_t QOS_MAX_CBS_KB = static_cast<int64_t>(std::numeric_limits<uint64_t>::max() / 1024u);
 
 /** @brief Largest `cir_kbps` whose bytes-per-second conversion cannot overflow. */
-inline constexpr int64_t QOS_MAX_CIR_KBPS = static_cast<int64_t>(std::numeric_limits<uint64_t>::max() / 1000ull);
+inline constexpr int64_t QOS_MAX_CIR_KBPS = static_cast<int64_t>(std::numeric_limits<uint64_t>::max() / 125u);
+
+/** @brief Exact identity class; missing transport bytes never select an aggregate. */
+enum class flow_kind : uint8_t {
+	UNSPECIFIED = 0,   ///< No admitted identity.
+	TRANSPORT = 1,	   ///< Unfragmented IPv4 TCP/UDP with both port fields present.
+	IP_AGGREGATE = 2,  ///< IPv4 fragments or a protocol without TCP/UDP ports.
+};
+
+/** @brief Directional post-rewrite identity; implicit padding is never hashed or compared. */
+struct flow_key {
+	uint32_t src_ip{0};			 ///< Source IPv4 lane.
+	uint32_t dst_ip{0};			 ///< Destination IPv4 lane.
+	uint16_t src_port{0};			 ///< Source port, or canonical zero for an aggregate.
+	uint16_t dst_port{0};			 ///< Destination port, or canonical zero for an aggregate.
+	uint8_t protocol{0};			 ///< IPv4 protocol lane.
+	flow_kind kind{flow_kind::UNSPECIFIED};	 ///< Exact tuple or aggregate class.
+
+	/** @return Equality of semantic fields only. */
+	[[nodiscard]] bool operator==(const flow_key &) const noexcept = default;
+	/** @return Whether the key has a complete class-specific shape. */
+	[[nodiscard]] bool valid() const noexcept
+	{
+		return (kind == flow_kind::TRANSPORT && (protocol == 6u || protocol == 17u)) ||
+		       (kind == flow_kind::IP_AGGREGATE && src_port == 0u && dst_port == 0u);
+	}
+};
+
+/** @brief Nonthrowing semantic-field hash; the parser's steering hash is not identity. */
+struct flow_identity_hash {
+	/** @param key Complete semantic key. @return Fixed-work candidate hash. */
+	[[nodiscard]] std::size_t operator()(const flow_key &key) const noexcept
+	{
+		uint64_t hash = algo::FNV1A_OFFSET_BASIS;
+		hash = (hash ^ key.src_ip) * algo::FNV1A_PRIME;
+		hash = (hash ^ key.dst_ip) * algo::FNV1A_PRIME;
+		hash = (hash ^ key.src_port) * algo::FNV1A_PRIME;
+		hash = (hash ^ key.dst_port) * algo::FNV1A_PRIME;
+		hash = (hash ^ key.protocol) * algo::FNV1A_PRIME;
+		return static_cast<std::size_t>((hash ^ static_cast<uint8_t>(key.kind)) * algo::FNV1A_PRIME);
+	}
+};
+
+static_assert(sizeof(flow_key) == 16 && std::is_trivially_copyable_v<flow_key>);
+static_assert(std::is_default_constructible_v<flow_key> && std::is_nothrow_copy_assignable_v<flow_key>);
+static_assert(sizeof(algo::cuckoo_bucket<flow_key, uint32_t>) == 128);
+
+/** @brief One policy outcome; trusted-state contradictions terminate instead of returning a drop. */
+enum class policer_result : uint8_t {
+	ALLOWED,	///< Exact cost consumed, or the selected profile is unlimited.
+	RATE_LIMIT,	///< Insufficient byte credit.
+	FLOW_CAPACITY,	///< No slab index or cuckoo position available.
+	INVALID_INPUT,	///< No valid semantic packet identity.
+};
 
 /**
  * @brief Runtime GC tuning for lock-free QoS policer.
@@ -151,7 +199,7 @@ static_assert(std::is_nothrow_move_constructible_v<qos_profiles_compiled>,
  *
  * Implements rate limiting using token bucket algorithm with:
  * - Pre-allocated cuckoo_map + contiguous bucket slab (zero hot-path malloc)
- * - Fixed-point arithmetic (Q20) for precision
+ * - Shared exact fractional-byte arithmetic
  * - Lock-free design for hot-path (no mutex, no shared_mutex)
  * - Incremental cursor-based garbage collection
  *
@@ -162,7 +210,7 @@ static_assert(std::is_nothrow_move_constructible_v<qos_profiles_compiled>,
  *
  * Thread Safety:
  * - Designed for one admitted context's sole packet worker
- * - RSS ensures the same flow always reaches the same owner worker
+ * - The admitted pipeline keeps the same flow with its context owner
  * - NO LOCKS - caller must ensure single-writer access
  *
  * Hot-path properties:
@@ -177,7 +225,7 @@ class qos_policer {
 	 * @brief Construct a lock-free policer with pre-allocated capacity.
 	 *
 	 * All memory is allocated here (construction-time, cold path).
-	 * No allocation occurs during allow() or GC (hot path).
+	 * No allocation occurs during police() or GC (hot path).
 	 *
 	 * @param max_flows Maximum concurrent flows (slab capacity).
 	 * @param memory_resource Exact context-lifetime storage authority.
@@ -191,6 +239,13 @@ class qos_policer {
 	[[nodiscard]] uint64_t active_flows() const noexcept;
 
 	/**
+	 * @brief Admit platform time before any policer or packet mutation.
+	 * @param now_ns Cached owner-worker time; zero and equal successive values are valid.
+	 * @note A regression contradicts the runtime clock contract and terminates.
+	 */
+	void observe_time(uint64_t now_ns) noexcept;
+
+	/**
 	 * @brief Check whether one packet conforms to its exact QoS profile.
 	 *
 	 * Existing flows retain token-bucket state across configuration activation,
@@ -199,42 +254,28 @@ class qos_policer {
 	 * one cuckoo lookup, new flows consume a preallocated pool index, and
 	 * capacity exhaustion drops fail-closed.
 	 *
-	 * @param now_ns Platform-stamped monotonic packet-arrival time in nanoseconds.
+	 * @param now_ns Exact cached owner-worker processing time in nanoseconds.
 	 * @param profile Exact active profile containing rate and burst limits.
 	 * @param runtime Bounded owner-local GC tuning.
-	 * @param flow_key Stable flow identifier, normally the RSS five-tuple hash.
+	 * @param key Semantic identity; ignored only by an explicitly unlimited profile.
 	 * @param bytes Packet length in bytes.
-	 * @return true when the packet conforms; false when policing or capacity
-	 *         admission drops it.
+	 * @return Exact allowance or rejection cause.
 	 *
 	 * @note Thread Safety: not thread-safe; call only on the context owner.
 	 */
-	[[nodiscard]] bool allow(uint64_t now_ns, const qos_profile_compiled &profile,
-				 const qos_runtime_tuning &runtime, uint64_t flow_key, std::size_t bytes) noexcept;
+	[[nodiscard]] policer_result police(uint64_t now_ns, const qos_profile_compiled &profile,
+					    const qos_runtime_tuning &runtime, const flow_key &key,
+					    std::size_t bytes) noexcept;
 
     private:
-	static constexpr int FP_SHIFT = QOS_FIXED_POINT_SHIFT;	///< Fixed-point fractional bit count.
-
 	/** @brief Cache-line-isolated mutable state for one owner-local flow. */
 	struct alignas(64) bucket {
-		int64_t tokens_fp{0};  ///< Available bytes in Q20 fixed-point form.
-		uint64_t last_ns{0};   ///< Monotonic packet-time high-watermark.
-		uint64_t flow_key{0};  ///< Exact cuckoo-map key owning this slab slot.
-		bool occupied{false};  ///< Whether the slot contributes live flow state.
+		algo::byte_credit credit;  ///< Exact byte credit, including its fractional part.
+		flow_key key;		   ///< Semantic identity used for lookup and reclamation.
+		uint64_t last_ns{0};	   ///< Last processing-time observation for refill and idle expiry.
+		bool occupied{false};	   ///< Whether the slot contributes live flow state.
 	};
-
-	/** @brief Supply one complete scalar identity for cuckoo candidate mixing. */
-	struct flow_identity_hash {
-		/**
-		 * @brief Return one flow identity without reading object representation.
-		 * @param flow_key Exact semantic flow identity.
-		 * @return Complete scalar input to cuckoo's SplitMix64 candidate derivation.
-		 */
-		[[nodiscard]] std::size_t operator()(uint64_t flow_key) const noexcept
-		{
-			return static_cast<std::size_t>(flow_key);
-		}
-	};
+	static_assert(sizeof(bucket) == 64 && alignof(bucket) == 64);
 
 	// -------------------------------------------------------------------------
 	// Flow storage: contiguous slab + cuckoo index map + bounded index pool
@@ -244,15 +285,16 @@ class qos_policer {
 
 	kinetum::algo::bounded_index_pool free_indices_;  ///< Fixed owner-local slab-index recycler.
 
-	kinetum::algo::cuckoo_map<uint64_t, uint32_t, flow_identity_hash> map_;	 ///< Flow-to-slab index.
+	kinetum::algo::cuckoo_map<flow_key, uint32_t, flow_identity_hash> map_;	 ///< Flow-to-slab index.
 
-	uint32_t max_flows_;	  ///< Fixed slab capacity.
-	uint64_t gc_counter_{0};  ///< Packet-operation cadence for bounded GC.
-	uint32_t gc_cursor_{0};	  ///< Cursor for incremental slab-walk GC.
+	uint32_t max_flows_;		///< Fixed slab capacity.
+	uint64_t gc_counter_{0};	///< Packet-operation cadence for bounded GC.
+	uint32_t gc_cursor_{0};		///< Cursor for incremental slab-walk GC.
+	uint64_t last_observed_ns_{0};	///< Context-wide clock-admission history, preserved across policies.
 
 	/**
 	 * @brief Reclaim one bounded cursor slice of idle context-local flow buckets.
-	 * @param now_ns Current monotonic packet-arrival time.
+	 * @param now_ns Admitted owner-worker processing time.
 	 * @param runtime Exact bounded GC policy.
 	 */
 	void maybe_gc_(uint64_t now_ns, const qos_runtime_tuning &runtime) noexcept;

@@ -242,8 +242,8 @@ TEST(module_execution_views, rejects_context_without_exact_active_view)
 	test::packet_record_test_owner packet(std::vector<uint8_t>(64, 0), 1);
 	ASSERT_TRUE(packet.valid()) << packet.error();
 	initialize_module_packet(*packet.get(), 1);
-	EXPECT_FALSE(
-		engine.execute_module_stage(*module->context().epoch_store, 0, 0, std::array{packet.get()}, scratch));
+	EXPECT_FALSE(engine.execute_module_stage(*module->context().epoch_store, 0, 0, 123u, std::array{packet.get()},
+						 scratch));
 	EXPECT_EQ(engine.stats().dropped_packets, 1u);
 	const auto diagnostics = module->context().epoch_store->diagnostics_after_quiescence();
 	EXPECT_EQ(diagnostics.mismatch_count, 1u);
@@ -388,8 +388,8 @@ TEST(module_execution_views, rejects_view_from_a_different_exact_snapshot_epoch)
 	ASSERT_TRUE(packet.valid()) << packet.error();
 	initialize_module_packet(*packet.get(), TEST_ACTIVE_EPOCH - 1u);
 	ASSERT_NE(module->context().epoch_store, nullptr);
-	EXPECT_FALSE(
-		engine.execute_module_stage(*module->context().epoch_store, 0, 0, std::array{packet.get()}, scratch));
+	EXPECT_FALSE(engine.execute_module_stage(*module->context().epoch_store, 0, 0, 123u, std::array{packet.get()},
+						 scratch));
 	const auto diagnostics = module->context().epoch_store->diagnostics_after_quiescence();
 	EXPECT_EQ(diagnostics.mismatch_count, 1u);
 	ASSERT_EQ(diagnostics.first_fault_valid, 1u);
@@ -412,11 +412,11 @@ TEST(module_execution_views, exact_active_view_drops_mismatch_then_runs_on_owner
 	ASSERT_TRUE(packet.valid()) << packet.error();
 	initialize_module_packet(*packet.get(), TEST_ACTIVE_EPOCH - 1u);
 	ASSERT_NE(module->context().epoch_store, nullptr);
-	EXPECT_FALSE(
-		engine.execute_module_stage(*module->context().epoch_store, 0, 0, std::array{packet.get()}, scratch));
+	EXPECT_FALSE(engine.execute_module_stage(*module->context().epoch_store, 0, 0, 123u, std::array{packet.get()},
+						 scratch));
 	packet.metadata().epoch = TEST_ACTIVE_EPOCH;
-	EXPECT_TRUE(
-		engine.execute_module_stage(*module->context().epoch_store, 0, 0, std::array{packet.get()}, scratch));
+	EXPECT_TRUE(engine.execute_module_stage(*module->context().epoch_store, 0, 0, 123u, std::array{packet.get()},
+						scratch));
 	EXPECT_EQ(packet.metadata().module_next_stage, 9u);
 	EXPECT_EQ(engine.stats().dropped_packets, 1u);
 	EXPECT_EQ(module->context().epoch_store->diagnostics_after_quiescence().mismatch_count, 1u);
@@ -430,6 +430,7 @@ TEST(module_execution_views, active_callback_observation_state_starts_zero)
 	EXPECT_EQ(harness.state->ingest_call_count.load(std::memory_order_relaxed), 0u);
 	EXPECT_EQ(harness.state->ingest_total_packets.load(std::memory_order_relaxed), 0u);
 	EXPECT_EQ(harness.state->last_ingest_epoch.load(std::memory_order_relaxed), 0u);
+	EXPECT_EQ(harness.state->last_ingest_now_ns.load(std::memory_order_relaxed), 0u);
 	EXPECT_EQ(harness.state->last_ingest_packet_config.load(std::memory_order_relaxed), 0u);
 	EXPECT_EQ(harness.state->run_call_count.load(std::memory_order_relaxed), 0u);
 	EXPECT_EQ(harness.state->control_call_count.load(std::memory_order_relaxed), 0u);
@@ -437,7 +438,7 @@ TEST(module_execution_views, active_callback_observation_state_starts_zero)
 	EXPECT_EQ(harness.state->pull_ready_count.load(std::memory_order_relaxed), 0u);
 }
 
-/** @brief Deliver the exact context, epoch, and packet-config facts to INGEST. */
+/** @brief Deliver exact context, epoch, packet-config, and processing-time facts to INGEST. */
 TEST(module_execution_views, active_callback_ingest_observes_exact_context_epoch_and_config)
 {
 	auto harness = test::active_test_harness::create(direct_module_resources());
@@ -450,10 +451,12 @@ TEST(module_execution_views, active_callback_ingest_observes_exact_context_epoch
 	batch.ctx = &harness.module->context().packet_context;
 
 	auto active_context = make_active_context(harness);
+	batch.now_ns = active_context.now_ns;
 	EXPECT_EQ(harness.ingest(active_context, batch), KINETUM_FORWARD_MASK(batch.count));
 	EXPECT_EQ(harness.state->ingest_call_count.load(std::memory_order_relaxed), 1u);
 	EXPECT_EQ(harness.state->ingest_total_packets.load(std::memory_order_relaxed), batch.count);
 	EXPECT_EQ(harness.state->last_ingest_epoch.load(std::memory_order_relaxed), TEST_ACTIVE_EPOCH);
+	EXPECT_EQ(harness.state->last_ingest_now_ns.load(std::memory_order_relaxed), active_context.now_ns);
 	EXPECT_EQ(harness.state->last_ingest_packet_config.load(std::memory_order_relaxed),
 		  reinterpret_cast<std::uintptr_t>(&packet_config));
 }
@@ -531,10 +534,11 @@ TEST(module_execution_views, active_callback_without_runtime_owner_cannot_publis
 /** @brief Prove callback-only views cannot fabricate async or recirculation ownership. */
 TEST(module_execution_views, active_callback_without_runtime_owner_cannot_publish_async_work)
 {
+	constexpr std::array<uint8_t, 9> PAYLOAD{};
 	kinetum_active_ctx context{};
 	kinetum_async_packet_view view{
-		.data = reinterpret_cast<const void *>(std::uintptr_t{1}),
-		.len = 9u,
+		.data = PAYLOAD.data(),
+		.len = PAYLOAD.size(),
 		._padding = 7u,
 	};
 	kinetum_retained_packet_handle restored{0u};

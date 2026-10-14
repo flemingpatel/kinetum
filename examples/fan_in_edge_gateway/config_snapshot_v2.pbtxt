@@ -4,8 +4,8 @@
 # rollback validation:
 #   - ACL: TCP/22 deny followed by permit remainder, default deny
 #   - NAT44: timeout=600s (v1 was 300s)
-#   - QoS: DSCP 20 and 500 KiB burst (v1 used DSCP 10 and 1000 KiB)
-#     Both versions retain a 10 Gbps per-flow rate.
+#   - QoS: DSCP 20 (v1 used DSCP 10)
+#     Both versions retain a 10 Gbps per-flow rate and 4096 KiB burst allowance.
 #
 # The same topology and modules as v1, with changed module configuration so
 # epoch, commit-confirmed, and rollback validation exercise a real transition.
@@ -13,7 +13,7 @@
 
 snapshot_id: "fan_in_edge_gw_baseline_v2"
 revision: 2
-description: "Fan-in edge-processing v2 - stricter ACL, longer NAT timeout, updated QoS marking and burst"
+description: "Fan-in edge-processing v2 - stricter ACL, longer NAT timeout, updated QoS marking"
 
 # =============================================================================
 # ACL Module Configuration - Changed from v1
@@ -45,5 +45,5 @@ modules {
   module_id: "kinetum.qos"
   revision: 2
   content_type: "application/json"
-  config_blob: "{ \"default_profile\": \"standard\", \"profiles\": [ { \"name\": \"standard\", \"cir_kbps\": 10000000, \"cbs_kb\": 500, \"conform_dscp\": 20 } ] }"
+  config_blob: "{ \"default_profile\": \"standard\", \"profiles\": [ { \"name\": \"standard\", \"cir_kbps\": 10000000, \"cbs_kb\": 4096, \"conform_dscp\": 20 } ] }"
 }

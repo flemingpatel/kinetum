@@ -230,6 +230,9 @@ shows those owners and readiness gates together.
 
 ## Ordered-CUT Boundary Protocol
 
+The Ordered-CUT Boundary Protocol coordinates configuration-epoch transitions
+across packet-processing workers.
+
 ### Current ordered transition transport
 
 Each cross-worker placement materializes three bounded lock-free lanes:

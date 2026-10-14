@@ -190,10 +190,10 @@ TEST_F(dp_integration, full_pipeline_processes_packet)
 	EXPECT_EQ(packet.metadata().dst_port, 53) << "Parse should extract dst_port";
 
 	// ACL stage (permit all)
-	ASSERT_TRUE(acl->process(*packet.get())) << "ACL should permit packet (permit all rule)";
+	ASSERT_TRUE(acl->process(*packet.get(), 0u)) << "ACL should permit packet (permit all rule)";
 
 	// NAT stage (SNAT)
-	ASSERT_TRUE(nat->process(*packet.get())) << "NAT stage should succeed";
+	ASSERT_TRUE(nat->process(*packet.get(), 0u)) << "NAT stage should succeed";
 
 	// Verify NAT translation
 	EXPECT_GE(packet.metadata().src_ipv4, 0xcb00710au)  // 203.0.113.10
@@ -204,7 +204,7 @@ TEST_F(dp_integration, full_pipeline_processes_packet)
 	EXPECT_LE(packet.metadata().src_port, 60000) << "After NAT, src_port should be in pool range";
 
 	// QoS stage (rate limiting)
-	ASSERT_TRUE(qos->process(*packet.get())) << "QoS should allow packet (within rate limit)";
+	ASSERT_TRUE(qos->process(*packet.get(), 0u)) << "QoS should allow packet (within rate limit)";
 }
 
 //==============================================================================
@@ -305,14 +305,14 @@ TEST_F(dp_integration, exact_acl_artifacts_preserve_epoch_specific_policy)
 		<< "Parse should succeed for in-flight packet";
 
 	// In-flight packet should be PERMITTED (epoch 1 config: permit all)
-	EXPECT_TRUE(epoch1_module->process(*inflight_packet.get()))
+	EXPECT_TRUE(epoch1_module->process(*inflight_packet.get(), 0u))
 		<< "In-flight packet (epoch 1) should be PERMITTED by epoch 1 config";
 
 	// Process new packet with epoch=2 config
 	ASSERT_TRUE(engine_->execute_stage(parse, new_packet.get())) << "Parse should succeed for new packet";
 
 	// New packet should be DENIED (epoch 2 config: deny 8.8.8.8)
-	EXPECT_FALSE(epoch2_module->process(*new_packet.get()))
+	EXPECT_FALSE(epoch2_module->process(*new_packet.get(), 0u))
 		<< "New packet (epoch 2) should be DENIED by epoch 2 config";
 }
 
@@ -377,7 +377,7 @@ TEST_F(dp_integration, nat44_handles_16_concurrent_flows)
 		ASSERT_TRUE(engine_->execute_stage(&parse, packet.get())) << "Parse failed for flow " << i;
 
 		// NAT
-		ASSERT_TRUE(module->process(*packet.get())) << "NAT failed for flow " << i;
+		ASSERT_TRUE(module->process(*packet.get(), 0u)) << "NAT failed for flow " << i;
 
 		// Verify public IP is in expected range
 		EXPECT_GE(packet.metadata().src_ipv4, 0xcb00710au)  // 203.0.113.10
@@ -407,11 +407,9 @@ TEST_F(dp_integration, nat44_handles_16_concurrent_flows)
  * @brief Verify QoS policer correctly rate-limits multiple flows.
  *
  * Test Scenario:
- * 1. Configure policer: 1KB/s CIR, 1KB burst
- * 2. Send burst of packets for flow A (1500 bytes total)
- * 3. Verify first 1000 bytes allowed, rest denied
- * 4. Wait for bucket refill
- * 5. Verify refilled tokens allow more packets
+ * 1. Configure policer: 10 Kbit/s CIR, 1 KiB burst
+ * 2. Send twenty 102-byte packets at one processing time
+ * 3. Verify ten fit in the 1024-byte burst and ten are denied
  *
  * Token Bucket Properties:
  * - Bucket fills at CIR rate (bytes/second)
@@ -419,9 +417,8 @@ TEST_F(dp_integration, nat44_handles_16_concurrent_flows)
  * - Each packet consumes tokens = packet size
  *
  * Expected Results:
- * - Initial burst: first 1000 bytes allowed
+ * - Initial burst: first 1020 bytes allowed
  * - Exceeding burst: packets denied
- * - After refill: more packets allowed
  */
 TEST_F(dp_integration, qos_rate_limits_flows_correctly)
 {
@@ -433,13 +430,13 @@ TEST_F(dp_integration, qos_rate_limits_flows_correctly)
 	ASSERT_TRUE(module_or.is_ok()) << module_or.error().message();
 	auto module = std::move(module_or).value();
 
-	// Configure QoS with strict rate limit: 10KB/s CIR, 1KB burst
+	// Configure QoS with strict rate limit: 10 Kbit/s CIR, 1 KiB burst
 	kinetum::module::qos::v1::QosProfiles qos_config;
 	qos_config.set_default_profile("default");  // Must set default profile!
 
 	auto *profile = qos_config.add_profiles();
 	profile->set_name("default");
-	profile->set_cir_kbps(10);  // 10 KB/s = 10240 bytes/s
+	profile->set_cir_kbps(10);  // 10 Kbit/s = 1250 bytes/s
 	profile->set_cbs_kb(1);	    // 1KB burst
 
 	const auto status = module->prepare_and_activate(1, kinetum::test::module_config_json(qos_config));
@@ -466,21 +463,15 @@ TEST_F(dp_integration, qos_rate_limits_flows_correctly)
 
 		ASSERT_TRUE(engine_->execute_stage(&parse, packet.get())) << "Parse failed for packet " << i;
 
-		if (module->process(*packet.get())) {
+		if (module->process(*packet.get(), 0u)) {
 			packets_allowed++;
 		} else {
 			packets_denied++;
 		}
 	}
 
-	// Verify some packets were allowed and some denied
-	EXPECT_GT(packets_allowed, 0) << "Some packets should be allowed (within burst)";
-	EXPECT_GT(packets_denied, 0) << "Some packets should be denied (exceeding burst)";
-
-	// The burst allows ~1024 bytes, each packet is ~100 bytes
-	// So approximately 10 packets should be allowed
-	EXPECT_GE(packets_allowed, 5) << "At least 5 packets should fit in burst";
-	EXPECT_LE(packets_allowed, 15) << "No more than 15 packets should fit in burst";
+	EXPECT_EQ(packets_allowed, 10);
+	EXPECT_EQ(packets_denied, 10);
 }
 
 //==============================================================================
@@ -491,7 +482,7 @@ TEST_F(dp_integration, qos_rate_limits_flows_correctly)
  * @brief Verify QoS maintains per-flow state isolation.
  *
  * Test Scenario:
- * 1. Configure QoS with 1KB/s CIR, 1KB burst
+ * 1. Configure QoS with 10 Kbit/s CIR, 1 KiB burst
  * 2. Exhaust flow A's bucket (send >1KB)
  * 3. Verify flow B still has full bucket
  * 4. Verify flows don't interfere with each other
@@ -514,13 +505,13 @@ TEST_F(dp_integration, qos_per_flow_isolation)
 	ASSERT_TRUE(module_or.is_ok()) << module_or.error().message();
 	auto module = std::move(module_or).value();
 
-	// Configure QoS: 10KB/s CIR, 1KB burst
+	// Configure QoS: 10 Kbit/s CIR, 1 KiB burst
 	kinetum::module::qos::v1::QosProfiles qos_config;
 	qos_config.set_default_profile("default");  // Must set default profile!
 
 	auto *profile = qos_config.add_profiles();
 	profile->set_name("default");
-	profile->set_cir_kbps(10);  // 10 KB/s
+	profile->set_cir_kbps(10);  // 1250 bytes/s
 	profile->set_cbs_kb(1);	    // 1KB burst
 
 	const auto status = module->prepare_and_activate(1, kinetum::test::module_config_json(qos_config));
@@ -548,15 +539,15 @@ TEST_F(dp_integration, qos_per_flow_isolation)
 		ASSERT_TRUE(packet.valid()) << packet.error();
 
 		EXPECT_TRUE(engine_->execute_stage(&parse, packet.get()));
-		if (module->process(*packet.get())) {
+		if (module->process(*packet.get(), 0u)) {
 			flow_a_allowed++;
 		} else {
 			flow_a_denied++;
 		}
 	}
 
-	EXPECT_GT(flow_a_allowed, 0) << "Flow A should consume its independent initial burst";
-	EXPECT_GT(flow_a_denied, 0) << "Flow A should have some packets denied after exhausting bucket";
+	EXPECT_EQ(flow_a_allowed, 10);
+	EXPECT_EQ(flow_a_denied, 10);
 
 	// Now send Flow B packets - should have full bucket available
 	int flow_b_allowed = 0;
@@ -566,16 +557,12 @@ TEST_F(dp_integration, qos_per_flow_isolation)
 		ASSERT_TRUE(packet.valid()) << packet.error();
 
 		EXPECT_TRUE(engine_->execute_stage(&parse, packet.get()));
-		if (module->process(*packet.get())) {
+		if (module->process(*packet.get(), 0u)) {
 			flow_b_allowed++;
 		}
 	}
 
-	// Flow B should have its own full burst available
-	EXPECT_GT(flow_b_allowed, 0) << "Flow B should have packets allowed (independent bucket from Flow A)";
-
-	// Flow B's first ~10 packets should be allowed (1KB burst / ~100 bytes each)
-	EXPECT_GE(flow_b_allowed, 5) << "Flow B should have at least 5 packets allowed within its burst";
+	EXPECT_EQ(flow_b_allowed, 10) << "Flow B has its own full 1024-byte allowance";
 }
 
 //==============================================================================
@@ -622,7 +609,7 @@ TEST_F(dp_integration, handles_1000_packet_burst)
 		kinetum::test::packet_record_test_owner packet(bytes);
 		ASSERT_TRUE(packet.valid()) << packet.error();
 
-		if (engine_->execute_stage(&parse, packet.get()) && module->process(*packet.get())) {
+		if (engine_->execute_stage(&parse, packet.get()) && module->process(*packet.get(), 0u)) {
 			processed++;
 		}
 	}
@@ -687,9 +674,9 @@ TEST_F(dp_integration, wire_format_full_pipeline_integrity)
 
 	// Process through the platform parser and exact policy callbacks.
 	ASSERT_TRUE(engine_->execute_stage(&parse, packet.get()));
-	ASSERT_TRUE(acl->process(*packet.get()));
-	ASSERT_TRUE(nat->process(*packet.get()));
-	ASSERT_TRUE(qos->process(*packet.get()));
+	ASSERT_TRUE(acl->process(*packet.get(), 0u));
+	ASSERT_TRUE(nat->process(*packet.get(), 0u));
+	ASSERT_TRUE(qos->process(*packet.get(), 0u));
 
 	// Verify wire-format integrity after the complete pipeline.
 
@@ -763,7 +750,7 @@ TEST_F(dp_integration, wire_format_nat_dnat_verification)
 	ASSERT_TRUE(outbound_packet.valid()) << outbound_packet.error();
 
 	ASSERT_TRUE(engine_->execute_stage(&parse, outbound_packet.get()));
-	ASSERT_TRUE(module->process(*outbound_packet.get()));
+	ASSERT_TRUE(module->process(*outbound_packet.get(), 0u));
 
 	// Capture NAT-allocated values
 	uint32_t nat_public_ip = outbound_packet.metadata().src_ipv4;
@@ -783,7 +770,7 @@ TEST_F(dp_integration, wire_format_nat_dnat_verification)
 	ASSERT_TRUE(inbound_packet.valid()) << inbound_packet.error();
 
 	ASSERT_TRUE(engine_->execute_stage(&parse, inbound_packet.get()));
-	ASSERT_TRUE(module->process(*inbound_packet.get()));
+	ASSERT_TRUE(module->process(*inbound_packet.get(), 0u));
 
 	// Verify wire-format after DNAT
 	const uint8_t *pkt_data = inbound_packet.data();

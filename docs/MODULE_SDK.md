@@ -15,7 +15,7 @@ lives in [`AXIOM.md`](AXIOM.md); placement and stage-instance identities live in
 [`CONTROL_PLANE_AND_GUARDRAILS_AND_ROLLBACK.md`](CONTROL_PLANE_AND_GUARDRAILS_AND_ROLLBACK.md).
 The visual lifecycle and dispatch reference is
 [`diagrams/platform_architecture.md`](diagrams/platform_architecture.md). Built-in
-module schemas, limits, and counters are summarized in
+module configuration, behavior, limits, and counters are defined in
 [`../src/modules/README.md`](../src/modules/README.md).
 
 ## Table of Contents
@@ -424,6 +424,10 @@ same number as Kinetum 0.1.0 but is an independent version domain: product
 releases do not change the ABI unless its binary contract changes. There is no
 same-major or lower-minor acceptance rule.
 
+The current module ABI is `0.2.0` (`0x00020000`). It requires the immutable
+batch processing-time field `now_ns`. Modules built for `0.1.0` must rebuild
+against the matching SDK; equal structure sizes do not imply compatibility.
+
 Both module modes, including ACTIVE modules with tracked async work, share
 that same ABI and descriptor layout.
 
@@ -564,6 +568,7 @@ typedef struct KINETUM_ALIGNED kinetum_batch {
     uint64_t epoch;
     const void *epoch_config;
     struct kinetum_ctx *ctx;
+    uint64_t now_ns;
 } kinetum_batch_t;
 ```
 
@@ -581,7 +586,7 @@ Layout invariants:
   bytes must update every mutable parsed lane invalidated by the rewrite. The
   runtime deliberately does not reparse between module stages.
 - `data`, `len`, `input_port`, `ts_ns`, `count`, `region_id`, `epoch`,
-  `epoch_config`, and `ctx` are borrowed immutable runtime authority.
+  `epoch_config`, `ctx`, and `now_ns` are borrowed immutable runtime authority.
   `padding` remains zero.
 - Parsed addresses, ports, protocol, DSCP, offsets, platform flags, flow hash,
   output port, next stage, and user metadata are mutable. Runtime validates
@@ -596,6 +601,11 @@ Layout invariants:
   [`DATA_PLANE.md`](DATA_PLANE.md).
 - `ctx` is the sole-owner live context for this callback. Its `state` pointer
   reaches context-local mutable state; it exposes no cold service table.
+- `now_ns` is the owner worker's monotonic processing time, sampled once per
+  turn and shared by every lane and callback in that turn. ACTIVE ingest receives
+  the same value in `active_ctx.now_ns`. Zero and repeated values are valid;
+  zero does not request a clock read. `ts_ns[i]` retains packet-origin time
+  across queues and rewrites and is not a downstream processing clock.
 - `epoch_config` is the exact immutable view selected by the platform's tagged
   epoch slot. C modules validate the pointer and cast it directly to their
   image-owned configuration type; C++ modules use
@@ -1211,8 +1221,9 @@ the callback's bounded forward mask visible in packet code.
 - `kinetum::algo`: fixed-capacity rings, cuckoo maps, token buckets, CIDR
   matching, and other shared bounded packet-processing mechanisms.
 
-Packet policy consumes the runtime-stamped `batch->ts_ns`; active callbacks
-consume the worker-cached `active_ctx.now_ns`. Health receives only context,
+Packet callbacks consume the worker-cached `batch->now_ns`; active callbacks
+receive the same authority through `active_ctx.now_ns`. Packet-origin time
+remains separately available in `batch->ts_ns[i]`. Health receives only context,
 active epoch, and active configuration. The platform timestamps its publication
 from the worker's cached turn time and may take the one documented post-return
 budget sample. The module ABI exposes no independent clock or cycle-counter
@@ -1440,328 +1451,158 @@ channel or mailbox.
 
 ## Part 6: Built-in Modules as Exemplars
 
-The three built-ins under `src/modules/` demonstrate production structure and
-conformance through the same SDK path as customer modules.
+The three built-ins under `src/modules/` use the same SDK path as customer
+modules. These walkthroughs show how a classifier, a translator, and a policer
+use the lifecycle, memory, packet, and telemetry contracts described above.
+The [built-in module reference](../src/modules/README.md) owns their complete
+configuration fields, packet behavior, counters, and health thresholds,
+including the shared [configuration format](../src/modules/README.md#config-blob-format).
 
 ### 17. ACL Module (`kinetum.acl`)
 
-**Purpose.** Stateless 5-tuple permit/deny classifier and the canonical
-SDK classifier example.
+ACL demonstrates immutable rule preparation and an epoch-tagged decision
+cache. Start with `src/modules/acl/acl_module.cpp` for the SDK callbacks and
+`acl_impl.cpp` for compilation and evaluation. The
+[ACL reference](../src/modules/README.md#acl-kinetumacl) defines the policy.
 
-**Files.**
+**Preparation.** `do_prepare_config` allocates an `acl_prepared_artifact`
+through `kinetum_lifecycle_allocate_epoch`. Its `epoch_memory_resource` backs
+the compiled rules and SIMD representation. `compile_acl_from_json` validates
+and orders the rules before the callback selects an evaluator from the enabled
+rule count. The returned `acl_packet_config` contains a pointer to that compiled
+policy and the chosen strategy. The artifact seals its resource before
+transferring `{owner_handle, packet_config}` to the platform.
 
-- `src/modules/acl/acl.proto` - typed host/offline authoring model for the
-  module-owned strict JSON contract.
-- `src/modules/acl/acl_impl.hpp` / `acl_impl.cpp` - CIDR parsing,
-  rule evaluator, hash cache.
-- `src/modules/acl/acl_module.hpp` / `acl_module.cpp` - SDK glue.
-  `KINETUM_MODULE_REGISTER(acl_module)` at the end of `acl_module.cpp`.
+**Packet path.** `sdk::exact_config<acl_packet_config>(batch)` borrows the
+already-selected policy. `do_process` reads tuple fields directly from the
+SoA lanes. Linear and cached evaluation handle individual lanes; SIMD
+evaluation copies the occupied lanes into `packet_batch_soa` and calls
+`classify_batch_acl`. All three return decisions through the same forward
+mask: a denied lane is cleared with `KINETUM_DROP`. Strategy selection and
+rule compilation add no packet-path parsing or allocation.
 
-**Config shape (`kinetum.module.acl.v1.AclRuleset`).** The proto is the
-host/offline authoring model. The runtime `config_blob` is strict snake-case
-JSON with the same compact shape. `default_action` is a required nonzero
-`PERMIT` or `DENY`; `rules` is an optional collection and `max_rules` is an
-optional nonnegative limit. Every authored rule requires a nonzero `action`;
-its priority, CIDRs, protocol, port ranges, and enabled state retain their
-documented proto3 defaults. Enum values are integers. Unknown, duplicate,
-removed, zero, or aliased action values; malformed UTF-8;
-fractional/exponent numbers; text-proto; binary-proto; and trailing data all
-reject rather than selecting another parser.
+**Context lifetime.** The module constructor allocates `cache_` from
+`context_memory_resource()`. Cached evaluation receives `batch->epoch`, and
+each entry stores that epoch alongside its semantic flow key and decision.
+Changing the active ruleset therefore invalidates old cache authority without
+clearing the table. The cache belongs to the context; RETIRE destroys only the
+received prepared ruleset artifact. A new context gets a new cache.
 
-The compiler rejects negative `max_rules`, a populated rule count above a
-nonzero limit, protocols outside `0..255`, invalid CIDRs, missing or unknown
-actions, and negative, reversed, or out-of-range port ranges.
-`ACL_ACTION_UNSPECIFIED` always rejects. PREPARE allocates and compiles one immutable
-`acl_prepared_artifact` in the platform-provided epoch arena. Its
-`acl_packet_config` points at the exact compiled ruleset and records the
-preselected evaluator strategy. The prepared artifact seals its epoch-resource
-adapter before returning success; the platform then publishes the packet view
-through its tagged slot and returns
-the ownership record to RETIRE exactly once.
-
-**Hot-path algorithm.** `do_process` iterates `batch->count` packets.
-For each, it reads `src_ip`, `dst_ip`, `src_port`, `dst_port`, `proto`
-from the SoA arrays and evaluates against the compiled ruleset:
-
-1. Rules are compiled and **sorted by priority (descending)** during
-   PREPARE, with authored order as the explicit equal-priority tie-breaker, so
-   evaluation walks one deterministic order without a per-packet sort.
-2. **First match wins.** The evaluator returns the matched rule's
-   action and stops scanning.
-3. **If no rule matches**, the explicitly authored `default_action` applies.
-   An absent or zero value rejects. An absent or empty rule collection is
-   lawful, so `{ "default_action": 2 }` is the explicit deny-all form. A
-   zero-length blob or empty JSON object is invalid.
-
-The evaluator strategy is declared by `enum class acl_eval_strategy {
-LINEAR, HASH_CACHE, SIMD_BATCH }` in `acl_impl.hpp`. Current selection
-is source-defined by ruleset size: `<= 16` rules uses linear scan,
-`17..256` uses the context-local hash cache, and `> 256` uses
-`classify_batch_acl()` over the precomputed SIMD rule representation.
-Every strategy consumes the same rule semantics. CIDR matching masks both the
-packet and the authored network, so accepted host bits outside the prefix do
-not change meaning. Source and destination port ranges constrain TCP and UDP
-only; ICMP and other protocols ignore those fields. SIMD unsigned inclusive
-port comparisons preserve both `0` and `65535` without wrapping endpoint
-arithmetic. Architecture-selected implementations are checked against one
-independent scalar oracle at every vector boundary.
-The forward-mask bit remains set for permit and is cleared with
-`KINETUM_DROP` for deny actions.
-
-The hash cache is a member of `acl_module`: one cache per admitted context,
-owned by that context's sole worker and allocated from the platform-provided
-INIT arena. A new context or generation receives a fresh object, so stale
-decisions cannot cross context or image ownership. Each entry is tagged by the
-exact platform packet epoch; epoch changes therefore invalidate lookup
-authority in O(1) without scanning the cache.
-
-**Health behavior.** `acl_module::do_health_check` runs on the owner worker
-against the exact active `acl_packet_config` and checks two conditions:
-
-- If no rules are configured, `health_score = 80`,
-  `KINETUM_HEALTH_F_CONFIG_ISSUE`, with a reason that names the exact
-  configured default (`deny-all` or `permit-all`). An unavailable active
-  configuration is reported separately.
-- If `packets_evaluated > 1000` and `denied/evaluated > 95%`,
-  `health_score = 60`, `KINETUM_HEALTH_F_CONFIG_ISSUE`, reason
-  "Deny ratio > 95% - check rules". Above 80% through 95%, score
-  drops to 75 without setting the config-issue flag.
-
-The `KINETUM_HEALTH_F_CONFIG_ISSUE` flag is the Guardrails-relevant
-output: it signals "a recent config change is the suspect."
-
-**Counters registered.** `acl.packets_evaluated`,
-`acl.packets_permitted`, `acl.packets_denied`, `acl.cache_hits`,
-`acl.cache_misses`. Updates are owner-local and batched; the module does not
-read a clock or publish an image-local latency source.
-
-**Runtime note.** ACL strategy selection is module-owned and derives from the compiled ruleset;
-no platform-level strategy hint overrides it.
+**Telemetry.** `do_init` registers the [ACL counters](../src/modules/README.md#acl-telemetry)
+once. `do_process` accumulates batch results before updating their native
+handles. The decision cache exposes batch hit/miss counts, which are reset
+after transfer to avoid adding them twice. `do_health_check` reads the same
+owner-local counters and exact active policy, then uses
+`set_health_reason_literal` to return a bounded assessment under the
+[health contract](#13-health-assessment-and-owner-worker-publication).
 
 ### 18. NAT44 Module (`kinetum.nat44`)
 
-**Purpose.** Stateful IPv4 NAT (NAPT) with bidirectional session
-tracking, multiple public-IP pools, and incremental garbage collection.
-The canonical use of the SDK for a stateful policy.
+NAT44 demonstrates context-lifetime sessions shared by both directions of a
+flow, while configuration artifacts change independently. Start with
+`src/modules/nat44/nat44_module.cpp` for the callbacks and `nat44_impl.cpp` for
+the pool compiler and session table. The
+[NAT44 reference](../src/modules/README.md#nat44-kinetumnat44) defines translation,
+allocation, timeout, and checksum behavior.
 
-**Files.**
+**Preparation.** `nat44_prepared_artifact` owns the compiled public-address
+pools through an `epoch_memory_resource`; `nat44_packet_config` exposes their
+immutable pointer. Address parsing uses the SDK's header-owned
+`kinetum::algo::parse_ipv4`. PREPARE builds the cumulative address index and
+the current context's eligible port ranges, so packet execution consumes
+validated allocation data without parsing configuration.
 
-- `src/modules/nat44/nat44.proto` - typed host/offline authoring model for the
-  module-owned strict JSON contract.
-- `src/modules/nat44/nat44_impl.hpp` / `nat44_impl.cpp` - session
-  table, pool allocator, GC.
-- `src/modules/nat44/nat44_module.hpp` / `nat44_module.cpp` - SDK
-  glue. `KINETUM_MODULE_REGISTER(nat44_module)` at the end of
-  `nat44_module.cpp`.
+**Packet path.** `do_process` obtains `nat44_packet_config` from the exact
+batch view. For a packet eligible for translation, it proves the writable
+header bounds before looking up or creating a session. Successful translation
+updates both the address/port lanes and the corresponding packet bytes. This
+is the SDK's [metadata/wire coherence rule](#8-the-kinetum_batch_t-soa-layout)
+in use: downstream modules read the updated lanes, while TX uses the bytes.
+Session activity and bounded GC consume `batch->ts_ns[i]` without a module
+clock read.
 
-**Config shape (`kinetum.module.nat44.v1.NatPools`).** The proto is the
-host/offline authoring model. Runtime `config_blob` bytes are strict
-snake-case JSON containing top-level `pools`, `session_timeout_s`, and
-`max_total_sessions`; each pool contains `public_ip_ranges`, `port_min`, and
-`port_max`. Unknown, duplicate, removed, or aliased fields and every non-JSON
-encoding reject. `public_ip_ranges` must contain dotted IPv4 addresses or
-ascending inclusive dotted-IPv4 ranges such as
-`"203.0.113.10-203.0.113.20"`; CIDR notation is not accepted. Ranges are
-sorted by address during PREPARE, and duplicate or overlapping address
-authority rejects rather than overstating the bounded allocation space. The
-module uses the public header-owned `kinetum::algo::parse_ipv4` authority, so
-the built-in image does not import a host implementation symbol for address
-parsing.
+**Context lifetime.** The constructor allocates `sessions_` from
+`context_memory_resource()`. Both cuckoo maps store indices into one session
+slab, so inbound and outbound activity update the same record. A
+`bounded_index_pool` supplies and recycles those indices. If admission fails
+after inserting the outbound key, the table removes that key and returns its
+index before reporting failure. ACTIVATE validates the prepared view and its
+context partition without rebuilding the live table. RETIRE destroys the
+received pool artifact; session state remains owned by the context.
 
-The PREPARE compiler rejects configs with no pools, pools with no public
-ranges, invalid or reversed IP ranges, negative `session_timeout_s`,
-negative `max_total_sessions`, `max_total_sessions` larger than the
-per-context slab capacity (`NAT_DEFAULT_MAX_SESSIONS = 65536`), and
-invalid port ranges. `port_min` and `port_max` must be `1..65535` with
-`port_min <= port_max`. A top-level `session_timeout_s` of `0` uses
-`NAT_DEFAULT_TIMEOUT_S`; `max_total_sessions` of `0` uses
-`NAT_DEFAULT_MAX_SESSIONS`. A successful `nat44_prepared_artifact` owns the
-compiled pools in the sealed PREPARE arena and exposes a compact immutable
-`nat44_packet_config` containing the pool pointer.
-
-**Hot-path algorithm.** `nat44_module::do_process` resolves the already-selected
-`nat44_packet_config` from `batch->epoch_config`. A missing exact view or pool
-drops the whole batch fail-closed. Per packet:
-
-1. Skip non-TCP/UDP and non-IPv4 traffic by forwarding it as-is. Drop
-   fragments because NAT needs L4 ports.
-2. Classify direction by `is_private_ip(src_ip)`: private source means
-   outbound/SNAT, otherwise inbound/DNAT.
-3. Validate the packet buffer, IPv4/TCP/UDP header bounds, and IPv4/UDP
-   length fields. Malformed or truncated input drops before session lookup,
-   creation, or byte mutation.
-4. Build the direction-specific 5-tuple key and look up the session in
-   `out_map_` (outbound direction) or `in_map_`
-   (inbound direction). Both are `kinetum::algo::cuckoo_map` instances
-   mapping keys to slab indices.
-5. If inbound and no session exists, drop. If outbound and no session exists,
-   allocate a public IP + port from the context's eligible pool residues
-   using deterministic round-robin/counter selection.
-   PREPARE records cumulative address ordinals, so range selection is an
-   allocation-free binary search rather than a packet-path linear rescan. The
-   fixed `NAT_MAX_ALLOC_ATTEMPTS` cap bounds collision work. On success,
-   install the session in both maps; on failure, drop.
-6. Rewrite the mapped source or destination IP and port in both SoA metadata
-   and packet bytes. Adjust IPv4 and L4 checksums from the changed words.
-   IPv4 UDP checksum absence stays zero; a computed UDP zero becomes `0xffff`,
-   while TCP zero remains an ordinary checksum. This neither scans the payload
-   nor validates or repairs an incoming checksum.
-
-The session table and telemetry baseline are **per admitted context** members of
-`nat44_module`, owned by one worker. There is no thread-local generation fence
-and no mutable state shared across replicas. Sessions live
-in a contiguous pre-sized PMR slab allocated from the platform INIT arena,
-with a `bounded_index_pool` for O(1) non-growing acquisition/release. The `out_map_` and `in_map_`
-map 5-tuples to slab indices, not to session pointers. No default heap fallback
-exists in the production constructors.
-
-Garbage collection is **incremental and cursor-based**: the table walks
-a bounded slice of the slab every `NAT_GC_TRIGGER_MASK + 1` translation calls,
-reclaiming sessions whose idle age exceeds the compiled
-top-level `session_timeout_s` (default `NAT_DEFAULT_TIMEOUT_S = 300`).
-Session activity consumes the platform-stamped monotonic packet-arrival
-timestamp from `batch->ts_ns[i]`; module code does not read a clock. A delayed
-packet cannot move the session high-watermark backward.
+**Telemetry.** The module registers [NAT44 counters](../src/modules/README.md#nat44-telemetry)
+during INIT. Translation and drop counts accumulate per batch. Session creation,
+expiration, inbound misses, and allocation failures come from cumulative table
+statistics. `baseline_` tracks the last transferred values, and `counter_delta`
+adds each increment once; regression terminates as an ownership contradiction.
+The health callback reads those owner-local counters and the active pool view,
+preserving the lowest score and its corresponding reason when conditions overlap.
 
 #### Session ownership across ingress queues
 
-For a module population of `N`, context `i` allocates only public ports with
-`port % N == i`. PREPARE compiles each pool's eligible range, and allocation
-steps directly through that range. Contexts keep independent session tables;
-public endpoints cannot collide between owners for the same remote tuple.
+`read_partition_` obtains the context ordinal and population through
+`kinetum_lifecycle_get_identity` during INIT. PREPARE receives the same identity
+when compiling pools. This connects the SDK's generation identity to the
+[NAT port-ownership rule](../src/modules/README.md#session-ownership).
 
-The stateless selector hashes the complete original outbound tuple into the
-permitted context set. Return traffic derives its owner from the translated
-destination port. Fragments and traffic outside IPv4 TCP/UDP are classified
-before port arithmetic; the packet callback retains its fragment-drop and
-non-NAT forwarding rules. An unavailable return owner rejects the packet.
+The descriptor advertises `KINETUM_MOD_F_CONTEXT_SELECTION` and supplies
+`select_contexts`. Its inputs are parsed packet lanes and the permitted target
+set; it needs no live session table or configuration pointer. Outbound hashing
+selects an owner, while the translated destination port identifies the return
+owner. If that owner is unavailable on the compiled edge, selection rejects
+the packet. Portless traffic follows stateless selection, leaving its packet
+policy to `do_process`.
 
-Existing sessions keep their endpoints across pool updates until expiration or
-context destruction. Hardware RSS chooses an ingress queue; it does not prove
-ownership after NAT rewrites a tuple. Custom stateful modules must likewise
-provide a proven same-context rule when using multiple owners.
-
-**Health behavior.** `nat44_module::do_health_check` runs on the owner worker
-against the exact active `nat44_packet_config`:
-
-- If no pools configured: `health_score = 60`,
-  `KINETUM_HEALTH_F_CONFIG_ISSUE`, reason "No NAT pools - traffic
-  dropped" (early return).
-- If `translated + alloc_failures > 1000` and `alloc_failures/total >
-  10%`: `health_score = 50`, `KINETUM_HEALTH_F_CONFIG_ISSUE`, reason
-  "Alloc fail >10% - pool exhausted".
-- Above 1% through 10%: `health_score = 80` (no config-issue flag).
-- If `translated + dropped > 1000` and `dropped/total > 30%`:
-  `health_score = 60`, no additional flag, reason "Drop >30% - check NAT
-  config". When conditions overlap, the lowest score and its corresponding
-  reason remain authoritative.
-
-**Counters registered.** `nat44.packets_translated`,
-`nat44.packets_dropped`, `nat44.sessions_created`,
-`nat44.sessions_expired`, `nat44.inbound_misses`, and
-`nat44.allocation_failures`. Current `do_process()` updates translated and
-dropped counters, and mirrors cumulative owner-local table deltas for
-`total_created`, `total_expired`, `inbound_misses`, and
-`allocation_failures` into the registered module counters. Those cumulative
-table values are monotonic under one context owner; regression is an ownership
-contradiction and terminates instead of being normalized as a reset.
-
-The compact schema has no mode, per-pool timeout/capacity, priority, or
-connection-tracking switches. Such fields are rejected as unknown rather than
-accepted and ignored.
+Hardware RSS selects an ingress queue independently. A stateful module that
+uses multiple contexts must establish its own same-context rule through the
+[selection contract](#module-context-selection).
 
 ### 19. QoS Module (`kinetum.qos`)
 
-**Purpose.** Token-bucket rate limiting with DSCP-name-based profile
-selection and optional DSCP remarking for conforming packets. The
-canonical use of the SDK for a policer.
+QoS demonstrates prepared profile lookup, caller-supplied time, and persistent
+per-flow credit. Start with `src/modules/qos/qos_module.cpp` for the callbacks
+and `qos_impl.cpp` for profile compilation and policing. The
+[QoS reference](../src/modules/README.md#qos-kinetumqos) defines profile selection,
+flow identity, packet outcomes, and limits.
 
-**Files.**
+**Preparation.** `qos_prepared_artifact` owns profile strings and arrays in its
+`epoch_memory_resource`. PREPARE resolves the configured default and the
+64 DSCP-specific profile pointers into `qos_packet_config` before sealing the
+artifact. Packet execution indexes that array with `batch->dscp[i]`, using the
+prepared default pointer when the slot is empty. No packet-path string lookup
+or profile-name hashing is needed.
 
-- `src/modules/qos/qos.proto` - typed host/offline authoring model for the
-  module-owned strict JSON contract.
-- `src/modules/qos/qos_impl.hpp` / `qos_impl.cpp` - profile compiler,
-  token bucket, and preallocated flow table.
-- `src/modules/qos/qos_module.hpp` / `qos_module.cpp` - SDK glue.
-  `KINETUM_MODULE_REGISTER(qos_module)` at the end of `qos_module.cpp`.
+**Packet path.** `do_process` validates the supplied `batch->now_ns` before
+handling any occupied lane. `configured_policy` distinguishes absent policy
+from a broken prepared artifact; the latter terminates in both packet and
+health callbacks. A bounded or remarking profile calls `read_ipv4_header` to
+prove the required bytes exist. Bounded policing also calls `make_flow_key`:
+packet bytes establish eligibility, while the post-rewrite SoA lanes supply
+the semantic identity. An unlimited profile without remarking needs neither
+step.
 
-**Config shape (`kinetum.module.qos.v1.QosProfiles`).** The proto is the
-host/offline authoring model. Runtime `config_blob` bytes are strict
-snake-case JSON containing `profiles`, `default_profile`, `gc_trigger_mask`,
-`gc_max_evictions`, and `idle_timeout_s`; each profile contains `name`,
-`cir_kbps`, `cbs_kb`, and `conform_dscp`. Unknown, duplicate, removed, or
-aliased fields and every non-JSON encoding reject. Profiles are mapped to packets by
-convention: a profile named `dscp_46` is used for DSCP 46; otherwise
-packets use the configured `default_profile`. The default profile name
-must be non-empty and must match a compiled profile. Empty profile
-lists, empty profile names, duplicate profile names, invalid numeric
-limits, and invalid `conform_dscp` values reject the epoch
-configuration during PREPARE. An authored `gc_max_evictions` is bounded by
-the fixed 1,024-entry GC scan prefix, so no accepted value is silently
-reduced. The prepared artifact and all profile strings
-and arrays live in the sealed platform PREPARE arena. It resolves the default
-profile and all 64 DSCP profile pointers once. An explicit unlimited profile
-is valid by setting that named profile's `cir_kbps` to `0`; the module does not
-create an implicit fallback for empty or missing defaults.
+`policer_.police` receives the worker processing time, selected profile,
+GC tuning, semantic key, and `batch->len[i]` byte cost. It composes the shared
+[`byte_credit` arithmetic](ALGORITHM_LIBRARY.md#ratelimithpp) with its own flow
+storage and clock ownership. Allowed packets retain their forward-mask bits;
+remarking updates both `batch->dscp[i]` and the IPv4 DS field and checksum.
+Rejections clear the corresponding bits.
 
-**Hot-path algorithm.** `qos_module::do_process` in `qos_module.cpp`:
+**Context lifetime.** The constructor allocates `policer_` and its slab,
+cuckoo map, and index pool through `context_memory_resource()`. The map hashes
+semantic fields and compares keys for equality; a steering-hash collision
+cannot merge balances. New-flow admission claims one fixed index and returns
+it if map insertion fails. ACTIVATE leaves the table intact, so the next
+observation applies the selected profile to retained credit. RETIRE destroys
+only the prepared profile artifact. The context clock history also survives
+configuration changes and an empty table.
 
-1. Cast the exact active `qos_packet_config` from `batch->epoch_config`.
-   If no exact config is published, the module
-   drops all packets fail-closed. **The table is a 64-entry array
-   indexed by DSCP byte (0-63), built during PREPARE from
-   `dscp_N` profile names, plus a direct pointer to the configured
-   default profile.** Lookup is a single indexed array read followed by
-   that pre-resolved default pointer when the DSCP slot is empty; no
-   hashing and no string lookup occur in `do_process()`.
-2. For each packet, read `dscp[i]`, index into the precomputed
-   profile array.
-3. Apply the token bucket using the platform-stamped monotonic packet-arrival
-   timestamp in `batch->ts_ns[i]`: compute tokens accumulated since the bucket
-   high-watermark using fixed-point Q20 arithmetic, cap at `cbs_kb`, and compare
-   against packet length. A delayed timestamp never moves the bucket backward.
-   When an exact replacement profile lowers `cbs_kb`, retained flow credit is
-   capped to the new burst before refill or consumption; old-policy credit
-   cannot escape the new ceiling. `cir_kbps == 0` means unlimited.
-4. Before policing a profile that requires remarking, validate the complete
-   IPv4 header so malformed bytes cannot consume tokens or flow capacity.
-   Allowed: keep `FORWARD`, optionally remark DSCP to `conform_dscp`
-   if configured (both the SoA `dscp[i]`
-   field and the on-wire IPv4 DS byte are updated, and the IPv4 header
-   checksum is recomputed). Malformed packet buffers are dropped before
-   policer-state or byte mutation. Not enough tokens: `DROP`.
-
-The flow policer is a member of each admitted `qos_module` context and has one
-owner worker. A new context/generation receives a fresh policer, so token
-buckets cannot bleed between replicas or image generations. Each policer uses a
-preallocated slab plus
-`cuckoo_map` from `flow_hash` to slab index. Each context owns one such policer,
-not a shard array. The slab, map, and `bounded_index_pool` are allocated from
-the platform INIT arena. New-flow admission acquires one fixed pool index;
-exhaustion fails closed and drops. No default heap fallback exists in the
-production constructors.
-
-**Health behavior.** `qos_module::do_health_check` runs on the owner worker
-against the exact active `qos_packet_config`:
-
-- If no profiles configured: `health_score = 70`,
-  `KINETUM_HEALTH_F_CONFIG_ISSUE`, reason "No QoS profiles
-  configured" (early return).
-- If `allowed + dropped > 1000` and `dropped/total > 50%`:
-  `health_score = 50`, `KINETUM_HEALTH_F_CONFIG_ISSUE`, reason "Drop
-  >50% - check rate limits".
-- Above 25% through 50%: `health_score = 75` (no config-issue
-  flag).
-
-**Counters registered.** `qos.packets_allowed`, `qos.packets_dropped`,
-`qos.bytes_allowed`, `qos.bytes_dropped`, and `qos.active_flows`. Updates are
-owner-local and batched; the module uses platform packet timestamps for policy
-and does not read a clock or publish an image-local latency source.
-
-The compact schema has no scheduler, peak-rate, weight, priority, exceed-color,
-or description surface. Such fields are rejected as unknown rather than
-accepted and ignored. The module is exactly the single-tier token-bucket
-policer described above.
+**Telemetry.** The [QoS counters](../src/modules/README.md#qos-telemetry) distinguish
+unconfigured execution, rate rejection, flow-capacity rejection, and invalid
+packet input. The callback accumulates each cause and the corresponding packet
+and byte totals before updating native handles. Current occupancy comes from
+the index pool. Processing-time regression and broken prepared state terminate;
+they never enter ordinary packet-drop accounting.
 
 ---
 

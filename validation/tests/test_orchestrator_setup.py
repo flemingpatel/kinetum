@@ -33,11 +33,13 @@ from kinetum_validation.scenarios import (
 )
 from kinetum_validation.engine.json_contract import PROTOCOL_FAULT_CODE_ORDER
 from kinetum_validation.engine.plan_metadata import PlanStorageTransitionMetadata
+from kinetum_validation.engine.qos_accounting import qos_accounting_complete
 from kinetum_validation.process.kinetumctl import ApplyConfigResult
 from kinetum_validation.process.telemetry import (
     BoundaryEpochStatsResult,
     EpochTransactionStatsResult,
     ModuleContextDomainResult,
+    ModuleCounterStatsResult,
     PortStatsResult,
     RegionEpochStatsResult,
     StageStatsResult,
@@ -961,6 +963,59 @@ class TestStatsSnapshot(unittest.IsolatedAsyncioTestCase):
             self.assertIs(observed, fresh)
             self.assertEqual(client.calls, 4)
 
+    async def test_final_snapshot_waits_for_qos_and_worker_bank_agreement(self):
+        """A fresh worker bank does not make an older QoS bank current."""
+        with tempfile.TemporaryDirectory() as directory:
+            orch = self._final_orchestrator(Path(directory))
+            baseline = self._final_observation(100, 200)
+            lagging = self._final_observation(301, 400)
+            fresh = self._final_observation(401, 500)
+            # Each RX stream advances once; worker/stage banks publish before QoS.
+            for stats in (lagging, fresh):
+                stats.rx_packets += 4
+                stats.tx_packets += 4
+                stats.rx_bytes += 256
+                stats.tx_bytes += 256
+                stats.worker_counters = [
+                    replace(row, rx_packets=202, tx_packets=202, rx_bytes=12928, tx_bytes=12928)
+                    for row in stats.worker_counters
+                ]
+                for row in stats.stream_stats:
+                    increment = 1 if row.direction == "rx" else 2
+                    row.packets += increment
+                    row.bytes += increment * 64
+                stats.stage_stats[0] = StageStatsResult(
+                    stage_id="qos", in_packets=404, out_packets=404,
+                    in_bytes=25856, out_bytes=25856,
+                )
+            for row in fresh.module_counter_stats:
+                if row.name == "qos.packets_allowed":
+                    row.value = 202
+                elif row.name == "qos.bytes_allowed":
+                    row.value = 12928
+            client = _SequenceStatsKinetumCtl([baseline, lagging, fresh])
+            orch._kinetumctl = client  # pylint: disable=protected-access
+            clock = _ObservationClock()
+            with patch("kinetum_validation.scenario_context.time", clock), patch(
+                "kinetum_validation.scenario_context.asyncio.sleep", clock.sleep
+            ):
+                observed = await orch.scenario_context().get_final_stats_snapshot()
+            self.assertIs(observed, fresh)
+            self.assertEqual(client.calls, 3)
+
+    async def test_final_snapshot_rejects_invalid_qos_causes_without_retry(self):
+        """Coherent cause disagreement is invalid evidence, not publication lag."""
+        with tempfile.TemporaryDirectory() as directory:
+            orch = self._final_orchestrator(Path(directory))
+            baseline = self._final_observation(100, 200)
+            invalid = self._final_observation(301, 400)
+            next(row for row in invalid.module_counter_stats if row.name == "qos.rate_limit_drops").value = 1
+            client = _SequenceStatsKinetumCtl([baseline, invalid, self._final_observation(401, 500)])
+            orch._kinetumctl = client  # pylint: disable=protected-access
+            with self.assertRaisesRegex(RuntimeError, "drop causes disagree"):
+                await orch.scenario_context().get_final_stats_snapshot()
+            self.assertEqual(client.calls, 2)
+
     async def test_final_snapshot_failure_cannot_be_replaced_by_later_success(self):
         """A failed query remains a failure inside the explicit freshness wait."""
         with tempfile.TemporaryDirectory() as directory:
@@ -1275,6 +1330,14 @@ class TestStreamTopologyStatsValidation(unittest.TestCase):
                   context_instance_ids: "qos@lane_0"
                   context_instance_ids: "qos@lane_1"
                 }
+                stage_instances {
+                  logical_stage_id: "qos"
+                  context_instance_id: "qos@lane_0"
+                }
+                stage_instances {
+                  logical_stage_id: "qos"
+                  context_instance_id: "qos@lane_1"
+                }
                 """
             ),
             encoding="utf-8",
@@ -1359,6 +1422,24 @@ class TestStreamTopologyStatsValidation(unittest.TestCase):
                 )
             ],
             module_context_count=8,
+            active_epoch=1,
+            module_counter_stats=[
+                ModuleCounterStatsResult(
+                    module_id="kinetum.qos", context_instance_id=f"qos@lane_{lane}",
+                    context_index=6 + lane, worker_index=lane, epoch=1, name=name, value=value,
+                )
+                for lane in (0, 1)
+                for name, value in (
+                    ("qos.packets_allowed", 200), ("qos.packets_dropped", 0),
+                    ("qos.bytes_allowed", 12800), ("qos.bytes_dropped", 0), ("qos.active_flows", 1),
+                    ("qos.unconfigured_drops", 0), ("qos.rate_limit_drops", 0),
+                    ("qos.flow_capacity_drops", 0), ("qos.invalid_input_drops", 0),
+                )
+            ],
+            stage_stats=[StageStatsResult(
+                stage_id="qos", in_packets=400, out_packets=400, dropped_packets=0,
+                in_bytes=25600, out_bytes=25600,
+            )],
             storage_domain_stats=[
                 StorageDomainStatsResult(
                     storage_domain_id="storage_fixture_primary",
@@ -1394,6 +1475,59 @@ class TestStreamTopologyStatsValidation(unittest.TestCase):
                 for port_id, port in enumerate(("wan0", "wan1"))
             ],
         )
+
+    def test_qos_accounting_requires_complete_canonical_context_evidence(self):
+        """Missing, repeated, foreign, and contradictory cause rows never become zeros."""
+        with tempfile.TemporaryDirectory() as directory:
+            orch = self._rx_rss_2_orchestrator(Path(directory))
+            topology = orch.scenario_context().plan_topology
+            clean = self._clean_rx_rss_2_stats()
+            self.assertTrue(qos_accounting_complete(clean, topology))
+            for fault in (
+                "missing", "duplicate", "foreign", "module", "negative", "boolean", "epoch", "owner", "cause",
+            ):
+                with self.subTest(fault=fault):
+                    stats = copy.deepcopy(clean)
+                    row = stats.module_counter_stats[0]
+                    if fault == "missing":
+                        stats.module_counter_stats.pop()
+                    elif fault == "duplicate":
+                        stats.module_counter_stats.append(copy.copy(row))
+                    elif fault == "foreign":
+                        row.context_instance_id = "unknown"
+                    elif fault == "module":
+                        row.module_id = "unknown"
+                    elif fault == "negative":
+                        row.value = -1
+                    elif fault == "boolean":
+                        row.value = True
+                    elif fault == "epoch":
+                        row.epoch = 0
+                    elif fault == "owner":
+                        row.worker_index += 1
+                    else:
+                        invalid = next(
+                            item for item in stats.module_counter_stats if item.name == "qos.invalid_input_drops"
+                        )
+                        invalid.value = 1
+                    with self.assertRaises(RuntimeError):
+                        qos_accounting_complete(stats, topology)
+            absent = copy.deepcopy(clean)
+            absent.module_counter_stats = []
+            with self.assertRaises(RuntimeError):
+                qos_accounting_complete(absent, topology)
+            for cause in ("unconfigured", "rate_limit", "flow_capacity", "invalid_input"):
+                with self.subTest(cause=cause):
+                    stats = copy.deepcopy(clean)
+                    for row in stats.module_counter_stats:
+                        if row.name in (f"qos.{cause}_drops", "qos.packets_dropped"):
+                            row.value = 1
+                        elif row.name == "qos.bytes_dropped":
+                            row.value = 64
+                    stats.stage_stats[0].in_packets += 2
+                    stats.stage_stats[0].dropped_packets += 2
+                    stats.stage_stats[0].in_bytes += 128
+                    self.assertTrue(qos_accounting_complete(stats, topology))
 
     def test_default_topology_does_not_require_stream_stats(self):
         """The default topology needs no additional RSS evidence predicate."""

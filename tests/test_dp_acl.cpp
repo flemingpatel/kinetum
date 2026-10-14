@@ -136,7 +136,8 @@ TEST(dp_acl, denies_by_rule_priority)
 	ASSERT_TRUE(eng.execute_stage(&parse, packet.get())) << "Parse stage should succeed";
 
 	// Execute ACL stage - should DENY (return false = drop packet)
-	EXPECT_FALSE(module->process(*packet.get())) << "ACL should DENY packet to 8.8.8.8 (high-priority deny rule)";
+	EXPECT_FALSE(module->process(*packet.get(), 0u))
+		<< "ACL should DENY packet to 8.8.8.8 (high-priority deny rule)";
 }
 
 //==============================================================================
@@ -202,7 +203,7 @@ TEST(dp_acl, wire_format_permit_unchanged)
 
 	// Execute parse and ACL
 	ASSERT_TRUE(eng.execute_stage(&parse, packet.get()));
-	ASSERT_TRUE(module->process(*packet.get())) << "ACL should PERMIT packet";
+	ASSERT_TRUE(module->process(*packet.get(), 0u)) << "ACL should PERMIT packet";
 
 	// Verify that the read-only callback preserved the complete packet.
 
@@ -283,7 +284,7 @@ TEST(dp_acl, wire_format_cidr_matching)
 	EXPECT_EQ(packet.metadata().dst_ipv4, 0xCB007132u) << "Parser should extract correct dst_ip";
 
 	// Execute ACL - should DENY based on CIDR match
-	EXPECT_FALSE(module->process(*packet.get()))
+	EXPECT_FALSE(module->process(*packet.get(), 0u))
 		<< "ACL should DENY packet matching CIDR rules (172.16.0.0/12 -> 203.0.113.0/24)";
 }
 
@@ -736,6 +737,6 @@ TEST(dp_acl, simd_batch_integration_large_ruleset)
 	ASSERT_TRUE(eng.execute_stage(&parse, packet.get())) << "Parse stage should succeed";
 
 	// Execute ACL stage - SIMD batch path should DENY packet to 8.8.8.8
-	EXPECT_FALSE(module->process(*packet.get()))
+	EXPECT_FALSE(module->process(*packet.get(), 0u))
 		<< "ACL simd_batch path should DENY packet to 8.8.8.8 (257 rules, high-priority deny)";
 }

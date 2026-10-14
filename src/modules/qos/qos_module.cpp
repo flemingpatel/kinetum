@@ -8,7 +8,7 @@
  *
  * Hot-Path Optimizations:
  * - Uses KINETUM_COUNTER_ADD for O(1) counter updates
- * - Uses fixed-point arithmetic (Q20) for precision without FP overhead
+ * - Uses shared exact byte-credit arithmetic without FP overhead
  * - One preallocated context-local policer with sole-worker ownership
  * - Lazy token refill minimizes per-packet work
  * - Precomputed DSCP->profile array for O(1) lookup
@@ -82,23 +82,29 @@ struct qos_prepared_artifact {
 }
 
 /**
- * @brief Resolve one exact writable IPv4 header before policing for remark.
+ * @brief Borrow one bounded IPv4 header for identity eligibility and remarking.
+ */
+struct ipv4_header_view {
+	uint8_t *data{nullptr};	   ///< Borrowed header within the packet's backing.
+	uint16_t total_length{0};  ///< Declared IPv4 extent, excluding Ethernet padding.
+	uint8_t header_length{0};  ///< Header length derived from the on-wire IHL.
+};
+
+/**
+ * @brief Validate the IPv4 bytes needed by classification and DSCP remarking.
  * @param batch Exact owner-worker packet batch.
  * @param index Occupied packet lane.
- * @param[out] header Writable IPv4 header start.
- * @param[out] header_length Exact validated IPv4 header length.
+ * @param[out] header Borrowed validated header and declared extent.
  * @return true only when parser facts and packet bytes prove a complete header.
  */
-[[nodiscard]] bool remarkable_ipv4_header(kinetum_batch_t *batch, uint16_t index, uint8_t **header,
-					  uint8_t *header_length) noexcept
+[[nodiscard]] bool read_ipv4_header(const kinetum_batch_t &batch, uint16_t index, ipv4_header_view &header) noexcept
 {
-	if (batch == nullptr || header == nullptr || header_length == nullptr ||
-	    (KINETUM_PKT_PLATFORM_FLAGS(batch, index) & KINETUM_PKT_F_L3_IPV4) == 0u) {
+	if ((batch.platform_flags[index] & KINETUM_PKT_F_L3_IPV4) == 0u) {
 		return false;
 	}
-	auto *packet = static_cast<uint8_t *>(KINETUM_PKT_DATA(batch, index));
-	const std::size_t packet_length = KINETUM_PKT_LEN(batch, index);
-	const std::size_t l3_offset = KINETUM_PKT_L3_OFF(batch, index);
+	auto *packet = static_cast<uint8_t *>(batch.data[index]);
+	const std::size_t packet_length = batch.len[index];
+	const std::size_t l3_offset = batch.l3_off[index];
 	if (packet == nullptr || l3_offset > packet_length || packet_length - l3_offset < 20u) {
 		return false;
 	}
@@ -109,9 +115,51 @@ struct qos_prepared_artifact {
 	    total_length < candidate_length || total_length > packet_length - l3_offset) {
 		return false;
 	}
-	*header = candidate;
-	*header_length = candidate_length;
+	header = {candidate, static_cast<uint16_t>(total_length), candidate_length};
 	return true;
+}
+
+/**
+ * @brief Classify present packet facts without using zero port values as absence.
+ * @param batch Exact post-rewrite SoA lanes.
+ * @param index Occupied packet lane.
+ * @param header Validated on-wire IPv4 extent.
+ * @param[out] key Semantic tuple or explicit address/protocol aggregate.
+ * @return false when an unfragmented TCP/UDP packet lacks its port bytes.
+ */
+[[nodiscard]] bool make_flow_key(const kinetum_batch_t &batch, uint16_t index, const ipv4_header_view &header,
+				 flow_key &key) noexcept
+{
+	const uint8_t protocol = batch.proto[index];
+	const bool transport = (batch.platform_flags[index] & KINETUM_PKT_F_FRAGMENT) == 0u &&
+			       (protocol == 6u || protocol == 17u);
+	if (transport && header.total_length < header.header_length + 4u) {
+		return false;
+	}
+	key = {
+		.src_ip = batch.src_ip[index],
+		.dst_ip = batch.dst_ip[index],
+		.src_port = transport ? batch.src_port[index] : uint16_t{0},
+		.dst_port = transport ? batch.dst_port[index] : uint16_t{0},
+		.protocol = protocol,
+		.kind = transport ? flow_kind::TRANSPORT : flow_kind::IP_AGGREGATE,
+	};
+	return true;
+}
+
+/**
+ * @brief Distinguish absent policy from a broken immutable prepared artifact.
+ * @param packet_config Exact configuration pointer supplied by the runtime.
+ * @return Null for absent policy; a complete typed view otherwise.
+ * @note A present view with missing prepared internals terminates.
+ */
+[[nodiscard]] const qos_packet_config *configured_policy(const void *packet_config) noexcept
+{
+	const auto *config = static_cast<const qos_packet_config *>(packet_config);
+	if (config != nullptr && (config->profiles == nullptr || config->default_profile == nullptr)) {
+		std::terminate();
+	}
+	return config;
 }
 
 }  // namespace
@@ -123,8 +171,13 @@ kinetum_error qos_module::do_init(const kinetum_lifecycle_ctx *lifecycle) noexce
 	bytes_allowed_ = sdk::counter::create(lifecycle, "qos.bytes_allowed");
 	bytes_dropped_ = sdk::counter::create(lifecycle, "qos.bytes_dropped");
 	active_flows_ = sdk::counter::create(lifecycle, "qos.active_flows");
+	unconfigured_drops_ = sdk::counter::create(lifecycle, "qos.unconfigured_drops");
+	rate_limit_drops_ = sdk::counter::create(lifecycle, "qos.rate_limit_drops");
+	flow_capacity_drops_ = sdk::counter::create(lifecycle, "qos.flow_capacity_drops");
+	invalid_input_drops_ = sdk::counter::create(lifecycle, "qos.invalid_input_drops");
 
-	if (!packets_allowed_ || !packets_dropped_ || !bytes_allowed_ || !bytes_dropped_ || !active_flows_) {
+	if (!packets_allowed_ || !packets_dropped_ || !bytes_allowed_ || !bytes_dropped_ || !active_flows_ ||
+	    !unconfigured_drops_ || !rate_limit_drops_ || !flow_capacity_drops_ || !invalid_input_drops_) {
 		return KINETUM_ERR_LIMIT_EXCEEDED;
 	}
 	return KINETUM_OK;
@@ -244,50 +297,40 @@ uint64_t qos_module::do_process(kinetum_batch_t *batch) noexcept
 		return 0;
 	}
 	uint64_t forward_mask = KINETUM_FORWARD_MASK(count);
+	policer_.observe_time(batch->now_ns);
 
-	const auto *cfg_ptr = sdk::exact_config<qos_packet_config>(batch);
+	const auto *cfg_ptr = configured_policy(batch->epoch_config);
 
-	if (KINETUM_UNLIKELY(!cfg_ptr || !cfg_ptr->profiles)) {
+	if (KINETUM_UNLIKELY(cfg_ptr == nullptr)) {
 		uint64_t dropped_bytes = 0;
 		for (uint16_t i = 0; i < count; i++) {
 			dropped_bytes += KINETUM_PKT_LEN(batch, i);
-			KINETUM_DROP(forward_mask, i);
 		}
 		KINETUM_COUNTER_ADD(packets_dropped_.native(), count);
 		KINETUM_COUNTER_ADD(bytes_dropped_.native(), dropped_bytes);
+		KINETUM_COUNTER_ADD(unconfigured_drops_.native(), count);
 		return 0;
 	}
 	const qos_packet_config &cfg = *cfg_ptr;
 
 	const auto &profiles = *cfg.profiles;
 	uint32_t local_allowed = 0;
-	uint32_t local_dropped = 0;
+	uint32_t local_rate_drops = 0;
+	uint32_t local_capacity_drops = 0;
+	uint32_t local_invalid_drops = 0;
 	uint64_t local_bytes_allowed = 0;
 	uint64_t local_bytes_dropped = 0;
 
 	const qos_profile_compiled *default_profile = cfg.default_profile;
-	if (KINETUM_UNLIKELY(default_profile == nullptr)) {
-		uint64_t dropped_bytes = 0;
-		for (uint16_t i = 0; i < count; i++) {
-			dropped_bytes += KINETUM_PKT_LEN(batch, i);
-			KINETUM_DROP(forward_mask, i);
-		}
-		KINETUM_COUNTER_ADD(packets_dropped_.native(), count);
-		KINETUM_COUNTER_ADD(bytes_dropped_.native(), dropped_bytes);
-		return 0;
-	}
-
 	qos_policer &policer = policer_;
 
 	for (uint16_t i = 0; i < count; i++) {
 		// Prefetch next SoA elements
 		if (KINETUM_LIKELY(i + 2 < count)) {
-			__builtin_prefetch(&batch->flow_hash[i + 2], 0, 3);
+			__builtin_prefetch(&batch->src_ip[i + 2], 0, 3);
 			__builtin_prefetch(&batch->dscp[i + 2], 0, 3);
 		}
 
-		// Use flow_hash as flow key (5-tuple hash computed by the shared parser).
-		const uint32_t flow_key = KINETUM_PKT_HASH(batch, i);
 		const std::size_t pkt_bytes = KINETUM_PKT_LEN(batch, i);
 		const uint8_t dscp = KINETUM_PKT_DSCP(batch, i);
 
@@ -297,24 +340,24 @@ uint64_t qos_module::do_process(kinetum_batch_t *batch) noexcept
 		if (dscp < MAX_DSCP && cfg.dscp_profiles[dscp] != nullptr) {
 			profile = cfg.dscp_profiles[dscp];
 		}
-		uint8_t *remark_header = nullptr;
-		uint8_t remark_header_length = 0u;
-		if (profile->conform_dscp != 0u &&
-		    !remarkable_ipv4_header(batch, i, &remark_header, &remark_header_length)) {
+		ipv4_header_view header;
+		flow_key key;
+		const bool bounded = profile->cir_bytes_per_s != 0u;
+		if (((bounded || profile->conform_dscp != 0u) && !read_ipv4_header(*batch, i, header)) ||
+		    (bounded && !make_flow_key(*batch, i, header, key))) {
 			KINETUM_DROP(forward_mask, i);
-			local_dropped++;
+			++local_invalid_drops;
 			local_bytes_dropped += pkt_bytes;
 			continue;
 		}
 
-		// RX owns monotonic packet time. The policer consumes that exact value
-		// without issuing a clock read on the packet worker.
-		const uint64_t packet_time_ns = KINETUM_PKT_TS(batch, i);
-		const bool allowed = policer.allow(packet_time_ns, *profile, profiles.runtime, flow_key, pkt_bytes);
+		const auto result = policer.police(batch->now_ns, *profile, profiles.runtime, key, pkt_bytes);
 
-		if (KINETUM_LIKELY(allowed)) {
+		if (KINETUM_LIKELY(result == policer_result::ALLOWED)) {
 			// DSCP remarking for conforming packets (IPv4 only)
-			if (KINETUM_UNLIKELY(remark_header != nullptr)) {
+			if (KINETUM_UNLIKELY(profile->conform_dscp != 0u)) {
+				auto *remark_header = header.data;
+				const uint8_t remark_header_length = header.header_length;
 				const uint8_t new_dscp = profile->conform_dscp;
 				batch->dscp[i] = new_dscp;
 				const uint8_t ecn = remark_header[1] & 0x03u;
@@ -339,14 +382,29 @@ uint64_t qos_module::do_process(kinetum_batch_t *batch) noexcept
 			local_bytes_allowed += pkt_bytes;
 		} else {
 			KINETUM_DROP(forward_mask, i);
-			local_dropped++;
+			switch (result) {
+			case policer_result::RATE_LIMIT:
+				++local_rate_drops;
+				break;
+			case policer_result::FLOW_CAPACITY:
+				++local_capacity_drops;
+				break;
+			case policer_result::INVALID_INPUT:
+				++local_invalid_drops;
+				break;
+			case policer_result::ALLOWED:
+				std::terminate();
+			}
 			local_bytes_dropped += pkt_bytes;
 		}
 	}
 
 	// Update telemetry
 	KINETUM_COUNTER_ADD(packets_allowed_.native(), local_allowed);
-	KINETUM_COUNTER_ADD(packets_dropped_.native(), local_dropped);
+	KINETUM_COUNTER_ADD(packets_dropped_.native(), local_rate_drops + local_capacity_drops + local_invalid_drops);
+	KINETUM_COUNTER_ADD(rate_limit_drops_.native(), local_rate_drops);
+	KINETUM_COUNTER_ADD(flow_capacity_drops_.native(), local_capacity_drops);
+	KINETUM_COUNTER_ADD(invalid_input_drops_.native(), local_invalid_drops);
 	KINETUM_COUNTER_ADD(bytes_allowed_.native(), local_bytes_allowed);
 	KINETUM_COUNTER_ADD(bytes_dropped_.native(), local_bytes_dropped);
 
@@ -363,8 +421,8 @@ kinetum_health_assessment qos_module::do_health_check(uint64_t, const void *acti
 
 	// Health executes on the owner worker against the same exact immutable
 	// policy pointer used by packet execution.
-	const auto *cfg_ptr = static_cast<const qos_packet_config *>(active_config);
-	if (!cfg_ptr || !cfg_ptr->profiles) {
+	const auto *cfg_ptr = configured_policy(active_config);
+	if (cfg_ptr == nullptr) {
 		assessment.health_score = 70;
 		assessment.flags |= KINETUM_HEALTH_F_CONFIG_ISSUE;
 		sdk::set_health_reason_literal(assessment, "No QoS profiles configured");

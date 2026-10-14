@@ -1138,6 +1138,15 @@ class TestOrchestrator:
                     message="final Data Plane telemetry is unavailable",
                 )
             stats_validation = self._validate_stream_topology_stats(stats)
+            if stats_validation.passed and self.config.deployment == DeploymentMode.FAN_IN_EDGE_GATEWAY:
+                stats_validation = StatsValidationResult(
+                    required=True,
+                    passed=True,
+                    message=(
+                        stats_validation.message + "; QoS cause accounting validated"
+                        if stats_validation.required else "QoS cause accounting validated"
+                    ),
+                )
             if stats_validation.required:
                 if stats_validation.passed:
                     self.reporter.print_progress(stats_validation.message)

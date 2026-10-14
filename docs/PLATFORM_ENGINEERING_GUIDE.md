@@ -847,9 +847,9 @@ buckets.
 **Rule.** New generic rate-limited operations (ingress shaping, control
 plane throttles, tenant limits) use the platform's `token_bucket`,
 `leaky_bucket`, or `sliding_window` primitives from
-`include/kinetum/algo/ratelimit.hpp`. Specialized hot-path policers may be
-module-owned only when their state layout is part of the module's
-performance contract.
+`include/kinetum/algo/ratelimit.hpp`. A module may own a specialized policer
+layout while composing the shared `byte_credit` arithmetic; a slab layout does
+not justify a second refill algorithm.
 
 **Rationale.** Burst handling, exact fractional-byte accrual, and monotonic
 time are easy to get wrong, silently losing or creating credit. Shared integer
@@ -859,19 +859,23 @@ math gives consumers one tested implementation of these edge cases.
 
 - `token_bucket(rate_bytes_per_sec, burst_bytes)`: standard token bucket with
   an exact integer numerator over the nanosecond denominator.
+- `byte_credit`: the same exact balance with caller-owned elapsed time and
+  policy. It caps retained credit before saturating refill and consumption.
 - `leaky_bucket`: meters bytes against a bounded level that drains at a fixed
   rate. It permits bursts up to capacity; it does not queue or pace packets.
 - `sliding_window`: for positive-duration time-window counters.
-- All three are stateful and operated on per-flow or per-tenant; storage
-  is the caller's responsibility.
-- Timestamp zero is ordinary input. A timestamp regression rejects without
+- State belongs to the caller's flow or tenant; storage is the caller's responsibility.
+- Timestamp zero is ordinary input. In standalone limiters, regression rejects without
   resetting credit or event count, and no rate is pre-divided into a zero
   low-rate representation.
+- Packet policers consume the immutable worker processing time in
+  `batch.now_ns`; packet-origin timestamps do not measure downstream execution.
+  QoS rejects a regressed platform clock as a contradiction, before any packet
+  or flow mutation, including under an unlimited policy.
 
 **Where this appears.** `docs/ALGORITHM_LIBRARY.md` (the primitives),
-`src/modules/README.md` (QoS uses a module-specific per-flow policer for
-its hot path; the generic `token_bucket` remains the reusable primitive
-for new consumers).
+`src/modules/README.md` (QoS composes the shared balance inside its
+preallocated per-flow state).
 
 ### Pat-14: Timer Wheel for Active Stages
 
@@ -1564,9 +1568,8 @@ Notes:
   same cost and the patterns are not load-bearing for them.
 - `Modules` covers built-in modules (ACL, NAT44, QoS) and customer
   modules. Both use the same SDK surface (mechanism vs policy, P-1).
-- Pat-13 applies to modules through the rate-limiting discipline. QoS uses
-  a module-specific policer with the same token-bucket semantics rather
-  than the generic `token_bucket` helper.
+- Pat-13 applies to modules through the rate-limiting discipline. QoS and
+  `token_bucket` share `byte_credit` while owning their distinct layouts and clocks.
 - Pat-14's SDK/DP/module cells name the exact active-scheduler
   contract. Production active workers consume one caller-storage timer wheel;
   the built-in ACL/NAT44/QoS modules remain passive and do not use it for

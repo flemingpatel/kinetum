@@ -90,7 +90,7 @@ static bool prepare_udp_checksum(std::vector<uint8_t> &bytes)
 	return true;
 }
 
-/** @brief Return a complete TCP fixture with an independent valid transport checksum. */
+/** @return Complete TCP fixture with independently computed IPv4 and transport checksums. */
 static std::vector<uint8_t> make_tcp_checksum_packet()
 {
 	auto bytes = build_eth_ipv4_udp(UINT32_C(0x0a000001), UINT32_C(0x08080808), 1234u, 80u, 0u, {});
@@ -221,7 +221,7 @@ TEST(dp_nat44, translated_checksum_zero_obeys_transport_semantics)
 		kinetum::axiom::v1::Stage parse;
 		parse.set_kind(kinetum::axiom::v1::STAGE_KIND_PARSE_IPV4);
 		ASSERT_TRUE(engine.execute_stage(&parse, probe.get()));
-		ASSERT_TRUE(module->process(*probe.get()));
+		ASSERT_TRUE(module->process(*probe.get(), 0u));
 		auto *const probe_bytes = probe.data();
 		if (probe_bytes == nullptr || probe.size() != packet_size) {
 			FAIL() << "translated probe lost its complete payload backing";
@@ -244,7 +244,7 @@ TEST(dp_nat44, translated_checksum_zero_obeys_transport_semantics)
 		kinetum::test::packet_record_test_owner packet(original);
 		ASSERT_TRUE(packet.valid()) << packet.error();
 		ASSERT_TRUE(engine.execute_stage(&parse, packet.get()));
-		ASSERT_TRUE(module->process(*packet.get()));
+		ASSERT_TRUE(module->process(*packet.get(), 0u));
 		const auto *const packet_bytes = packet.data();
 		if (packet_bytes == nullptr || packet.size() != packet_size) {
 			FAIL() << "translated packet lost its complete payload backing";
@@ -278,7 +278,7 @@ TEST(dp_nat44, incremental_translation_does_not_repair_invalid_payload_checksum)
 	kinetum::axiom::v1::Stage parse;
 	parse.set_kind(kinetum::axiom::v1::STAGE_KIND_PARSE_IPV4);
 	ASSERT_TRUE(engine.execute_stage(&parse, packet.get()));
-	ASSERT_TRUE(module->process(*packet.get()));
+	ASSERT_TRUE(module->process(*packet.get(), 0u));
 	const uint8_t *ip = packet.data() + wire_offsets::IP_HDR_START;
 	const uint8_t *udp = packet.data() + wire_offsets::UDP_HDR_START;
 	EXPECT_NE(compute_ipv4_l4_checksum({17u, ip, udp, 10u}), 0u);
@@ -474,7 +474,7 @@ TEST(dp_nat44, snat_and_dnat_roundtrip)
 
 	// Outbound NAT (SNAT)
 	ASSERT_TRUE(eng.execute_stage(&parse, packet.get())) << "Parse stage should succeed for outbound packet";
-	ASSERT_TRUE(module->process(*packet.get())) << "NAT stage should succeed for outbound packet";
+	ASSERT_TRUE(module->process(*packet.get(), 0u)) << "NAT stage should succeed for outbound packet";
 
 	// Verify SNAT translation
 	EXPECT_EQ(packet.metadata().src_ipv4, 0xcb00710au)  // 203.0.113.10 in network byte order
@@ -500,7 +500,7 @@ TEST(dp_nat44, snat_and_dnat_roundtrip)
 
 	// Parse and NAT the reply
 	ASSERT_TRUE(eng.execute_stage(&parse, reply.get())) << "Parse stage should succeed for inbound reply";
-	ASSERT_TRUE(module->process(*reply.get())) << "NAT stage should succeed for inbound reply";
+	ASSERT_TRUE(module->process(*reply.get(), 0u)) << "NAT stage should succeed for inbound reply";
 
 	// Verify DNAT translation
 	EXPECT_EQ(reply.metadata().dst_ipv4, 0x0a000001u)  // 10.0.0.1
@@ -591,7 +591,7 @@ TEST(dp_nat44, wire_format_snat_verification)
 
 	// Execute parse and NAT
 	ASSERT_TRUE(eng.execute_stage(&parse, packet.get()));
-	ASSERT_TRUE(module->process(*packet.get()));
+	ASSERT_TRUE(module->process(*packet.get(), 0u));
 
 	// Verify the packet buffer through the independent test-side wire helpers.
 
@@ -685,7 +685,7 @@ TEST(dp_nat44, snat_l4_checksum_uses_protocol_length_not_padding)
 	ASSERT_TRUE(module->prepare_and_activate(1, kinetum::test::module_config_json(nat_config)).is_ok());
 
 	ASSERT_TRUE(eng.execute_stage(&parse, packet.get()));
-	ASSERT_TRUE(module->process(*packet.get()));
+	ASSERT_TRUE(module->process(*packet.get(), 0u));
 
 	const uint8_t *pkt_data = packet.data();
 	const uint8_t *ip_after = pkt_data + wire_offsets::IP_HDR_START;
@@ -755,7 +755,7 @@ TEST(dp_nat44, wire_format_dnat_verification)
 
 	// Process outbound to create session
 	ASSERT_TRUE(eng.execute_stage(&parse, outbound_packet.get()));
-	ASSERT_TRUE(module->process(*outbound_packet.get()));
+	ASSERT_TRUE(module->process(*outbound_packet.get(), 0u));
 
 	// Capture allocated port from outbound
 	uint16_t nat_port = outbound_packet.metadata().src_port;
@@ -779,7 +779,7 @@ TEST(dp_nat44, wire_format_dnat_verification)
 
 	// Process inbound
 	ASSERT_TRUE(eng.execute_stage(&parse, inbound_packet.get()));
-	ASSERT_TRUE(module->process(*inbound_packet.get()));
+	ASSERT_TRUE(module->process(*inbound_packet.get(), 0u));
 
 	// Verify the DNAT mutation in the packet bytes.
 
