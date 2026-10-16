@@ -259,7 +259,9 @@ class _FakeEpochSender:
         if self.overlap_start_count != 1 or self.overlap_end_count != 1:
             raise RuntimeError("generation overlap did not complete both edges")
         self.finish_called_at = self._clock()
-        stats = PacketStats(tx_count=100, start_time=0.0, end_time=self.finish_called_at)
+        stats = PacketStats(
+            tx_count=100, start_time=0.0, end_time=self.finish_called_at, duration_s=self.finish_called_at,
+        )
         stats.generation_tag_counts = {1: 50, 2: 50}
         return stats
 

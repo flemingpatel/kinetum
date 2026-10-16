@@ -30,7 +30,7 @@ python3 -B -m venv /var/tmp/kinetum-validation
 ```bash
 sudo /var/tmp/kinetum-validation/bin/python3 -I -B -X utf8 -m kinetum_validation --runtime-root /opt/kinetum --test-type standard
 sudo /var/tmp/kinetum-validation/bin/python3 -I -B -X utf8 -m kinetum_benchmark run --runtime-root /opt/kinetum --runs 30
-/var/tmp/kinetum-validation/bin/python3 -I -B -X utf8 -m kinetum_benchmark report --input-dir /tmp/kinetum_benchmark
+sudo /var/tmp/kinetum-validation/bin/python3 -I -B -X utf8 -m kinetum_benchmark report --input-dir /tmp/kinetum_benchmark
 ```
 
 Python 3.12 or newer is required locally. The remote traffic endpoint retains

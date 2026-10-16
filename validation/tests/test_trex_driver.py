@@ -159,7 +159,7 @@ def _remote_action_execution(action: str) -> str:
 
 
 def _execute_remote_action(client, spec, monotonic, wall_time):
-    """Execute the owned endpoint action against supplied TRex observations."""
+    """Execute the owned endpoint action against exact clock sequences and TRex observations."""
     def fail(message, code=1):
         """Reject endpoint failures instead of allowing execution to continue."""
         raise RuntimeError(f"{code}: {message}")
@@ -183,8 +183,8 @@ def _execute_remote_action(client, spec, monotonic, wall_time):
         "promisc_ports": [],
     }
     exec(compile(functions, "<remote_trex_functions>", "exec"), namespace)  # pylint: disable=exec-used
-    namespace["time"].monotonic.return_value = monotonic
-    namespace["time"].time.return_value = wall_time
+    namespace["time"].monotonic.side_effect = monotonic
+    namespace["time"].time.side_effect = wall_time
     namespace["emit"] = MagicMock()
     namespace["fail"] = fail
     namespace["build_generation_stream"] = MagicMock()
@@ -360,6 +360,7 @@ class _CapturingTRexDriver(TRexTrafficDriver):
                 "start_time": 1.0,
                 "start_monotonic": spec["start_monotonic"],
                 "end_time": 16.0,
+                "duration_s": 15.0,
                 "ingress_ports": [0, 1],
                 "egress_ports": [2],
                 "generation_flow_plan": spec["generation_flow_plan"],
@@ -397,6 +398,7 @@ class _CapturingTRexDriver(TRexTrafficDriver):
                 "port_counter_final": _port_counter_final(5, 5, 9),
                 "start_time": 1.0,
                 "end_time": 2.0,
+                "duration_s": 1.0,
                 "ingress_ports": [0, 1],
                 "egress_ports": [2],
                 "promiscuous_ports": [2],
@@ -549,13 +551,7 @@ class TestTRexTrafficDriver(unittest.TestCase):  # pylint: disable=too-many-publ
             self.assertEqual(result.valid, 97)
             self.assertEqual(result.missing_count, 3)
             self.assertIsNone(result.latency_stats())
-            result.set_latency_stats({
-                "avg": 10.0,
-                "min": 5.0,
-                "max": 20.0,
-                "p50": 9.0,
-                "p99": 19.0,
-            })
+            result.set_latency_stats(dict.fromkeys(("avg", "min", "max", "p50", "p99"), 10.0))
             with self.assertRaisesRegex(RuntimeError, "without an owned source"):
                 ValidationOrchestrator(_trex_config()).scenario_context().measured_average_latency(result)
             sidecar = Path(tmpdir) / "capture_64.trex_stats.json"
@@ -1378,7 +1374,7 @@ class TestTRexTrafficDriver(unittest.TestCase):  # pylint: disable=too-many-publ
         }
         start_client = _counter_client(PORT_COUNTER_BASELINE, relative_zero)
         with patch.object(os, "getcwd", return_value=request["work_dir"]):
-            session = _execute_remote_action(start_client, request, 10.0, 1.0)
+            session = _execute_remote_action(start_client, request, [10.0], [1.0])
         driver._validate_remote_success(session, "generation_start", request)  # pylint: disable=protected-access
         self.assertEqual(session["port_counter_baseline"], PORT_COUNTER_BASELINE)
         self.assertLess(
@@ -1412,13 +1408,14 @@ class TestTRexTrafficDriver(unittest.TestCase):  # pylint: disable=too-many-publ
         }
         finish_client = _counter_client(current, {"flow_stats": flow_stats})
         with patch.object(os, "getcwd", return_value=request["work_dir"]):
-            result = _execute_remote_action(finish_client, finish_request, 25.0, 16.0)
+            result = _execute_remote_action(finish_client, finish_request, [25.0, 25.2], [16.0, 16.2])
         driver._validate_remote_success(result, "generation_finish", finish_request)  # pylint: disable=protected-access
         self.assertEqual(result["port_tx_count"], 15500)
         self.assertEqual(result["port_rx_count"], 15500)
         self.assertEqual(result["errors"], 0)
         self.assertEqual(result["tx_count"], 15500)
         self.assertEqual(result["rx_count"], 15500)
+        self.assertAlmostEqual(result["duration_s"], 15.2)
         self.assertEqual(result["port_counter_baseline"], PORT_COUNTER_BASELINE)
         self.assertEqual(result["port_counter_final"], current)
         finish_client.get_stats.assert_called_once_with(ports=[0, 1, 2])
@@ -1452,7 +1449,7 @@ class TestTRexTrafficDriver(unittest.TestCase):  # pylint: disable=too-many-publ
 
         client.wait_on_traffic.side_effect = complete_traffic
         with patch.object(os, "getcwd", return_value=request["work_dir"]):
-            result = _execute_remote_action(client, request, 10.0, 1.0)
+            result = _execute_remote_action(client, request, [10.0, 11.0], [1.0, 21.0])
         driver._validate_remote_success(result, "run", request)  # pylint: disable=protected-access
         self.assertEqual(set(result), trex_module._REMOTE_SUCCESS_KEYS["run"])  # pylint: disable=protected-access
         self.assertEqual(result["port_counter_baseline"], PORT_COUNTER_BASELINE)
@@ -1460,6 +1457,17 @@ class TestTRexTrafficDriver(unittest.TestCase):  # pylint: disable=too-many-publ
         self.assertEqual(result["tx_count"], 10)
         self.assertEqual(result["rx_count"], 9)
         self.assertEqual(result["errors"], 0)
+        self.assertEqual(result["duration_s"], 1.0)
+        stats = trex_module.TRexSender._stats_from_raw(result)  # pylint: disable=protected-access
+        self.assertEqual(stats.actual_pps, 10.0)
+        missing = {key: value for key, value in result.items() if key != "duration_s"}
+        with self.assertRaisesRegex(RuntimeError, "required evidence"):
+            trex_module.TRexSender._stats_from_raw(missing)  # pylint: disable=protected-access
+        for elapsed in (0.0, -1.0, None):
+            with self.subTest(elapsed=elapsed), self.assertRaises((RuntimeError, ValueError)):
+                driver._validate_remote_success(  # pylint: disable=protected-access
+                    {**result, "duration_s": elapsed}, "run", request,
+                )
         self.assertEqual(client.get_stats.call_args_list, [call(ports=[0, 1, 2])] * 2)
         self.assertLess(
             client.mock_calls.index(call.get_stats(ports=[0, 1, 2])),

@@ -89,7 +89,7 @@ _REMOTE_SUCCESS_KEYS = {
     "run": frozenset(
         {
             "ok", "action", "tx_count", "rx_count", "errors", "start_time",
-            "end_time", "ingress_ports", "egress_ports", "promiscuous_ports",
+            "end_time", "duration_s", "ingress_ports", "egress_ports", "promiscuous_ports",
             "work_dir", "generation_tag_counts", "tag_counts",
             "port_counter_baseline", "port_counter_final",
         }
@@ -113,7 +113,7 @@ _REMOTE_SUCCESS_KEYS = {
     "generation_finish": frozenset(
         {
             "ok", "action", "tx_count", "rx_count", "errors", "port_tx_count",
-            "port_rx_count", "start_time", "end_time", "ingress_ports",
+            "port_rx_count", "start_time", "end_time", "duration_s", "ingress_ports",
             "port_counter_baseline", "port_counter_final",
             "egress_ports", "promiscuous_ports", "work_dir",
             "generation_tag_counts", "tag_counts", "generation_flow_plan",
@@ -344,7 +344,7 @@ class TRexSender:
     def _stats_from_raw(raw: Dict[str, Any]) -> PacketStats:
         """Convert raw TRex counters into the sender stats contract."""
         required = {
-            "tx_count", "errors", "start_time", "end_time",
+            "tx_count", "errors", "start_time", "end_time", "duration_s",
             "generation_tag_counts",
         }
         if not required.issubset(raw):
@@ -364,14 +364,17 @@ class TRexSender:
             end_time=require_number(
                 raw["end_time"], "TRex end_time", minimum=0.0
             ),
+            duration_s=require_number(
+                raw["duration_s"], "TRex elapsed duration", minimum=0.0
+            ),
         )
         stats.generation_tag_counts = _generation_counts(
             raw["generation_tag_counts"], "TRex generation_tag_counts"
         )
         if sum(stats.generation_tag_counts.values()) != stats.tx_count:
             raise RuntimeError("TRex generation-tag counts disagree with TX")
-        if stats.end_time < stats.start_time:
-            raise RuntimeError("TRex sender timestamps regress")
+        if stats.end_time < stats.start_time or stats.duration_s <= 0.0:
+            raise RuntimeError("TRex sender timing is contradictory")
         return stats
 
 
@@ -1384,6 +1387,14 @@ class TRexTrafficDriver(TrafficDriver):
             )
             if end_time < start_time:
                 raise RuntimeError("trex remote timestamps regress")
+            elapsed_s = require_number(payload["duration_s"], "TRex elapsed duration", minimum=0.0)
+            if elapsed_s <= 0.0:
+                raise RuntimeError("trex remote elapsed duration is not positive")
+            if action == "generation_finish" and elapsed_s < (
+                require_number(payload["next_pause_monotonic"], "TRex final pause", minimum=0.0)
+                - require_number(payload["start_monotonic"], "TRex start", minimum=0.0)
+            ):
+                raise RuntimeError("trex elapsed duration omits the active generation interval")
             tx_tags = _generation_counts(
                 payload["generation_tag_counts"], "TRex TX generation tags"
             )

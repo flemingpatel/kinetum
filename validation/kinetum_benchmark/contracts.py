@@ -6,6 +6,7 @@ from datetime import datetime
 from typing import Any, Dict, Iterable
 
 from kinetum_validation.config.types import StreamTopologyProfile, StorageProfile, TrafficEndpointConfig
+from kinetum_validation.statistics import validate_percentile_population
 from kinetum_validation.engine.json_contract import (
     EXPECTED_SCENARIO_METRICS_BY_TEST,
     EXPECTED_TRANSITION_TYPES_BY_TEST,
@@ -489,6 +490,10 @@ def _validate_distribution(
         ]
     if count != expected_count or values != sorted(values):
         raise JsonContractError(f"{context} distribution is contradictory")
+    try:
+        validate_percentile_population(count, dict(zip((0, 50, 95, 99, 100), values)))
+    except ValueError as exc:
+        raise JsonContractError(f"{context} percentiles contradict their sample count") from exc
 
 
 def _validate_distribution_map(
@@ -551,6 +556,61 @@ def _validate_latency_distribution(
         raise JsonContractError(f"{context} contains fabricated zero latency")
 
 
+def _validate_observed_metric_family(
+    metrics: Dict[str, Any],
+    fields: set[str],
+    integral_fields: set[str],
+    context: str,
+    *,
+    latency_available: bool,
+    inclusion_policy: str,
+    passed_runs: int,
+    total_runs: int,
+) -> None:
+    """Validate each observed metric's population and correlated measurement groups."""
+    allowed = fields | ({"avg_latency_us"} if latency_available else set())
+    require_key_contract(metrics, allowed if passed_runs else set(), set() if passed_runs else allowed, context)
+    if not metrics:
+        raise JsonContractError(f"{context} contains no observations")
+    counts = {}
+    for name, value in metrics.items():
+        distribution = require_object(value, f"{context} {name}")
+        count = require_int(distribution.get("count"), f"{context} {name} count", minimum=1)
+        _validate_benchmark_sample_count(count, inclusion_policy, passed_runs, total_runs, context)
+        _validate_distribution(
+            distribution, f"{context} {name}", count,
+            integral=name in integral_fields, maximum=100.0 if name == "loss_pct" else None,
+        )
+        counts[name] = count
+
+    tx_key = "total_sent" if "total_sent" in fields else "tx_count"
+    rx_key = "total_received" if "total_received" in fields else "rx_count"
+    if tx_key in fields:
+        traffic_fields = {tx_key, rx_key} | ({"throughput_pps"} if "throughput_pps" in fields else set())
+        observed_traffic = traffic_fields & metrics.keys()
+        if observed_traffic and observed_traffic != traffic_fields:
+            raise JsonContractError(f"{context} traffic measurement group is incomplete")
+        if observed_traffic:
+            _common_distribution_count({name: metrics[name] for name in traffic_fields}, context)
+        for name in ("loss_pct", "avg_latency_us"):
+            if name in metrics and (tx_key not in counts or counts[name] > counts[tx_key]):
+                raise JsonContractError(f"{context} {name} exceeds its traffic population")
+        if "avg_latency_us" in metrics:
+            _validate_latency_distribution(
+                metrics["avg_latency_us"], f"{context} average latency", counts[tx_key],
+                inclusion_policy, passed_runs,
+            )
+    control_fields = {"boundary_count", "completed_boundaries", "protocol_faults_observed", "backpressure_events"}
+    observed_control = control_fields & metrics.keys()
+    if observed_control:
+        if observed_control != control_fields:
+            raise JsonContractError(f"{context} boundary measurement group is incomplete")
+        _common_distribution_count({name: metrics[name] for name in control_fields}, context)
+    if "rollback_epoch_step" in metrics:
+        if "duration_s" not in counts or counts["rollback_epoch_step"] > counts["duration_s"]:
+            raise JsonContractError(f"{context} rollback population exceeds completed scenario observations")
+
+
 def _validate_benchmark_scenario_metrics(
     value: object,
     test_type: str,
@@ -575,71 +635,27 @@ def _validate_benchmark_scenario_metrics(
 
     if "packet_tests" in metrics_by_family:
         _validate_benchmark_packet_metrics(
-            metrics_by_family["packet_tests"],
-            inclusion_policy,
-            passed_runs,
-            total_runs,
-            latency_available,
+            metrics_by_family["packet_tests"], inclusion_policy, passed_runs, total_runs, latency_available,
         )
-
-    scenario_shapes = {
+    shapes = {
         "epoch_test": {
-            "total_sent", "total_received", "loss_pct",
-            "boundary_count", "completed_boundaries",
-            "protocol_faults_observed", "backpressure_events",
+            "total_sent", "total_received", "loss_pct", "boundary_count",
+            "completed_boundaries", "protocol_faults_observed", "backpressure_events",
         },
-        "commit_confirmed_test": {
-            "tx_count", "rx_count", "loss_pct",
-        },
-        "rollback_test": {
-            "tx_count", "rx_count", "loss_pct",
-        },
+        "commit_confirmed_test": {"tx_count", "rx_count", "loss_pct"},
+        "rollback_test": {"tx_count", "rx_count", "loss_pct"},
         "guardrails_test": {"duration_s", "rollback_epoch_step"},
     }
     integral_fields = {
-        "total_sent", "total_received", "boundary_count",
-        "completed_boundaries", "protocol_faults_observed",
-        "backpressure_events", "tx_count", "rx_count",
-        "rollback_epoch_step",
+        "total_sent", "total_received", "boundary_count", "completed_boundaries",
+        "protocol_faults_observed", "backpressure_events", "tx_count", "rx_count", "rollback_epoch_step",
     }
-    for family, expected_fields in scenario_shapes.items():
-        if family not in metrics_by_family:
-            continue
-        metrics = require_object(metrics_by_family[family], f"{family} metrics")
-        carries_latency = family != "guardrails_test"
-        latency_required = carries_latency and latency_available and passed_runs > 0
-        require_key_contract(
-            metrics,
-            expected_fields | ({"avg_latency_us"} if latency_required else set()),
-            {"avg_latency_us"}
-            if carries_latency and latency_available and not latency_required
-            else set(),
-            f"{family} metrics",
-        )
-        base_metrics = {
-            name: distribution
-            for name, distribution in metrics.items()
-            if name != "avg_latency_us"
-        }
-        count = _common_distribution_count(base_metrics, family)
-        _validate_benchmark_sample_count(
-            count, inclusion_policy, passed_runs, total_runs, family
-        )
-        for name, distribution in base_metrics.items():
-            _validate_distribution(
-                distribution,
-                f"{family} {name}",
-                count,
-                integral=name in integral_fields,
-                maximum=100.0 if name == "loss_pct" else None,
-            )
-        if "avg_latency_us" in metrics:
-            _validate_latency_distribution(
-                metrics["avg_latency_us"],
-                f"{family} average latency",
-                count,
-                inclusion_policy,
-                passed_runs,
+    for family, fields in shapes.items():
+        if family in metrics_by_family:
+            _validate_observed_metric_family(
+                require_object(metrics_by_family[family], f"{family} metrics"), fields, integral_fields, family,
+                latency_available=latency_available and family != "guardrails_test",
+                inclusion_policy=inclusion_policy, passed_runs=passed_runs, total_runs=total_runs,
             )
 
 
@@ -656,56 +672,16 @@ def _validate_benchmark_packet_metrics(
         raise JsonContractError("packet scenario metrics are empty")
     for packet_size, metrics_value in packet_tests.items():
         if (
-            not packet_size.isascii()
-            or not packet_size.isdecimal()
-            or str(int(packet_size)) != packet_size
-            or not 64 <= int(packet_size) <= 9000
+            not packet_size.isascii() or not packet_size.isdecimal()
+            or str(int(packet_size)) != packet_size or not 64 <= int(packet_size) <= 9000
         ):
             raise JsonContractError("packet scenario identity is malformed")
-        metrics = require_object(metrics_value, "packet scenario row")
-        latency_required = latency_available and passed_runs > 0
-        base_fields = {
-            "tx_count", "rx_count", "loss_pct", "throughput_pps",
-        }
-        require_key_contract(
-            metrics,
-            base_fields | ({"avg_latency_us"} if latency_required else set()),
-            {"avg_latency_us"}
-            if latency_available and not latency_required
-            else set(),
-            "packet scenario row",
+        _validate_observed_metric_family(
+            require_object(metrics_value, "packet scenario row"),
+            {"tx_count", "rx_count", "loss_pct", "throughput_pps"}, {"tx_count", "rx_count"},
+            f"packet {packet_size}", latency_available=latency_available, inclusion_policy=inclusion_policy,
+            passed_runs=passed_runs, total_runs=total_runs,
         )
-        base_metrics = {
-            name: distribution
-            for name, distribution in metrics.items()
-            if name != "avg_latency_us"
-        }
-        count = _common_distribution_count(
-            base_metrics, f"packet {packet_size}"
-        )
-        _validate_benchmark_sample_count(
-            count,
-            inclusion_policy,
-            passed_runs,
-            total_runs,
-            f"packet {packet_size}",
-        )
-        for name, distribution in base_metrics.items():
-            _validate_distribution(
-                distribution,
-                f"packet {packet_size} {name}",
-                count,
-                integral=name in {"tx_count", "rx_count"},
-                maximum=100.0 if name == "loss_pct" else None,
-            )
-        if "avg_latency_us" in metrics:
-            _validate_latency_distribution(
-                metrics["avg_latency_us"],
-                f"packet {packet_size} average latency",
-                count,
-                inclusion_policy,
-                passed_runs,
-            )
 
 
 def _common_distribution_count(value: Dict[str, Any], context: str) -> int:

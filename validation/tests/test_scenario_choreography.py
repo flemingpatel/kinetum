@@ -193,6 +193,7 @@ class _ScenarioSender:
             generation_tag_counts={0: 100},
             start_time=float(self.calls),
             end_time=float(self.calls) + duration_s,
+            duration_s=duration_s,
         )
 
     def complete_held_run(self) -> None:

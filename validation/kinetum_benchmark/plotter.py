@@ -12,6 +12,8 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List
 
+from kinetum_validation.statistics import nearest_rank_percentile
+
 try:
     import matplotlib
     matplotlib.use("Agg")  # non-interactive backend
@@ -104,13 +106,21 @@ def _read_transitions_raw(artifacts_dir: Path) -> List[dict]:
     return rows
 
 
-def _cdf(values: List[float]):
-    """Compute CDF x/y arrays from a list of values."""
-    s = sorted(values)
-    n = len(s)
-    x = s
-    y = [(i + 1) / n for i in range(n)]
-    return x, y
+def _boxplot_statistics(values: List[float]) -> dict:
+    """Return nearest-rank quartiles and Tukey whiskers without discarding outliers."""
+    q1 = nearest_rank_percentile(values, 25)
+    q3 = nearest_rank_percentile(values, 75)
+    allowance = 1.5 * (q3 - q1)
+    lower = q1 - allowance
+    upper = q3 + allowance
+    return {
+        "q1": q1,
+        "med": nearest_rank_percentile(values, 50),
+        "q3": q3,
+        "whislo": min(value for value in values if value >= lower),
+        "whishi": max(value for value in values if value <= upper),
+        "fliers": [value for value in values if value < lower or value > upper],
+    }
 
 
 def _save_svg(figure: Any, path: Path) -> None:
@@ -153,13 +163,11 @@ def _plot_epoch_latency_cdf(artifacts_dir: Path, figures_dir: Path) -> None:
     if len(latencies) < 2:
         return
 
-    x, y = _cdf(latencies)
-
     fig, ax = plt.subplots(figsize=(FIGURE_WIDTH, FIGURE_HEIGHT))
-    ax.plot(x, y, color=COLORS["epoch"], linewidth=2)
-    ax.set_xlabel("Average Latency (us)")
+    ax.ecdf(latencies, color=COLORS["epoch"], linewidth=2)
+    ax.set_xlabel("Per-Run Mean Packet Latency (us)")
     ax.set_ylabel("CDF")
-    ax.set_title("Epoch Test Latency Distribution")
+    ax.set_title("Epoch Test: Per-Run Mean Packet Latency")
     ax.set_ylim(0, 1.05)
     ax.grid(True, alpha=0.3)
     ax.axhline(y=0.5, color="gray", linestyle="--", alpha=0.4, linewidth=0.8)
@@ -193,10 +201,9 @@ def _plot_boundary_ack_gate_cdf(artifacts_dir: Path, figures_dir: Path) -> None:
 
     line_colors = ["#2196F3", "#F44336", "#4CAF50", "#FF9800"]
     for i, (col, values_us) in enumerate(series):
-        x, y = _cdf(values_us)
         label = col.removeprefix("ack_gate_ns_")
         color = line_colors[i % len(line_colors)]
-        ax.plot(x, y, color=color, linewidth=2, label=label)
+        ax.ecdf(values_us, color=color, linewidth=2, label=label)
 
     ax.set_xlabel("Boundary ACK-Gate Duration (us)")
     ax.set_ylabel("CDF")
@@ -251,7 +258,8 @@ def _plot_boundary_ack_gate_by_type(artifacts_dir: Path, figures_dir: Path) -> N
 
         # Full-range plot
         fig, ax = plt.subplots(figsize=(FIGURE_WIDTH, FIGURE_HEIGHT))
-        bp = ax.boxplot(data, labels=labels, patch_artist=True, widths=0.6)
+        bp = ax.bxp([_boxplot_statistics(values) for values in data], patch_artist=True, widths=0.6)
+        ax.set_xticks(range(1, len(labels) + 1), labels)
         for patch, color in zip(bp["boxes"], colors):
             patch.set_facecolor(color)
             patch.set_alpha(0.7)

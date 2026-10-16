@@ -22,13 +22,9 @@ from ..process.installation import is_symlink_free_regular_file
 from ..process.telemetry import PortStatsResult, StatsResult
 from ..process.guardrails_observation import GuardrailsRead, parse_guardrails_json
 from .console import ConsoleReporter
+from ..statistics import nearest_rank_percentile
 from ..process.telemetry_validation import boundary_transition_is_complete, worker_counters_are_exact
 from ..process.system_tools import RECOVERABLE_EXCEPTIONS
-
-
-def round_latency(value: Optional[float]) -> Optional[float]:
-    """Round one measured latency while preserving unavailability."""
-    return round(value, 2) if value is not None else None
 
 
 class RunArtifacts:
@@ -464,22 +460,14 @@ class RunArtifacts:
                     "transition summary membership changed across evidence records"
                 )
 
-        def percentile(values: List[float], pct: float) -> float:
-            """Compute percentile using nearest-rank method."""
-            if not values:
-                return 0.0
-            s = sorted(values)
-            idx = max(0, min(len(s) - 1, int(math.ceil(pct / 100.0 * len(s))) - 1))
-            return s[idx]
-
         def distribution(values: List[float]) -> dict:
             """Compute min/p50/p95/max distribution."""
             if not values:
-                return {"min": 0, "p50": 0, "p95": 0, "max": 0, "count": 0}
+                raise ValueError("distribution requires observed samples")
             return {
                 "min": min(values),
-                "p50": percentile(values, 50),
-                "p95": percentile(values, 95),
+                "p50": nearest_rank_percentile(values, 50),
+                "p95": nearest_rank_percentile(values, 95),
                 "max": max(values),
                 "count": len(values),
             }
@@ -976,10 +964,10 @@ class RunArtifacts:
                     "passed": test.passed,
                     "tx_count": test.tx_count,
                     "rx_count": test.rx_count,
-                    "loss_pct": round(test.loss_pct, 2),
-                    "avg_latency_us": round_latency(test.avg_latency_us),
-                    "throughput_pps": round(test.throughput_pps, 2),
-                    "duration_s": round(test.duration_s, 2),
+                    "loss_pct": test.loss_pct,
+                    "avg_latency_us": test.avg_latency_us,
+                    "throughput_pps": test.throughput_pps,
+                    "duration_s": test.duration_s,
                     "message": test.message,
                 })
 
@@ -987,7 +975,7 @@ class RunArtifacts:
             if result.epoch_test:
                 data["epoch_test"] = {
                     "passed": result.epoch_test.passed,
-                    "duration_s": round(result.epoch_test.duration_s, 2),
+                    "duration_s": result.epoch_test.duration_s,
                     "total_sent": result.epoch_test.total_sent,
                     "total_received": result.epoch_test.total_received,
                     "initial_generation_sent": (
@@ -1003,10 +991,8 @@ class RunArtifacts:
                     "generation_tag_transition_seq": (
                         result.epoch_test.generation_tag_transition_seq
                     ),
-                    "loss_pct": round(result.epoch_test.loss_pct, 2),
-                    "avg_latency_us": round_latency(
-                        result.epoch_test.avg_latency_us
-                    ),
+                    "loss_pct": result.epoch_test.loss_pct,
+                    "avg_latency_us": result.epoch_test.avg_latency_us,
                     "zero_loss": result.epoch_test.zero_loss,
                     "transitions_observed": result.epoch_test.transitions_observed,
                     "boundary_count": result.epoch_test.boundary_count,
@@ -1024,7 +1010,7 @@ class RunArtifacts:
                 cc = result.commit_confirmed_test
                 data["commit_confirmed_test"] = {
                     "passed": cc.passed,
-                    "duration_s": round(cc.duration_s, 2),
+                    "duration_s": cc.duration_s,
                     "confirm_success": cc.confirm_success,
                     "confirm_snapshot_id": cc.confirm_snapshot_id,
                     "confirm_time_remaining_ms": cc.confirm_time_remaining_ms,
@@ -1034,8 +1020,8 @@ class RunArtifacts:
                     "timeout_rollback_snapshot_id": cc.timeout_rollback_snapshot_id,
                     "tx_count": cc.tx_count,
                     "rx_count": cc.rx_count,
-                    "loss_pct": round(cc.loss_pct, 4),
-                    "avg_latency_us": round_latency(cc.avg_latency_us),
+                    "loss_pct": cc.loss_pct,
+                    "avg_latency_us": cc.avg_latency_us,
                     "message": cc.message,
                 }
 
@@ -1044,7 +1030,7 @@ class RunArtifacts:
                 rb = result.rollback_test
                 data["rollback_test"] = {
                     "passed": rb.passed,
-                    "duration_s": round(rb.duration_s, 2),
+                    "duration_s": rb.duration_s,
                     "full_rollback_success": rb.full_rollback_success,
                     "full_rollback_snapshot_id": rb.full_rollback_snapshot_id,
                     "selective_rollback_success": rb.selective_rollback_success,
@@ -1052,8 +1038,8 @@ class RunArtifacts:
                     "selective_rollback_snapshot_id": rb.selective_rollback_snapshot_id,
                     "tx_count": rb.tx_count,
                     "rx_count": rb.rx_count,
-                    "loss_pct": round(rb.loss_pct, 4),
-                    "avg_latency_us": round_latency(rb.avg_latency_us),
+                    "loss_pct": rb.loss_pct,
+                    "avg_latency_us": rb.avg_latency_us,
                     "message": rb.message,
                 }
 
@@ -1061,7 +1047,7 @@ class RunArtifacts:
                 guardrails = result.guardrails_test
                 data["guardrails_test"] = {
                     "passed": guardrails.passed,
-                    "duration_s": round(guardrails.duration_s, 2),
+                    "duration_s": guardrails.duration_s,
                     "policy_configured": guardrails.policy_configured,
                     "baseline_snapshot_id": guardrails.baseline_snapshot_id,
                     "candidate_snapshot_id": guardrails.candidate_snapshot_id,

@@ -15,6 +15,7 @@
 #include <cerrno>
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -55,8 +56,9 @@ enum class analyzer_output_destination : uint8_t {
 
 /** @brief Independently authored packet identity and traffic-profile tag. */
 struct packet_spec {
-	uint32_t sequence;  ///< Global successful-send ordinal.
-	uint16_t tag;	    ///< Traffic generation, independent of the DP epoch.
+	uint32_t sequence;	       ///< Global successful-send ordinal.
+	uint16_t tag;		       ///< Traffic generation, independent of the DP epoch.
+	uint32_t latency_us{1000000};  ///< Authored capture delay after the packet TX timestamp.
 };
 
 /** @brief Scope-bound owner for one complete authored classic-PCAP file. */
@@ -65,8 +67,9 @@ class pcap_fixture final {
 	/**
 	 * @brief Construct complete packet bytes before acquiring one temporary file.
 	 * @param packets Exact arrival order to encode.
+	 * @param transmit_seconds Exact wall-clock second encoded in every packet.
 	 */
-	explicit pcap_fixture(const std::vector<packet_spec> &packets)
+	explicit pcap_fixture(const std::vector<packet_spec> &packets, uint32_t transmit_seconds = 1)
 	{
 		std::vector<std::uint8_t> bytes{
 			0xd4, 0xc3, 0xb2, 0xa1,	 // Little-endian microsecond magic.
@@ -78,7 +81,12 @@ class pcap_fixture final {
 		};
 		for (const auto &packet : packets) {
 			std::array<uint8_t, 16> record{};
-			record[0] = 2;	// Capture time: two seconds.
+			const uint32_t seconds = transmit_seconds + packet.latency_us / 1000000u;
+			const uint32_t microseconds = packet.latency_us % 1000000u;
+			for (std::size_t index = 0; index < 4; ++index) {
+				record[index] = static_cast<uint8_t>(seconds >> (8u * index));
+				record[index + 4] = static_cast<uint8_t>(microseconds >> (8u * index));
+			}
 			record[8] = 64;
 			record[12] = 64;
 			bytes.insert(bytes.end(), record.begin(), record.end());
@@ -114,9 +122,10 @@ class pcap_fixture final {
 			std::copy(MAGIC.begin(), MAGIC.end(), frame.begin() + 42);
 			algo::net::write_be32(frame.data() + 49, packet.sequence);
 			algo::net::write_be16(frame.data() + 53, packet.tag);
-			std::fill_n(frame.begin() + 55, 8, uint8_t{0});
-			frame[55] = 0x3f;  // Transmit time: binary64 1.0.
-			frame[56] = 0xf0;
+			const auto timestamp = std::bit_cast<uint64_t>(static_cast<double>(transmit_seconds));
+			for (std::size_t index = 0; index < 8; ++index) {
+				frame[55 + index] = static_cast<uint8_t>(timestamp >> (56u - 8u * index));
+			}
 			bytes.insert(bytes.end(), frame.begin(), frame.end());
 		}
 		path_ = (std::filesystem::temp_directory_path() / "kinetum_tap_analyzer.XXXXXX").string();
@@ -292,9 +301,8 @@ TEST(validation_tap_analyzer, result_delivery_is_complete_or_nonzero)
 	ASSERT_EQ(captured.exit_code, 0) << captured.output;
 	EXPECT_EQ(captured.output,
 		  "{\"total_rx\":0,\"valid\":0,\"invalid\":0,\"duplicates\":0,\"out_of_order\":0,"
-		  "\"transition_seq\":-1,\"tag_transition_count\":0,\"max_gap\":0,\"loss_pct\":0.0000,"
-		  "\"missing_count\":0,\"latency\":{\"avg\":0.00,\"min\":0.00,\"max\":0.00,\"p50\":0.00,"
-		  "\"p99\":0.00,\"count\":0},\"tag_counts\":{},\"streams\":[{\"stream_index\":0,"
+		  "\"transition_seq\":-1,\"tag_transition_count\":0,\"max_gap\":0,\"loss_pct\":null,"
+		  "\"missing_count\":0,\"latency\":null,\"tag_counts\":{},\"streams\":[{\"stream_index\":0,"
 		  "\"expected_count\":0,\"valid\":0,\"duplicates\":0,\"out_of_order\":0,"
 		  "\"missing_count\":0,\"transition_seq\":-1,\"tag_transition_count\":0,"
 		  "\"first_tag\":null,\"last_tag\":null,\"tag_counts\":{}}]}\n");
@@ -370,6 +378,99 @@ TEST(validation_tap_analyzer, missing_membership_includes_edges_and_excludes_dup
 		expect_counter(json.fields().at("streams").list_value().values(index).struct_value(), "missing_count",
 			       2);
 	}
+}
+
+/** @brief Packet latency percentiles use exact nearest ranks at even and hundred-sample boundaries. */
+TEST(validation_tap_analyzer, latency_percentiles_select_exact_observed_ranks)
+{
+	/** @brief One independently authored population and its expected percentile values. */
+	struct percentile_case {
+		uint32_t count;	 ///< Number of unique packets with delays 1..count microseconds.
+		uint32_t p50;	 ///< Expected observed p50 in microseconds.
+		uint32_t p99;	 ///< Expected observed p99 in microseconds.
+	};
+	constexpr std::array<percentile_case, 8> CASES{{{1, 1, 1},
+							{2, 1, 2},
+							{3, 2, 3},
+							{4, 2, 4},
+							{99, 50, 99},
+							{100, 50, 99},
+							{101, 51, 100},
+							{200, 100, 198}}};
+	for (const auto &sample : CASES) {
+		SCOPED_TRACE(sample.count);
+		std::vector<packet_spec> packets;
+		packets.reserve(sample.count);
+		for (uint32_t index = 0; index < sample.count; ++index) {
+			packets.push_back({index, 0, index + 1u});
+		}
+		pcap_fixture pcap(packets);
+		ASSERT_TRUE(pcap.valid());
+		const auto observed = run_analyzer(pcap.path(), analyzer_output_destination::CAPTURE,
+						   {"--expected", std::to_string(sample.count), "--stream-count", "1"});
+		ASSERT_EQ(observed.exit_code, 0) << observed.output;
+		google::protobuf::Struct json;
+		ASSERT_TRUE(google::protobuf::util::JsonStringToMessage(observed.output, &json).ok());
+		const auto &latency = json.fields().at("latency").struct_value();
+		expect_counter(latency, "count", sample.count);
+		expect_counter(latency, "min", 1);
+		expect_counter(latency, "max", sample.count);
+		expect_counter(latency, "p50", sample.p50);
+		expect_counter(latency, "p99", sample.p99);
+		EXPECT_DOUBLE_EQ(latency.fields().at("avg").number_value(),
+				 (static_cast<double>(sample.count) + 1.0) / 2.0);
+	}
+}
+
+/** @brief A duplicate packet cannot skew the mean, extrema, or percentile population. */
+TEST(validation_tap_analyzer, duplicate_latency_is_excluded_from_all_statistics)
+{
+	pcap_fixture pcap({{0, 0, 1}, {1, 0, 3}, {1, 0, 99}});
+	ASSERT_TRUE(pcap.valid());
+	const auto observed = run_analyzer(pcap.path(), analyzer_output_destination::CAPTURE,
+					   {"--expected", "2", "--stream-count", "1"});
+	ASSERT_EQ(observed.exit_code, 0) << observed.output;
+	google::protobuf::Struct json;
+	ASSERT_TRUE(google::protobuf::util::JsonStringToMessage(observed.output, &json).ok());
+	expect_counter(json, "duplicates", 1);
+	const auto &latency = json.fields().at("latency").struct_value();
+	expect_counter(latency, "count", 2);
+	expect_counter(latency, "avg", 2);
+	expect_counter(latency, "min", 1);
+	expect_counter(latency, "max", 3);
+	expect_counter(latency, "p50", 1);
+	expect_counter(latency, "p99", 3);
+}
+
+/** @brief A one-microsecond capture interval remains exact at contemporary Unix timestamps. */
+TEST(validation_tap_analyzer, epoch_seconds_do_not_erase_capture_microseconds)
+{
+	pcap_fixture pcap({{0, 0, 1}}, 1700000000u);
+	ASSERT_TRUE(pcap.valid());
+	const auto observed = run_analyzer(pcap.path(), analyzer_output_destination::CAPTURE,
+					   {"--expected", "1", "--stream-count", "1"});
+	ASSERT_EQ(observed.exit_code, 0) << observed.output;
+	google::protobuf::Struct json;
+	ASSERT_TRUE(google::protobuf::util::JsonStringToMessage(observed.output, &json).ok());
+	const auto &latency = json.fields().at("latency").struct_value();
+	for (const auto *field : {"avg", "min", "max", "p50", "p99", "count"}) {
+		expect_counter(latency, field, 1);
+	}
+}
+
+/** @brief Loss serialization retains a received packet even near the 100-percent endpoint. */
+TEST(validation_tap_analyzer, loss_percentage_retains_small_counter_differences)
+{
+	pcap_fixture pcap({{0, 0}});
+	ASSERT_TRUE(pcap.valid());
+	const auto observed = run_analyzer(pcap.path(), analyzer_output_destination::CAPTURE,
+					   {"--expected", "100000000", "--stream-count", "1"});
+	ASSERT_EQ(observed.exit_code, 0) << observed.output;
+	google::protobuf::Struct json;
+	ASSERT_TRUE(google::protobuf::util::JsonStringToMessage(observed.output, &json).ok());
+	expect_counter(json, "valid", 1);
+	expect_counter(json, "missing_count", 99999999);
+	EXPECT_DOUBLE_EQ(json.fields().at("loss_pct").number_value(), 99.999999);
 }
 
 /** @brief Missing population facts, invalid ranges, and repeated authoring are usage errors. */

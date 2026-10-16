@@ -1,6 +1,7 @@
 """Tests for native TAP sender session ownership."""
 
 import asyncio
+import json
 import signal
 import tempfile
 import unittest
@@ -102,12 +103,42 @@ class _CompletedGenerationProcess(_GenerationSignalProcess):
 class TestNativeSenderLifecycle(unittest.IsolatedAsyncioTestCase):
     """Generation-tag edges form one exact linear local state machine."""
 
+    async def test_reported_rate_uses_monotonic_duration_and_requires_its_presence(self) -> None:
+        """Wall-clock movement cannot change TX rate or supply a missing elapsed observation."""
+        valid = {
+            "tx_count": 10, "error_count": 0, "start_time": 1.0, "end_time": 21.0,
+            "duration_s": 1.0, "actual_pps": 10.0, "generation_tag_counts": {"0": 10},
+        }
+        cases = [valid, {key: value for key, value in valid.items() if key != "duration_s"}]
+        cases.extend({**valid, "duration_s": duration} for duration in (0.0, -1.0, None))
+        cases.append({**valid, "actual_pps": 10.1})
+        with tempfile.TemporaryDirectory() as directory:
+            sender_bin = Path(directory).resolve() / "kinetum_tap_sender"
+            sender_bin.write_text("#!/bin/sh\n", encoding="utf-8")
+            sender_bin.chmod(0o755)
+            for index, response in enumerate(cases):
+                with self.subTest(response=response):
+                    process = _CompletedGenerationProcess()
+                    process.returncode = 0
+                    process.communicate = AsyncMock(return_value=(json.dumps(response).encode(), b""))
+                    sender = NativeSender(sender_bin, ["neb_rx"], PacketConfig(pps=10))
+                    with patch.object(native_sender_module.asyncio, "create_subprocess_exec", return_value=process):
+                        if index == 0:
+                            result = await sender.run_standard(1.0)
+                            self.assertEqual(result.duration_s, 1.0)
+                            self.assertEqual(result.actual_pps, 10.0)
+                        else:
+                            with self.assertRaisesRegex(RuntimeError, "invalid stats"):
+                                await sender.run_standard(1.0)
+
     async def test_generation_overlap_edges_are_exactly_once(self) -> None:
         """Duplicate start/end/finish operations reject without mutation."""
         sender = NativeSender(
             Path("/unused/kinetum_tap_sender"), ["neb_rx"], PacketConfig()
         )
-        expected = PacketStats(tx_count=2, generation_tag_counts={1: 1, 2: 1})
+        expected = PacketStats(
+            tx_count=2, generation_tag_counts={1: 1, 2: 1}, start_time=1.0, end_time=2.0, duration_s=1.0,
+        )
         sender._run_generation_tags = AsyncMock(  # type: ignore[method-assign]  # pylint: disable=protected-access
             return_value=expected
         )

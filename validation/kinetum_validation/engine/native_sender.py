@@ -342,10 +342,10 @@ class NativeSender:
             actual_pps = require_number(
                 raw["actual_pps"], "sender actual_pps", minimum=0.0
             )
-            if end_time < start_time or abs((end_time - start_time) - duration) > 0.002:
+            if end_time < start_time or duration <= 0.0:
                 raise JsonContractError("native sender timing is contradictory")
-            expected_pps = tx_count / (end_time - start_time) if end_time > start_time else 0.0
-            if abs(actual_pps - expected_pps) > max(0.2, expected_pps * 0.001):
+            expected_pps = tx_count / duration
+            if not math.isclose(actual_pps, expected_pps, rel_tol=1e-12, abs_tol=0.0):
                 raise JsonContractError("native sender rate is contradictory")
             raw_tags = require_object(
                 raw["generation_tag_counts"], "sender generation_tag_counts"
@@ -373,6 +373,7 @@ class NativeSender:
             generation_tag_counts=generation_tag_counts,
             start_time=start_time,
             end_time=end_time,
+            duration_s=duration,
         )
 
         self._process = None

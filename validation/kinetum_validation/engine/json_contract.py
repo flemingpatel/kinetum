@@ -643,6 +643,56 @@ def _require_average_latency(
     return measured
 
 
+def _observed_counter(
+    value: object,
+    context: str,
+    required: bool,
+    *,
+    minimum: int = 0,
+    maximum: int = _UINT64_MAX,
+) -> int | None:
+    """Validate an observed counter or explicit absence from an incomplete result."""
+    if value is None and not required:
+        return None
+    return require_int(value, context, minimum=minimum, maximum=maximum)
+
+
+def _observed_number(value: object, context: str, required: bool) -> float | None:
+    """Validate a finite nonnegative measurement or explicit absence."""
+    if value is None and not required:
+        return None
+    return require_number(value, context, minimum=0.0)
+
+
+def _validate_traffic_measurements(
+    row: Dict[str, Any],
+    sent_key: str,
+    received_key: str,
+    row_passed: bool,
+    latency_source: str | None,
+    context: str,
+) -> tuple[int | None, int | None]:
+    """Validate one observed traffic population without inventing loss for missing or zero TX."""
+    sent = _observed_counter(row[sent_key], f"{context} TX", row_passed)
+    received = _observed_counter(row[received_key], f"{context} RX", row_passed)
+    if (sent is None) != (received is None):
+        raise JsonContractError(f"{context} traffic population is incomplete")
+    if sent is None or sent == 0:
+        if row["loss_pct"] is not None:
+            raise JsonContractError(f"{context} loss has no positive TX population")
+    else:
+        loss = require_number(row["loss_pct"], f"{context} loss", minimum=0.0, maximum=100.0)
+        expected_loss = max(0, sent - received) / sent * 100.0
+        if not math.isclose(loss, expected_loss, rel_tol=1e-12, abs_tol=0.0):
+            raise JsonContractError(f"{context} traffic counters are contradictory")
+    _require_average_latency(row["avg_latency_us"], f"{context} average latency", latency_source, row_passed)
+    if (received is None or received == 0) and row["avg_latency_us"] is not None:
+        raise JsonContractError(f"{context} latency has no received population")
+    if row_passed and not 0 < received <= sent:
+        raise JsonContractError(f"{context} successful traffic population is incomplete")
+    return sent, received
+
+
 def _validate_packet_test_results(items: object, latency_source: str | None) -> None:
     """Validate each packet result and its measured traffic and latency facts."""
     packet_keys = {
@@ -654,82 +704,59 @@ def _validate_packet_test_results(items: object, latency_source: str | None) -> 
         require_exact_keys(row, packet_keys, f"packet test {index}")
         require_int(row["packet_size"], "packet size", minimum=64, maximum=9000)
         row_passed = require_bool(row["passed"], "packet result")
-        tx_count = require_int(
-            row["tx_count"], "packet TX", minimum=0, maximum=_UINT64_MAX
+        tx_count, _ = _validate_traffic_measurements(
+            row, "tx_count", "rx_count", row_passed, latency_source, "packet",
         )
-        rx_count = require_int(
-            row["rx_count"], "packet RX", minimum=0, maximum=_UINT64_MAX
-        )
-        require_number(
-            row["loss_pct"], "packet loss_pct", minimum=0.0, maximum=100.0
-        )
-        _require_average_latency(
-            row["avg_latency_us"],
-            "packet average latency",
-            latency_source,
-            row_passed,
-        )
-        throughput = require_number(
-            row["throughput_pps"], "packet throughput_pps", minimum=0.0
-        )
-        duration = require_number(
-            row["duration_s"], "packet duration_s", minimum=0.0
-        )
+        throughput = _observed_number(row["throughput_pps"], "packet throughput_pps", row_passed)
+        duration = _observed_number(row["duration_s"], "packet duration_s", row_passed)
         require_string(row["message"], "packet message", allow_empty=True)
-        expected_loss = (
-            max(0, tx_count - rx_count) / tx_count * 100.0
-            if tx_count > 0 else 0.0
-        )
-        traffic_complete = 0 < rx_count <= tx_count and throughput > 0.0 and duration > 0.0
-        if (
-            abs(float(row["loss_pct"]) - expected_loss) > 0.011
-            or (row_passed and not traffic_complete)
-        ):
+        if (tx_count is None) != (throughput is None):
             raise JsonContractError("packet result counters are contradictory")
+        if tx_count is not None and (tx_count == 0) != (throughput == 0.0):
+            raise JsonContractError("packet TX and measured rate disagree")
+        if row_passed and (throughput <= 0.0 or duration <= 0.0):
+            raise JsonContractError("packet success has no measured rate or duration")
 
 
 def _validate_epoch_test_result(
     row: Dict[str, Any], row_passed: bool, latency_source: str | None, traffic_driver: str,
 ) -> None:
     """Validate the complete epoch test evidence row."""
+    sent, received = _validate_traffic_measurements(
+        row, "total_sent", "total_received", row_passed, latency_source, "epoch",
+    )
     for name in (
-        "total_sent", "total_received", "initial_generation_sent",
+        "initial_generation_sent",
         "next_generation_sent", "initial_generation_received",
         "next_generation_received", "transitions_observed",
         "boundary_count", "completed_boundaries",
         "protocol_faults_observed", "backpressure_events",
     ):
-        require_int(
-            row[name], f"epoch {name}", minimum=0,
-            maximum=_UINT64_MAX,
-        )
+        _observed_counter(row[name], f"epoch {name}", row_passed)
     require_int(
         row["generation_tag_transition_seq"],
         "epoch generation-tag transition sequence", minimum=-1,
         maximum=_UINT32_MAX,
     )
-    require_number(
-        row["loss_pct"], "epoch loss percentage", minimum=0.0,
-        maximum=100.0,
-    )
-    _require_average_latency(
-        row["avg_latency_us"],
-        "epoch average latency",
-        latency_source,
-        row_passed,
-    )
-    zero_loss = require_bool(row["zero_loss"], "epoch zero-loss fact")
+    if sent is not None and sent > 0:
+        zero_loss = require_bool(row["zero_loss"], "epoch zero-loss fact")
+        if zero_loss != (sent == received):
+            raise JsonContractError("epoch zero-loss fact contradicts its counters")
+    elif row["zero_loss"] is not None:
+        raise JsonContractError("epoch zero-loss fact has no positive TX population")
     ordering_validated = require_bool(
         row["boundary_ordering_validated"],
         "epoch boundary-ordering result",
     )
     require_string(row["message"], "epoch message", allow_empty=True)
-    expected_loss = (
-        max(0, row["total_sent"] - row["total_received"])
-        / row["total_sent"] * 100.0
-        if row["total_sent"] > 0 else 0.0
+    generation_fields = (
+        "initial_generation_sent", "next_generation_sent",
+        "initial_generation_received", "next_generation_received",
     )
-    if (
+    generation_presence = [row[name] is not None for name in generation_fields]
+    if any(generation_presence) and not all(generation_presence):
+        raise JsonContractError("epoch generation observations are incomplete")
+    if all(generation_presence) and (
         row["initial_generation_sent"] + row["next_generation_sent"]
         != row["total_sent"]
         or row["initial_generation_received"]
@@ -737,17 +764,22 @@ def _validate_epoch_test_result(
         != row["total_received"]
     ):
         raise JsonContractError("epoch result facts are contradictory")
-    measured_zero_loss = row["total_sent"] > 0 and row["total_sent"] == row["total_received"]
-    if zero_loss != measured_zero_loss or abs(float(row["loss_pct"]) - expected_loss) > 0.011:
+    control_fields = ("boundary_count", "completed_boundaries", "protocol_faults_observed", "backpressure_events")
+    control_presence = [row[name] is not None for name in control_fields]
+    if any(control_presence) and not all(control_presence):
+        raise JsonContractError("epoch boundary observations are incomplete")
+    if all(control_presence) and row["completed_boundaries"] > row["boundary_count"]:
         raise JsonContractError("epoch result facts are contradictory")
-    if row["completed_boundaries"] > row["boundary_count"] or row["transitions_observed"] > 1:
+    if row["transitions_observed"] is not None and row["transitions_observed"] > 1:
         raise JsonContractError("epoch result facts are contradictory")
-    if ordering_validated and (
-        row["boundary_count"] == 0
-        or row["completed_boundaries"] != row["boundary_count"]
-        or row["protocol_faults_observed"] != 0
-    ):
-        raise JsonContractError("epoch result facts are contradictory")
+    if ordering_validated:
+        if not all(control_presence):
+            raise JsonContractError("epoch proof has no boundary observations")
+        if (
+            row["transitions_observed"] != 1 or row["boundary_count"] == 0
+            or row["completed_boundaries"] != row["boundary_count"] or row["protocol_faults_observed"] != 0
+        ):
+            raise JsonContractError("epoch result facts are contradictory")
     if row_passed and not _epoch_success_is_complete(row, ordering_validated, traffic_driver):
         raise JsonContractError("epoch result facts are contradictory")
 
@@ -776,33 +808,15 @@ def _validate_commit_confirmed_test_result(
         require_string(
             row[name], f"commit-confirmed {name}", allow_empty=True
         )
-    for name in ("confirm_time_remaining_ms", "confirmed_survival_elapsed_ms", "tx_count", "rx_count"):
+    for name in ("confirm_time_remaining_ms", "confirmed_survival_elapsed_ms"):
         require_int(
             row[name], f"commit-confirmed {name}", minimum=0,
             maximum=_UINT64_MAX,
         )
-    require_number(
-        row["loss_pct"], "commit-confirmed loss", minimum=0.0,
-        maximum=100.0,
-    )
-    _require_average_latency(
-        row["avg_latency_us"],
-        "commit-confirmed latency",
-        latency_source,
-        row_passed,
-    )
+    _validate_traffic_measurements(row, "tx_count", "rx_count", row_passed, latency_source, "commit-confirmed")
     require_string(
         row["message"], "commit-confirmed message", allow_empty=True
     )
-    expected_loss = (
-        max(0, row["tx_count"] - row["rx_count"])
-        / row["tx_count"] * 100.0
-        if row["tx_count"] > 0 else 0.0
-    )
-    if abs(float(row["loss_pct"]) - expected_loss) > 0.00011:
-        raise JsonContractError(
-            "commit-confirmed traffic counters are contradictory"
-        )
     confirmation_complete = (
         row["confirm_success"] and bool(row["confirm_snapshot_id"])
         and row["confirm_time_remaining_ms"] > 0
@@ -810,15 +824,15 @@ def _validate_commit_confirmed_test_result(
         and row["confirmed_survival_elapsed_ms"] >= row["confirm_time_remaining_ms"]
     )
     if row["confirmed_survived_deadline"] and (
-        not confirmation_complete or row["confirmed_survival_elapsed_ms"] > row["duration_s"] * 1000.0
+        not confirmation_complete or row["duration_s"] is None
+        or row["confirmed_survival_elapsed_ms"] > row["duration_s"] * 1000.0
     ):
         raise JsonContractError("confirmed survival has no complete after-deadline observation")
     rollback_complete = (
         row["timeout_rollback_occurred"]
         and row["timeout_rollback_snapshot_id"] == row["confirm_snapshot_id"]
     )
-    traffic_complete = 0 < row["rx_count"] <= row["tx_count"]
-    if row_passed and (not confirmation_complete or not rollback_complete or not traffic_complete):
+    if row_passed and (not confirmation_complete or not rollback_complete):
         raise JsonContractError("commit-confirmed success is incomplete")
 
 
@@ -843,37 +857,15 @@ def _validate_rollback_test_result(
     ]
     if len(modules) != len(set(modules)):
         raise JsonContractError("selective rollback modules are duplicated")
-    for name in ("tx_count", "rx_count"):
-        require_int(
-            row[name], f"rollback {name}", minimum=0,
-            maximum=_UINT64_MAX,
-        )
-    require_number(
-        row["loss_pct"], "rollback loss", minimum=0.0,
-        maximum=100.0,
-    )
-    _require_average_latency(
-        row["avg_latency_us"],
-        "rollback latency",
-        latency_source,
-        row_passed,
-    )
+    _validate_traffic_measurements(row, "tx_count", "rx_count", row_passed, latency_source, "rollback")
     require_string(row["message"], "rollback message", allow_empty=True)
-    expected_loss = (
-        max(0, row["tx_count"] - row["rx_count"])
-        / row["tx_count"] * 100.0
-        if row["tx_count"] > 0 else 0.0
-    )
-    if abs(float(row["loss_pct"]) - expected_loss) > 0.00011:
-        raise JsonContractError("rollback traffic counters are contradictory")
     operations_complete = row["full_rollback_success"] and row["selective_rollback_success"]
     identities_complete = (
         bool(row["full_rollback_snapshot_id"] and row["selective_rollback_snapshot_id"])
         and row["full_rollback_snapshot_id"] != row["selective_rollback_snapshot_id"]
         and modules == ["kinetum.acl"]
     )
-    traffic_complete = 0 < row["rx_count"] <= row["tx_count"]
-    if row_passed and (not operations_complete or not identities_complete or not traffic_complete):
+    if row_passed and (not operations_complete or not identities_complete):
         raise JsonContractError("rollback success is incomplete")
 
 
@@ -887,17 +879,17 @@ def _validate_guardrails_test_result(
         "rollback_snapshot_id",
     ):
         require_string(row[name], f"guardrails {name}", allow_empty=True)
-    candidate_epoch = require_int(
-        row["candidate_epoch"], "guardrails candidate epoch", minimum=0,
+    candidate_epoch = _observed_counter(
+        row["candidate_epoch"], "guardrails candidate epoch", row_passed, minimum=1,
         maximum=_UINT64_MAX - 1,
     )
-    rollback_epoch = require_int(
-        row["rollback_epoch"], "guardrails rollback epoch", minimum=0,
+    rollback_epoch = _observed_counter(
+        row["rollback_epoch"], "guardrails rollback epoch", row_passed, minimum=1,
         maximum=_UINT64_MAX - 1,
     )
-    faults = require_int(
+    faults = _observed_counter(
         row["protocol_faults_observed"], "guardrails protocol faults",
-        minimum=0, maximum=_UINT64_MAX,
+        row_passed,
     )
     require_string(
         row["message"], "guardrails message", allow_empty=True
@@ -907,6 +899,8 @@ def _validate_guardrails_test_result(
         and row["candidate_snapshot_id"] != row["baseline_snapshot_id"]
         and row["rollback_snapshot_id"] == row["baseline_snapshot_id"]
     )
+    if rollback_epoch is not None and (candidate_epoch is None or rollback_epoch <= candidate_epoch):
+        raise JsonContractError("guardrails rollback epoch has no earlier candidate")
     if row_passed and (
         not row["policy_configured"]
         or not content_restored
@@ -1041,9 +1035,7 @@ def validate_test_suite_result(
         require_exact_keys(row, expected, f"{field} result")
         row_passed = require_bool(row["passed"], f"{field} passed")
         present_results.append(row_passed)
-        row_duration = require_number(
-            row["duration_s"], f"{field} duration", minimum=0.0
-        )
+        row_duration = _observed_number(row["duration_s"], f"{field} duration", row_passed)
         if row_passed and row_duration <= 0.0:
             raise JsonContractError(f"{field} success has no positive duration")
 

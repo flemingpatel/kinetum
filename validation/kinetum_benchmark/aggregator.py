@@ -3,7 +3,7 @@ Benchmark aggregator - merge per-run artifacts and compute distributions.
 
 Reads immutable per-run outputs (transition_metrics.jsonl, test_results.json)
 and produces:
-  - merged_transitions.jsonl: concatenation of all runs' JSONL
+  - merged_transitions.jsonl: all transition records with their run identities
   - benchmark_summary.json: scenario-bound two-section summary
       scenario_metrics:   per-test-type counters and available latency
       transition_metrics:  per-transition-type boundary/stage distributions
@@ -12,12 +12,12 @@ and produces:
 from __future__ import annotations
 
 import json
-import math
 import sys
 from pathlib import Path
 from typing import Dict, List
 
 from kinetum_validation.engine.json_contract import parse_exact_json_object, validate_transition_metric_record
+from kinetum_validation.statistics import nearest_rank_percentile
 
 from .contracts import (
     validate_benchmark_result_identity,
@@ -28,31 +28,22 @@ from .contracts import (
 )
 
 
-def _percentile(values: List[float], pct: float) -> float:
-    """Compute percentile using nearest-rank method."""
-    if not values:
-        return 0.0
-    s = sorted(values)
-    idx = max(0, min(len(s) - 1, int(math.ceil(pct / 100.0 * len(s))) - 1))
-    return s[idx]
-
-
 def _distribution(values: List[float]) -> dict:
     """Compute min/p50/p95/p99/max distribution."""
     if not values:
-        return {"min": 0, "p50": 0, "p95": 0, "p99": 0, "max": 0, "count": 0}
+        raise ValueError("distribution requires observed samples")
     return {
         "min": min(values),
-        "p50": _percentile(values, 50),
-        "p95": _percentile(values, 95),
-        "p99": _percentile(values, 99),
+        "p50": nearest_rank_percentile(values, 50),
+        "p95": nearest_rank_percentile(values, 95),
+        "p99": nearest_rank_percentile(values, 99),
         "max": max(values),
         "count": len(values),
     }
 
 
 def _selected_trex_identity(
-    results: List[dict],
+    results_by_run: Dict[str, dict],
     identities_by_run: Dict[str, dict],
     include_all: bool,
     traffic_driver: str,
@@ -60,12 +51,11 @@ def _selected_trex_identity(
     """Return one homogeneous TRex identity for the selected run population."""
     if traffic_driver != "trex":
         return None
-    selected = [
-        result for result in results if include_all or result["all_passed"]
-    ]
     identities = []
-    for result in selected:
-        identity = identities_by_run.get(result["_run"])
+    for run_name, result in results_by_run.items():
+        if not include_all and not result["all_passed"]:
+            continue
+        identity = identities_by_run.get(run_name)
         if identity is None:
             if result["setup_failed"]:
                 continue
@@ -91,6 +81,8 @@ def aggregate(input_dir: Path, inclusion_policy: str = "passed_only") -> None:
     ----------
     input_dir : Path
         Benchmark root directory containing run_NNN/ subdirectories.
+    inclusion_policy : str
+        ``passed_only`` or ``all_runs``; must match the terminal manifest.
     """
     if inclusion_policy not in {"passed_only", "all_runs"}:
         raise ValueError("benchmark inclusion policy is undeclared")
@@ -126,7 +118,7 @@ def aggregate(input_dir: Path, inclusion_policy: str = "passed_only") -> None:
     print(f"Aggregating {len(run_dirs)} runs from {input_dir}", file=sys.stderr)
 
     # Step 1: identify passed vs failed runs from test_results.json.
-    all_results: List[dict] = []
+    results_by_run: Dict[str, dict] = {}
     passed_run_names: set = set()
     failed_runs: List[str] = []
     failure_reasons: Dict[str, str] = {}
@@ -176,8 +168,7 @@ def aggregate(input_dir: Path, inclusion_policy: str = "passed_only") -> None:
                 trex_identities_by_run[run_dir.name] = trex_identity
         elif not result["setup_failed"]:
             raise ValueError(f"{run_dir.name} omitted run metadata")
-        result["_run"] = run_dir.name
-        all_results.append(result)
+        results_by_run[run_dir.name] = result
         if result["all_passed"]:
             passed_run_names.add(run_dir.name)
         else:
@@ -191,9 +182,7 @@ def aggregate(input_dir: Path, inclusion_policy: str = "passed_only") -> None:
 
     # Step 2: merge transition_metrics.jsonl. The raw ledger contains
     # all runs; distributions use passed runs unless policy says otherwise.
-    all_transitions: List[dict] = []
-    passed_transitions: List[dict] = []
-    transitions_by_run: Dict[str, List[str]] = {
+    transitions_by_run: Dict[str, List[dict]] = {
         run_dir.name: [] for run_dir in run_dirs
     }
     merged_path = input_dir / "merged_transitions.jsonl"
@@ -224,16 +213,12 @@ def aggregate(input_dir: Path, inclusion_policy: str = "passed_only") -> None:
                     line[:-1], f"{run_dir.name} transition metric"
                 )
                 validate_transition_metric_record(record)
-                record["_run"] = run_dir.name
-                all_transitions.append(record)
-                transitions_by_run[run_dir.name].append(record["transition_type"])
-                if run_dir.name in passed_run_names:
-                    passed_transitions.append(record)
+                transitions_by_run[run_dir.name].append(record)
 
     test_type = manifest["scenario"]["test_type"]
-    for run_name, observed_types in transitions_by_run.items():
+    for run_name, records in transitions_by_run.items():
         validate_benchmark_transition_multiset(
-            observed_types,
+            [record["transition_type"] for record in records],
             test_type,
             complete=manifest_rows[run_name]["passed"],
         )
@@ -241,15 +226,22 @@ def aggregate(input_dir: Path, inclusion_policy: str = "passed_only") -> None:
     # Step 3: compute scenario_metrics.
     include_all = inclusion_policy == "all_runs"
     trex_identity = _selected_trex_identity(
-        all_results,
+        results_by_run,
         trex_identities_by_run,
         include_all,
         manifest["scenario"]["traffic_driver"],
     )
-    scenario_metrics = _compute_scenario_metrics(all_results, include_all=include_all)
+    scenario_metrics = _compute_scenario_metrics(
+        list(results_by_run.values()), include_all=include_all
+    )
 
     # Step 4: compute transition_metrics.
-    selected_transitions = all_transitions if include_all else passed_transitions
+    selected_transitions = [
+        record
+        for run_name, records in transitions_by_run.items()
+        if include_all or run_name in passed_run_names
+        for record in records
+    ]
     transition_metrics = _compute_transition_metrics(selected_transitions)
 
     # Step 5: write benchmark_summary.json.
@@ -276,8 +268,9 @@ def aggregate(input_dir: Path, inclusion_policy: str = "passed_only") -> None:
     validate_benchmark_summary_identity(summary, manifest)
 
     merged_bytes = "".join(
-        json.dumps(record, allow_nan=False, sort_keys=True) + "\n"
-        for record in all_transitions
+        json.dumps({**record, "_run": run_name}, allow_nan=False, sort_keys=True) + "\n"
+        for run_name, records in transitions_by_run.items()
+        for record in records
     )
     summary_bytes = json.dumps(
         summary, allow_nan=False, indent=2, sort_keys=True
@@ -285,9 +278,14 @@ def aggregate(input_dir: Path, inclusion_policy: str = "passed_only") -> None:
 
     with open(merged_path, "x", encoding="utf-8") as merged_file:
         merged_file.write(merged_bytes)
+    transition_count = sum(len(records) for records in transitions_by_run.values())
+    passed_transition_count = sum(
+        len(records) for run_name, records in transitions_by_run.items()
+        if run_name in passed_run_names
+    )
     print(
-        f"  Merged {len(all_transitions)} transition records "
-        f"({len(passed_transitions)} from passed runs) "
+        f"  Merged {transition_count} transition records "
+        f"({passed_transition_count} from passed runs) "
         f"into {merged_path.name}",
         file=sys.stderr,
     )
@@ -298,170 +296,79 @@ def aggregate(input_dir: Path, inclusion_policy: str = "passed_only") -> None:
     print(f"  Summary written to {summary_path.name}", file=sys.stderr)
 
 
+def _observed_distributions(rows: List[dict], fields: tuple[str, ...]) -> dict:
+    """Aggregate present measurements; absence contributes no sample."""
+    metrics = {}
+    for name in fields:
+        values = [row[name] for row in rows if row[name] is not None]
+        if values:
+            metrics[name] = _distribution(values)
+    return metrics
+
+
 def _compute_scenario_metrics(results: List[dict], include_all: bool = False) -> dict:
-    """
-    Compute per-scenario distributions from test_results.json files.
+    """Compute per-scenario distributions from admitted per-run measurements."""
+    selected = [result for result in results if include_all or result["all_passed"]]
+    metrics = {}
 
-    Aggregates TX/RX/loss and available latency across runs for each test type:
-    packet tests (per size), epoch, commit_confirmed, rollback.
-    """
-    if include_all:
-        passed = results
-    else:
-        passed = [r for r in results if r["all_passed"]]
-    if not passed:
-        return {}
+    by_size: Dict[int, List[dict]] = {}
+    for result in selected:
+        for packet in result["packet_tests"]:
+            by_size.setdefault(packet["packet_size"], []).append(packet)
+    packet_metrics = {}
+    for size, rows in sorted(by_size.items()):
+        observed = _observed_distributions(rows, (
+            "tx_count", "rx_count", "loss_pct", "avg_latency_us", "throughput_pps",
+        ))
+        if observed:
+            packet_metrics[str(size)] = observed
+    if packet_metrics:
+        metrics["packet_tests"] = packet_metrics
 
-    metrics: dict = {}
+    fields_by_family = {
+        "epoch_test": (
+            "total_sent", "total_received", "loss_pct", "avg_latency_us",
+            "boundary_count", "completed_boundaries", "protocol_faults_observed", "backpressure_events",
+        ),
+        "commit_confirmed_test": ("tx_count", "rx_count", "loss_pct", "avg_latency_us"),
+        "rollback_test": ("tx_count", "rx_count", "loss_pct", "avg_latency_us"),
+    }
+    for family, fields in fields_by_family.items():
+        rows = [
+            result[family] for result in selected
+            if result[family] is not None and (include_all or result[family]["passed"])
+        ]
+        observed = _observed_distributions(rows, fields)
+        if observed:
+            metrics[family] = observed
 
-    # Packet tests (per size).
-    pkt_by_size: Dict[int, Dict[str, List[float]]] = {}
-    for r in passed:
-        for pt in r["packet_tests"]:
-            size = pt["packet_size"]
-            if size not in pkt_by_size:
-                pkt_by_size[size] = {
-                    "tx_count": [], "rx_count": [],
-                    "loss_pct": [], "throughput_pps": [],
-                }
-            pkt_by_size[size]["tx_count"].append(pt["tx_count"])
-            pkt_by_size[size]["rx_count"].append(pt["rx_count"])
-            pkt_by_size[size]["loss_pct"].append(pt["loss_pct"])
-            if pt["avg_latency_us"] is not None:
-                pkt_by_size[size].setdefault("avg_latency_us", []).append(
-                    pt["avg_latency_us"]
-                )
-            pkt_by_size[size]["throughput_pps"].append(pt["throughput_pps"])
-
-    if pkt_by_size:
-        metrics["packet_tests"] = {
-            str(size): {
-                k: _distribution(vals) for k, vals in data.items()
-            }
-            for size, data in sorted(pkt_by_size.items())
-        }
-
-    # Epoch test.
-    epoch_loss: List[float] = []
-    epoch_latency: List[float] = []
-    epoch_sent: List[float] = []
-    epoch_received: List[float] = []
-    epoch_boundaries: List[float] = []
-    epoch_completed_boundaries: List[float] = []
-    epoch_protocol_faults: List[float] = []
-    epoch_backpressure: List[float] = []
-    for r in passed:
-        et = r["epoch_test"]
-        if et and (include_all or et["passed"]):
-            epoch_loss.append(et["loss_pct"])
-            if et["avg_latency_us"] is not None:
-                epoch_latency.append(et["avg_latency_us"])
-            epoch_sent.append(et["total_sent"])
-            epoch_received.append(et["total_received"])
-            epoch_boundaries.append(et["boundary_count"])
-            epoch_completed_boundaries.append(
-                et["completed_boundaries"]
-            )
-            epoch_protocol_faults.append(
-                et["protocol_faults_observed"]
-            )
-            epoch_backpressure.append(et["backpressure_events"])
-
-    if epoch_loss:
-        epoch_metrics: dict = {
-            "total_sent": _distribution(epoch_sent),
-            "total_received": _distribution(epoch_received),
-            "loss_pct": _distribution(epoch_loss),
-        }
-        if epoch_latency:
-            epoch_metrics["avg_latency_us"] = _distribution(epoch_latency)
-        if epoch_boundaries:
-            epoch_metrics["boundary_count"] = _distribution(epoch_boundaries)
-            epoch_metrics["completed_boundaries"] = _distribution(
-                epoch_completed_boundaries
-            )
-            epoch_metrics["protocol_faults_observed"] = _distribution(
-                epoch_protocol_faults
-            )
-            epoch_metrics["backpressure_events"] = _distribution(
-                epoch_backpressure
-            )
-        metrics["epoch_test"] = epoch_metrics
-
-    # Commit-confirmed test.
-    cc_tx: List[float] = []
-    cc_rx: List[float] = []
-    cc_loss: List[float] = []
-    cc_latency: List[float] = []
-    for r in passed:
-        cc = r["commit_confirmed_test"]
-        if cc and (include_all or cc["passed"]):
-            cc_tx.append(cc["tx_count"])
-            cc_rx.append(cc["rx_count"])
-            cc_loss.append(cc["loss_pct"])
-            if cc["avg_latency_us"] is not None:
-                cc_latency.append(cc["avg_latency_us"])
-
-    if cc_loss:
-        commit_confirmed_metrics = {
-            "tx_count": _distribution(cc_tx),
-            "rx_count": _distribution(cc_rx),
-            "loss_pct": _distribution(cc_loss),
-        }
-        if cc_latency:
-            commit_confirmed_metrics["avg_latency_us"] = _distribution(
-                cc_latency
-            )
-        metrics["commit_confirmed_test"] = commit_confirmed_metrics
-
-    # Rollback test.
-    rb_tx: List[float] = []
-    rb_rx: List[float] = []
-    rb_loss: List[float] = []
-    rb_latency: List[float] = []
-    for r in passed:
-        rb = r["rollback_test"]
-        if rb and (include_all or rb["passed"]):
-            rb_tx.append(rb["tx_count"])
-            rb_rx.append(rb["rx_count"])
-            rb_loss.append(rb["loss_pct"])
-            if rb["avg_latency_us"] is not None:
-                rb_latency.append(rb["avg_latency_us"])
-
-    if rb_loss:
-        rollback_metrics = {
-            "tx_count": _distribution(rb_tx),
-            "rx_count": _distribution(rb_rx),
-            "loss_pct": _distribution(rb_loss),
-        }
-        if rb_latency:
-            rollback_metrics["avg_latency_us"] = _distribution(rb_latency)
-        metrics["rollback_test"] = rollback_metrics
-
-    guardrail_durations: List[float] = []
-    guardrail_epoch_steps: List[float] = []
-    for result in passed:
+    guardrail_rows = []
+    for result in selected:
         guardrail = result["guardrails_test"]
-        if guardrail and (include_all or guardrail["passed"]):
-            epoch_step = guardrail["rollback_epoch"] - guardrail["candidate_epoch"]
-            if epoch_step <= 0:
+        if guardrail is None or (not include_all and not guardrail["passed"]):
+            continue
+        candidate = guardrail["candidate_epoch"]
+        rollback = guardrail["rollback_epoch"]
+        step = None
+        if candidate is not None and rollback is not None:
+            if rollback <= candidate:
                 raise ValueError("guardrails result has no later rollback epoch")
-            guardrail_durations.append(guardrail["duration_s"])
-            guardrail_epoch_steps.append(epoch_step)
-    if guardrail_durations:
-        metrics["guardrails_test"] = {
-            "duration_s": _distribution(guardrail_durations),
-            "rollback_epoch_step": _distribution(guardrail_epoch_steps),
-        }
-
+            step = rollback - candidate
+        guardrail_rows.append({
+            "duration_s": guardrail["duration_s"],
+            "rollback_epoch_step": step,
+        })
+    guardrail_metrics = _observed_distributions(guardrail_rows, ("duration_s", "rollback_epoch_step"))
+    if guardrail_metrics:
+        metrics["guardrails_test"] = guardrail_metrics
     return metrics
 
 
 def _compute_transition_metrics(transitions: List[dict]) -> dict:
     """
-    Compute per-transition-type distributions from merged JSONL records.
+    Compute per-transition-type distributions from raw per-run records.
 
-    Same logic as TestOrchestrator.write_transition_summary() but across
+    Same logic as RunArtifacts.write_transition_summary() but across
     multiple runs for statistical depth.
     """
     if not transitions:

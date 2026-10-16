@@ -2,7 +2,8 @@
 Core types and constants for Kinetum physical-I/O validation framework.
 
 Configuration records are immutable. Result records remain mutable only while
-their owning scenario assembles one terminal observation.
+their owning scenario assembles one terminal observation. Unobserved result
+measurements remain None; an observed zero is retained as a numeric value.
 
 Design:
 -------
@@ -28,6 +29,8 @@ import math
 from pathlib import Path
 import posixpath
 from typing import Dict, List, Optional, Tuple
+
+from ..statistics import validate_percentile_population
 
 
 # Constants
@@ -863,17 +866,11 @@ class PacketStats:
     generation_tag_counts: Dict[int, int] = field(default_factory=dict)
     start_time: float = 0.0
     end_time: float = 0.0
-
-    @property
-    def duration_s(self) -> float:
-        """Generation duration in seconds."""
-        if self.start_time >= 0.0 and self.end_time > self.start_time:
-            return self.end_time - self.start_time
-        return 0.0
+    duration_s: float = 0.0  # Observed monotonic sender interval; zero before completion.
 
     @property
     def actual_pps(self) -> float:
-        """Actual packets per second achieved."""
+        """Return successful TX per measured monotonic second, or zero before completion."""
         return self.tx_count / self.duration_s if self.duration_s > 0 else 0.0
 
 
@@ -928,10 +925,10 @@ class AnalysisResult:
         """Return measured tag changes summed across inputs, or None when unmeasured."""
         return None if self.streams is None else sum(row.tag_transition_count for row in self.streams)
 
-    def loss_pct(self, expected: int) -> float:
-        """Return nonnegative loss; excess observations remain duplicates."""
+    def loss_pct(self, expected: int) -> Optional[float]:
+        """Return measured nonnegative loss, or None when no packets were sent."""
         if expected <= 0:
-            return 0.0
+            return None
         return max(0, expected - self.valid) / expected * 100
 
     # Sole validated latency publication from the native analyzer.
@@ -964,6 +961,9 @@ class AnalysisResult:
             or not normalized["min"] <= normalized["avg"] <= normalized["max"]
         ):
             raise ValueError("latency statistics are not one valid publication")
+        validate_percentile_population(self.valid, {
+            0: normalized["min"], 50: normalized["p50"], 99: normalized["p99"], 100: normalized["max"],
+        })
         self._latency_stats_cache = normalized
 
     def latency_stats(self) -> Optional[Dict[str, float]]:
@@ -985,12 +985,12 @@ class TestResult:
     """
     packet_size: int
     passed: bool
-    tx_count: int = 0
-    rx_count: int = 0
-    loss_pct: float = 0.0
+    tx_count: Optional[int] = None
+    rx_count: Optional[int] = None
+    loss_pct: Optional[float] = None
     avg_latency_us: Optional[float] = None
-    throughput_pps: float = 0.0
-    duration_s: float = 0.0
+    throughput_pps: Optional[float] = None
+    duration_s: Optional[float] = None
     message: str = ""
 
 
@@ -1014,29 +1014,31 @@ class EpochTestResult:
     ``avg_latency_us`` follows the selected profile's nullable latency law.
     """
     passed: bool
-    duration_s: float = 0.0
-    total_sent: int = 0
-    total_received: int = 0
-    initial_generation_sent: int = 0
-    next_generation_sent: int = 0
-    initial_generation_received: int = 0
-    next_generation_received: int = 0
+    duration_s: Optional[float] = None
+    total_sent: Optional[int] = None
+    total_received: Optional[int] = None
+    initial_generation_sent: Optional[int] = None
+    next_generation_sent: Optional[int] = None
+    initial_generation_received: Optional[int] = None
+    next_generation_received: Optional[int] = None
     generation_tag_transition_seq: int = -1
-    transitions_observed: int = 0
-    loss_pct: float = 0.0
+    transitions_observed: Optional[int] = None
+    loss_pct: Optional[float] = None
     avg_latency_us: Optional[float] = None
     # Exact ordered-CUT proof from final runtime telemetry.
-    boundary_count: int = 0
-    completed_boundaries: int = 0
-    protocol_faults_observed: int = 0
-    backpressure_events: int = 0
+    boundary_count: Optional[int] = None
+    completed_boundaries: Optional[int] = None
+    protocol_faults_observed: Optional[int] = None
+    backpressure_events: Optional[int] = None
     boundary_ordering_validated: bool = False
     message: str = ""
 
     @property
-    def zero_loss(self) -> bool:
-        """True if no packets lost during epoch transition."""
-        return self.total_sent == self.total_received and self.total_sent > 0
+    def zero_loss(self) -> Optional[bool]:
+        """Return the measured conservation fact, or None without a positive TX population."""
+        if self.total_sent is None or self.total_received is None or self.total_sent <= 0:
+            return None
+        return self.total_sent == self.total_received
 
 
 @dataclass
@@ -1047,7 +1049,7 @@ class CommitConfirmedTestResult:
     ``avg_latency_us`` follows the selected profile's nullable latency law.
     """
     passed: bool
-    duration_s: float = 0.0
+    duration_s: Optional[float] = None
     # Confirm scenario
     confirm_success: bool = False
     confirm_snapshot_id: str = ""
@@ -1058,9 +1060,9 @@ class CommitConfirmedTestResult:
     timeout_rollback_occurred: bool = False
     timeout_rollback_snapshot_id: str = ""
     # Traffic-under-transition metrics
-    tx_count: int = 0
-    rx_count: int = 0
-    loss_pct: float = 0.0
+    tx_count: Optional[int] = None
+    rx_count: Optional[int] = None
+    loss_pct: Optional[float] = None
     avg_latency_us: Optional[float] = None
     message: str = ""
 
@@ -1073,7 +1075,7 @@ class RollbackTestResult:
     ``avg_latency_us`` follows the selected profile's nullable latency law.
     """
     passed: bool
-    duration_s: float = 0.0
+    duration_s: Optional[float] = None
     # Full rollback
     full_rollback_success: bool = False
     full_rollback_snapshot_id: str = ""
@@ -1082,9 +1084,9 @@ class RollbackTestResult:
     selective_rollback_modules: List[str] = field(default_factory=list)
     selective_rollback_snapshot_id: str = ""
     # Traffic-under-transition metrics
-    tx_count: int = 0
-    rx_count: int = 0
-    loss_pct: float = 0.0
+    tx_count: Optional[int] = None
+    rx_count: Optional[int] = None
+    loss_pct: Optional[float] = None
     avg_latency_us: Optional[float] = None
     message: str = ""
 
@@ -1107,25 +1109,25 @@ class GuardrailsTestResult:
         Dedicated degradation content activated by the scenario.
     rollback_snapshot_id : str
         Content identity restored by automatic rollback.
-    candidate_epoch : int
+    candidate_epoch : int or None
         Exact completed candidate epoch.
-    rollback_epoch : int
+    rollback_epoch : int or None
         Exact later automatic-rollback epoch.
-    protocol_faults_observed : int
+    protocol_faults_observed : int or None
         Protocol-fault delta across the rollback transition.
     message : str
         Human-readable terminal verdict.
     """
 
     passed: bool
-    duration_s: float = 0.0
+    duration_s: Optional[float] = None
     policy_configured: bool = False
     baseline_snapshot_id: str = ""
     candidate_snapshot_id: str = ""
     rollback_snapshot_id: str = ""
-    candidate_epoch: int = 0
-    rollback_epoch: int = 0
-    protocol_faults_observed: int = 0
+    candidate_epoch: Optional[int] = None
+    rollback_epoch: Optional[int] = None
+    protocol_faults_observed: Optional[int] = None
     message: str = ""
 
 

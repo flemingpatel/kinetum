@@ -38,5 +38,5 @@ def complete_native_analysis(
         tag_counts=dict(Counter(tag for _, tag in packets)),
     )
     if packets:
-        result.set_latency_stats({"avg": 10.0, "min": 5.0, "max": 20.0, "p50": 9.0, "p99": 19.0})
+        result.set_latency_stats(dict.fromkeys(("avg", "min", "max", "p50", "p99"), 10.0))
     return result
