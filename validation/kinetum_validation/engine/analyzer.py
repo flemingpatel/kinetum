@@ -8,6 +8,7 @@ Computes loss, latency, generation-tag transition, and tag distributions.
 from __future__ import annotations
 
 import os
+import math
 import subprocess
 from pathlib import Path
 
@@ -271,10 +272,7 @@ class PacketAnalyzer:
                 raw["missing_count"], "analyzer missing_count", minimum=0,
                 maximum=_UINT64_MAX,
             )
-            loss_pct = require_number(
-                raw["loss_pct"], "analyzer loss_pct", minimum=0.0,
-                maximum=100.0,
-            )
+            loss_pct = raw["loss_pct"]
             if (
                 valid + invalid + duplicates != total_rx
                 or valid > self.expected_count
@@ -305,41 +303,31 @@ class PacketAnalyzer:
                 row.tag_transition_count for row in streams
             ):
                 raise JsonContractError("analyzer tag changes disagree with input observations")
-            expected_loss = (
-                (self.expected_count - valid) / self.expected_count * 100.0
-                if self.expected_count > 0 and valid < self.expected_count
-                else 0.0
-            )
-            if abs(loss_pct - expected_loss) > 0.0001:
-                raise JsonContractError("analyzer loss percentage is contradictory")
+            if self.expected_count == 0:
+                if loss_pct is not None:
+                    raise JsonContractError("analyzer loss has no sent population")
+            else:
+                loss_pct = require_number(loss_pct, "analyzer loss_pct", minimum=0.0, maximum=100.0)
+                expected_loss = (self.expected_count - valid) / self.expected_count * 100.0
+                if not math.isclose(loss_pct, expected_loss, rel_tol=1e-12, abs_tol=0.0):
+                    raise JsonContractError("analyzer loss percentage is contradictory")
             if (tag_transition_count == 0) != (transition_seq == -1):
                 raise JsonContractError("analyzer transition identity is contradictory")
 
-            latency = require_object(raw["latency"], "analyzer latency")
-            require_exact_keys(latency, _LATENCY_KEYS, "analyzer latency")
-            latency_count = require_int(
-                latency["count"], "analyzer latency count", minimum=0,
-                maximum=_UINT64_MAX,
-            )
-            latency_values = {
-                key: require_number(
-                    latency[key], f"analyzer latency {key}", minimum=0.0
-                )
-                for key in ("avg", "min", "max", "p50", "p99")
-            }
-            if latency_count != valid:
-                raise JsonContractError(
-                    "analyzer latency membership disagrees with valid packets"
-                )
-            if latency_count == 0 and any(latency_values.values()):
-                raise JsonContractError("empty analyzer latency retained values")
-            if latency_count > 0 and not (
-                latency_values["min"] <= latency_values["p50"]
-                <= latency_values["p99"] <= latency_values["max"]
-                and latency_values["min"] <= latency_values["avg"]
-                <= latency_values["max"]
-            ):
-                raise JsonContractError("analyzer latency order is contradictory")
+            latency_values = None
+            if valid == 0:
+                if raw["latency"] is not None:
+                    raise JsonContractError("empty analyzer capture retained latency measurements")
+            else:
+                latency = require_object(raw["latency"], "analyzer latency")
+                require_exact_keys(latency, _LATENCY_KEYS, "analyzer latency")
+                latency_count = require_int(latency["count"], "analyzer latency count", minimum=1, maximum=_UINT64_MAX)
+                if latency_count != valid:
+                    raise JsonContractError("analyzer latency membership disagrees with valid packets")
+                latency_values = {
+                    key: require_number(latency[key], f"analyzer latency {key}", minimum=0.0)
+                    for key in ("avg", "min", "max", "p50", "p99")
+                }
         except JsonContractError as exc:
             raise RuntimeError("native analyzer produced malformed evidence") from exc
 
@@ -353,7 +341,7 @@ class PacketAnalyzer:
             tag_counts=tag_counts,
             streams=streams,
         )
-        if latency_count > 0:
+        if latency_values is not None:
             try:
                 result.set_latency_stats(latency_values)
             except ValueError as exc:

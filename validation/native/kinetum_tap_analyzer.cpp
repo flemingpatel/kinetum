@@ -239,16 +239,21 @@ struct analysis_result {
 			std::vector<double> sorted_lats = latencies;
 			std::sort(sorted_lats.begin(), sorted_lats.end());
 			size_t n = sorted_lats.size();
-			double sum = 0;
-			for (double l : sorted_lats) {
-				sum += l;
+			// Compensate accumulation before the final binary64 conversion.
+			long double sum = 0;
+			long double compensation = 0;
+			for (double latency : sorted_lats) {
+				const long double adjusted = static_cast<long double>(latency) - compensation;
+				const long double next = sum + adjusted;
+				compensation = (next - sum) - adjusted;
+				sum = next;
 			}
-			lat_avg = sum / static_cast<double>(n);
+			lat_avg = static_cast<double>(sum / static_cast<long double>(n));
 			lat_min = sorted_lats.front();
 			lat_max = sorted_lats.back();
-			lat_p50 = sorted_lats[n / 2];
-			lat_p99 = (n > 100) ? sorted_lats[static_cast<size_t>(static_cast<double>(n) * 0.99)] :
-					      sorted_lats[n - 1];
+			// Nearest-rank indices: ceil(p * n / 100) - 1, without multiplication overflow.
+			lat_p50 = sorted_lats[(n - 1u) / 2u];
+			lat_p99 = sorted_lats[n - 1u - n / 100u];
 		}
 
 		std::ostringstream output;
@@ -258,10 +263,21 @@ struct analysis_result {
 		       << ",\"duplicates\":" << duplicates << ",\"out_of_order\":" << out_of_order
 		       << ",\"transition_seq\":" << transition_seq
 		       << ",\"tag_transition_count\":" << tag_transition_count << ",\"max_gap\":" << max_gap
-		       << ",\"loss_pct\":" << std::fixed << std::setprecision(4) << loss_pct
-		       << ",\"missing_count\":" << missing_count << ",\"latency\":{\"avg\":" << std::setprecision(2)
-		       << lat_avg << ",\"min\":" << lat_min << ",\"max\":" << lat_max << ",\"p50\":" << lat_p50
-		       << ",\"p99\":" << lat_p99 << ",\"count\":" << latencies.size() << "},\"tag_counts\":";
+		       << ",\"loss_pct\":" << std::setprecision(std::numeric_limits<double>::max_digits10);
+		if (expected_count == 0) {
+			output << "null";
+		} else {
+			output << loss_pct;
+		}
+		output << ",\"missing_count\":" << missing_count << ",\"latency\":";
+		if (latencies.empty()) {
+			output << "null";
+		} else {
+			output << "{\"avg\":" << lat_avg << ",\"min\":" << lat_min << ",\"max\":" << lat_max
+			       << ",\"p50\":" << lat_p50 << ",\"p99\":" << lat_p99 << ",\"count\":" << latencies.size()
+			       << '}';
+		}
+		output << ",\"tag_counts\":";
 		append_tag_counts(output, tag_counts);
 		output << ",\"streams\":[";
 		for (std::size_t index = 0; index < streams.size(); ++index) {
@@ -494,8 +510,8 @@ static analysis_result analyze_pcap(const char *path, uint64_t expected_count, u
 		}
 		double latency_us = 0.0;
 		if (measure_latency) {
-			const double rx_time = static_cast<double>(ts_sec) + static_cast<double>(ts_usec) / 1e6;
-			latency_us = (rx_time - tx_time) * 1e6;
+			// Subtract epoch seconds before adding the exact microsecond capture fraction.
+			latency_us = (static_cast<double>(ts_sec) - tx_time) * 1e6 + static_cast<double>(ts_usec);
 			if (!std::isfinite(tx_time) || tx_time <= 0.0 || !std::isfinite(latency_us) ||
 			    latency_us <= 0.0 || latency_us >= 1e9) {
 				result.invalid++;

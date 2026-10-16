@@ -92,6 +92,7 @@ class ConsoleReporterTest(unittest.TestCase):
         result = GuardrailsTestResult(
             passed=True, policy_configured=True, baseline_snapshot_id="baseline", candidate_snapshot_id="deny",
             rollback_snapshot_id="baseline", candidate_epoch=11, rollback_epoch=12, duration_s=60.1,
+            protocol_faults_observed=0,
             message="GUARDRAILS VALIDATED: exact attributed rollback completed",
         )
         output = io.StringIO()

@@ -920,6 +920,7 @@ try:
             client.stop(ports=ingress_ports)
         promisc_ports = list(egress_ports)
         promisc_enabled = bool(promisc_ports)
+        elapsed_s = time.monotonic() - start_mono
         end_time = time.time()
 
         port_tx_count = sum(stat_value(port_stats, port_id, "opackets") for port_id in ingress_ports)
@@ -968,6 +969,7 @@ try:
             "start_time": float(spec["start_time"]),
             "start_monotonic": start_mono,
             "end_time": end_time,
+            "duration_s": elapsed_s,
             "ingress_ports": ingress_ports,
             "egress_ports": egress_ports,
             "promiscuous_ports": egress_ports,
@@ -1041,6 +1043,7 @@ try:
         port_counter_baseline = absolute_port_counters(client, ports)
 
     start_time = time.time()
+    start_mono = time.monotonic()
     with contextlib.redirect_stdout(sys.stderr):
         client.start(ports=ingress_ports, duration=duration_s, force=True)
         client.wait_on_traffic(
@@ -1049,6 +1052,7 @@ try:
         )
         client.get_stats(ports=ports)
         port_counter_final = absolute_port_counters(client, ports)
+    elapsed_s = time.monotonic() - start_mono
     end_time = time.time()
 
     port_stats = port_counter_deltas(port_counter_final, port_counter_baseline)
@@ -1069,6 +1073,7 @@ try:
         "port_counter_final": port_counter_final,
         "start_time": start_time,
         "end_time": end_time,
+        "duration_s": elapsed_s,
         "ingress_ports": ingress_ports,
         "egress_ports": egress_ports,
         "promiscuous_ports": promisc_ports,

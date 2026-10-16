@@ -13,6 +13,8 @@ import sys
 from datetime import datetime
 from typing import Optional
 
+from ..statistics import format_number
+
 from ..config.types import (
     CommitConfirmedTestResult,
     EpochTestResult,
@@ -164,21 +166,23 @@ class ConsoleReporter:
 
         print(f"  Status:     {status}", file=sys.stderr)
         if isinstance(result, (TestResult, CommitConfirmedTestResult, RollbackTestResult)):
-            if result.passed or result.tx_count > 0:
+            if result.tx_count is not None:
                 self._print_traffic(result.tx_count, result.rx_count, result.loss_pct, result.avg_latency_us)
                 if isinstance(result, TestResult):
-                    print(f"  Throughput: {result.throughput_pps:.0f} PPS", file=sys.stderr)
-        elif isinstance(result, EpochTestResult) and (result.passed or result.total_sent > 0):
+                    print(f"  TX rate:    {format_number(result.throughput_pps)} PPS", file=sys.stderr)
+        elif isinstance(result, EpochTestResult) and result.total_sent is not None:
             self._print_traffic(result.total_sent, result.total_received, result.loss_pct, result.avg_latency_us)
-            self.print_progress(f"Boundaries: {result.completed_boundaries}/{result.boundary_count} complete")
-            self.print_progress(f"Protocol faults: {result.protocol_faults_observed}")
-            self.print_progress(f"Backpressure: {result.backpressure_events}")
-            self.print_progress(
-                f"Initial tag: TX={result.initial_generation_sent:,} RX={result.initial_generation_received:,}"
-            )
-            self.print_progress(
-                f"Next tag: TX={result.next_generation_sent:,} RX={result.next_generation_received:,}"
-            )
+            if result.boundary_count is not None:
+                self.print_progress(f"Boundaries: {result.completed_boundaries}/{result.boundary_count} complete")
+                self.print_progress(f"Protocol faults: {result.protocol_faults_observed}")
+                self.print_progress(f"Backpressure: {result.backpressure_events}")
+            if result.initial_generation_sent is not None:
+                self.print_progress(
+                    f"Initial tag: TX={result.initial_generation_sent:,} RX={result.initial_generation_received:,}"
+                )
+                self.print_progress(
+                    f"Next tag: TX={result.next_generation_sent:,} RX={result.next_generation_received:,}"
+                )
             if result.generation_tag_transition_seq >= 0:
                 self.print_progress(f"First tag-change sequence: {result.generation_tag_transition_seq}")
         if isinstance(result, CommitConfirmedTestResult):
@@ -203,18 +207,21 @@ class ConsoleReporter:
             elif isinstance(result, NatExchangeResult):
                 self.print_progress(f"Mappings: {result.session_count}; return packets: {result.return_count}")
                 self.print_progress(f"NAT contexts: {result.context_count}")
-        print(f"  Duration:   {result.duration_s:.2f}s", file=sys.stderr)
+        if result.duration_s is not None:
+            print(f"  Duration:   {format_number(result.duration_s, 2)}s", file=sys.stderr)
 
         if result.message and not result.passed:
             print(f"  Message:    {result.message}", file=sys.stderr)
 
     @staticmethod
-    def _print_traffic(tx: int, rx: int, loss_pct: float, latency_us: Optional[float]) -> None:
+    def _print_traffic(tx: int, rx: Optional[int], loss_pct: Optional[float], latency_us: Optional[float]) -> None:
         """Print observed traffic values once, preserving explicit latency absence."""
         print(f"  TX:         {tx:,}", file=sys.stderr)
-        print(f"  RX:         {rx:,}", file=sys.stderr)
-        print(f"  Loss:       {loss_pct:.2f}%", file=sys.stderr)
-        latency = f"{latency_us:.1f}us" if latency_us is not None else "unavailable"
+        received = f"{rx:,}" if rx is not None else "unavailable"
+        print(f"  RX:         {received}", file=sys.stderr)
+        loss = f"{format_number(loss_pct, 2)}%" if loss_pct is not None else "unavailable"
+        print(f"  Loss:       {loss}", file=sys.stderr)
+        latency = f"{format_number(latency_us, 1)}us" if latency_us is not None else "unavailable"
         print(f"  Latency:    {latency}", file=sys.stderr)
 
     def print_suite_result(self, result: TestSuiteResult) -> None:

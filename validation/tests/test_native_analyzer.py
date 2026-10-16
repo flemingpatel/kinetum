@@ -31,7 +31,7 @@ def _capture_reply() -> dict:
         "total_rx": 4, "valid": 4, "invalid": 0, "duplicates": 0, "out_of_order": 0,
         "transition_seq": 2, "tag_transition_count": 2, "max_gap": 0,
         "loss_pct": 0.0, "missing_count": 0,
-        "latency": {"avg": 10.0, "min": 5.0, "max": 20.0, "p50": 9.0, "p99": 19.0, "count": 4},
+        "latency": {"avg": 10.0, "min": 10.0, "max": 10.0, "p50": 10.0, "p99": 10.0, "count": 4},
         "tag_counts": {"1": 2, "2": 2},
         "streams": [
             {
@@ -160,18 +160,34 @@ class TestNativeAnalyzer(unittest.TestCase):
     def test_empty_declared_inputs_remain_explicit(self) -> None:
         """An empty capture retains every authored row without packet or latency evidence."""
         reply = _capture_reply()
-        reply.update(total_rx=0, valid=0, transition_seq=-1, tag_transition_count=0, tag_counts={})
-        reply["latency"] = dict.fromkeys(reply["latency"], 0)
+        reply.update(total_rx=0, valid=0, transition_seq=-1, tag_transition_count=0, tag_counts={}, loss_pct=None)
+        reply["latency"] = None
         for row in reply["streams"]:
             row.update(expected_count=0, valid=0, transition_seq=-1, tag_transition_count=0,
                        first_tag=None, last_tag=None, tag_counts={})
         result = self.parse(reply, expected=0)
         self.assertEqual(len(result.streams), 2)
         self.assertIsNone(result.latency_stats())
+        self.assertIsNone(_context(self.root, BackendType.DPDK_TAP).measured_average_latency(result))
+
+    def test_empty_capture_retains_measured_total_loss_without_latency(self) -> None:
+        """No received packets means measured loss and unavailable latency, not an analyzer failure."""
+        reply = _capture_reply()
+        reply.update(total_rx=0, valid=0, transition_seq=-1, tag_transition_count=0,
+                     tag_counts={}, loss_pct=100.0, missing_count=4, max_gap=4, latency=None)
+        for row in reply["streams"]:
+            row.update(valid=0, missing_count=2, transition_seq=-1, tag_transition_count=0,
+                       first_tag=None, last_tag=None, tag_counts={})
+        result = self.parse(reply)
+        self.assertEqual(result.loss_pct(4), 100.0)
+        self.assertIsNone(result.latency_stats())
+        self.assertIsNone(_context(self.root, BackendType.DPDK_TAP).measured_average_latency(result))
 
     def test_verdict_requires_input_order_and_preserves_driver_availability(self) -> None:
         """TAP requires complete input evidence; TRex counters cannot claim packet ordering."""
-        sender = PacketStats(tx_count=4, generation_tag_counts={1: 2, 2: 2}, start_time=1.0, end_time=2.0)
+        sender = PacketStats(
+            tx_count=4, generation_tag_counts={1: 2, 2: 2}, start_time=1.0, end_time=2.0, duration_s=1.0,
+        )
         native = _context(self.root, BackendType.DPDK_TAP)
         analysis = self.parse(_capture_reply())
         self.assertTrue(native.traffic_observation_is_clean(sender, analysis))
@@ -189,7 +205,9 @@ class TestNativeAnalyzer(unittest.TestCase):
         context = _context(self.root, BackendType.DPDK_TAP)
         analysis = complete_native_analysis(((0, 4),), 2)
         analysis.streams = (replace(analysis.streams[0], out_of_order=1), analysis.streams[1])
-        sender = PacketStats(tx_count=4, errors=1, generation_tag_counts={0: 4}, start_time=1.0, end_time=2.0)
+        sender = PacketStats(
+            tx_count=4, errors=1, generation_tag_counts={0: 4}, start_time=1.0, end_time=2.0, duration_s=1.0,
+        )
         self.assertFalse(context.traffic_observation_is_clean(sender, analysis))
         context.artifacts.write_traffic_evidence(self.capture, TrafficDriverType.NATIVE_TAP, sender, analysis)
         retained = json.loads(self.capture.with_suffix(".traffic.json").read_text())
@@ -216,7 +234,9 @@ class TestCaptureCompletionEvidence(unittest.IsolatedAsyncioTestCase):
                 )
                 driver.analyze_capture = AsyncMock(side_effect=RuntimeError("invalid pcap"))
                 context = replace(_context(root, BackendType.DPDK_TAP), traffic=driver)
-                sender = PacketStats(tx_count=4, errors=1, generation_tag_counts={0: 4}, start_time=1.0, end_time=2.0)
+                sender = PacketStats(
+                    tx_count=4, errors=1, generation_tag_counts={0: 4}, start_time=1.0, end_time=2.0, duration_s=1.0,
+                )
                 diagnostic = "capture drops" if failed_operation == "stop" else "invalid pcap"
                 with self.assertRaisesRegex(RuntimeError, diagnostic):
                     await context.complete_capture(capture, sender)
@@ -238,7 +258,7 @@ class TestCaptureCompletionEvidence(unittest.IsolatedAsyncioTestCase):
             driver = MagicMock(stop_capture=AsyncMock(side_effect=asyncio.CancelledError))
             driver.analyze_capture = AsyncMock()
             context = replace(_context(root, BackendType.DPDK_TAP), traffic=driver)
-            sender = PacketStats(tx_count=4, generation_tag_counts={0: 4}, start_time=1.0, end_time=2.0)
+            sender = PacketStats(tx_count=4, generation_tag_counts={0: 4}, start_time=1.0, end_time=2.0, duration_s=1.0)
             with self.assertRaises(asyncio.CancelledError):
                 await context.complete_capture(capture, sender)
             driver.analyze_capture.assert_not_awaited()
@@ -253,7 +273,9 @@ class TestCaptureCompletionEvidence(unittest.IsolatedAsyncioTestCase):
                 root = Path(directory)
                 driver = MagicMock(stop_capture=AsyncMock(side_effect=failure))
                 context = replace(_context(root, BackendType.DPDK_TAP), traffic=driver)
-                sender = PacketStats(tx_count=4, generation_tag_counts={0: 4}, start_time=1.0, end_time=2.0)
+                sender = PacketStats(
+                    tx_count=4, generation_tag_counts={0: 4}, start_time=1.0, end_time=2.0, duration_s=1.0,
+                )
                 with (
                     patch.object(context.artifacts, "write_traffic_evidence", side_effect=OSError("disk full")),
                     patch.object(context.reporter, "print_warning") as warning,

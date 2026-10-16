@@ -1,5 +1,5 @@
 """
-Tests for RunArtifacts.write_transition_summary per-type aggregation.
+Tests for transition summaries and benchmark evidence aggregation.
 
 Validates that transition_summary.json correctly groups metrics by
 transition_type and computes independent distributions for each type.
@@ -11,11 +11,17 @@ Run:
 import json
 import io
 import copy
+import csv
 import tempfile
 import unittest
+from argparse import Namespace
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
+from dataclasses import asdict, replace
+from datetime import datetime, timezone
 from pathlib import Path
+from unittest.mock import patch
 
+from kinetum_benchmark.__main__ import cmd_report
 from kinetum_benchmark.aggregator import (
     _compute_scenario_metrics,
     _compute_transition_metrics,
@@ -29,15 +35,22 @@ from kinetum_benchmark.contracts import (
     validate_benchmark_summary_identity,
     validate_benchmark_transition_multiset,
 )
+from kinetum_benchmark.exporter import export_csv
 from kinetum_validation.config.types import (
     AnalysisResult,
     BackendConfig,
     BackendType,
     DEPLOYMENT_SPECS,
     DeploymentMode,
+    EpochTestResult,
+    GuardrailsTestResult,
     ProcessConfig,
+    StatsValidationResult,
     TestConfig as ValidationConfig,
     TestResult as ValidationResult,
+    TestSuiteResult as ValidationSuiteResult,
+    TestType as ValidationTestType,
+    TrafficEndpointConfig,
     TransitionType,
 )
 from kinetum_validation.engine.json_contract import (
@@ -52,6 +65,7 @@ from kinetum_validation.engine.json_contract import (
 from kinetum_validation.orchestrator import TestOrchestrator as ValidationOrchestrator
 
 from kinetum_validation.report.console import ConsoleReporter
+from kinetum_validation.report.artifacts import RunArtifacts
 
 
 TREX_IDENTITY = {"version": "v3.06", "mode": "STL"}
@@ -471,6 +485,302 @@ def _write_summary_quietly(orch: ValidationOrchestrator) -> None:
         orch.artifacts.write_transition_summary()
 
 
+@contextmanager
+def _epoch_benchmark_case(inclusion_policy: str):
+    """Yield complete TRex artifacts with one final-statistics failure.
+
+    Parameters
+    ----------
+    inclusion_policy : str
+        Exact manifest selection: ``passed_only`` or ``all_runs``.
+
+    Yields
+    ------
+    Path
+        Fresh two-run root whose files are removed on context exit.
+    """
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory).resolve()
+        manifest = _epoch_benchmark_manifest()
+        manifest.update(
+            inclusion_policy=inclusion_policy, runs=2, total_duration_s=120.0,
+            completed="2026-09-03T12:02:00+00:00",
+        )
+        manifest["config"].update(epoch_pps=100, epoch_duration=10.5)
+        manifest["scenario"].update(
+            backend="dpdk_pci", traffic_driver="trex",
+            latency_source=None, traffic_host="traffic-host",
+        )
+        manifest["results"].update(total_runs=2, failed_runs=1)
+        manifest["results"]["runs"].append({
+            "run_id": 2, "passed": False, "duration_s": 60.0,
+            "error": "statistics unavailable",
+        })
+        (root / "manifest.json").write_text(
+            json.dumps(manifest, allow_nan=False) + "\n", encoding="utf-8"
+        )
+        profile = DEPLOYMENT_SPECS[DeploymentMode.FAN_IN_EDGE_GATEWAY].backend_profile(BackendType.DPDK_PCI)
+        backend = BackendConfig(
+            backend_type=BackendType.DPDK_PCI,
+            ports=tuple(
+                replace(port, runtime_direction=port.traffic_role, runtime_mac=f"02:00:00:00:00:{index:02x}")
+                for index, port in enumerate(profile.ports)
+            ),
+        )
+        for run_id, ack_gate_ns in ((1, 100), (2, 900)):
+            run_root = root / f"run_{run_id:03d}"
+            run_root.mkdir()
+            config = ValidationConfig(
+                deployment=DeploymentMode.FAN_IN_EDGE_GATEWAY,
+                process=TEST_PROCESS_CONFIG, backend=backend,
+                traffic=TrafficEndpointConfig(host="traffic-host"), output_dir=run_root,
+            )
+            orchestrator = ValidationOrchestrator(config, release_metadata=manifest["runtime_release"])
+            bundle = run_root / "runtime_bundle"
+            with redirect_stdout(io.StringIO()):
+                orchestrator._save_run_metadata(  # pylint: disable=protected-access
+                    bundle / "configs/plan.pbtxt", bundle, dict(TREX_IDENTITY)
+                )
+            result = _as_trex_latency_unavailable(_epoch_test_result_artifact())
+            result["epoch_test"].update(
+                total_sent=1100, total_received=1100,
+                initial_generation_sent=550, next_generation_sent=550,
+                initial_generation_received=550, next_generation_received=550,
+                boundary_count=2, completed_boundaries=2,
+            )
+            result.update(
+                total_tests=2, passed_tests=2,
+                timestamp=f"2026-09-03T12:0{run_id}:00+00:00",
+            )
+            result["stats_validation"] = {"required": True, "passed": True, "message": "exact"}
+            if run_id == 2:
+                result.update(all_passed=False, passed_tests=1, failed_tests=1)
+                result["stats_validation"].update(passed=False, message="statistics unavailable")
+            (run_root / "test_results.json").write_text(
+                json.dumps(result, allow_nan=False) + "\n", encoding="utf-8"
+            )
+            record = _make_record(TransitionType.EPOCH, 1, 2, ack_gate_ns)
+            observations = record["counter_observations"]
+            observations["expected_workers"] = 3
+            for endpoint in ("before", "after"):
+                original = observations[endpoint]["workers"][0]
+                total = original["rx_packets"]
+                observations[endpoint]["workers"] = [
+                    {
+                        **original, "worker_index": index,
+                        "rx_packets": rx, "tx_packets": tx,
+                        "rx_bytes": rx * 64, "tx_bytes": tx * 64,
+                    }
+                    for index, (rx, tx) in enumerate(((total // 2, 0), (total // 2, 0), (0, total)))
+                ]
+            boundary = record["boundary_epoch_stats"][0]
+            record["boundary_epoch_stats"] = [
+                {
+                    **boundary, "boundary_id": f"boundary.acl{index}.nat", "boundary_index": index,
+                    "cut_sequence": 100, "data_enqueued_sequence_delta": 500,
+                    "data_dequeued_sequence_delta": 500, "data_backpressure_events_delta": 0,
+                }
+                for index in range(2)
+            ]
+            region = record["region_epoch_stats"][0]
+            record["region_epoch_stats"] = [{**region, "region_id": index} for index in range(3)]
+            record["stage_stats"] = [
+                {"stage_id": name, "in_packets_delta": count, "out_packets_delta": count, "dropped_packets_delta": 0}
+                for name, count in (
+                    ("rx0", 500), ("parse0", 500), ("acl0", 500),
+                    ("rx1", 500), ("parse1", 500), ("acl1", 500),
+                    ("nat", 1000), ("qos", 1000), ("tx", 1000),
+                )
+            ]
+            (run_root / "transition_metrics.jsonl").write_text(
+                json.dumps(record, allow_nan=False) + "\n", encoding="utf-8"
+            )
+        yield root
+
+
+class TestBenchmarkAggregation(unittest.TestCase):
+    """Aggregation and reporting preserve strict per-run evidence and provenance."""
+
+    def test_partial_guardrails_keeps_elapsed_time_without_fabricating_rollback(self):
+        """A failed baseline wait contributes its observed duration but no epoch step."""
+        result = _single_scenario_result_artifact(
+            "guardrails", "guardrails_test",
+            asdict(GuardrailsTestResult(passed=False, duration_s=60.0, message="baseline unavailable")),
+        )
+        result.update(all_passed=False, passed_tests=0, failed_tests=1)
+        validate_test_suite_result(result)
+        metrics = _compute_scenario_metrics([result], include_all=True)
+        self.assertEqual(metrics, {"guardrails_test": {"duration_s": _distribution(60.0)}})
+        self.assertEqual(_compute_scenario_metrics([result]), {})
+
+    def test_failed_loss_measurement_is_included_by_all_runs(self):
+        """A failed verdict cannot erase an observed packet deficit from failure analysis."""
+        result = _packet_test_result_artifact()
+        result.update(all_passed=False, passed_tests=1, failed_tests=1)
+        result["packet_tests"][0].update(
+            passed=False, tx_count=1000, rx_count=980, loss_pct=2.0, throughput_pps=1000.0, duration_s=2.0,
+        )
+        validate_test_suite_result(result)
+        metrics = _compute_scenario_metrics([result], include_all=True)
+        self.assertEqual(metrics["packet_tests"]["64"]["loss_pct"], _distribution(2.0))
+        self.assertEqual(_compute_scenario_metrics([result]), {})
+
+    def test_incomplete_failed_trial_adds_no_zero_samples(self):
+        """All-runs retains a failed trial while excluding its unavailable measurements."""
+        with _epoch_benchmark_case("all_runs") as root:
+            run = root / "run_002"
+            (run / "test_results.json").unlink()
+            (run / "transition_metrics.jsonl").unlink()
+            result = ValidationSuiteResult(
+                deployment=DeploymentMode.FAN_IN_EDGE_GATEWAY, test_type=ValidationTestType.EPOCH,
+                epoch_test=EpochTestResult(passed=False, duration_s=60.0, message="statistics unavailable"),
+                stats_validation=StatsValidationResult(required=True, passed=False, message="statistics unavailable"),
+                total_duration_s=60.0,
+            )
+            profile = DEPLOYMENT_SPECS[DeploymentMode.FAN_IN_EDGE_GATEWAY].backend_profile(BackendType.DPDK_PCI)
+            with patch("kinetum_validation.report.artifacts.datetime", wraps=datetime) as clock, \
+                    redirect_stderr(io.StringIO()), redirect_stdout(io.StringIO()):
+                clock.now.return_value = datetime(2026, 9, 3, 12, 2, tzinfo=timezone.utc)
+                RunArtifacts(run, ConsoleReporter(color=False)).save_test_results(result, profile)
+                aggregate_benchmark(root, "all_runs")
+                export_csv(root)
+                self.assertEqual(cmd_report(Namespace(input_dir=root, inclusion_policy="all-runs")), 0)
+            summary = json.loads((root / "benchmark_summary.json").read_text())
+            self.assertEqual((summary["passed_runs"], summary["failed_runs"]), (1, 1))
+            self.assertTrue(all(row["count"] == 1 for row in summary["scenario_metrics"]["epoch_test"].values()))
+            self.assertEqual(summary["transition_metrics"]["total_transitions"], 1)
+            with (root / "artifacts/benchmark_scenario_raw.csv").open(newline="") as stream:
+                rows = list(csv.DictReader(stream))
+            self.assertEqual(len(rows), 2)
+            self.assertEqual(rows[1]["run"], "run_002")
+            self.assertTrue(all(rows[1][name] == "" for name in ("tx_count", "rx_count", "loss_pct", "avg_latency_us")))
+
+    def test_observed_zero_is_retained_without_inventing_a_loss_percentage(self):
+        """A completed empty sender has zero TX/RX/rate but no loss denominator or latency."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            result = ValidationSuiteResult(
+                deployment=DeploymentMode.PASSTHROUGH, test_type=ValidationTestType.STANDARD,
+                packet_tests=[ValidationResult(
+                    packet_size=64, passed=False, tx_count=0, rx_count=0,
+                    throughput_pps=0.0, duration_s=1.0, message="no packets sent",
+                )],
+                stats_validation=StatsValidationResult(required=True, passed=True, message="exact"),
+                total_duration_s=1.0,
+            )
+            profile = DEPLOYMENT_SPECS[DeploymentMode.PASSTHROUGH].backend_profile(BackendType.DPDK_TAP)
+            with redirect_stderr(io.StringIO()), redirect_stdout(io.StringIO()):
+                RunArtifacts(root, ConsoleReporter(color=False)).save_test_results(result, profile)
+            recorded = json.loads((root / "test_results.json").read_text())
+            row = recorded["packet_tests"][0]
+            self.assertIsNone(row["loss_pct"])
+            self.assertIsNone(row["avg_latency_us"])
+            summary = _compute_scenario_metrics([recorded], include_all=True)["packet_tests"]["64"]
+            self.assertEqual(set(summary), {"tx_count", "rx_count", "throughput_pps"})
+            self.assertTrue(all(item == _distribution(0) for item in summary.values()))
+            row["loss_pct"] = 0.0
+            with self.assertRaisesRegex(JsonContractError, "positive TX"):
+                validate_test_suite_result(recorded)
+
+    def test_small_nonzero_loss_survives_result_publication_and_summary(self):
+        """One missing packet remains nonzero in admitted artifacts and cannot be reported as zero loss."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            config = ValidationConfig(
+                process=TEST_PROCESS_CONFIG, deployment=DeploymentMode.PASSTHROUGH, output_dir=root,
+            )
+            orchestrator = ValidationOrchestrator(config)
+            result = ValidationSuiteResult(
+                deployment=DeploymentMode.PASSTHROUGH, test_type=ValidationTestType.STANDARD,
+                packet_tests=[ValidationResult(
+                    packet_size=64, passed=True, tx_count=100000000, rx_count=99999999,
+                    loss_pct=0.000001, avg_latency_us=10.123456789, throughput_pps=5000000.12345, duration_s=21.0,
+                )],
+                stats_validation=StatsValidationResult(required=True, passed=True, message="exact"),
+                total_duration_s=21.0,
+            )
+            with redirect_stderr(io.StringIO()), redirect_stdout(io.StringIO()):
+                orchestrator.artifacts.save_test_results(result, config.backend_profile)
+            recorded = json.loads((root / "test_results.json").read_text())
+            self.assertEqual(recorded["packet_tests"][0]["loss_pct"], 0.000001)
+            self.assertEqual(recorded["packet_tests"][0]["avg_latency_us"], 10.123456789)
+            self.assertEqual(recorded["packet_tests"][0]["throughput_pps"], 5000000.12345)
+            summary = _compute_scenario_metrics([recorded])
+            self.assertEqual(summary["packet_tests"]["64"]["loss_pct"]["max"], 0.000001)
+            recorded["packet_tests"][0]["loss_pct"] = 0.0
+            with self.assertRaisesRegex(JsonContractError, "counters"):
+                validate_test_suite_result(recorded)
+
+    def test_epoch_records_aggregate_and_report_under_both_inclusion_policies(self):
+        """Run provenance belongs only to the merged ledger; failed runs follow the chosen policy."""
+        for policy, expected_count, maximum in (("passed_only", 1, 100), ("all_runs", 2, 900)):
+            with self.subTest(policy=policy), _epoch_benchmark_case(policy) as root:
+                original = {path: path.read_bytes() for path in root.rglob("*") if path.is_file()}
+                with redirect_stderr(io.StringIO()):
+                    aggregate_benchmark(root, policy)
+                    export_csv(root)
+                    arguments = Namespace(
+                        input_dir=root, inclusion_policy=policy.replace("_", "-"),
+                    )
+                    self.assertEqual(cmd_report(arguments), 0)
+                summary = json.loads((root / "benchmark_summary.json").read_text(encoding="utf-8"))
+                self.assertEqual(summary["trex_identity"], TREX_IDENTITY)
+                self.assertEqual((summary["passed_runs"], summary["failed_runs"]), (1, 1))
+                transitions = summary["transition_metrics"]
+                self.assertEqual(transitions["total_transitions"], expected_count)
+                for distribution in transitions["aggregate"]["boundary_ack_gate_ns"].values():
+                    self.assertEqual(distribution["count"], expected_count)
+                    self.assertEqual(distribution["min"], 100)
+                    self.assertEqual(distribution["max"], maximum)
+                merged = [
+                    json.loads(line)
+                    for line in (root / "merged_transitions.jsonl").read_text(encoding="utf-8").splitlines()
+                ]
+                self.assertEqual([row["_run"] for row in merged], ["run_001", "run_002"])
+                for row in merged:
+                    run_name = row.pop("_run")
+                    validate_transition_metric_record(row)
+                    self.assertEqual(row, json.loads((root / run_name / "transition_metrics.jsonl").read_text()))
+                for name in ("benchmark_scenario_raw.csv", "benchmark_transitions_raw.csv"):
+                    with (root / "artifacts" / name).open(encoding="utf-8", newline="") as stream:
+                        self.assertEqual(len(list(csv.DictReader(stream))), expected_count)
+                for name in ("benchmark_scenario.csv", "benchmark_transitions.csv"):
+                    with (root / name).open(encoding="utf-8", newline="") as stream:
+                        rows = list(csv.DictReader(stream))
+                    self.assertTrue(rows)
+                    self.assertTrue(all(int(row["count"]) == expected_count for row in rows))
+                figures = root / "artifacts" / "figures"
+                expected_figures = {
+                    "boundary_ack_gate_ns_by_type_000.svg",
+                    "boundary_ack_gate_ns_by_type_001.svg",
+                }
+                if expected_count > 1:
+                    expected_figures.add("boundary_ack_gate_ns_cdf.svg")
+                self.assertEqual({path.name for path in figures.iterdir()}, expected_figures)
+                self.assertEqual(
+                    {path.name for path in (root / "artifacts" / "tables").iterdir()},
+                    {
+                        "ordered_cut_boundary_proof.md", "scenario_traffic.md",
+                        "boundary_ack_gate_000.md", "boundary_ack_gate_001.md",
+                    },
+                )
+                for path, contents in original.items():
+                    self.assertEqual(path.read_bytes(), contents)
+
+    def test_run_annotation_in_source_artifacts_rejects_before_publication(self):
+        """Even an excluded failed run cannot inject merged-ledger metadata into a raw artifact."""
+        for name in ("test_results.json", "transition_metrics.jsonl"):
+            with self.subTest(artifact=name), _epoch_benchmark_case("passed_only") as root:
+                path = root / "run_002" / name
+                value = json.loads(path.read_text(encoding="utf-8"))
+                value["_run"] = "run_002"
+                path.write_text(json.dumps(value, allow_nan=False) + "\n", encoding="utf-8")
+                with redirect_stderr(io.StringIO()), self.assertRaisesRegex(JsonContractError, "membership"):
+                    aggregate_benchmark(root)
+                self.assertFalse((root / "merged_transitions.jsonl").exists())
+                self.assertFalse((root / "benchmark_summary.json").exists())
+
+
 class TestTransitionSummaryPerType(unittest.TestCase):
     """Validate per-type aggregation in transition_summary.json."""
 
@@ -538,11 +848,15 @@ class TestTransitionSummaryPerType(unittest.TestCase):
                 with self.assertRaisesRegex(JsonContractError, "contradictory"):
                     validate_test_suite_result(malformed)
 
-        packet = _packet_test_result_artifact()
+        packet = _as_trex_latency_unavailable(_packet_test_result_artifact())
         validate_test_suite_result(packet)
-        packet["packet_tests"][0].update({"rx_count": 0, "loss_pct": 100.0})
-        with self.assertRaisesRegex(JsonContractError, "contradictory"):
-            validate_test_suite_result(packet)
+        for received, loss in ((0, 100.0), (2, 0.0)):
+            malformed = copy.deepcopy(packet)
+            malformed["packet_tests"][0].update(rx_count=received, loss_pct=loss)
+            with self.subTest(received=received), self.assertRaisesRegex(
+                JsonContractError, "packet successful traffic population is incomplete"
+            ):
+                validate_test_suite_result(malformed)
 
         commit = _commit_confirmed_result_artifact()
         validate_test_suite_result(commit)
@@ -596,7 +910,7 @@ class TestTransitionSummaryPerType(unittest.TestCase):
             validate_test_suite_result(guardrails)
 
     def test_latency_availability_is_source_qualified_and_never_zero_filled(self):
-        """Native latency is positive while TRex latency stays unavailable."""
+        """Latency requires received packets and the profile's owned measurement source."""
         native_artifacts = {
             "packet": _packet_test_result_artifact(),
             "epoch": _epoch_test_result_artifact(),
@@ -638,6 +952,12 @@ class TestTransitionSummaryPerType(unittest.TestCase):
             "passed_tests": 1,
             "failed_tests": 1,
         })
+        validate_test_suite_result(failed_native)
+        failed_packet = failed_native["packet_tests"][0]
+        failed_packet.update(rx_count=0, loss_pct=100.0, avg_latency_us=1.0)
+        with self.assertRaisesRegex(JsonContractError, "packet latency has no received population"):
+            validate_test_suite_result(failed_native)
+        failed_packet["avg_latency_us"] = None
         validate_test_suite_result(failed_native)
 
         native_metrics = _compute_scenario_metrics([native])
@@ -716,17 +1036,14 @@ class TestTransitionSummaryPerType(unittest.TestCase):
         unavailable_output = io.StringIO()
         with redirect_stderr(unavailable_output):
             ConsoleReporter(color=False).print_test_result(
-                ValidationResult(packet_size=64, passed=True, avg_latency_us=unavailable_latency)
+                ValidationResult(
+                    packet_size=64, passed=True, tx_count=1, rx_count=1, loss_pct=0.0,
+                    avg_latency_us=unavailable_latency, throughput_pps=1.0, duration_s=1.0,
+                )
             )
         self.assertIn("Latency:    unavailable", unavailable_output.getvalue())
 
-        evidence = {
-            "avg": 10.0,
-            "min": 5.0,
-            "max": 20.0,
-            "p50": 9.0,
-            "p99": 19.0,
-        }
+        evidence = dict.fromkeys(("avg", "min", "max", "p50", "p99"), 10.0)
         analysis.set_latency_stats(evidence)
         borrowed = analysis.latency_stats()
         self.assertIsNotNone(borrowed)
@@ -735,7 +1052,10 @@ class TestTransitionSummaryPerType(unittest.TestCase):
         measured_output = io.StringIO()
         with redirect_stderr(measured_output):
             ConsoleReporter(color=False).print_test_result(
-                ValidationResult(packet_size=64, passed=True, avg_latency_us=measured_latency)
+                ValidationResult(
+                    packet_size=64, passed=True, tx_count=1, rx_count=1, loss_pct=0.0,
+                    avg_latency_us=measured_latency, throughput_pps=1.0, duration_s=1.0,
+                )
             )
         self.assertIn("Latency:    10.0us", measured_output.getvalue())
         with self.assertRaisesRegex(ValueError, "valid publication"):
@@ -931,10 +1251,10 @@ class TestTransitionSummaryPerType(unittest.TestCase):
         with self.assertRaisesRegex(JsonContractError, "terminal manifest"):
             validate_benchmark_summary_identity(summary, manifest)
 
-        selected_runs = [
-            {"_run": "run_001", "all_passed": True, "setup_failed": False},
-            {"_run": "run_002", "all_passed": True, "setup_failed": False},
-        ]
+        selected_runs = {
+            "run_001": {"all_passed": True, "setup_failed": False},
+            "run_002": {"all_passed": True, "setup_failed": False},
+        }
         identities = {
             "run_001": dict(TREX_IDENTITY),
             "run_002": dict(TREX_IDENTITY),
@@ -948,7 +1268,7 @@ class TestTransitionSummaryPerType(unittest.TestCase):
             _selected_trex_identity(selected_runs, identities, False, "trex")
         self.assertIsNone(
             _selected_trex_identity(
-                [{"_run": "run_001", "all_passed": False, "setup_failed": True}],
+                {"run_001": {"all_passed": False, "setup_failed": True}},
                 {},
                 True,
                 "trex",

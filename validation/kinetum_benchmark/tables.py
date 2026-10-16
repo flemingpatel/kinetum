@@ -14,6 +14,7 @@ from kinetum_validation.engine.json_contract import (
     require_exact_keys,
     require_object,
 )
+from kinetum_validation.statistics import format_number as _fmt
 
 from .contracts import validate_benchmark_summary_identity
 
@@ -63,15 +64,6 @@ def generate_tables(input_dir: Path, artifacts_dir: Path) -> None:
     _write_scenario_table(tables_dir, summary)
 
 
-def _fmt(val, precision=0):
-    """Format a number for table display."""
-    if isinstance(val, float):
-        if precision == 0:
-            return f"{val:.0f}"
-        return f"{val:.{precision}f}"
-    return str(val)
-
-
 def _optional_object(parent: dict, key: str, context: str) -> dict:
     """Return one optional object without manufacturing missing content."""
     return require_object(parent[key], context) if key in parent else {}
@@ -92,24 +84,21 @@ def _optional_distribution(parent: dict, key: str) -> dict:
     return _distribution(parent, key) if key in parent else {}
 
 
-def _latency_cells(metrics: dict) -> tuple[str, str]:
-    """Return p50/p99 latency cells without manufacturing unsupported data."""
-    latency = _optional_distribution(metrics, "avg_latency_us")
-    if not latency:
-        return "n/a", "n/a"
-    return _fmt(latency["p50"], 2), _fmt(latency["p99"], 2)
+def _statistic_cell(distribution: dict, name: str, precision: int = 0) -> str:
+    """Render one observed statistic or explicit unavailability."""
+    return _fmt(distribution[name], precision) if distribution else "n/a"
 
 
 def _write_boundary_ordering_table(tables_dir: Path, summary: dict) -> None:
     """Write the ordered-CUT boundary proof results."""
     scenario = require_object(summary["scenario_metrics"], "scenario metrics")
     epoch = _optional_object(scenario, "epoch_test", "epoch metrics")
-    if not epoch:
+    if not epoch or "boundary_count" not in epoch:
         return
 
-    sent = _distribution(epoch, "total_sent")
-    received = _distribution(epoch, "total_received")
-    loss = _distribution(epoch, "loss_pct")
+    sent = _optional_distribution(epoch, "total_sent")
+    received = _optional_distribution(epoch, "total_received")
+    loss = _optional_distribution(epoch, "loss_pct")
     latency = _optional_distribution(epoch, "avg_latency_us")
     boundaries = _distribution(epoch, "boundary_count")
     completed = _distribution(epoch, "completed_boundaries")
@@ -119,10 +108,8 @@ def _write_boundary_ordering_table(tables_dir: Path, summary: dict) -> None:
     lines = [
         "# Ordered-CUT Boundary Proof",
         "",
-        f"Runs: {sent['count']}",
-        "",
-        "| Metric | min | p50 | p95 | p99 | max |",
-        "|--------|-----|-----|-----|-----|-----|",
+        "| Metric | n | min | p50 | p95 | p99 | max |",
+        "|--------|---|-----|-----|-----|-----|-----|",
     ]
 
     for label, dist in [
@@ -139,7 +126,7 @@ def _write_boundary_ordering_table(tables_dir: Path, summary: dict) -> None:
             continue
         p = 2 if "latency" in label or "pct" in label else 0
         lines.append(
-            f"| {label} | {_fmt(dist['min'], p)} | {_fmt(dist['p50'], p)} | "
+            f"| {label} | {dist['count']} | {_fmt(dist['min'], p)} | {_fmt(dist['p50'], p)} | "
             f"{_fmt(dist['p95'], p)} | {_fmt(dist['p99'], p)} | {_fmt(dist['max'], p)} |"
         )
 
@@ -203,74 +190,43 @@ def _write_boundary_ack_gate_tables(tables_dir: Path, summary: dict) -> None:
 
 
 def _write_scenario_table(tables_dir: Path, summary: dict) -> None:
-    """Write traffic counters and available profile-qualified latency."""
-    sm = require_object(summary["scenario_metrics"], "scenario metrics")
-    if not sm:
+    """Write traffic and latency statistics with their observed sample counts."""
+    scenario = require_object(summary["scenario_metrics"], "scenario metrics")
+    rows = []
+    packets = _optional_object(scenario, "packet_tests", "packet metrics")
+    for size, metrics in sorted(packets.items(), key=lambda item: int(item[0])):
+        rows.append((f"Packet {size}B", metrics, "tx_count", "rx_count"))
+    for family, label, sent, received in (
+        ("epoch_test", "Epoch", "total_sent", "total_received"),
+        ("commit_confirmed_test", "Commit-confirmed", "tx_count", "rx_count"),
+        ("rollback_test", "Rollback", "tx_count", "rx_count"),
+    ):
+        metrics = _optional_object(scenario, family, family)
+        if metrics and sent in metrics:
+            rows.append((label, metrics, sent, received))
+    if not rows:
         return
 
     lines = [
         "# Scenario Traffic Summary",
         "",
-        "| Test | TX p50 | RX p50 | Loss max | Latency p50 (us) | Latency p99 (us) | n |",
-        "|------|--------|--------|----------|-------------------|-------------------|---|",
+        "| Test | TX p50 | RX p50 | Traffic n | Loss max | Loss n | "
+        "Run-mean latency p50 (us) | Run-mean latency p99 (us) | Latency n |",
+        "|------|--------|--------|-----------|----------|--------|"
+        "--------------------------|--------------------------|-----------|",
     ]
-
-    # Packet tests
-    packet_metrics = _optional_object(sm, "packet_tests", "packet metrics")
-    for size, metrics in sorted(packet_metrics.items(), key=lambda x: int(x[0])):
-        tx = _distribution(metrics, "tx_count")
-        rx = _distribution(metrics, "rx_count")
-        loss = _distribution(metrics, "loss_pct")
-        latency_p50, latency_p99 = _latency_cells(metrics)
-        n = tx["count"]
+    for label, metrics, sent, received in rows:
+        tx = _optional_distribution(metrics, sent)
+        rx = _optional_distribution(metrics, received)
+        loss = _optional_distribution(metrics, "loss_pct")
+        latency = _optional_distribution(metrics, "avg_latency_us")
+        loss_cell = f"{_fmt(loss['max'], 2)}%" if loss else "n/a"
         lines.append(
-            f"| Packet {size}B | {_fmt(tx['p50'])} | {_fmt(rx['p50'])} | "
-            f"{_fmt(loss['max'], 2)}% | {latency_p50} | "
-            f"{latency_p99} | {n} |"
+            f"| {label} | {_statistic_cell(tx, 'p50')} | {_statistic_cell(rx, 'p50')} | "
+            f"{_statistic_cell(tx, 'count')} | {loss_cell} | {_statistic_cell(loss, 'count')} | "
+            f"{_statistic_cell(latency, 'p50', 2)} | {_statistic_cell(latency, 'p99', 2)} | "
+            f"{_statistic_cell(latency, 'count')} |"
         )
-
-    # Epoch
-    et = _optional_object(sm, "epoch_test", "epoch metrics")
-    if et:
-        sent = _distribution(et, "total_sent")
-        recv = _distribution(et, "total_received")
-        loss = _distribution(et, "loss_pct")
-        latency_p50, latency_p99 = _latency_cells(et)
-        n = sent["count"]
-        lines.append(
-            f"| Epoch | {_fmt(sent['p50'])} | {_fmt(recv['p50'])} | "
-            f"{_fmt(loss['max'], 2)}% | {latency_p50} | "
-            f"{latency_p99} | {n} |"
-        )
-
-    # Commit-confirmed
-    cc = _optional_object(sm, "commit_confirmed_test", "commit-confirmed metrics")
-    if cc:
-        tx = _distribution(cc, "tx_count")
-        rx = _distribution(cc, "rx_count")
-        loss = _distribution(cc, "loss_pct")
-        latency_p50, latency_p99 = _latency_cells(cc)
-        n = tx["count"]
-        lines.append(
-            f"| Commit-confirmed | {_fmt(tx['p50'])} | {_fmt(rx['p50'])} | "
-            f"{_fmt(loss['max'], 2)}% | {latency_p50} | "
-            f"{latency_p99} | {n} |"
-        )
-
-    # Rollback
-    rb = _optional_object(sm, "rollback_test", "rollback metrics")
-    if rb:
-        tx = _distribution(rb, "tx_count")
-        rx = _distribution(rb, "rx_count")
-        loss = _distribution(rb, "loss_pct")
-        latency_p50, latency_p99 = _latency_cells(rb)
-        n = tx["count"]
-        lines.append(
-            f"| Rollback | {_fmt(tx['p50'])} | {_fmt(rx['p50'])} | "
-            f"{_fmt(loss['max'], 2)}% | {latency_p50} | "
-            f"{latency_p99} | {n} |"
-        )
-
     path = tables_dir / "scenario_traffic.md"
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     print(f"  Table: {path.name}", file=sys.stderr)

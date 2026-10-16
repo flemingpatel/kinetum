@@ -355,6 +355,7 @@ struct sender_stats {
 	uint64_t error_count{0};				///< Failed send attempts and fatal sender errors.
 	double start_time{0};					///< Wall-clock start time in seconds.
 	double end_time{0};					///< Wall-clock end time in seconds.
+	double duration_s{0};					///< Elapsed steady-clock sender interval in seconds.
 	bool fatal_error{false};				///< True when the sender must exit nonzero.
 	static constexpr size_t MAX_GENERATION_TAGS = 16;	///< Maximum distinct tags tracked in JSON.
 	uint32_t generation_tags[MAX_GENERATION_TAGS]{};	///< Tags in insertion order.
@@ -384,6 +385,12 @@ struct sender_stats {
 		return true;
 	}
 
+	/** @return Successful TX per measured monotonic second, or zero before completion. */
+	[[nodiscard]] double actual_pps() const noexcept
+	{
+		return duration_s > 0 ? static_cast<double>(tx_count) / duration_s : 0;
+	}
+
 	/**
 	 * @brief Render sender statistics using the JSON schema consumed by Python.
 	 *
@@ -391,15 +398,15 @@ struct sender_stats {
 	 */
 	[[nodiscard]] std::string render_json() const
 	{
-		const double duration = end_time - start_time;
-		const double actual_pps = duration > 0 ? static_cast<double>(tx_count) / duration : 0;
 		std::ostringstream output;
 		output.exceptions(std::ios::badbit | std::ios::failbit);
 		output.imbue(std::locale::classic());
 		output << "{\"tx_count\":" << tx_count << ",\"error_count\":" << error_count
 		       << ",\"start_time\":" << std::fixed << std::setprecision(6) << start_time
-		       << ",\"end_time\":" << end_time << ",\"duration_s\":" << std::setprecision(3) << duration
-		       << ",\"actual_pps\":" << std::setprecision(1) << actual_pps << ",\"generation_tag_counts\":{";
+		       << ",\"end_time\":" << end_time << ",\"duration_s\":" << std::setprecision(9) << duration_s
+		       << ",\"actual_pps\":" << std::defaultfloat
+		       << std::setprecision(std::numeric_limits<double>::max_digits10) << actual_pps()
+		       << ",\"generation_tag_counts\":{";
 
 		for (size_t i = 0; i < generation_tag_slots_used; ++i) {
 			if (i > 0) {
@@ -413,11 +420,11 @@ struct sender_stats {
 };
 
 // =============================================================================
-// Rate Limiter (monotonic clock token bucket)
+// Packet Pacing (monotonic clock)
 // =============================================================================
 
 /**
- * @brief Busy-poll token bucket for deterministic TAP traffic generation.
+ * @brief Busy-poll packet pacer for native TAP traffic generation.
  */
 struct rate_limiter {
 	uint64_t interval_ns{0};   ///< Positive nanoseconds between packets.
@@ -487,7 +494,8 @@ static sender_stats run_send_loop(const std::vector<int> &sockets, packet_templa
 	std::size_t port_index = 0;
 
 	stats.start_time = now_seconds();
-	const auto end_time = std::chrono::steady_clock::now() + std::chrono::duration<double>(spec.duration_s);
+	const auto started = std::chrono::steady_clock::now();
+	const auto end_time = started + std::chrono::duration<double>(spec.duration_s);
 	const uint64_t end_time_ns = static_cast<uint64_t>(
 		std::chrono::duration_cast<std::chrono::nanoseconds>(end_time.time_since_epoch()).count());
 
@@ -564,6 +572,7 @@ static sender_stats run_send_loop(const std::vector<int> &sockets, packet_templa
 		}
 	}
 
+	stats.duration_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
 	stats.end_time = now_seconds();
 	return stats;
 }
@@ -1080,8 +1089,6 @@ static int run_sender(int argc, char *argv[])
 					   .next_generation_tag = cfg.next_generation_tag,
 				   });
 
-	const double duration = stats.end_time - stats.start_time;
-	const double actual_pps = duration > 0 ? static_cast<double>(stats.tx_count) / duration : 0;
 	const bool socket_cleanup_complete = sockets.close_all();
 	if (!socket_cleanup_complete) {
 		fprintf(stderr, "kinetum_tap_sender: resource cleanup did not complete exactly\n");
@@ -1092,7 +1099,7 @@ static int run_sender(int argc, char *argv[])
 		return 1;
 	}
 	const std::string output = stats.render_json();
-	const std::string warning = render_rate_warning(cfg.pps, actual_pps);
+	const std::string warning = render_rate_warning(cfg.pps, stats.actual_pps());
 	return kinetum::common::emit_process_output({
 		.standard_output = output,
 		.standard_error = warning,

@@ -28,7 +28,7 @@ from .scenario_context import (
     INITIAL_GENERATION_TAG,
     NEXT_GENERATION_TAG,
 )
-from .report.artifacts import round_latency
+from .statistics import format_number
 from .process.telemetry_validation import (
     boundary_transition_is_complete,
     worker_counters_advanced,
@@ -167,9 +167,9 @@ async def run_packet_test(context: ScenarioContext, packet_size: int) -> TestRes
             throughput_pps=stats.actual_pps,
             duration_s=time.monotonic() - start_time,
             message=(
-                f"Loss: {loss_pct:.2f}%"
+                f"Loss: {format_number(loss_pct, 2)}%"
                 if clean_traffic
-                else "Sender or capture evidence is not exact"
+                else "Traffic observations do not satisfy the scenario requirements"
             ),
         )
 
@@ -427,19 +427,19 @@ async def run_epoch_test(context: ScenarioContext) -> EpochTestResult:
         )
         initial_generation_sent = (
             stats.generation_tag_counts[INITIAL_GENERATION_TAG]
-            if generation_membership_valid else 0
+            if generation_membership_valid else None
         )
         next_generation_sent = (
             stats.generation_tag_counts[NEXT_GENERATION_TAG]
-            if generation_membership_valid else 0
+            if generation_membership_valid else None
         )
         initial_generation_rx = (
             analysis.tag_counts[INITIAL_GENERATION_TAG]
-            if generation_membership_valid else 0
+            if generation_membership_valid else None
         )
         next_generation_rx = (
             analysis.tag_counts[NEXT_GENERATION_TAG]
-            if generation_membership_valid else 0
+            if generation_membership_valid else None
         )
         generation_tags_valid = (
             generation_membership_valid
@@ -591,7 +591,7 @@ async def run_epoch_test(context: ScenarioContext) -> EpochTestResult:
             ),
             transitions_observed=transitions_observed,
             loss_pct=loss_pct,
-            avg_latency_us=round_latency(epoch_avg_latency),
+            avg_latency_us=epoch_avg_latency,
             boundary_count=boundary_count,
             completed_boundaries=completed_boundaries,
             protocol_faults_observed=protocol_faults_observed,
@@ -977,7 +977,7 @@ async def run_commit_confirmed_test(context: ScenarioContext) -> CommitConfirmed
             cc_traffic_evidence_exact
             and cc_loss <= context.config.max_loss_pct
         )
-        traffic_summary = f"traffic TX={cc_tx} RX={cc_rx} loss={cc_loss:.2f}%"
+        traffic_summary = f"traffic TX={cc_tx} RX={cc_rx} loss={format_number(cc_loss, 2)}%"
         if cc_traffic_ok:
             cc_message = (
                 "COMMIT-CONFIRMED VALIDATED: "
@@ -993,7 +993,7 @@ async def run_commit_confirmed_test(context: ScenarioContext) -> CommitConfirmed
         else:
             cc_message = (
                 "COMMIT-CONFIRMED FAILED: "
-                f"traffic loss {cc_loss:.2f}% exceeds threshold "
+                f"traffic loss {format_number(cc_loss, 2)}% exceeds threshold "
                 f"{context.config.max_loss_pct}%, {traffic_summary}"
             )
         result = replace(
@@ -1002,8 +1002,8 @@ async def run_commit_confirmed_test(context: ScenarioContext) -> CommitConfirmed
             duration_s=time.monotonic() - start_time,
             tx_count=cc_tx,
             rx_count=cc_rx,
-            loss_pct=round(cc_loss, 4),
-            avg_latency_us=round_latency(cc_latency),
+            loss_pct=cc_loss,
+            avg_latency_us=cc_latency,
             message=cc_message,
         )
 
@@ -1424,8 +1424,8 @@ async def run_rollback_test(context: ScenarioContext) -> RollbackTestResult:
             duration_s=time.monotonic() - start_time,
             tx_count=rb_tx,
             rx_count=rb_rx,
-            loss_pct=round(rb_loss, 4),
-            avg_latency_us=round_latency(rb_latency),
+            loss_pct=rb_loss,
+            avg_latency_us=rb_latency,
             message=context.rollback_result_message(
                 full_success,
                 selective_success,

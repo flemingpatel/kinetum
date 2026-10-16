@@ -23,6 +23,7 @@ from .process.kinetumctl import ActiveSnapshot, KinetumCtl
 from .process.telemetry import StatsResult, StatsSelection
 from .process.telemetry_validation import worker_counters_are_exact, worker_counters_advanced
 from .report.console import ConsoleReporter
+from .statistics import format_number
 from .traffic import TrafficDriver
 from .traffic.base import TrafficSender
 from .report.artifacts import RunArtifacts
@@ -621,6 +622,10 @@ class ScenarioContext:
                     "traffic driver published latency without an owned source"
                 )
             return None
+        if analysis.valid == 0:
+            if stats is not None:
+                raise RuntimeError("traffic driver published latency without received packets")
+            return None
         if stats is None or stats["avg"] <= 0.0:
             raise RuntimeError(
                 "traffic driver omitted latency from an owned measurement source"
@@ -663,7 +668,7 @@ class ScenarioContext:
             traffic_result = (
                 f"Zero loss ({tx} TX = {rx} RX)"
                 if result.zero_loss
-                else f"Loss {result.loss_pct:.2f}% within the admitted validation tolerance"
+                else f"Loss {format_number(result.loss_pct, 2)}% within the admitted validation tolerance"
             )
             return (
                 "BOUNDARY ORDERING VALIDATED: "
@@ -674,11 +679,11 @@ class ScenarioContext:
         if not traffic_within_tolerance:
             return (
                 f"TRAFFIC EVIDENCE FAILED: {tx} TX, {rx} RX, "
-                f"loss {result.loss_pct:.2f}%"
+                f"loss {format_number(result.loss_pct, 2)}%"
             )
         if not generation_tags_valid:
             return "GENERATION-TAG EVIDENCE FAILED: observed tags disagree with the authored traffic profile"
-        if result.protocol_faults_observed != 0:
+        if result.protocol_faults_observed is not None and result.protocol_faults_observed != 0:
             return (
                 "BOUNDARY ORDERING VIOLATION: "
                 f"{result.protocol_faults_observed} typed protocol faults detected "
@@ -690,7 +695,7 @@ class ScenarioContext:
 
     def rollback_result_message(
         self, full_success: bool, selective_success: bool,
-        traffic_ok: bool, traffic_evidence_exact: bool, loss_pct: float,
+        traffic_ok: bool, traffic_evidence_exact: bool, loss_pct: Optional[float],
     ) -> str:
         """Generate rollback test result message."""
         if not traffic_ok:
@@ -701,7 +706,7 @@ class ScenarioContext:
                 )
             return (
                 "ROLLBACK FAILED: "
-                f"traffic loss {loss_pct:.2f}% exceeds threshold "
+                f"traffic loss {format_number(loss_pct, 2)}% exceeds threshold "
                 f"{self.config.max_loss_pct}%"
             )
         if full_success and selective_success:

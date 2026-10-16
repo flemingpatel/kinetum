@@ -800,6 +800,13 @@ to end with loss within threshold, while recording the achieved rate.
    `tx_count`, `rx_count`, `loss_pct`, nullable `avg_latency_us`, and
    `throughput_pps`.
 
+`throughput_pps` is the successful TX count divided by the traffic driver's
+measured monotonic interval. It is the observed sender rate; scenario
+`duration_s` also includes capture, drain, and analysis and is not its denominator.
+Result JSON and CSVs retain measured rates, loss percentages, and latency values
+without decimal rounding. Human-readable output preserves small nonzero values rather than
+displaying them as zero.
+
 **What this proves.** That the runner, selected traffic driver, pipeline, and
 validated packet/counter evidence line up end to end. Native TAP exercises the
 DPDK TAP PMD, AF_PACKET injection, tcpdump capture, and pcap analyzer; physical
@@ -1201,8 +1208,9 @@ frame from valid counters.
   test. The native sender is duration-based; for count-based standard
   tests the Python wrapper converts `count / pps` into a duration
   before launching the binary. Reports `tx_count`, `error_count`, and
-  the total elapsed. A steady-clock deadline governs emission; wall time is
-  recorded only for sender/analyzer latency correlation. Only an exact full-
+  the total elapsed. A steady-clock deadline governs emission and supplies the
+  elapsed interval used for TX rate. Wall timestamps provide provenance and
+  sender/analyzer latency correlation. Only an exact full-
   frame packet-socket send advances sequence and TX count; an impossible
   positive short send is fatal rather than partial success. Multi-port
   rotation uses a predicted wrap branch, not a packet-rate integer divide.
@@ -1227,7 +1235,7 @@ layout is shown below using type placeholders:
   "error_count": <uint64>,
   "start_time": <double, system-clock seconds>,
   "end_time": <double>,
-  "duration_s": <double>,
+  "duration_s": <double, elapsed steady-clock seconds>,
   "actual_pps": <double>,
   "generation_tag_counts": { "<tag>": <count>, ... }
 }
@@ -1357,12 +1365,15 @@ Behaviour:
   one finite positive TX timestamp and one finite positive bounded latency for
   every unique valid frame, then compute
   `latency_us = (capture_time - tx_time) * 1e6`. Track avg, min, max, p50, and
-  p99. The validation harness always uses this measured native mode.
+  p99. Percentiles use nearest rank: the sorted sample at one-based position
+  `ceil(p * n / 100)`. Duplicate packets contribute no latency sample.
+  The validation harness always uses this measured native mode.
 - Track unique per-tag counts, first/last tags, and adjacent tag changes per
   input. Root counts sum those rows; root `transition_seq` is the lowest observed
   input-change ID, or `-1` when absent. Empty inputs remain explicit rows.
 - Compute nonnegative `loss_pct` from the supplied expected count; excess
   observations remain duplicate/error evidence rather than negative loss.
+  With no expected packets, the percentage is undefined and is JSON null.
 - Emit a single JSON object to stdout. Malformed CLI arguments return
   exit code `2`; corrupted or truncated pcap structure returns exit
   code `1`. The complete locale-independent JSON object is rendered before its
@@ -1385,7 +1396,7 @@ The analyzer emits one JSON object with this field layout (type placeholders):
   "out_of_order": <int>,
   "missing_count": <int>,
   "max_gap": <int>,
-  "loss_pct": <double>,
+  "loss_pct": <double or null>,
   "transition_seq": <int>,
   "tag_transition_count": <int>,
   "tag_counts": { "<tag>": <count>, ... },
@@ -1413,7 +1424,9 @@ The analyzer emits one JSON object with this field layout (type placeholders):
 }
 ```
 
-Latency values are in microseconds. The Python `AnalysisResult` accepts one
+The `latency` object is null when there are no measured latency samples,
+including standalone `--no-latency` diagnostics. Its values otherwise use
+microseconds. The Python `AnalysisResult` accepts one
 validated native-analyzer latency publication in `_latency_stats_cache` and
 returns copies of that cache. Without such a publication, `latency_stats()`
 returns unavailable; it neither recomputes nor manufactures zeros.
@@ -1518,6 +1531,11 @@ benchmark measurements. For TRex,
 `latency_source` and every `avg_latency_us` value are JSON null. A successful
 native-TAP row requires a positive measured average; a numeric TRex value is a
 contract violation. Missing latency never becomes zero.
+
+A failed scenario keeps unobserved measurements as null; an observed zero
+remains numeric zero. A successful scenario requires all measurements used by
+its verdict. Loss percentage and the epoch `zero_loss` fact are null when no
+packets were sent, because there is no positive population to compare.
 
 A `packet_tests[]` entry:
 
@@ -1867,9 +1885,9 @@ validation profile may be local TAP or physical DPDK PCI/TRex.
 The `kinetum_benchmark` module is installed by the same private wheel. With the
 environment from Section 3, invoke it as
 `/var/tmp/kinetum-validation/bin/python3 -I -B -X utf8 -m kinetum_benchmark`.
-Use `sudo` for a live `run`. A fresh `run`
-uses the same exact installed-root admission, bundle construction, Photon
-startup, and selected scenario choreography as the validation runner.
+Use `sudo` for a live `run` and to post-process its root-owned artifacts.
+A fresh `run` uses the same exact installed-root admission, bundle construction,
+Photon startup, and selected scenario choreography as the validation runner.
 The source-only `validation/run_benchmark.sh` wrapper uses the same protected
 Bash and project Python environment described in Section 5.2. The module's
 root parser and every subcommand parser likewise reject
@@ -1940,6 +1958,8 @@ deployment profile, release, roots, traffic endpoint, and immutable port
 identity; a run that passed setup cannot omit it. A manifest success without
 exact results or the scenario's exact transition multiset rejects, while a
 failed run may contribute only a duplicate-free subset of that same multiset.
+Only the merged ledger adds `_run` to identify each record's source directory;
+per-run records remain unchanged.
 The command creates `merged_transitions.jsonl` and `benchmark_summary.json`;
 pre-existing aggregate output rejects rather than being overwritten. The
 summary retains the complete scenario identity, including the nullable latency
@@ -1949,6 +1969,12 @@ than being averaged. The summary validates each metric-family and transition
 distribution against the selected run population. Unsupported latency has no distribution. A standalone
 aggregate must repeat the terminal manifest's inclusion policy; a flag cannot
 reinterpret an existing run set.
+
+Benchmark percentiles use the same nearest-rank rule as the native analyzer,
+over observations from selected runs. Null measurements contribute no sample.
+Each distribution retains its own count, so partial failed runs cannot inflate
+another metric's population. Latency percentiles summarize the per-run means;
+they are not percentiles over all captured packets pooled together.
 
 ### 18.4 export-csv
 
@@ -1971,6 +1997,14 @@ requested policy, then writes the following into a newly created direct
   inputs under the recorded report environment produce identical bytes.
   Per-transition-type ACK figures retain the complete observed range; no
   fixed physical-latency clipping threshold is applied.
+
+Unavailable measurements remain empty CSV cells and appear as `n/a` in tables;
+sample counts distinguish traffic, loss, and measured latency populations.
+
+CDFs are empirical steps, with each observation contributing `1 / n` of the
+population. Boxplots use nearest-rank p25, p50, and p75; whiskers reach the
+outermost observations within 1.5 times the interquartile range, and points
+beyond the whiskers remain visible.
 
 The noninteractive Matplotlib backend is a required report dependency and is
 preflighted before the artifact child is created. Pip installs Matplotlib as a
@@ -2196,7 +2230,7 @@ and platform role files under `logs/` to locate faults.
 | Standard test: high `loss_pct` on `neb_tx` | Sender/receiver deficit; the percentage alone does not locate it. | Check sender and capture integrity first, then DP port, stage, and module counters. Capture drops invalidate the evidence independently of the loss tolerance. |
 | Standard test: `missing_count`, `duplicates`, or `out_of_order` nonzero | Absent IDs, repeated IDs, or reordering within one ingress. | Per-input rows in `<capture-stem>.traffic.json` plus the pcap. |
 | Standard test: `invalid` count high | Frames fail the complete Ethernet/IPv4/UDP generation-envelope contract: protocol/fragment/length coherence, magic, bounded sequence/tag, or valid timestamp evidence. ARP, ICMP, truncated packets, and foreign UDP all fail this gate. | Tighten the BPF filter and inspect the egress pcap for non-test or malformed traffic. |
-| Native TAP: `latency.count` is zero | No valid timestamped Kinetum frames were accepted, `--no-latency` was used when invoking the analyzer directly, or timestamp samples were filtered because capture time was not after TX time. | Check `valid`, `invalid`, and the pcap timestamps in analyzer output. |
+| Native TAP: `latency` is null | No valid timestamped Kinetum frames were accepted, or `--no-latency` was used when invoking the analyzer directly. | Check `valid`, `invalid`, and the pcap timestamps; measured latency requires capture time to follow TX time. |
 | Epoch test: `transitions_observed == 0` | CP apply failed, the bounded tag did not switch, or exact pre/post epochs agree. | `photon.log` and the `kinetumctl` result. |
 | Epoch test: `loss_pct > 0.1%` | Observed loss exceeded the epoch tolerance. | Check driver evidence, port errors, stage drops, QoS causes, and boundary deltas; a loss total alone does not identify a protocol fault. |
 | Epoch test: incomplete boundary rows or nonzero protocol-fault delta | CUT/ACK identity, drain, timing, or ownership safety did not converge exactly. | Inspect `boundary_epoch_stats`, `protocol_fault_deltas`, and the first-fault record; never infer success from packet loss alone. |
