@@ -17,6 +17,7 @@ function(kinetum_require_dpdk_dependency SOURCE_ROOT)
     third_party/dpdk/i40e_close.patch
     third_party/dpdk/KinetumDPDKConfig.cmake.in
     third_party/dpdk/KinetumDPDKConfigVersion.cmake.in
+    third_party/dpdk/kinetum_i40e_pci_ids.hpp.in
     tooling/environment/build_kinetum_dpdk.py
   )
   foreach(_kinetum_dpdk_policy_file IN LISTS _kinetum_dpdk_policy_files)

@@ -110,12 +110,12 @@ int native_read_meminfo(void *state, char *buffer, uint32_t capacity, uint32_t *
 
 /**
  * @brief Return true only for a complete bounded host-probe API.
- * @param api Borrowed candidate native version and meminfo callbacks.
- * @return true only when both required operations are present.
+ * @param api Borrowed native runtime, memory, and PCI observation callbacks.
+ * @return true only when all required operations are present.
  */
 [[nodiscard]] bool api_is_complete(const dpdk_host_probe_api &api) noexcept
 {
-	return api.runtime_version != nullptr && api.read_meminfo != nullptr;
+	return api.runtime_version != nullptr && api.read_meminfo != nullptr && api.pci.read_function != nullptr;
 }
 
 /**
@@ -221,6 +221,7 @@ dpdk_host_probe_api default_dpdk_host_probe_api() noexcept
 		.state = nullptr,
 		.runtime_version = native_runtime_version,
 		.read_meminfo = native_read_meminfo,
+		.pci = default_dpdk_pci_probe_api(),
 	};
 }
 
@@ -271,8 +272,8 @@ kinetum_provider_status prove_dpdk_host(const kinetum_provider_host_proof_reques
 		return fail(KINETUM_PROVIDER_STATUS_FAILED_PRECONDITION, diagnostic,
 			    "unreserved hugepage bytes are below the compiled payload floor");
 	}
-	component_support::write_diagnostic(diagnostic, std::string_view{});
-	return KINETUM_PROVIDER_STATUS_OK;
+	const auto &facts = *request.compiled_facts.process_facility;
+	return prove_dpdk_pci_ownership({facts.attachments, facts.attachment_count}, api.pci, diagnostic);
 }
 
 }  // namespace kinetum::provider::dpdk_component

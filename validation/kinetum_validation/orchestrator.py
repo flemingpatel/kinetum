@@ -18,7 +18,7 @@ import os
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import List, Optional, Tuple, Union
+from typing import Any, List, Optional, Tuple, Union
 
 from .config.types import (
     BackendType,
@@ -124,7 +124,7 @@ class TestOrchestrator:
         self.reporter = (
             reporter
             if reporter is not None
-            else ConsoleReporter(verbose=config.verbose)
+            else ConsoleReporter(color=config.color)
         )
         self._supervisor: Optional[AsyncProcessSupervisor] = None
         self._backend: Optional[Union[DPDKTapBackend, DPDKPCIBackend]] = None
@@ -274,7 +274,7 @@ class TestOrchestrator:
             # Photon is the sole child-process and bootstrap authority.
             self._supervisor = AsyncProcessSupervisor(
                 config=self.config.process,
-                log_callback=self.reporter.log_callback if self.config.verbose else None,
+                log_callback=self.reporter.log_callback,
                 output_dir=self.config.output_dir,
             )
 
@@ -286,7 +286,7 @@ class TestOrchestrator:
             self.reporter.print_progress(
                 "Starting installed Photon through PACKET_READY..."
             )
-            await self._supervisor.start_runtime(bundle_root)
+            await self._supervisor.start_runtime(bundle_root, debug_logging=self.config.verbose)
 
             self._kinetumctl = KinetumCtl(
                 runtime_root=self.config.process.runtime_root,
@@ -1064,7 +1064,7 @@ class TestOrchestrator:
         self,
         plan_file: Path,
         bundle_root: Path,
-        trex_identity: Optional[dict[str, str]],
+        trex_identity: Optional[dict[str, Any]],
     ) -> None:
         """Persist backend, topology, and observed generator provenance."""
         if self._release_metadata is None:
@@ -1257,7 +1257,7 @@ async def run_test_suite(
     release_metadata = collect_runtime_release_metadata(
         config.process.runtime_root, config.process.validation_root
     )
-    reporter = ConsoleReporter(verbose=config.verbose, color=config.color)
+    reporter = ConsoleReporter(color=config.color)
     reporter.print_banner(release_metadata["version"])
     reporter.print_config(config)
 

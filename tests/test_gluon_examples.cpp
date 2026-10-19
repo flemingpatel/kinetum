@@ -168,6 +168,38 @@ void expect_snapshots_match(const kinetum::gluon::v1::DeploymentPlan &planned, c
 	}
 }
 
+/**
+ * @brief Prove the actual RSS examples carry an ordinary, exact-width, nondefault i40e key.
+ * @param planned Complete plan emitted by the production readers and planner.
+ * @param compiled Compact topology already admitted by the production compiler.
+ */
+void expect_i40e_rss_profile(const kinetum::gluon::v1::DeploymentPlan &planned,
+			     const kinetum::provider::compiled_provider_topology &compiled)
+{
+	constexpr std::array<uint32_t, 13> PMD_DEFAULT_KEY{
+		0x6b793944, 0x23504cb5, 0x5bea75b6, 0x309f4f12, 0x3dc0a2b8, 0x024ddcdf, 0x339b8ca0,
+		0x4c4af64a, 0x34fac605, 0x55d85839, 0x3a58997d, 0x2ec938e1, 0x66031581,
+	};
+	const std::string_view native_default(reinterpret_cast<const char *>(PMD_DEFAULT_KEY.data()),
+					      sizeof(PMD_DEFAULT_KEY));
+	ASSERT_EQ(planned.traffic_steering_profiles_size(), 2);
+	for (const auto &profile : planned.traffic_steering_profiles()) {
+		EXPECT_EQ(profile.kind(), kinetum::gluon::v1::TRAFFIC_STEERING_KIND_RSS);
+		EXPECT_FALSE(profile.symmetric());
+		EXPECT_EQ(profile.hash_key().size(), 52u);
+		EXPECT_NE(std::string_view(profile.hash_key()), native_default);
+		EXPECT_EQ(profile.hash_key(), planned.traffic_steering_profiles(0).hash_key());
+		ASSERT_EQ(profile.hash_fields_size(), 2);
+		EXPECT_EQ(profile.hash_fields(0), "ipv4");
+		EXPECT_EQ(profile.hash_fields(1), "udp");
+	}
+	ASSERT_EQ(compiled.steering_profiles.size(), 2u);
+	for (const auto &profile : compiled.steering_profiles) {
+		EXPECT_FALSE(profile.symmetric);
+		EXPECT_EQ(profile.hash_key, planned.traffic_steering_profiles(0).hash_key());
+	}
+}
+
 }  // namespace
 
 /** @brief Shipped single-queue examples plan with complete explicit shared-pool handoffs. */
@@ -221,6 +253,7 @@ TEST(gluon_examples, rss_bindings_plan_complete_context_selection_handoffs)
 	EXPECT_EQ(planned->module_context_domains(1).context_instance_ids_size(), 2);
 	const auto compiled = kinetum::provider::compile_provider_topology(planned.value());
 	ASSERT_TRUE(compiled.is_ok()) << compiled.error().message();
+	expect_i40e_rss_profile(planned.value(), compiled.value());
 	ASSERT_EQ(compiled->storage_domains.size(), 1u);
 	EXPECT_EQ(compiled->storage_domains[0].budget.required_min_buffers, 34752u);
 	expect_shared_pool_handoffs(planned.value(), RSS_EXAMPLE.expected_handoffs);
@@ -273,6 +306,9 @@ TEST(gluon_examples, per_queue_storage_bindings_plan_original_domains)
 		expect_snapshots_match(planned.value(), spec.source);
 		const auto compiled = kinetum::provider::compile_provider_topology(planned.value());
 		ASSERT_TRUE(compiled.is_ok()) << compiled.error().message();
+		if (spec.lane_count == 2) {
+			expect_i40e_rss_profile(planned.value(), compiled.value());
+		}
 		for (const auto &domain : compiled->storage_domains) {
 			EXPECT_EQ(domain.budget.required_min_buffers, spec.required_buffers);
 		}

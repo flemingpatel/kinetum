@@ -3,8 +3,8 @@ TRex stateless traffic driver.
 
 The driver controls an already-prepared TRex stateless endpoint over SSH. It
 does not start TRex, bind NICs, install packages, or write endpoint
-configuration; those setup steps remain explicit operator actions. During
-probe/run actions it temporarily enables promiscuous mode on TRex observation
+configuration; those setup steps remain explicit operator actions. Setup is
+read-only. During traffic runs it enables promiscuous mode on TRex observation
 ports so port counters can measure forwarded frames independently of the
 dataplane's egress L2 destination behavior. Standard tests consume TRex port
 counters. Epoch tests use TRex packet-group counters for generation-tag-separated TX/RX
@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import copy
 import ipaddress
 import json
 import posixpath
@@ -26,6 +27,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 from ..config.logger import log_info, log_warn
 from ..engine.json_contract import (
     MAX_JSON_DOCUMENT_CHARACTERS,
+    MAX_TREX_PORT_RECORD_BYTES,
     JsonContractError,
     parse_exact_json_object,
     require_array,
@@ -52,6 +54,13 @@ from ..config.types import (
 )
 from .base import EXCHANGE_PACKET_BYTES, TrafficDriver, TrafficSender, validate_udp_exchange
 from .trex_remote_script import REMOTE_TREX_SCRIPT as _REMOTE_TREX_SCRIPT
+from .trex_protocol import (
+    REMOTE_REQUEST_KEYS as _REMOTE_REQUEST_KEYS,
+    REMOTE_SUCCESS_KEYS as _REMOTE_SUCCESS_KEYS,
+    TRexRemoteFailure,
+    generation_pgid_layout,
+    require_trex_capacity,
+)
 
 
 _REMOTE_BOOTSTRAP = (
@@ -78,103 +87,6 @@ _STDERR_WARNING_TOKENS = (
     "timeout",
     "refused",
 )
-_REMOTE_SUCCESS_KEYS = {
-    "exchange_udp": frozenset({"ok", "action", "frames"}),
-    "probe": frozenset(
-        {
-            "ok", "action", "ports", "stats_keys", "promiscuous_ports",
-            "work_dir", "trex_identity",
-        }
-    ),
-    "run": frozenset(
-        {
-            "ok", "action", "tx_count", "rx_count", "errors", "start_time",
-            "end_time", "duration_s", "ingress_ports", "egress_ports", "promiscuous_ports",
-            "work_dir", "generation_tag_counts", "tag_counts",
-            "port_counter_baseline", "port_counter_final",
-        }
-    ),
-    "generation_start": frozenset(
-        {
-            "ok", "action", "duration_s", "initial_generation_tag",
-            "next_generation_tag", "start_time", "start_monotonic",
-            "ingress_ports", "egress_ports", "generation_stream_ids",
-            "generation_flow_plan", "port_counter_baseline", "promiscuous_ports", "work_dir",
-        }
-    ),
-    "generation_resume_next": frozenset(
-        {"ok", "action", "resumed_stream_ids", "next_start_time",
-         "next_start_monotonic", "timestamp_source"}
-    ),
-    "generation_pause_initial": frozenset(
-        {"ok", "action", "paused_stream_ids", "initial_pause_time",
-         "initial_pause_monotonic", "timestamp_source"}
-    ),
-    "generation_finish": frozenset(
-        {
-            "ok", "action", "tx_count", "rx_count", "errors", "port_tx_count",
-            "port_rx_count", "start_time", "end_time", "duration_s", "ingress_ports",
-            "port_counter_baseline", "port_counter_final",
-            "egress_ports", "promiscuous_ports", "work_dir",
-            "generation_tag_counts", "tag_counts", "generation_flow_plan",
-            "generation_pgid_stats", "generation_overlap_method",
-            "transition_time_s_requested", "requested_overlap_window_ms",
-            "overlap_window_ms_measured", "overlap_window_timestamp_source",
-            "expected_tx_count", "expected_tx_count_source",
-            "steady_state_target_pps", "overlap_aggregate_target_pps",
-            "start_monotonic", "next_start_time", "initial_pause_time",
-            "next_pause_time", "next_start_monotonic",
-            "initial_pause_monotonic", "next_pause_monotonic",
-        }
-    ),
-    "generation_abort": frozenset({"ok", "action"}),
-}
-_REMOTE_RUN_BASE_KEYS = frozenset(
-    {
-        "duration_s", "pps", "packet_size", "num_flows", "src_ip", "dst_ip",
-        "sport", "dport", "ports", "ingress_streams",
-        "egress_ports", "trex_server", "trex_api_path", "work_dir", "action",
-    }
-)
-_REMOTE_PACKET_RUN_KEYS = _REMOTE_RUN_BASE_KEYS | {"generation_tag"}
-_REMOTE_GENERATION_RUN_KEYS = _REMOTE_RUN_BASE_KEYS | {
-    "initial_generation_tag", "next_generation_tag", "transition_time_s",
-    "overlap_window_ms",
-}
-_REMOTE_REQUEST_KEYS = {
-    "exchange_udp": frozenset({
-        "action", "ports", "egress_ports", "trex_server", "trex_api_path", "work_dir",
-        "ingress_stream", "packets", "capture_marker",
-    }),
-    "probe": frozenset(
-        {"action", "ports", "egress_ports", "trex_server", "trex_api_path", "work_dir"}
-    ),
-    "run": _REMOTE_PACKET_RUN_KEYS | {"mode"},
-    "generation_start": _REMOTE_GENERATION_RUN_KEYS,
-    "generation_resume_next": frozenset(
-        {
-            "action", "ports", "ingress_ports", "generation_stream_ids",
-            "trex_server", "trex_api_path", "work_dir",
-        }
-    ),
-    "generation_pause_initial": frozenset(
-        {
-            "action", "ports", "ingress_ports", "generation_stream_ids",
-            "trex_server", "trex_api_path", "work_dir",
-        }
-    ),
-    "generation_finish": _REMOTE_GENERATION_RUN_KEYS
-    | {
-        "ingress_ports", "generation_stream_ids", "generation_flow_plan",
-        "port_counter_baseline",
-        "start_time", "start_monotonic", "next_start_time",
-        "next_start_monotonic", "initial_pause_time",
-        "initial_pause_monotonic",
-    },
-    "generation_abort": frozenset(
-        {"action", "ports", "ingress_ports", "egress_ports", "trex_server", "trex_api_path", "work_dir"}
-    ),
-}
 
 
 def _generation_counts(value: object, context: str) -> Dict[int, int]:
@@ -391,7 +303,7 @@ class TRexTrafficDriver(TrafficDriver):
         self._remote_proc: Optional[asyncio.subprocess.Process] = None
         self._remote_kill_task: Optional[asyncio.Task[None]] = None
         self._active_generation_session: Optional[Dict[str, Any]] = None
-        self._trex_identity: Optional[Dict[str, str]] = None
+        self._trex_identity: Optional[Dict[str, Any]] = None
         self._udp_exchange_incomplete = False
 
     @property
@@ -400,9 +312,9 @@ class TRexTrafficDriver(TrafficDriver):
         return True
 
     @property
-    def traffic_generator_identity(self) -> Optional[Dict[str, str]]:
+    def traffic_generator_identity(self) -> Optional[Dict[str, Any]]:
         """Return the TRex identity admitted by the setup probe."""
-        return None if self._trex_identity is None else dict(self._trex_identity)
+        return copy.deepcopy(self._trex_identity)
 
     async def setup(self) -> None:
         """Validate endpoint connectivity and egress observation capability."""
@@ -702,16 +614,21 @@ class TRexTrafficDriver(TrafficDriver):
             "egress_ports": self._egress_port_ids,
         }
         self._active_generation_session = provisional_session
+        session = None
         try:
             session = await self._invoke_remote(request)
-        except BaseException:
-            try:
-                await self.abort_generation_session(provisional_session)
-            except BaseException as cleanup_error:
-                raise RuntimeError(
-                    "trex generation start failed with unresolved remote ownership"
-                ) from cleanup_error
+        except TRexRemoteFailure as error:
+            if not error.mutation_attempted:
+                self._active_generation_session = None
             raise
+        finally:
+            if session is None and self._active_generation_session is provisional_session:
+                try:
+                    await self.abort_generation_session(provisional_session)
+                except BaseException as cleanup_error:
+                    raise RuntimeError(
+                        "trex generation start failed with unresolved remote ownership"
+                    ) from cleanup_error
         self._active_generation_session = session
         return session
 
@@ -850,11 +767,12 @@ class TRexTrafficDriver(TrafficDriver):
             float(session["duration_s"]),
             expected_tx_count=expected_tx_count,
         )
-        self._active_generation_session = None
         return result
 
     async def abort_generation_session(self, session: Dict[str, Any]) -> None:
-        """Stop and release the exact active TRex generation-tag session."""
+        """Stop the exact active session; an already retired session needs no remote action."""
+        if self._active_generation_session is None:
+            return
         if self._active_generation_session is not session:
             raise RuntimeError("trex abort session ownership is foreign")
         await self._invoke_remote({
@@ -866,7 +784,6 @@ class TRexTrafficDriver(TrafficDriver):
             "trex_api_path": self.config.traffic.trex_api_path,
             "work_dir": self.config.traffic.work_dir,
         })
-        self._active_generation_session = None
 
     def _packet_run_spec(
         self,
@@ -891,6 +808,7 @@ class TRexTrafficDriver(TrafficDriver):
             "trex_server": self.config.traffic.trex_server,
             "trex_api_path": self.config.traffic.trex_api_path,
             "work_dir": self.config.traffic.work_dir,
+            "trex_identity": self.traffic_generator_identity,
         }
 
     def _generation_run_spec(
@@ -950,12 +868,13 @@ class TRexTrafficDriver(TrafficDriver):
         raw["capture_filter"] = self._capture_filter
         raw["timestamp_source"] = self.config.backend_profile.timestamp_source
         raw["rate_control_source"] = self.config.backend_profile.rate_control_source
-        raw["trex_identity"] = dict(self._trex_identity)
+        if require_trex_identity(raw["trex_identity"], "TRex run admission") != self._trex_identity:
+            raise RuntimeError("trex run admission differs from setup provenance")
         self._last_run = raw
         return raw
 
-    @staticmethod
     def _generation_result_extent_bound(
+        self,
         ingress_streams: List[Dict[str, Any]],
         num_flows: int,
     ) -> int:
@@ -964,7 +883,7 @@ class TRexTrafficDriver(TrafficDriver):
         # One MiB covers every non-repeated field, bounded endpoint string,
         # array/object delimiter, and future scalar-width margin; repeated flow
         # and PGID rows are charged explicitly below.
-        extent = _GENERATION_RESPONSE_FIXED_RESERVE_BYTES
+        extent = _GENERATION_RESPONSE_FIXED_RESERVE_BYTES + len(self._all_port_ids) * MAX_TREX_PORT_RECORD_BYTES
         for stream in ingress_streams:
             for role in ("pre_overlap", "post_overlap"):
                 plan_row = {
@@ -1021,8 +940,8 @@ class TRexTrafficDriver(TrafficDriver):
             "ingress_stream": streams[0],
             "packets": [packet.hex() for packet in packets],
             "capture_marker": marker.hex(),
+            "trex_identity": self.traffic_generator_identity,
         })
-        self._udp_exchange_incomplete = False
         return tuple(bytes.fromhex(frame) for frame in result["frames"])
 
     def _validate_udp_exchange_request(self, spec: Dict[str, Any]) -> None:
@@ -1094,6 +1013,7 @@ class TRexTrafficDriver(TrafficDriver):
             )
         if action == "exchange_udp":
             self._validate_udp_exchange_request(spec)
+        pgid_demand = 0
         if action in {"run", "generation_start", "generation_finish"}:
             duration = require_number(
                 spec["duration_s"], "TRex request duration", minimum=0.0
@@ -1158,13 +1078,12 @@ class TRexTrafficDriver(TrafficDriver):
                 )
             if normalized_ingress != self._ingress_streams:
                 raise RuntimeError("trex ingress-stream request identity disagrees")
-            if 1000 + len(normalized_ingress) * num_flows * 2 > _UINT32_MAX:
-                raise RuntimeError("trex generated PGID range overflows")
             if action == "run":
                 mode = require_string(spec["mode"], "TRex run mode")
                 if mode not in {"standard", "timed"}:
                     raise RuntimeError("trex one-shot run identity is inexact")
         if action in {"generation_start", "generation_finish"}:
+            pgid_demand = generation_pgid_layout(len(normalized_ingress), num_flows)["demand"]
             transition = require_number(
                 spec["transition_time_s"], "TRex request transition time",
                 minimum=0.0,
@@ -1199,6 +1118,11 @@ class TRexTrafficDriver(TrafficDriver):
                 raise RuntimeError(
                     "trex generation evidence exceeds the bounded JSON result"
                 )
+        if action in {"run", "generation_start", "generation_finish", "exchange_udp"}:
+            identity = require_trex_identity(spec["trex_identity"], "TRex requested instrument identity")
+            if identity != self._trex_identity:
+                raise RuntimeError("trex run request has foreign instrument identity")
+            require_trex_capacity(identity, self._egress_port_ids, pgid_demand)
         if action in {
             "generation_resume_next", "generation_pause_initial", "generation_finish",
         }:
@@ -1287,13 +1211,16 @@ class TRexTrafficDriver(TrafficDriver):
         finally:
             if self._remote_proc is proc and proc.returncode is not None:
                 self._remote_proc = None
+            if proc.returncode == 0:
+                # These actions exit zero only after endpoint cleanup. Retire
+                # ownership before local decoding or evidence checks can fail.
+                if action == "exchange_udp":
+                    self._udp_exchange_incomplete = False
+                elif action in {"generation_finish", "generation_abort"}:
+                    self._active_generation_session = None
             if proc.returncode is not None:
                 await self._discard_remote_kill_task()
 
-        if action == "exchange_udp" and proc.returncode == 0:
-            # The endpoint exits zero only after capture, service mode, and client
-            # retirement. A later local payload rejection does not undo that proof.
-            self._udp_exchange_incomplete = False
         try:
             stderr_text = stderr.decode("utf-8")
         except UnicodeError as exc:
@@ -1320,14 +1247,20 @@ class TRexTrafficDriver(TrafficDriver):
                 "trex remote action exited after success; endpoint cleanup is unproved"
             )
         if not ok:
-            require_exact_keys(payload, {"ok", "error"}, "TRex remote failure")
+            require_exact_keys(payload, {"ok", "error", "mutation_attempted"}, "TRex remote failure")
+            mutation_attempted = require_bool(payload["mutation_attempted"], "TRex mutation attempt")
+            if action == "exchange_udp" and not mutation_attempted:
+                self._udp_exchange_incomplete = False
             error = self._safe_remote_text(
                 require_string(payload["error"], "TRex remote error"), 2000
             )
             tail = self._stderr_tail(stderr_text)
             if tail:
                 error = f"{error}; {tail}"
-            raise RuntimeError(f"trex remote action failed: {error}")
+            raise TRexRemoteFailure(
+                f"trex remote action failed: {error}",
+                mutation_attempted,
+            )
         if action not in _REMOTE_SUCCESS_KEYS:
             raise RuntimeError("trex remote action has no response contract")
         expected_keys = _REMOTE_SUCCESS_KEYS[action]
@@ -1337,11 +1270,27 @@ class TRexTrafficDriver(TrafficDriver):
         self._validate_remote_success(payload, action, spec)
         return payload
 
+    def _validate_instrument_admission(self, payload: Dict[str, Any], request: Dict[str, Any]) -> None:
+        """Check retained instrument facts and workload demand before consuming remote counters."""
+        identity = require_trex_identity(payload["trex_identity"], "TRex admitted instrument identity")
+        if identity != request["trex_identity"]:
+            raise RuntimeError("trex admitted instrument identity differs from the request")
+        demand = 0 if request["action"] in {"run", "exchange_udp"} else generation_pgid_layout(
+            len(self._ingress_port_ids), request["num_flows"],
+        )["demand"]
+        observed_demand = require_int(
+            payload["pgid_demand"], "TRex admitted PGID demand", minimum=0, maximum=_UINT32_MAX,
+        )
+        if observed_demand != demand:
+            raise RuntimeError("trex admitted PGID demand differs from the workload")
+        require_trex_capacity(identity, self._egress_port_ids, demand)
+
     def _validate_remote_success(
         self, payload: Dict[str, Any], action: str, request: Dict[str, Any]
     ) -> None:
         """Validate one response against its exact local request."""
         if action == "exchange_udp":
+            self._validate_instrument_admission(payload, request)
             frames = require_array(payload["frames"], "UDP exchange captured frames")
             if len(frames) > len(request["packets"]) + 1:
                 raise RuntimeError("UDP exchange capture exceeded its packet bound")
@@ -1366,17 +1315,11 @@ class TRexTrafficDriver(TrafficDriver):
             self._require_exact_port_array(
                 payload["ports"], self._all_port_ids, "TRex probe ports"
             )
-            self._require_exact_port_array(
-                payload["promiscuous_ports"], self._egress_port_ids,
-                "TRex probe promiscuous ports",
-            )
-            stats_keys = require_array(payload["stats_keys"], "TRex stats keys")
-            normalized_keys = [
-                require_string(value, "TRex stats key") for value in stats_keys
-            ]
-            if len(normalized_keys) != len(set(normalized_keys)):
-                raise RuntimeError("trex stats keys are duplicated")
+            if [row["port_id"] for row in probe_identity["ports"]] != sorted(self._all_port_ids):
+                raise RuntimeError("trex probe capabilities have foreign port membership")
             self._trex_identity = probe_identity
+        if action in {"run", "generation_start", "generation_finish"}:
+            self._validate_instrument_admission(payload, request)
         if action in {"run", "generation_finish"}:
             tx_count, rx_count = self._validated_port_totals(payload)
             start_time = require_number(
@@ -1692,12 +1635,13 @@ class TRexTrafficDriver(TrafficDriver):
         )
         if any(len(stream_ids) != num_flows for stream_ids in initial_ids.values()):
             raise RuntimeError("trex generation stream per-port cardinality is inexact")
-        expected_per_role = len(self._ingress_port_ids) * num_flows
+        pgids = generation_pgid_layout(len(self._ingress_port_ids), num_flows)
+        expected_per_role = len(pgids["initial"])
 
         plan = require_array(
             payload["generation_flow_plan"], "TRex generation flow plan"
         )
-        if len(plan) != expected_per_role * 2:
+        if len(plan) != pgids["demand"]:
             raise RuntimeError("trex generation flow-plan cardinality is inexact")
         seen_pg_ids = set()
         seen_relations = set()
@@ -1771,13 +1715,9 @@ class TRexTrafficDriver(TrafficDriver):
                 row["expected_tx"], "TRex expected flow TX", minimum=0,
                 maximum=_UINT64_MAX,
             )
-            expected_pg_id = (
-                1000
-                + stream_index_by_port[port_id]
-                * num_flows * 2
-                + flow_id * 2
-                + (1 if role == "post_overlap" else 0)
-            )
+            expected_pg_id = pgids["next" if role == "post_overlap" else "initial"][
+                stream_index_by_port[port_id] * num_flows + flow_id
+            ]
             expected_flow_tx = int(round(
                 per_flow_pps
                 * (

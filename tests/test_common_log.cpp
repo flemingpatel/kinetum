@@ -12,6 +12,7 @@
 #include <atomic>
 #include <chrono>
 #include <csignal>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -374,6 +375,8 @@ void reserve_with_fatal(uint32_t depth)
 			 if (depth != 0) {
 				 reserve_with_fatal(depth - 1);
 			 } else {
+				 EXPECT_GE(std::fputs("reserved fatal diagnostic\n", stderr), 0);
+				 EXPECT_EQ(std::fflush(stderr), 0);
 				 offer_fatal_log({log_level::FATAL, "logging", "test.fatal", __func__},
 						 "reserved fatal diagnostic");
 			 }
@@ -383,13 +386,16 @@ void reserve_with_fatal(uint32_t depth)
 }
 
 /**
- * @brief Give the reserved record its own delivery opportunity, then retire all ordinary owners.
+ * @brief Preserve the reserved file record without repeating its independent stderr breadcrumb.
  * @param root Protected fixture destination, retained through writer retirement.
  */
 void verify_fatal_reservation(const std::filesystem::path &root)
 {
+	test_support::log_stderr_capture capture;
+	ASSERT_TRUE(capture.valid());
 	log_options options;
 	options.directory = root.string();
+	options.console = true;
 	auto owner_or = log_service::start(options, "kinetum_cp");
 	ASSERT_TRUE(owner_or.is_ok());
 	auto owner = std::move(owner_or).value();
@@ -397,6 +403,11 @@ void verify_fatal_reservation(const std::filesystem::path &root)
 	EXPECT_EQ(owner->health().accepted_records, 257u);
 	EXPECT_EQ(owner->health().queue_rejections, 0u);
 	owner.reset();
+	std::string console;
+	ASSERT_TRUE(capture.finish(console));
+	EXPECT_NE(console.find("reserved fatal diagnostic\n"), std::string::npos);
+	EXPECT_EQ(console.find("test.fatal"), std::string::npos);
+	EXPECT_EQ(std::count(console.begin(), console.end(), '\n'), 257);
 	const auto output = test_support::read_log_file(root / "kinetum_cp.log");
 	EXPECT_NE(output.find("test.fatal"), std::string::npos);
 	EXPECT_EQ(std::count(output.begin(), output.end(), '\n'), 257);
@@ -646,6 +657,7 @@ TEST(log_options, child_projection_keeps_every_setting)
 {
 	log_options options;
 	options.directory = "/var/tmp/logs";
+	options.level = log_level::DEBUG;
 	options.console = true;
 	options.keep_files = 3;
 	options.maximum_bytes = 65536;
@@ -655,7 +667,7 @@ TEST(log_options, child_projection_keeps_every_setting)
 	const std::vector<std::string> expected{"--log-dir",
 						"/var/tmp/logs",
 						"--log-level",
-						"info",
+						"debug",
 						"--log-max-bytes",
 						"65536",
 						"--log-keep-files",

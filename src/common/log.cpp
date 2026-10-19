@@ -292,8 +292,13 @@ class log_service::implementation final {
 	 */
 	[[nodiscard]] bool enabled(log_level level, std::size_t component) const noexcept
 	{
+		// Native connection details are opt-in; keep gRPC's ordinary ERROR
+		// threshold unless DEBUG or an explicit component override requests more.
+		const auto default_level = LOG_COMPONENTS[component] == "grpc" && options_.level != log_level::DEBUG ?
+						   std::max(options_.level, log_level::ERROR) :
+						   options_.level;
 		return (startup_.load(std::memory_order_acquire) && level >= log_level::ERROR) ||
-		       level >= options_.component_levels[component].value_or(options_.level);
+		       level >= options_.component_levels[component].value_or(default_level);
 	}
 	/**
 	 * @brief Claim one bounded record, format without locks, and publish only owned bytes.
@@ -410,7 +415,9 @@ class log_service::implementation final {
 			return;
 		}
 		stamp(fatal_record_, site, application_);
-		fatal_record_.console = options_.console;
+		// The caller already owns raw stderr delivery, independently of this
+		// reserved file copy. Mirroring it would repeat the same failure.
+		fatal_record_.console = false;
 		fatal_record_.level = log_level::FATAL;
 		fatal_record_.message_size = std::min(message.size(), fatal_record_.message.size());
 		if (fatal_record_.message_size != 0) {

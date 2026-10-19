@@ -1085,7 +1085,7 @@ does not permit an unaccounted record.
 | --------------------- | --------------------- | -------------------------------------------- |
 | `steering_profile_id` | `string`              | Stable steering profile identifier.          |
 | `kind`                | `TrafficSteeringKind` | Steering mechanism.                          |
-| `symmetric`           | `bool`                | Hardware symmetry for an unchanged tuple. |
+| `symmetric`           | `bool`                | Hardware symmetry for an unchanged tuple; unsupported by the current DPDK contract. |
 | `io_stream_ids`       | `repeated string`     | Exact stable governed stream identities.     |
 
 `RuntimeTelemetry.module_context_domains[]` (field 18) uses the plan's

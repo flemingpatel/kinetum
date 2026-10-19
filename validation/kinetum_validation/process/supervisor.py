@@ -60,7 +60,7 @@ class AsyncProcessSupervisor:
         self._log_files: Dict[str, Path] = {}
         self._log_handles: Dict[str, TextIO] = {}
 
-    async def start_runtime(self, bundle_root: Path) -> None:
+    async def start_runtime(self, bundle_root: Path, *, debug_logging: bool = False) -> None:
         """
         Start the installed Photon supervisor over one complete bundle.
 
@@ -68,6 +68,8 @@ class AsyncProcessSupervisor:
         ----------
         bundle_root : Path
             Exact absolute runtime-bundle root produced by kinetum_pack.
+        debug_logging : bool
+            Select DEBUG instead of INFO for Photon and its CP/DP children.
 
         Raises
         ------
@@ -107,6 +109,7 @@ class AsyncProcessSupervisor:
             "--dp-endpoint", self.config.dp_endpoint,
             "--config-store-dir", str(cp_store_dir),
             "--log-dir", str(log_dir),
+            "--log-level", "debug" if debug_logging else "info",
             "--log-console",
         ]
 

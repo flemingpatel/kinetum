@@ -79,7 +79,7 @@ constexpr uint64_t NATIVE_LCORE_SERVICE_OWNER = UINT64_MAX;
 	       api.current_log_level != nullptr && api.thread_register != nullptr && api.thread_unregister != nullptr &&
 	       api.current_lcore_id != nullptr && api.main_lcore_id != nullptr && api.lcore_is_enabled != nullptr &&
 	       api.remote_launch != nullptr && api.wait_lcore != nullptr && api.current_cpu != nullptr &&
-	       api.eth_port_by_name != nullptr && api.runtime_version != nullptr;
+	       api.eth_port_by_name != nullptr && api.runtime_version != nullptr && api.pci.read_function != nullptr;
 }
 
 /**
@@ -366,6 +366,7 @@ dpdk_process_facility_api default_dpdk_process_facility_api() noexcept
 		.eth_port_by_name = native_eth_port_by_name,
 		.runtime_version = native_runtime_version,
 		.unassigned_lcore_id = static_cast<uint32_t>(LCORE_ID_ANY),
+		.pci = default_dpdk_pci_probe_api(),
 	};
 }
 
@@ -642,6 +643,11 @@ kinetum_provider_status dpdk_process_facility::create(const kinetum_provider_fac
 				    "DPDK native diagnostic stream registration failed");
 		}
 		candidate->state_->log_registered = true;
+		const auto ownership = prove_dpdk_pci_ownership({facts.attachments, facts.attachment_count},
+								candidate->state_->api.pci, diagnostic);
+		if (ownership != KINETUM_PROVIDER_STATUS_OK) {
+			return ownership;
+		}
 		const int init_result = candidate->state_->api.eal_init(candidate->state_->api.state,
 									static_cast<int>(argv.size()), argv.data());
 		if (init_result < 0) {

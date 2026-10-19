@@ -107,7 +107,7 @@ retain their checked delivery contracts.
 Finite-tool diagnostics use the same record encoder with synchronous stderr
 delivery. Native gRPC diagnostics in finite commands admit ERROR and higher;
 ordinary RPC startup messages do not accompany successful command results.
-Service gRPC diagnostics follow the configured component level.
+Service gRPC diagnostics follow the settings below.
 Finite tools do not start a background writer.
 
 ### 3. Settings
@@ -134,6 +134,13 @@ unrepresentable retention limits reject. Settings are fixed for the invocation;
 there is no live configuration reload or environment-selected destination.
 Photon forwards the admitted settings explicitly to DP and CP. Each child
 performs its own admission.
+
+Native gRPC diagnostics default to `error`; connection attempts and event-loop
+details do not appear in ordinary `info` output. Global `--log-level debug`
+enables native detail as well. An explicit `--log-component-level grpc=info`
+or `grpc=debug` selects it independently, and a component override takes
+precedence over the global level. Native severities are preserved; foreign
+ERROR and higher records retain their mandatory delivery path.
 
 Startup errors are mirrored to stderr even when ordinary console mirroring is
 off. Once the existing service startup gate completes, configured live filters
@@ -286,11 +293,13 @@ ownership cannot be retired is a terminal failure; it is never detached and
 its arena is never freed while live.
 
 Abort-adjacent diagnostics retain their raw, allocation-free breadcrumbs.
-They may offer a separately reserved record for up to 100 ms; failed reservation
-returns immediately. They do not acquire ordinary queue capacity or depend on
-file delivery before the caller's abort. Neither deadline is a hard real-time
-guarantee against kernel I/O stalls or process descheduling, and ordinary append
-does not claim crash or power-loss durability.
+After writing to stderr, they may offer a separately reserved file record for
+up to 100 ms; failed reservation returns immediately. This copy is not mirrored
+back to stderr, including with `--log-console`. It does not acquire ordinary
+queue capacity or make the caller's abort depend on file delivery.
+Neither deadline is a hard real-time guarantee against kernel I/O stalls or
+process descheduling, and ordinary append does not claim crash or power-loss
+durability.
 
 ### 5. Rotation and Reopen
 

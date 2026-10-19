@@ -5,17 +5,18 @@
 
 /**
  * @file dpdk_host_probe.hpp
- * @brief Non-materializing DPDK EAL and hugepage host proof.
+ * @brief Non-materializing DPDK runtime, hugepage, and PCI ownership proof.
  * @author Fleming Patel
  *
- * The exact DPDK facility contract requires a linked runtime and a minimum
- * hugepage floor before materialization may initialize EAL. The probe consumes
- * the role-tagged compiled facility facts, performs only bounded read-only host
- * inspection, and closes every temporary descriptor before return.
+ * The DPDK facility contract requires a linked runtime, a minimum hugepage floor,
+ * and exclusive PCI ownership before materialization initializes EAL. The probe
+ * consumes the role-tagged compiled facility facts, performs bounded read-only
+ * host inspection, and closes every temporary descriptor before return.
  */
 
 #include <cstdint>
 
+#include "src/dp/backends/dpdk/dpdk_pci_probe.hpp"
 #include "src/provider/provider_component_abi.h"
 
 namespace kinetum::provider::dpdk_component
@@ -28,6 +29,7 @@ struct dpdk_host_probe_api {
 	const char *(*runtime_version)(void *state) noexcept;  ///< Return the linked DPDK runtime identity.
 	int (*read_meminfo)(void *state, char *buffer, uint32_t capacity,
 			    uint32_t *size) noexcept;  ///< Read bounded Linux /proc/meminfo bytes.
+	dpdk_pci_probe_api pci;			       ///< Shared read-only PCI observation mechanism.
 };
 
 /**
@@ -45,12 +47,13 @@ struct dpdk_host_probe_api {
  * proves that currently unreserved hugepage bytes cover at least the complete
  * plan-visible packet-payload floor. Exact mempool overhead, page placement,
  * and allocation remain native materialization results; this probe never
- * initializes EAL or reserves memory.
+ * initializes EAL or reserves memory. The declared PCI attachment set passes
+ * the same adapter-ownership proof used immediately before EAL initialization.
  *
  * @param request Exact role-tagged facility proof request.
  * @param api Complete bounded host-inspection mechanism.
  * @param diagnostic Optional caller-owned bounded diagnostic.
- * @return OK only after both current component-phase host facts are proven.
+ * @return OK only after every current component-phase host fact is proven.
  */
 [[nodiscard]] kinetum_provider_status prove_dpdk_host(const kinetum_provider_host_proof_request &request,
 						      const dpdk_host_probe_api &api,

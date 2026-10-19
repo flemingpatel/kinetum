@@ -1,11 +1,4 @@
-"""
-Console Reporter - real-time test output and result formatting.
-
-Provides structured console output with:
-- Real-time progress updates
-- Colored status indicators
-- Detailed result summaries
-"""
+"""Render validation progress, runtime diagnostics, and measured results on stderr."""
 
 from __future__ import annotations
 
@@ -39,17 +32,12 @@ _SCENARIO_NAMES = {
 
 class ConsoleReporter:
     """
-    Console output for test execution and results.
-
-    Provides real-time streaming output with structured
-    formatting for test progress and results.
+    Format scenario verdicts while preserving unavailable observations.
 
     Parameters
     ----------
-    verbose : bool
-        Enable verbose output.
     color : bool
-        Enable ANSI color codes.
+        Permit ANSI color when stderr is a terminal.
     """
 
     # ANSI color codes
@@ -61,9 +49,8 @@ class ConsoleReporter:
     BLUE = "\033[94m"
     CYAN = "\033[96m"
 
-    def __init__(self, verbose: bool = False, color: bool = True) -> None:
-        """Initialize stderr reporting with explicit verbosity and color."""
-        self.verbose = verbose
+    def __init__(self, color: bool = True) -> None:
+        """Initialize stderr reporting with explicit color selection."""
         self.color = color and sys.stderr.isatty()
 
     def _c(self, code: str, text: str) -> str:
@@ -286,5 +273,4 @@ class ConsoleReporter:
         line : str
             Log line.
         """
-        if self.verbose:
-            print(line, file=sys.stderr)
+        print(line, file=sys.stderr, flush=True)

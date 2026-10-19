@@ -24,6 +24,7 @@
 #include <array>
 #include <cerrno>
 #include <cstdlib>
+#include <cstdio>
 #include <filesystem>
 #include <optional>
 #include <stdexcept>
@@ -63,7 +64,7 @@ using common::status_or;
 
 /** Environment key carrying the fixture-owned event descriptor. */
 constexpr char TRACE_FD_ENVIRONMENT[] = "KINETUM_TEST_MATERIALIZER_TRACE_FD";
-/** Environment key selecting a factory-role failure. */
+/** Environment key selecting a factory role or exact driver activation failure. */
 constexpr char FAIL_ROLE_ENVIRONMENT[] = "KINETUM_TEST_MATERIALIZER_FAIL_ROLE";
 /** Environment key injecting diagnostic residue into a successful callback. */
 constexpr char SUCCESS_DIAGNOSTIC_ENVIRONMENT[] = "KINETUM_TEST_MATERIALIZER_SUCCESS_DIAGNOSTIC";
@@ -92,14 +93,14 @@ class scoped_materializer_injection final {
 	/**
 	 * @brief Install one event descriptor and optional exact failing role.
 	 *
-	 * @param failing_role Empty for success, otherwise one of S, I, E, or T.
+	 * @param failing_role Empty for success; S/I/E/T for a factory failure or A0/A1 for driver activation.
 	 * @param success_diagnostic Empty for the ordinary contract, otherwise one
 	 *        exact callback identity selected to return forbidden residue.
 	 */
 	explicit scoped_materializer_injection(std::string_view failing_role, std::string_view success_diagnostic = {})
 	{
 		if (!failing_role.empty() && failing_role != "S" && failing_role != "I" && failing_role != "E" &&
-		    failing_role != "T") {
+		    failing_role != "T" && failing_role != "A0" && failing_role != "A1") {
 			throw std::invalid_argument("materializer injection role is outside the exact test set");
 		}
 		if (!success_diagnostic.empty() && success_diagnostic != "host-proof" &&
@@ -139,9 +140,13 @@ class scoped_materializer_injection final {
 		close_descriptors_();
 	}
 
+	/** @brief Process environment and descriptor ownership cannot be copied. */
 	scoped_materializer_injection(const scoped_materializer_injection &) = delete;
+	/** @brief Copy assignment cannot duplicate restoration obligations. */
 	scoped_materializer_injection &operator=(const scoped_materializer_injection &) = delete;
+	/** @brief Scope-bound restoration ownership cannot be moved. */
 	scoped_materializer_injection(scoped_materializer_injection &&) = delete;
+	/** @brief Move assignment cannot replace a live restoration scope. */
 	scoped_materializer_injection &operator=(scoped_materializer_injection &&) = delete;
 
 	/**
@@ -184,7 +189,7 @@ class scoped_materializer_injection final {
 		}
 	}
 
-	/** @brief Restore both exact prior process environment values. */
+	/** @brief Restore all exact prior process environment values. */
 	void restore_environment_() const noexcept
 	{
 		const auto restore = [](const char *name, const std::optional<std::string> &value) {
@@ -510,6 +515,12 @@ make_dpdk_materialization_bindings(const kinetum::axiom::v1::Pipeline &pipeline)
 			.role = provider_contract_role::PROCESS_FACILITY,
 			.instance_index = 0,
 		},
+		compiled_provider_host_requirement{
+			.phase = provider_host_proof_phase::COMPONENT_HOST_PROOF,
+			.fact = provider_host_fact::DPDK_PCI_ADAPTER_OWNERSHIP,
+			.role = provider_contract_role::PROCESS_FACILITY,
+			.instance_index = 0,
+		},
 	};
 	topology.required_contract_type_urls.emplace_back(DPDK_FACILITY_TYPE_URL);
 	return topology;
@@ -730,6 +741,98 @@ TEST_F(provider_runtime_materialization_test, io_activation_success_rejects_diag
 	auto retired_events_or = injection.drain();
 	ASSERT_TRUE(retired_events_or.is_ok()) << retired_events_or.error().message();
 	EXPECT_EQ(retired_events_or.value(), "teisf");
+}
+
+/** @brief The real launcher retains owners even when an adversarial driver violates cold-on-failure. */
+TEST_F(provider_runtime_materialization_test, launch_failure_retains_uncertain_io_and_all_dependencies)
+{
+	const auto host = kinetum::quark::probe_host();
+	auto selected_or = test::packet_runtime_fixture_detail::select_host(host, 3u);
+	ASSERT_TRUE(selected_or.is_ok()) << selected_or.error().message();
+	const auto pipeline = test::packet_runtime_fixture_detail::make_pipeline(std::nullopt);
+	auto bindings_or = test::packet_runtime_fixture_detail::make_bindings(
+		pipeline, selected_or->numa_node, 31'001, 31'002,
+		test::packet_runtime_fixture_detail::TEST_RUNTIME_BUFFER_COUNT, 0, 0);
+	ASSERT_TRUE(bindings_or.is_ok()) << bindings_or.error().message();
+	auto bindings = std::move(bindings_or).value();
+	kinetum::io::udp::v1::UdpDriverConfig original;
+	ASSERT_TRUE(bindings.io_driver_instances(0).configuration().UnpackTo(&original));
+	ASSERT_EQ(original.ports_size(), 2);
+	bindings.clear_io_driver_instances();
+	for (int index = 0; index < original.ports_size(); ++index) {
+		kinetum::io::udp::v1::UdpDriverConfig configuration;
+		*configuration.add_ports() = original.ports(index);
+		auto *driver = bindings.add_io_driver_instances();
+		driver->set_io_driver_instance_id("io_udp_" + std::to_string(index));
+		driver->mutable_configuration()->PackFrom(configuration);
+		for (auto &port : *bindings.mutable_logical_port_bindings()) {
+			if (port.driver_port_id() == original.ports(index).driver_port_id()) {
+				port.set_io_driver_instance_id(driver->io_driver_instance_id());
+			}
+		}
+	}
+	gluon::planner_options options;
+	options.regions = 1;
+	options.reserved_cores = 1;
+	options.numa_aware = false;
+	options.allowed_numa_nodes = {selected_or->numa_node};
+	options.deployment_bindings = std::move(bindings);
+	auto plan_or = gluon::plan(pipeline, test::packet_runtime_fixture_detail::make_hardware_inventory(*selected_or),
+				   options);
+	ASSERT_TRUE(plan_or.is_ok()) << plan_or.error().message();
+	auto topology_or = compile_provider_topology(*plan_or);
+	ASSERT_TRUE(topology_or.is_ok()) << topology_or.error().message();
+	ASSERT_EQ(topology_or->io_drivers.size(), 2u);
+	ASSERT_TRUE(kinetum::quark::validate_runtime_compat(*topology_or, host).compatible);
+	auto bootstrap_or = test::packet_runtime_fixture_detail::make_bootstrap_request(*plan_or, std::nullopt);
+	ASSERT_TRUE(bootstrap_or.is_ok()) << bootstrap_or.error().message();
+
+	for (const std::string_view failure : {"A0", "A1"}) {
+		SCOPED_TRACE(failure);
+		scoped_materializer_injection injection(failure);
+		auto mailbox_or =
+			kinetum::dp::epoch_transition_command_mailbox::create(topology_or->transition_topology);
+		ASSERT_TRUE(mailbox_or.is_ok()) << mailbox_or.error().message();
+		auto admitted_or = admit_installed_provider_runtime(*topology_or, provider_fixture_.root(),
+								    provider_fixture_.runtime_image(),
+								    test::PROVIDER_TEST_PUBLIC_KEY,
+								    provider_fixture_.file_policy());
+		ASSERT_TRUE(admitted_or.is_ok()) << admitted_or.error().message();
+		auto input_or = kinetum::dp::packet_runtime_generation_input::create(*plan_or, *topology_or,
+										     std::move(mailbox_or).value(),
+										     std::move(admitted_or).value(), {},
+										     TEST_RUNTIME_GENERATION);
+		ASSERT_TRUE(input_or.is_ok()) << input_or.error().message();
+		EXPECT_DEATH(
+			{
+				auto runtime_or = kinetum::dp::partitioned_runtime::create(std::move(input_or).value());
+				if (!runtime_or.is_ok()) {
+					const auto message = runtime_or.error().message();
+					std::fprintf(stderr, "fixture construction failed: %.*s\n",
+						     static_cast<int>(message.size()), message.data());
+					std::_Exit(0);
+				}
+				auto runtime = std::move(runtime_or).value();
+				const auto bootstrapped = test::run_packet_runtime_control_producer(*runtime, [&]() {
+					return runtime->bootstrap(*bootstrap_or);
+				});
+				if (!bootstrapped.is_ok()) {
+					const auto message = bootstrapped.error().message();
+					std::fprintf(stderr, "fixture bootstrap returned: %.*s\n",
+						     static_cast<int>(message.size()), message.data());
+				} else {
+					std::fputs("fixture bootstrap unexpectedly succeeded\n", stderr);
+				}
+				// A returned failure is not the required fatal boundary. Avoid an
+				// unrelated destructor abort making that regression pass this test.
+				std::_Exit(0);
+			},
+			failure == "A0" ? "provider I/O driver activation failed for compact driver 0" :
+					  "provider I/O driver activation failed for compact driver 1");
+		auto events_or = injection.drain();
+		ASSERT_TRUE(events_or.is_ok()) << events_or.error().message();
+		EXPECT_EQ(events_or.value(), failure == "A0" ? "SIIEA" : "SIIEAAD");
+	}
 }
 
 /** @brief Successful lifecycle binding with diagnostic residue fails stop at its ownership edge. */

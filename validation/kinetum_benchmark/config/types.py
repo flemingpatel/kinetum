@@ -88,7 +88,7 @@ class BenchmarkConfig:
     traffic : TrafficEndpointConfig
         External traffic endpoint settings.
     verbose : bool
-        Verbose output.
+        Enable runtime DEBUG logging, endpoint details, and run error tracebacks.
     """
     runtime_root: Path
     validation_root: Path
@@ -148,8 +148,6 @@ class BenchmarkResult:
         Number of runs that passed.
     failed_runs : int
         Number of runs that failed.
-    interrupted : bool
-        Whether SIGINT ended the requested run set after a complete prefix.
     run_results : List[RunResult]
         Per-run results.
     total_duration_s : float
@@ -158,6 +156,5 @@ class BenchmarkResult:
     total_runs: int = 0
     passed_runs: int = 0
     failed_runs: int = 0
-    interrupted: bool = False
     run_results: List[RunResult] = field(default_factory=list)
     total_duration_s: float = 0.0

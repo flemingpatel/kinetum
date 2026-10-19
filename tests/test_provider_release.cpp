@@ -380,6 +380,12 @@ compiled_provider_topology minimal_dpdk_facility_topology()
 			.role = provider_contract_role::PROCESS_FACILITY,
 			.instance_index = 0,
 		},
+		compiled_provider_host_requirement{
+			.phase = provider_host_proof_phase::COMPONENT_HOST_PROOF,
+			.fact = provider_host_fact::DPDK_PCI_ADAPTER_OWNERSHIP,
+			.role = provider_contract_role::PROCESS_FACILITY,
+			.instance_index = 0,
+		},
 	};
 	topology.required_contract_type_urls.emplace_back(DPDK_FACILITY_TYPE_URL);
 	return topology;

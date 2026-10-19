@@ -39,8 +39,10 @@ void set_command_log_identity(std::string_view application) noexcept;
  * @param level Declared severity; an undeclared value is a contract violation.
  * @param component Name in the closed component registry.
  * @return True if this diagnostic should be constructed; filtering is not loss.
- * @note Services use their configured thresholds. Finite commands admit gRPC
- *       ERROR and higher, and other components at INFO and higher.
+ * @note Services inherit the global threshold except that gRPC starts at
+ *       ERROR unless global DEBUG or an explicit component override is set.
+ *       Finite commands admit gRPC ERROR and higher, and other components at INFO
+ *       and higher.
  */
 [[nodiscard]] bool log_enabled(log_level level, std::string_view component) noexcept;
 
@@ -129,11 +131,13 @@ void reject_log_record() noexcept;
 [[nodiscard]] bool flush_logs() noexcept;
 
 /**
- * @brief Offer a preformatted fatal record without ordinary queue dependency.
+ * @brief Offer a preformatted fatal file record without ordinary queue dependency.
  * @param site Actual fatal emitter identity.
  * @param message Borrowed bounded diagnostic, copied immediately if admitted.
- * @note A reserved record gets at most 100 ms to complete. Failed reservation
- *       returns immediately; the caller retains its raw breadcrumb and abort.
+ * @note The caller emits its independent raw stderr breadcrumb before this call.
+ *       This reserved copy is file-only, including with console mirroring enabled.
+ *       It gets at most 100 ms to complete; failed reservation returns immediately.
+ *       The caller owns termination regardless of file delivery.
  */
 void offer_fatal_log(log_site site, std::string_view message) noexcept;
 

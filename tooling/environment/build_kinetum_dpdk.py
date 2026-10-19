@@ -13,6 +13,7 @@ import argparse
 import ctypes
 import errno
 import hashlib
+import io
 import json
 import math
 import os
@@ -29,19 +30,31 @@ import tempfile
 from typing import Any
 import urllib.request
 
+from elftools.common.exceptions import ELFError
+from elftools.elf.elffile import ELFFile
+from elftools.elf.sections import SymbolTableSection
+
 
 DPDK_SOURCE_PATCH = "third_party/dpdk/i40e_close.patch"
+I40E_IDENTITY_TEMPLATE = "third_party/dpdk/kinetum_i40e_pci_ids.hpp.in"
 POLICY_FILES = (
     "third_party/dpdk/dependency_manifest.json",
     DPDK_SOURCE_PATCH,
     "third_party/dpdk/KinetumDPDKConfig.cmake.in",
     "third_party/dpdk/KinetumDPDKConfigVersion.cmake.in",
+    I40E_IDENTITY_TEMPLATE,
     "tooling/environment/build_kinetum_dpdk.py",
 )
 PACKAGE_CONFIG_DIRECTORY = Path("lib/cmake/KinetumDPDK")
 PACKAGE_DIRECTORY_MODE = 0o755
 PACKAGE_FILE_MODE = 0o644
 PACKAGE_MANIFEST = Path("share/kinetum/dpdk/build_manifest.json")
+I40E_IDENTITY_HEADER = Path("include/dpdk/kinetum_i40e_pci_ids.hpp")
+I40E_ARCHIVE = "drivers/librte_net_i40e.a"
+I40E_PMD_INFO_SYMBOL = "net_i40e_pmd_info"
+PMD_INFO_PREFIX = b"PMD_INFO_STRING= "
+PMD_INFO_LIMIT_BYTES = 64 * 1024
+PCI_IDENTITY_LIMIT = 256
 STATIC_CLOSURE_NOTICE = Path(
     "share/licenses/KinetumDPDK/DPDK_STATIC_CLOSURE_NOTICE.txt"
 )
@@ -1269,6 +1282,127 @@ def verify_pmd_membership(
         )
 
 
+def _i40e_pmd_record(raw: bytes) -> dict[str, Any] | None:
+    """Read the defined i40e metadata symbol from one bounded ELF archive member.
+
+    Return None only when the member does not define the symbol. Reject invalid
+    ELF, ambiguous definitions, indirect storage, or incomplete metadata bytes.
+    No object code is loaded or executed.
+    """
+
+    try:
+        image = ELFFile(io.BytesIO(raw))
+        if image.elfclass != 64 or not image.little_endian or image["e_type"] != "ET_REL":
+            raise ProducerError("i40e archive member is not a supported relocatable ELF")
+        symbols = image.get_section_by_name(".symtab")
+        if not isinstance(symbols, SymbolTableSection):
+            raise ProducerError("i40e archive member lacks its symbol table")
+        definitions = [
+            symbol for symbol in symbols.get_symbol_by_name(I40E_PMD_INFO_SYMBOL) or []
+            if symbol["st_shndx"] != "SHN_UNDEF"
+        ]
+        if not definitions:
+            return None
+        if len(definitions) != 1:
+            raise ProducerError("i40e archive member repeats its PMD metadata symbol")
+        symbol = definitions[0]
+        section_index = symbol["st_shndx"]
+        if (
+            not isinstance(section_index, int)
+            or section_index <= 0
+            or section_index >= image.num_sections()
+            or symbol["st_info"]["type"] != "STT_OBJECT"
+        ):
+            raise ProducerError("i40e PMD metadata has no exact object storage")
+        section = image.get_section(section_index)
+        offset = symbol["st_value"]
+        extent = symbol["st_size"]
+        if (
+            section["sh_type"] != "SHT_PROGBITS"
+            or extent <= len(PMD_INFO_PREFIX) + 1
+            or extent > PMD_INFO_LIMIT_BYTES
+            or offset < 0
+            or offset + extent > section["sh_size"]
+        ):
+            raise ProducerError("i40e PMD metadata has an invalid extent")
+        record = section.data()[offset:offset + extent]
+    except (ELFError, IndexError, KeyError, TypeError, ValueError) as error:
+        raise ProducerError("i40e archive member has malformed ELF metadata") from error
+    if (
+        len(record) != extent
+        or not record.startswith(PMD_INFO_PREFIX)
+        or not record.endswith(b"\0")
+        or b"\0" in record[:-1]
+    ):
+        raise ProducerError("i40e PMD metadata is not one complete record")
+    return _parse_json_object(record[len(PMD_INFO_PREFIX):-1], "i40e PMD metadata")
+
+
+def i40e_pci_identities(build: Path, environment: dict[str, str]) -> tuple[int, ...]:
+    """Derive sorted vendor/device identities from the actual built i40e archive.
+
+    Require exactly one named PMD record and wildcard subsystem identities.
+    Reject duplicates and unsupported row shapes instead of broadening a match.
+    The returned integers place vendor in the upper 16 bits and device below it.
+    """
+
+    archive_path = build / I40E_ARCHIVE
+    members = _parse_archive_members(
+        _build_metadata_output(
+            ["ar", "t", os.fspath(archive_path)], environment, build,
+            "i40e archive member table",
+        ),
+        I40E_ARCHIVE,
+    )
+    record: dict[str, Any] | None = None
+    for member in members:
+        candidate = _i40e_pmd_record(_build_metadata_output(
+            ["ar", "p", os.fspath(archive_path), member], environment, build,
+            f"i40e archive member {member}",
+        ))
+        if candidate is not None:
+            if record is not None:
+                raise ProducerError("i40e archive repeats its PMD metadata record")
+            record = candidate
+    if (
+        record is None
+        or record.get("name") != "net_i40e"
+        or not {"name", "pci_ids"}.issubset(record)
+        or set(record) - {"name", "pci_ids", "params", "kmod"}
+        or any(not isinstance(record[key], str) for key in ("params", "kmod") if key in record)
+    ):
+        raise ProducerError("i40e archive lacks exact net_i40e metadata")
+    rows = record["pci_ids"]
+    if not isinstance(rows, list) or not 0 < len(rows) <= PCI_IDENTITY_LIMIT:
+        raise ProducerError("i40e PCI identity set is empty or oversized")
+    identities: set[int] = set()
+    for row in rows:
+        if not isinstance(row, list) or len(row) != 4:
+            raise ProducerError("i40e PCI identity is not one four-field row")
+        if any(not isinstance(value, int) or isinstance(value, bool) or not 0 <= value <= 0xffff for value in row):
+            raise ProducerError("i40e PCI identity has a non-uint16 field")
+        if not 0 < row[0] < 0xffff or not 0 < row[1] < 0xffff or row[2:] != [0xffff, 0xffff]:
+            raise ProducerError("i40e PCI identity requires exact vendor/device and wildcard subsystems")
+        identity = (row[0] << 16) | row[1]
+        if identity in identities:
+            raise ProducerError("i40e PCI identity set contains a duplicate")
+        identities.add(identity)
+    return tuple(sorted(identities))
+
+
+def render_i40e_identity_header(root: Path, build: Path, environment: dict[str, str]) -> str:
+    """Render the component-private identity projection of the built PMD record."""
+
+    identities = i40e_pci_identities(build, environment)
+    rows = "\n".join(f"\tUINT32_C(0x{identity:08x})," for identity in identities)
+    text = (root / I40E_IDENTITY_TEMPLATE).read_text(encoding="ascii")
+    text = text.replace("@KINETUM_I40E_PCI_ID_COUNT@", str(len(identities)))
+    text = text.replace("@KINETUM_I40E_PCI_ID_ROWS@", rows)
+    if "@KINETUM_I40E_" in text:
+        raise ProducerError("unresolved i40e identity-template token")
+    return text
+
+
 def copy_declared_headers(
     policy: dict[str, Any], meson: Path, build: Path, stage: Path,
     environment: dict[str, str],
@@ -1862,6 +1996,7 @@ def main() -> int:
                 policy, tuple_name, dpdk_source, build
             )
             verify_pmd_membership(policy, build, environment)
+            i40e_identity_header = render_i40e_identity_header(root, build, environment)
             static_closure_notice = render_static_closure_notice(
                 policy, dpdk_source, build, environment
             )
@@ -1873,6 +2008,8 @@ def main() -> int:
                 )
             )
             copy_declared_headers(policy, meson, build, stage, environment)
+            with (stage / I40E_IDENTITY_HEADER).open("x", encoding="ascii") as header:
+                header.write(i40e_identity_header)
             (stage / "lib").mkdir(parents=True)
             for relative in policy["archive_targets"]:
                 shutil.copyfile(build / relative, stage / "lib" / Path(relative).name)

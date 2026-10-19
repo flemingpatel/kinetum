@@ -8,7 +8,9 @@
  *
  * The tests pin strict state classification, bounded retry semantics,
  * post-response liveness checking, exact DP/CP argv construction, and complete
- * dependency-ordered rollback without creating real gRPC servers or children.
+ * dependency-ordered rollback using controlled monotonic time. A reserved
+ * loopback endpoint separately exercises real gRPC connection waiting without
+ * a listening server.
  */
 
 #include <gtest/gtest.h>
@@ -20,9 +22,14 @@
 #include <cstdint>
 #include <iterator>
 #include <string>
-#include <thread>
 #include <utility>
 #include <vector>
+
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+#include <grpcpp/grpcpp.h>
 
 #include "gen/kinetum/common/v1/common.pb.h"
 #include "gen/kinetum/dataplane/v1/dataplane.pb.h"
@@ -42,6 +49,72 @@ using health_response = kinetum::dataplane::v1::HealthResponse;
 using kinetum::common::status;
 using kinetum::common::status_code;
 using kinetum::common::status_or;
+
+/** @brief Advance only authored component time while recording every requested wait. */
+class manual_readiness_clock final : public readiness_clock {
+    public:
+	/** @return Authored monotonic time, independent of host scheduling. */
+	[[nodiscard]] std::chrono::steady_clock::time_point now() const noexcept override
+	{
+		return now_;
+	}
+	/**
+	 * @brief Record a retry delay and advance its exact duration without a real sleep.
+	 * @param duration Wait requested by the production loop.
+	 */
+	void sleep_for(std::chrono::milliseconds duration) override
+	{
+		waits_.push_back(duration);
+		advance(duration);
+	}
+	/** @param duration Nonnegative elapsed time authored by an observation or progress check. */
+	void advance(std::chrono::steady_clock::duration duration) noexcept
+	{
+		now_ += duration;
+	}
+	/** @return Exact retry delays requested by the production readiness loop. */
+	[[nodiscard]] const std::vector<std::chrono::milliseconds> &waits() const noexcept
+	{
+		return waits_;
+	}
+
+    private:
+	std::chrono::steady_clock::time_point now_{};	///< Sole component-test time authority.
+	std::vector<std::chrono::milliseconds> waits_;	///< Ordered requested retry delays.
+};
+
+/** @brief Reserve an unavailable loopback endpoint without a port-allocation race. */
+class PhotonReadinessTransportTest : public ::testing::Test {
+    protected:
+	/** @brief Bind but do not listen, so every connection receives a real refusal. */
+	void SetUp() override
+	{
+		descriptor_ = ::socket(AF_INET, SOCK_STREAM, 0);
+		ASSERT_GE(descriptor_, 0);
+		sockaddr_in address{};
+		address.sin_family = AF_INET;
+		address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+		ASSERT_EQ(::bind(descriptor_, reinterpret_cast<const sockaddr *>(&address), sizeof(address)), 0);
+		socklen_t size = sizeof(address);
+		ASSERT_EQ(::getsockname(descriptor_, reinterpret_cast<sockaddr *>(&address), &size), 0);
+		ASSERT_EQ(size, sizeof(address));
+		endpoint_ = "127.0.0.1:" + std::to_string(ntohs(address.sin_port));
+	}
+
+	/** @brief Release only the endpoint retained by this fixture. */
+	void TearDown() override
+	{
+		if (descriptor_ >= 0) {
+			EXPECT_EQ(::close(descriptor_), 0);
+			descriptor_ = -1;
+		}
+	}
+
+	std::string endpoint_;	///< Exact reserved endpoint for both real clients.
+
+    private:
+	int descriptor_{-1};  ///< Sole bound socket, retained through every client call.
+};
 
 /**
  * @brief Construct one application-success Health response.
@@ -154,12 +227,14 @@ class scripted_health_observer final : public dp_health_observer {
 class delayed_ready_observer final : public dp_health_observer {
     public:
 	/**
-	 * @brief Construct an observer with one deterministic response delay.
+	 * @brief Construct an observer with one authored response delay.
 	 *
-	 * @param delay Wall-clock delay before returning the target response.
+	 * @param clock Shared component time retained through this observer.
+	 * @param delay Elapsed component time before returning the target response.
 	 */
-	explicit delayed_ready_observer(std::chrono::milliseconds delay)
-		: delay_(delay)
+	delayed_ready_observer(manual_readiness_clock &clock, std::chrono::milliseconds delay)
+		: clock_(clock)
+		, delay_(delay)
 	{
 	}
 
@@ -171,11 +246,12 @@ class delayed_ready_observer final : public dp_health_observer {
 	[[nodiscard]] status_or<health_response> observe(std::chrono::milliseconds rpc_timeout) override
 	{
 		(void)rpc_timeout;
-		std::this_thread::sleep_for(delay_);
+		clock_.advance(delay_);
 		return healthy(health_response::STATE_CONTROL_READY);
 	}
 
     private:
+	manual_readiness_clock &clock_;	   ///< Borrowed time authority shared with the readiness loop.
 	std::chrono::milliseconds delay_;  ///< Deliberate contract-violation delay.
 };
 
@@ -336,11 +412,12 @@ supervised_children running_pair()
 void fail_startup_rollback_reaping()
 {
 	auto spec = valid_startup_spec();
+	manual_readiness_clock clock;
 	fake_startup_process_controller processes;
 	processes.fail_spawn_name = "cp";
 	processes.fail_terminate_names = {"dp"};
 	scripted_health_observer observer({healthy(health_response::STATE_CONTROL_READY)});
-	(void)start_supervised_children(spec, observer, processes);
+	(void)start_supervised_children(spec, observer, processes, clock);
 }
 
 /** @brief Trigger final packet-ready pair cleanup failure in a death-test child. */
@@ -464,17 +541,35 @@ TEST(photon_readiness, unknown_health_state_is_terminal)
 	EXPECT_NE(result.error().message().find("UNKNOWN_STATE(1234)"), std::string::npos);
 }
 
-/**
- * @brief Verify only transient transport failures are retried to exact readiness.
- */
+/** @brief A readiness RPC waits through a proven connection refusal until its own deadline. */
+TEST_F(PhotonReadinessTransportTest, connection_wait_remains_bounded_by_the_rpc_deadline)
+{
+	auto channel = grpc::CreateChannel(endpoint_, grpc::InsecureChannelCredentials());
+	auto stub = kinetum::dataplane::v1::DataplaneService::NewStub(channel);
+	grpc::ClientContext control;
+	control.set_wait_for_ready(false);
+	control.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(2));
+	kinetum::dataplane::v1::HealthRequest request;
+	health_response response;
+	const auto refused = stub->Health(&control, request, &response);
+	ASSERT_EQ(refused.error_code(), grpc::StatusCode::UNAVAILABLE) << refused.error_message();
+
+	grpc_dp_health_observer observer(endpoint_);
+	const auto observed = observer.observe(std::chrono::milliseconds(50));
+	ASSERT_FALSE(observed.is_ok());
+	EXPECT_EQ(observed.error().code(), status_code::DEADLINE_EXCEEDED);
+}
+
+/** @brief Verify only transient transport failures are retried to exact readiness. */
 TEST(photon_readiness, transient_transport_failures_retry)
 {
+	manual_readiness_clock clock;
 	scripted_health_observer observer({status::unavailable("not listening"),
 					   status::deadline_exceeded("rpc expired"),
 					   healthy(health_response::STATE_CONTROL_READY)});
 	const readiness_wait_policy policy{std::chrono::milliseconds(1), std::chrono::milliseconds(1),
 					   std::chrono::milliseconds(20)};
-	const auto result = wait_for_exact_readiness(observer, readiness_gate::CONTROL, policy);
+	const auto result = wait_for_exact_readiness(observer, readiness_gate::CONTROL, policy, clock);
 	ASSERT_TRUE(result.is_ok()) << result.error().message();
 	EXPECT_EQ(result->state, health_response::STATE_CONTROL_READY);
 	EXPECT_EQ(result->runtime_generation, 1u);
@@ -482,6 +577,9 @@ TEST(photon_readiness, transient_transport_failures_retry)
 	EXPECT_EQ(result->active_workers, 0u);
 	EXPECT_EQ(result->expected_workers, 1u);
 	EXPECT_EQ(observer.calls(), 3U);
+	EXPECT_EQ(clock.waits(),
+		  (std::vector<std::chrono::milliseconds>{std::chrono::milliseconds(1), std::chrono::milliseconds(1)}));
+	EXPECT_EQ(clock.now().time_since_epoch(), std::chrono::milliseconds(2));
 	ASSERT_EQ(observer.observed_timeouts().size(), 3U);
 	for (const auto timeout : observer.observed_timeouts()) {
 		EXPECT_GT(timeout.count(), 0);
@@ -494,6 +592,7 @@ TEST(photon_readiness, transient_transport_failures_retry)
  */
 TEST(photon_readiness, application_and_nontransient_transport_errors_are_terminal)
 {
+	manual_readiness_clock clock;
 	auto response = healthy(health_response::STATE_CONTROL_READY);
 	response.set_state(health_response::STATE_ERROR);
 	response.clear_runtime_generation();
@@ -504,17 +603,18 @@ TEST(photon_readiness, application_and_nontransient_transport_errors_are_termina
 	scripted_health_observer observer({response}, healthy(health_response::STATE_CONTROL_READY));
 	const readiness_wait_policy policy{std::chrono::milliseconds(1), std::chrono::milliseconds(1),
 					   std::chrono::milliseconds(10)};
-	const auto result = wait_for_exact_readiness(observer, readiness_gate::CONTROL, policy);
+	const auto result = wait_for_exact_readiness(observer, readiness_gate::CONTROL, policy, clock);
 	ASSERT_FALSE(result.is_ok());
 	EXPECT_EQ(result.error().code(), status_code::FAILED_PRECONDITION);
 	EXPECT_EQ(observer.calls(), 1U);
 
 	scripted_health_observer denied_observer({status::permission_denied("denied")},
 						 healthy(health_response::STATE_CONTROL_READY));
-	const auto denied_result = wait_for_exact_readiness(denied_observer, readiness_gate::CONTROL, policy);
+	const auto denied_result = wait_for_exact_readiness(denied_observer, readiness_gate::CONTROL, policy, clock);
 	ASSERT_FALSE(denied_result.is_ok());
 	EXPECT_EQ(denied_result.error().code(), status_code::PERMISSION_DENIED);
 	EXPECT_EQ(denied_observer.calls(), 1U);
+	EXPECT_TRUE(clock.waits().empty());
 }
 
 /**
@@ -522,11 +622,13 @@ TEST(photon_readiness, application_and_nontransient_transport_errors_are_termina
  */
 TEST(photon_readiness, malformed_application_status_is_terminal_before_state_classification)
 {
+	manual_readiness_clock clock;
 	scripted_health_observer unspecified_observer({healthy(health_response::STATE_UNSPECIFIED)},
 						      healthy(health_response::STATE_CONTROL_READY));
 	const readiness_wait_policy policy{std::chrono::milliseconds(1), std::chrono::milliseconds(1),
 					   std::chrono::milliseconds(10)};
-	const auto unspecified_result = wait_for_exact_readiness(unspecified_observer, readiness_gate::CONTROL, policy);
+	const auto unspecified_result =
+		wait_for_exact_readiness(unspecified_observer, readiness_gate::CONTROL, policy, clock);
 	ASSERT_FALSE(unspecified_result.is_ok());
 	EXPECT_EQ(unspecified_result.error().code(), status_code::DATA_LOSS);
 	EXPECT_EQ(unspecified_observer.calls(), 1U);
@@ -535,7 +637,7 @@ TEST(photon_readiness, malformed_application_status_is_terminal_before_state_cla
 	contradictory.mutable_status()->set_error_code(kinetum::common::v1::ERROR_CODE_UNAVAILABLE);
 	scripted_health_observer contradictory_observer({contradictory}, healthy(health_response::STATE_CONTROL_READY));
 	const auto contradictory_result =
-		wait_for_exact_readiness(contradictory_observer, readiness_gate::CONTROL, policy);
+		wait_for_exact_readiness(contradictory_observer, readiness_gate::CONTROL, policy, clock);
 	ASSERT_FALSE(contradictory_result.is_ok());
 	EXPECT_EQ(contradictory_result.error().code(), status_code::DATA_LOSS);
 	EXPECT_EQ(contradictory_observer.calls(), 1U);
@@ -543,7 +645,8 @@ TEST(photon_readiness, malformed_application_status_is_terminal_before_state_cla
 	auto undeclared = healthy(health_response::STATE_CONTROL_READY);
 	undeclared.mutable_status()->set_error_code(static_cast<kinetum::common::v1::ErrorCode>(1234));
 	scripted_health_observer undeclared_observer({undeclared}, healthy(health_response::STATE_CONTROL_READY));
-	const auto undeclared_result = wait_for_exact_readiness(undeclared_observer, readiness_gate::CONTROL, policy);
+	const auto undeclared_result =
+		wait_for_exact_readiness(undeclared_observer, readiness_gate::CONTROL, policy, clock);
 	ASSERT_FALSE(undeclared_result.is_ok());
 	EXPECT_EQ(undeclared_result.error().code(), status_code::DATA_LOSS);
 	EXPECT_EQ(undeclared_observer.calls(), 1U);
@@ -561,26 +664,34 @@ TEST(photon_readiness, malformed_application_status_is_terminal_before_state_cla
 		ASSERT_TRUE(removed_wire.ParseFromString(removed_bytes));
 		scripted_health_observer removed_observer({removed_wire},
 							  healthy(health_response::STATE_CONTROL_READY));
-		const auto removed_result = wait_for_exact_readiness(removed_observer, readiness_gate::CONTROL, policy);
+		const auto removed_result =
+			wait_for_exact_readiness(removed_observer, readiness_gate::CONTROL, policy, clock);
 		ASSERT_FALSE(removed_result.is_ok());
 		EXPECT_EQ(removed_result.error().code(), status_code::DATA_LOSS);
 		EXPECT_EQ(removed_observer.calls(), 1U);
 	}
+	EXPECT_TRUE(clock.waits().empty());
 }
 
 /**
- * @brief Verify overall timeout retains the last exact state observation.
+ * @brief Verify timeout retains the last state and caps both RPC and retry delays to the remaining budget.
  */
 TEST(photon_readiness, overall_timeout_reports_last_observation)
 {
+	manual_readiness_clock clock;
 	const auto starting = healthy(health_response::STATE_STARTING);
 	scripted_health_observer observer({starting}, starting);
-	const readiness_wait_policy policy{std::chrono::milliseconds(1), std::chrono::milliseconds(1),
+	const readiness_wait_policy policy{std::chrono::milliseconds(4), std::chrono::milliseconds(3),
 					   std::chrono::milliseconds(5)};
-	const auto result = wait_for_exact_readiness(observer, readiness_gate::CONTROL, policy);
+	const auto result = wait_for_exact_readiness(observer, readiness_gate::CONTROL, policy, clock);
 	ASSERT_FALSE(result.is_ok());
 	EXPECT_EQ(result.error().code(), status_code::DEADLINE_EXCEEDED);
 	EXPECT_NE(result.error().details().find("STATE_STARTING"), std::string::npos);
+	EXPECT_EQ(observer.observed_timeouts(),
+		  (std::vector<std::chrono::milliseconds>{std::chrono::milliseconds(4), std::chrono::milliseconds(2)}));
+	EXPECT_EQ(clock.waits(),
+		  (std::vector<std::chrono::milliseconds>{std::chrono::milliseconds(3), std::chrono::milliseconds(2)}));
+	EXPECT_EQ(clock.now().time_since_epoch(), policy.overall_timeout);
 }
 
 /**
@@ -588,31 +699,45 @@ TEST(photon_readiness, overall_timeout_reports_last_observation)
  */
 TEST(photon_readiness, late_target_response_is_deadline_exceeded)
 {
-	delayed_ready_observer observer(std::chrono::milliseconds(8));
+	manual_readiness_clock clock;
+	delayed_ready_observer observer(clock, std::chrono::milliseconds(8));
 	const readiness_wait_policy policy{std::chrono::milliseconds(1), std::chrono::milliseconds(1),
 					   std::chrono::milliseconds(4)};
-	const auto result = wait_for_exact_readiness(observer, readiness_gate::CONTROL, policy);
+	const auto result = wait_for_exact_readiness(observer, readiness_gate::CONTROL, policy, clock);
 	ASSERT_FALSE(result.is_ok());
 	EXPECT_EQ(result.error().code(), status_code::DEADLINE_EXCEEDED);
 	EXPECT_NE(result.error().details().find("after the overall readiness deadline"), std::string::npos);
+	EXPECT_TRUE(clock.waits().empty());
 }
 
 /**
- * @brief Verify liveness/cancellation is rechecked after a target response.
+ * @brief Verify a target response still requires final liveness and deadline checks.
  */
 TEST(photon_readiness, target_response_does_not_bypass_final_progress_check)
 {
-	scripted_health_observer observer({healthy(health_response::STATE_CONTROL_READY)});
 	const readiness_wait_policy policy{std::chrono::milliseconds(1), std::chrono::milliseconds(1),
 					   std::chrono::milliseconds(10)};
-	int checks = 0;
-	const auto result = wait_for_exact_readiness(observer, readiness_gate::CONTROL, policy, [&checks]() {
-		++checks;
-		return checks == 1 ? status::ok() : status::cancelled("cancelled after response");
-	});
-	ASSERT_FALSE(result.is_ok());
-	EXPECT_EQ(result.error().code(), status_code::CANCELLED);
-	EXPECT_EQ(checks, 2);
+	for (const bool cancelled : {true, false}) {
+		SCOPED_TRACE(cancelled);
+		manual_readiness_clock clock;
+		scripted_health_observer observer({healthy(health_response::STATE_CONTROL_READY)});
+		int checks = 0;
+		const auto result = wait_for_exact_readiness(observer, readiness_gate::CONTROL, policy, clock, [&]() {
+			++checks;
+			if (checks == 2) {
+				if (cancelled) {
+					return status::cancelled("cancelled after response");
+				}
+				clock.advance(policy.overall_timeout);
+			}
+			return status::ok();
+		});
+		ASSERT_FALSE(result.is_ok());
+		EXPECT_EQ(result.error().code(), cancelled ? status_code::CANCELLED : status_code::DEADLINE_EXCEEDED);
+		EXPECT_EQ(checks, 2);
+		EXPECT_EQ(observer.calls(), 1U);
+		EXPECT_TRUE(clock.waits().empty());
+	}
 }
 
 /**
@@ -620,6 +745,7 @@ TEST(photon_readiness, target_response_does_not_bypass_final_progress_check)
  */
 TEST(photon_startup, exact_gate_order_and_bootstrap_handoff_succeed)
 {
+	manual_readiness_clock clock;
 	auto spec = valid_startup_spec();
 	const std::vector<std::string> expected_dp{
 		"/opt/kinetum/bin/kinetum_dp",
@@ -662,7 +788,7 @@ TEST(photon_startup, exact_gate_order_and_bootstrap_handoff_succeed)
 					   healthy(health_response::STATE_PACKET_READY)},
 					  status::unavailable("unexpected observation"), &processes.events);
 
-	auto result = start_supervised_children(spec, observer, processes);
+	auto result = start_supervised_children(spec, observer, processes, clock);
 	ASSERT_TRUE(result.is_ok()) << result.error().message();
 	{
 		supervised_pair_owner pair_owner(std::move(result).value(), std::move(spec), restart_policy::NEVER,
@@ -753,12 +879,13 @@ TEST(photon_startup, final_cleanup_failure_fails_stop_before_authority_loss)
  */
 TEST(photon_startup, malformed_authority_fails_before_startup_side_effects)
 {
+	manual_readiness_clock clock;
 	auto spec = valid_startup_spec();
 	spec.plan_content_hash = std::string(64, 'A');
 	fake_startup_process_controller processes;
 	scripted_health_observer observer({healthy(health_response::STATE_CONTROL_READY)});
 
-	auto result = start_supervised_children(spec, observer, processes);
+	auto result = start_supervised_children(spec, observer, processes, clock);
 	ASSERT_FALSE(result.is_ok());
 	EXPECT_EQ(result.error().code(), status_code::INVALID_ARGUMENT);
 	EXPECT_TRUE(processes.spawns.empty());
@@ -777,7 +904,7 @@ TEST(photon_startup, malformed_authority_fails_before_startup_side_effects)
 	for (const auto field : text_fields) {
 		auto nul_spec = valid_startup_spec();
 		(nul_spec.*field).push_back('\0');
-		auto nul_result = start_supervised_children(nul_spec, observer, processes);
+		auto nul_result = start_supervised_children(nul_spec, observer, processes, clock);
 		ASSERT_FALSE(nul_result.is_ok());
 		EXPECT_EQ(nul_result.error().code(), status_code::INVALID_ARGUMENT);
 		EXPECT_TRUE(processes.events.empty());
@@ -790,12 +917,13 @@ TEST(photon_startup, malformed_authority_fails_before_startup_side_effects)
  */
 TEST(photon_startup, relative_process_or_store_paths_fail_before_startup_side_effects)
 {
+	manual_readiness_clock clock;
 	auto spec = valid_startup_spec();
 	fake_startup_process_controller processes;
 	scripted_health_observer observer({healthy(health_response::STATE_CONTROL_READY)});
 
 	spec.dp_executable = "./bin/kinetum_dp";
-	auto relative_process = start_supervised_children(spec, observer, processes);
+	auto relative_process = start_supervised_children(spec, observer, processes, clock);
 	ASSERT_FALSE(relative_process.is_ok());
 	EXPECT_EQ(relative_process.error().code(), status_code::INVALID_ARGUMENT);
 	EXPECT_TRUE(processes.events.empty());
@@ -803,7 +931,7 @@ TEST(photon_startup, relative_process_or_store_paths_fail_before_startup_side_ef
 
 	spec = valid_startup_spec();
 	spec.config_store_dir = ".kinetum_config_store";
-	auto relative_store = start_supervised_children(spec, observer, processes);
+	auto relative_store = start_supervised_children(spec, observer, processes, clock);
 	ASSERT_FALSE(relative_store.is_ok());
 	EXPECT_EQ(relative_store.error().code(), status_code::INVALID_ARGUMENT);
 	EXPECT_TRUE(processes.events.empty());
@@ -815,12 +943,13 @@ TEST(photon_startup, relative_process_or_store_paths_fail_before_startup_side_ef
  */
 TEST(photon_startup, dp_exit_during_control_gate_rolls_back_only_dp)
 {
+	manual_readiness_clock clock;
 	auto spec = valid_startup_spec();
 	fake_startup_process_controller processes;
 	processes.exit_on_check_name = "dp";
 	scripted_health_observer observer({healthy(health_response::STATE_CONTROL_READY)});
 
-	auto result = start_supervised_children(spec, observer, processes);
+	auto result = start_supervised_children(spec, observer, processes, clock);
 	ASSERT_FALSE(result.is_ok());
 	EXPECT_EQ(result.error().code(), status_code::FAILED_PRECONDITION);
 	EXPECT_NE(result.error().message().find("exit_code=73"), std::string::npos);
@@ -834,12 +963,13 @@ TEST(photon_startup, dp_exit_during_control_gate_rolls_back_only_dp)
  */
 TEST(photon_startup, cp_spawn_failure_rolls_back_dp)
 {
+	manual_readiness_clock clock;
 	auto spec = valid_startup_spec();
 	fake_startup_process_controller processes;
 	processes.fail_spawn_name = "cp";
 	scripted_health_observer observer({healthy(health_response::STATE_CONTROL_READY)});
 
-	auto result = start_supervised_children(spec, observer, processes);
+	auto result = start_supervised_children(spec, observer, processes, clock);
 	ASSERT_FALSE(result.is_ok());
 	EXPECT_EQ(result.error().code(), status_code::INTERNAL_ERROR);
 	EXPECT_EQ(processes.terminated_names, (std::vector<std::string>{"dp"}));
@@ -850,13 +980,14 @@ TEST(photon_startup, cp_spawn_failure_rolls_back_dp)
  */
 TEST(photon_startup, cp_exit_during_packet_gate_rolls_back_cp_before_dp)
 {
+	manual_readiness_clock clock;
 	auto spec = valid_startup_spec();
 	fake_startup_process_controller processes;
 	processes.exit_on_check_name = "cp";
 	scripted_health_observer observer(
 		{healthy(health_response::STATE_CONTROL_READY), healthy(health_response::STATE_PACKET_READY)});
 
-	auto result = start_supervised_children(spec, observer, processes);
+	auto result = start_supervised_children(spec, observer, processes, clock);
 	ASSERT_FALSE(result.is_ok());
 	EXPECT_EQ(result.error().code(), status_code::FAILED_PRECONDITION);
 	EXPECT_NE(result.error().message().find("cp exited during PACKET_READY readiness"), std::string::npos);
@@ -870,17 +1001,20 @@ TEST(photon_startup, cp_exit_during_packet_gate_rolls_back_cp_before_dp)
  */
 TEST(photon_startup, packet_gate_timeout_rolls_back_cp_before_dp)
 {
+	manual_readiness_clock clock;
 	auto spec = valid_startup_spec();
 	spec.packet_wait = {std::chrono::milliseconds(1), std::chrono::milliseconds(1), std::chrono::milliseconds(4)};
 	fake_startup_process_controller processes;
 	const auto control_ready = healthy(health_response::STATE_CONTROL_READY);
 	scripted_health_observer observer({control_ready}, control_ready);
 
-	auto result = start_supervised_children(spec, observer, processes);
+	auto result = start_supervised_children(spec, observer, processes, clock);
 	ASSERT_FALSE(result.is_ok());
 	EXPECT_EQ(result.error().code(), status_code::DEADLINE_EXCEEDED);
 	EXPECT_EQ(processes.terminated_names, (std::vector<std::string>{"cp", "dp"}));
 	EXPECT_EQ(processes.termination_timeouts, (std::vector<int>{37, 37}));
+	EXPECT_EQ(clock.now().time_since_epoch(), std::chrono::milliseconds(4));
+	EXPECT_EQ(clock.waits().size(), 4U);
 }
 
 /**
@@ -888,11 +1022,12 @@ TEST(photon_startup, packet_gate_timeout_rolls_back_cp_before_dp)
  */
 TEST(photon_startup, shutdown_cancellation_rolls_back_before_health_observation)
 {
+	manual_readiness_clock clock;
 	auto spec = valid_startup_spec();
 	fake_startup_process_controller processes;
 	scripted_health_observer observer({healthy(health_response::STATE_CONTROL_READY)});
 
-	auto result = start_supervised_children(spec, observer, processes, []() { return true; });
+	auto result = start_supervised_children(spec, observer, processes, clock, []() { return true; });
 	ASSERT_FALSE(result.is_ok());
 	EXPECT_EQ(result.error().code(), status_code::CANCELLED);
 	EXPECT_EQ(observer.calls(), 0U);
@@ -904,6 +1039,7 @@ TEST(photon_startup, shutdown_cancellation_rolls_back_before_health_observation)
  */
 TEST(photon_startup, dp_failure_restarts_complete_pair_through_bundle_and_readiness)
 {
+	manual_readiness_clock clock;
 	auto spec = valid_startup_spec();
 	const auto expected_dp = std::vector<std::string>{spec.dp_executable,
 							  "--bundle",
@@ -925,7 +1061,7 @@ TEST(photon_startup, dp_failure_restarts_complete_pair_through_bundle_and_readin
 					  status::unavailable("unexpected observation"), &processes.events);
 
 	supervised_pair_owner owner(std::move(children), std::move(spec), restart_policy::ON_FAILURE, processes);
-	const auto result = owner.resolve_observed_exit(observer);
+	const auto result = owner.resolve_observed_exit(observer, clock);
 	ASSERT_TRUE(result.is_ok()) << result.message();
 	const auto &replacement = owner.children();
 	EXPECT_EQ(processes.terminated_names, (std::vector<std::string>{"cp", "dp"}));
@@ -943,6 +1079,7 @@ TEST(photon_startup, dp_failure_restarts_complete_pair_through_bundle_and_readin
  */
 TEST(photon_startup, cp_failure_restarts_complete_pair_through_bundle_and_readiness)
 {
+	manual_readiness_clock clock;
 	auto spec = valid_startup_spec();
 	auto children = observed_terminal_pair(terminal_child_role::CP, 72);
 	fake_startup_process_controller processes;
@@ -950,7 +1087,7 @@ TEST(photon_startup, cp_failure_restarts_complete_pair_through_bundle_and_readin
 		{healthy(health_response::STATE_CONTROL_READY), healthy(health_response::STATE_PACKET_READY)});
 
 	supervised_pair_owner owner(std::move(children), std::move(spec), restart_policy::ON_FAILURE, processes);
-	const auto result = owner.resolve_observed_exit(observer);
+	const auto result = owner.resolve_observed_exit(observer, clock);
 	ASSERT_TRUE(result.is_ok()) << result.message();
 	const auto &replacement = owner.children();
 	EXPECT_EQ(processes.terminated_names, (std::vector<std::string>{"cp", "dp"}));
@@ -969,13 +1106,14 @@ TEST(photon_startup, cp_failure_restarts_complete_pair_through_bundle_and_readin
  */
 TEST(photon_startup, never_policy_reports_unexpected_exit_after_pair_cleanup)
 {
+	manual_readiness_clock clock;
 	auto spec = valid_startup_spec();
 	auto children = observed_terminal_pair(terminal_child_role::DP, 71);
 	fake_startup_process_controller processes;
 	scripted_health_observer observer({healthy(health_response::STATE_CONTROL_READY)});
 
 	supervised_pair_owner owner(std::move(children), std::move(spec), restart_policy::NEVER, processes);
-	const auto result = owner.resolve_observed_exit(observer);
+	const auto result = owner.resolve_observed_exit(observer, clock);
 	EXPECT_EQ(result.code(), status_code::FAILED_PRECONDITION);
 	EXPECT_EQ(result.message(), "supervised child exit is not eligible for pair replacement");
 	EXPECT_EQ(processes.terminated_names, (std::vector<std::string>{"cp", "dp"}));
@@ -986,13 +1124,14 @@ TEST(photon_startup, never_policy_reports_unexpected_exit_after_pair_cleanup)
 /** @brief Verify a zero exit cannot satisfy the nonzero-exit restart policy. */
 TEST(photon_startup, on_failure_policy_reports_zero_exit_after_pair_cleanup)
 {
+	manual_readiness_clock clock;
 	auto spec = valid_startup_spec();
 	auto children = observed_terminal_pair(terminal_child_role::CP, 0);
 	fake_startup_process_controller processes;
 	scripted_health_observer observer({healthy(health_response::STATE_CONTROL_READY)});
 
 	supervised_pair_owner owner(std::move(children), std::move(spec), restart_policy::ON_FAILURE, processes);
-	const auto result = owner.resolve_observed_exit(observer);
+	const auto result = owner.resolve_observed_exit(observer, clock);
 	EXPECT_EQ(result.code(), status_code::FAILED_PRECONDITION);
 	EXPECT_EQ(result.message(), "supervised child exit is not eligible for pair replacement");
 	EXPECT_EQ(processes.terminated_names, (std::vector<std::string>{"cp", "dp"}));

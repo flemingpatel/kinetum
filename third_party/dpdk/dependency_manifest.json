@@ -110,7 +110,7 @@
         "-moutline-atomics"
       ],
       "expected_rte_build_config_sha256": "8173d2a45c6a3910297ae4ce775135a008963215f8b3cb3c78a7e2691e452ea3",
-      "expected_payload_sha256": "68ddfe604fe74d0fff67818245b1de642739041e065bd263a7ae58a8c9c4cdfb"
+      "expected_payload_sha256": "990d8137740553d8f0f753cfbb2a994b4eeb6f067f3660a27205bdc2f22b1184"
     },
     "linux-gnu-x86_64": {
       "machine": "x86_64",
@@ -120,7 +120,7 @@
         "-march=corei7"
       ],
       "expected_rte_build_config_sha256": "a37e992ba067f20fa87fbbf2785335a1592d5dcb3cf60445596bdde45b4f51ee",
-      "expected_payload_sha256": "351519c4b8c612818748b047528ad97bfd2877e46ae40b09d8cefaeb46f66e3f"
+      "expected_payload_sha256": "97bee24b01cfcf0fea3d2cb6df2d20118acdf119babaa658fa3ff98c54972f13"
     }
   }
 }

@@ -66,9 +66,10 @@ from kinetum_validation.orchestrator import TestOrchestrator as ValidationOrches
 
 from kinetum_validation.report.console import ConsoleReporter
 from kinetum_validation.report.artifacts import RunArtifacts
+from tests.traffic_fixtures import complete_trex_identity
 
 
-TREX_IDENTITY = {"version": "v3.06", "mode": "STL"}
+TREX_IDENTITY = complete_trex_identity()
 TEST_PROCESS_CONFIG = ProcessConfig(
     runtime_root=Path("/opt/kinetum"),
     validation_root=Path("/var/tmp/kinetum-validation"),
@@ -539,7 +540,7 @@ def _epoch_benchmark_case(inclusion_policy: str):
             bundle = run_root / "runtime_bundle"
             with redirect_stdout(io.StringIO()):
                 orchestrator._save_run_metadata(  # pylint: disable=protected-access
-                    bundle / "configs/plan.pbtxt", bundle, dict(TREX_IDENTITY)
+                    bundle / "configs/plan.pbtxt", bundle, copy.deepcopy(TREX_IDENTITY)
                 )
             result = _as_trex_latency_unavailable(_epoch_test_result_artifact())
             result["epoch_test"].update(
@@ -973,7 +974,7 @@ class TestTransitionSummaryPerType(unittest.TestCase):
             "traffic_host": "trex.example",
             "latency_source": None,
         })
-        trex_summary["trex_identity"] = dict(TREX_IDENTITY)
+        trex_summary["trex_identity"] = copy.deepcopy(TREX_IDENTITY)
         del trex_summary["scenario_metrics"]["epoch_test"]["avg_latency_us"]
         validate_benchmark_summary(trex_summary)
         missing_identity = copy.deepcopy(trex_summary)
@@ -1223,7 +1224,7 @@ class TestTransitionSummaryPerType(unittest.TestCase):
             traffic_driver="trex", latency_source=None, traffic_host="traffic-host",
         )
         summary["scenario_metrics"]["epoch_test"].pop("avg_latency_us")
-        summary["trex_identity"] = dict(TREX_IDENTITY)
+        summary["trex_identity"] = copy.deepcopy(TREX_IDENTITY)
         manifest = _epoch_benchmark_manifest()
         manifest["scenario"] = copy.deepcopy(summary["scenario"])
         validate_benchmark_summary_identity(summary, manifest)
@@ -1234,6 +1235,24 @@ class TestTransitionSummaryPerType(unittest.TestCase):
             validate_benchmark_summary_identity(summary, manifest)
         manifest["scenario"]["storage_profile"] = "per_rx_queue"
         validate_benchmark_summary_identity(summary, manifest)
+
+    def test_benchmark_capability_ports_match_default_and_overridden_endpoints(self):
+        """Valid capability rows for a missing or foreign port cannot enter a report."""
+        summary = _epoch_benchmark_summary()
+        summary["scenario"].update(
+            deployment="fan_in_edge_gateway", backend="dpdk_pci",
+            traffic_driver="trex", latency_source=None, traffic_host="traffic-host",
+        )
+        summary["scenario_metrics"]["epoch_test"].pop("avg_latency_us")
+        for override, expected in (([], (0, 1, 2)), ([5, 7, 6], (5, 6, 7))):
+            with self.subTest(override=override):
+                summary["scenario"]["trex_ports"] = override
+                summary["trex_identity"] = complete_trex_identity(ports=expected)
+                validate_benchmark_summary(summary)
+                for invalid in (expected[:-1], (*expected, 9), (*expected[:-1], 9)):
+                    summary["trex_identity"] = complete_trex_identity(ports=invalid)
+                    with self.assertRaisesRegex(JsonContractError, "foreign port membership"):
+                        validate_benchmark_summary(summary)
 
     def test_benchmark_summary_is_bound_to_exact_scenario_and_run_population(self):
         """Aggregate validation must reject cross-scenario or invented samples."""
@@ -1256,14 +1275,17 @@ class TestTransitionSummaryPerType(unittest.TestCase):
             "run_002": {"all_passed": True, "setup_failed": False},
         }
         identities = {
-            "run_001": dict(TREX_IDENTITY),
-            "run_002": dict(TREX_IDENTITY),
+            "run_001": copy.deepcopy(TREX_IDENTITY),
+            "run_002": copy.deepcopy(TREX_IDENTITY),
         }
         self.assertEqual(
             _selected_trex_identity(selected_runs, identities, False, "trex"),
             TREX_IDENTITY,
         )
-        identities["run_002"] = {"version": "v3.07", "mode": "STL"}
+        identities["run_002"] = complete_trex_identity(version="v3.07")
+        with self.assertRaisesRegex(ValueError, "different TRex identities"):
+            _selected_trex_identity(selected_runs, identities, False, "trex")
+        identities["run_002"] = complete_trex_identity(counters=256, filter_mode="fetch all")
         with self.assertRaisesRegex(ValueError, "different TRex identities"):
             _selected_trex_identity(selected_runs, identities, False, "trex")
         self.assertIsNone(

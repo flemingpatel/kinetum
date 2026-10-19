@@ -541,7 +541,7 @@ make_dpdk_rss_bindings(const kinetum::axiom::v1::Pipeline &pipeline)
 	}
 	set_queue_count(*rx, 2);
 	rx->mutable_steering()->set_kind(kinetum::gluon::v1::TRAFFIC_STEERING_KIND_RSS);
-	rx->mutable_steering()->set_symmetric(true);
+	rx->mutable_steering()->set_symmetric(false);
 	rx->mutable_steering()->add_hash_fields("ipv4");
 	rx->mutable_steering()->add_hash_fields("udp");
 	rx->mutable_steering()->set_hash_key(RSS_KEY, sizeof(RSS_KEY) - 1u);
@@ -1726,7 +1726,7 @@ TEST(runtime_plan_compiler, compiles_multiple_rx_streams_with_rss_traffic_steeri
 	ASSERT_EQ(compiled.steering_profiles.size(), 1u);
 	const auto &profile = compiled.steering_profiles[0];
 	EXPECT_EQ(profile.kind, compiled_steering_kind::RSS);
-	EXPECT_TRUE(profile.symmetric);
+	EXPECT_FALSE(profile.symmetric);
 	EXPECT_EQ(profile.hash_fields, (std::vector<std::string>{"ipv4", "udp"}));
 	EXPECT_EQ(profile.hash_key, "0123456789abcdef0123456789abcdef01234567");
 	EXPECT_EQ(profile.io_stream_indices.size(), 2u);
@@ -1742,11 +1742,22 @@ TEST(runtime_plan_compiler, rejects_single_stream_rss_profile)
 	ASSERT_EQ(plan.traffic_steering_profiles_size(), 1);
 	auto *profile = plan.mutable_traffic_steering_profiles(0);
 	profile->set_kind(kinetum::gluon::v1::TRAFFIC_STEERING_KIND_RSS);
-	profile->set_symmetric(true);
+	profile->set_symmetric(false);
 	profile->add_hash_fields("ipv4");
 	profile->set_hash_key("0123456789abcdef0123456789abcdef01234567");
 
 	expect_compiler_reject(plan, "RSS steering requires fields, deterministic key, and multiple streams");
+}
+
+/** @brief Unsupported symmetry rejects before any provider is materialized. */
+TEST(runtime_plan_compiler, rejects_symmetric_rss_before_provider_materialization)
+{
+	auto plan_or = make_valid_rss_provider_plan();
+	ASSERT_TRUE(plan_or.is_ok()) << plan_or.error().message();
+	auto plan = std::move(plan_or).value();
+	ASSERT_EQ(plan.traffic_steering_profiles_size(), 1);
+	plan.mutable_traffic_steering_profiles(0)->set_symmetric(true);
+	expect_compiler_reject(plan, "does not support symmetric RSS");
 }
 
 /** @brief Verify multi-queue RX never infers an omitted steering profile. */
@@ -1766,7 +1777,7 @@ TEST(runtime_plan_compiler, rejects_multiple_rx_streams_without_traffic_steering
 }
 
 /** @brief Verify RSS always carries exact deterministic key bytes. */
-TEST(runtime_plan_compiler, rejects_symmetric_rss_profile_without_exact_key)
+TEST(runtime_plan_compiler, rejects_rss_profile_without_exact_key)
 {
 	auto plan_or = make_valid_rss_provider_plan();
 	ASSERT_TRUE(plan_or.is_ok()) << plan_or.error().message();
@@ -2049,7 +2060,7 @@ TEST(runtime_plan_compiler, compiles_dpdk_host_requirements_at_exact_proof_phase
 	ASSERT_TRUE(compiled_or.is_ok()) << compiled_or.error().message();
 	const auto &requirements = compiled_or.value().host_requirements;
 
-	ASSERT_EQ(requirements.size(), 5u);
+	ASSERT_EQ(requirements.size(), 6u);
 	auto count = [&](provider_host_proof_phase phase, provider_host_fact fact, provider_contract_role role) {
 		return std::count_if(requirements.begin(), requirements.end(), [&](const auto &requirement) {
 			return requirement.phase == phase && requirement.fact == fact && requirement.role == role;
@@ -2066,6 +2077,9 @@ TEST(runtime_plan_compiler, compiles_dpdk_host_requirements_at_exact_proof_phase
 		  1);
 	EXPECT_EQ(count(provider_host_proof_phase::COMPONENT_HOST_PROOF,
 			provider_host_fact::DPDK_HUGEPAGE_PAYLOAD_FLOOR, provider_contract_role::PROCESS_FACILITY),
+		  1);
+	EXPECT_EQ(count(provider_host_proof_phase::COMPONENT_HOST_PROOF, provider_host_fact::DPDK_PCI_ADAPTER_OWNERSHIP,
+			provider_contract_role::PROCESS_FACILITY),
 		  1);
 	EXPECT_EQ(count(provider_host_proof_phase::MATERIALIZATION_PROOF, provider_host_fact::DPDK_ETHDEV_PORT,
 			provider_contract_role::IO_DRIVER),

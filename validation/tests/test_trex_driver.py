@@ -12,6 +12,7 @@ import contextlib
 import copy
 import inspect
 import json
+import math
 import os
 import sys
 import tempfile
@@ -42,9 +43,11 @@ from kinetum_validation.process.kinetumctl import KinetumCtl
 from kinetum_validation.process.telemetry import StatsResult
 from kinetum_validation.traffic import trex as trex_module
 from kinetum_validation.traffic.trex import TRexTrafficDriver
+from kinetum_validation.traffic.trex_protocol import TRexRemoteFailure, generation_pgid_layout, require_trex_capacity
+from tests.traffic_fixtures import complete_trex_identity, native_trex_port_info
 
 
-TREX_IDENTITY = {"version": "v3.06", "mode": "STL"}
+TREX_IDENTITY = complete_trex_identity()
 PORT_COUNTER_BASELINE = {
     "0": {"opackets": 100000, "ipackets": 8, "oerrors": 3, "ierrors": 1},
     "1": {"opackets": 200000, "ipackets": 9, "oerrors": 4, "ierrors": 2},
@@ -171,6 +174,8 @@ def _execute_remote_action(client, spec, monotonic, wall_time):
     )
     namespace = {
         "contextlib": contextlib,
+        "json": json,
+        "math": math,
         "sys": sys,
         "os": os,
         "time": MagicMock(),
@@ -181,7 +186,11 @@ def _execute_remote_action(client, spec, monotonic, wall_time):
         "egress_ports": spec["egress_ports"],
         "ingress_streams": spec["ingress_streams"],
         "promisc_ports": [],
+        "CAPABILITY_TEXT_BYTES": 128,
+        "RX_CAPABILITY_LIMIT": 16,
     }
+    if spec["action"] in {"generation_start", "generation_finish"}:
+        namespace["generation_layout"] = generation_pgid_layout(len(spec["ingress_streams"]), spec["num_flows"])
     exec(compile(functions, "<remote_trex_functions>", "exec"), namespace)  # pylint: disable=exec-used
     namespace["time"].monotonic.side_effect = monotonic
     namespace["time"].time.side_effect = wall_time
@@ -204,6 +213,8 @@ def _counter_client(counters, stats):
     client.get_port.side_effect = ports.__getitem__
     client.get_stats.return_value = stats
     client.add_streams.return_value = [1, 2]
+    client.get_server_version.return_value = {"version": TREX_IDENTITY["version"], "mode": "STL"}
+    client.get_port_info.return_value = native_trex_port_info(TREX_IDENTITY)
     return client
 
 
@@ -222,8 +233,8 @@ async def _analyze_stats_run(
         Normalized traffic evidence returned by the production driver path.
     """
     await driver.start_capture(pcap_file, "udp")
-    driver._trex_identity = dict(TREX_IDENTITY)  # pylint: disable=protected-access
-    raw["trex_identity"] = dict(TREX_IDENTITY)
+    driver._trex_identity = copy.deepcopy(TREX_IDENTITY)  # pylint: disable=protected-access
+    raw["trex_identity"] = copy.deepcopy(TREX_IDENTITY)
     driver._last_run = raw  # pylint: disable=protected-access
     await driver.stop_capture()
     return await driver.analyze_capture(
@@ -247,13 +258,13 @@ class _CapturingTRexDriver(TRexTrafficDriver):
         self.specs = []
         self.cancelled = False
         self.probe_identity = (
-            dict(TREX_IDENTITY)
+            copy.deepcopy(TREX_IDENTITY)
             if probe_identity is None
             else probe_identity
         )
         self.probe_work_dir = probe_work_dir
         if initialized:
-            self._trex_identity = dict(TREX_IDENTITY)  # pylint: disable=protected-access
+            self._trex_identity = copy.deepcopy(TREX_IDENTITY)  # pylint: disable=protected-access
 
     async def _invoke_remote(self, spec):  # pylint: disable=arguments-differ
         """Validate, record, and answer one endpoint action deterministically."""
@@ -264,8 +275,6 @@ class _CapturingTRexDriver(TRexTrafficDriver):
                 "ok": True,
                 "action": "probe",
                 "ports": [0, 1, 2],
-                "stats_keys": ["global"],
-                "promiscuous_ports": [2],
                 "work_dir": (
                     spec["work_dir"]
                     if self.probe_work_dir is None
@@ -277,6 +286,8 @@ class _CapturingTRexDriver(TRexTrafficDriver):
             response = {
                 "ok": True,
                 "action": "generation_start",
+                "trex_identity": copy.deepcopy(TREX_IDENTITY),
+                "pgid_demand": 4,
                 "duration_s": spec["duration_s"],
                 "initial_generation_tag": spec["initial_generation_tag"],
                 "next_generation_tag": spec["next_generation_tag"],
@@ -350,6 +361,8 @@ class _CapturingTRexDriver(TRexTrafficDriver):
             response = {
                 "ok": True,
                 "action": "generation_finish",
+                "trex_identity": copy.deepcopy(TREX_IDENTITY),
+                "pgid_demand": 4,
                 "tx_count": 15500,
                 "rx_count": 15500,
                 "errors": 0,
@@ -391,6 +404,8 @@ class _CapturingTRexDriver(TRexTrafficDriver):
             response = {
                 "ok": True,
                 "action": "run",
+                "trex_identity": copy.deepcopy(TREX_IDENTITY),
+                "pgid_demand": 0,
                 "tx_count": 10,
                 "rx_count": 9,
                 "errors": 0,
@@ -409,6 +424,8 @@ class _CapturingTRexDriver(TRexTrafficDriver):
         else:
             raise RuntimeError("test TRex action is undeclared")
 
+        if spec["action"] in {"generation_finish", "generation_abort"}:
+            self._active_generation_session = None
         expected_keys = trex_module._REMOTE_SUCCESS_KEYS[  # pylint: disable=protected-access
             spec["action"]
         ]
@@ -456,15 +473,17 @@ class _FailedGenerationStartDriver(TRexTrafficDriver):
         """Initialize one exact action ledger."""
         super().__init__(_trex_config())
         self.actions = []
-        self._trex_identity = dict(TREX_IDENTITY)  # pylint: disable=protected-access
+        self.start_failure = RuntimeError("injected generation-start response loss")
+        self._trex_identity = copy.deepcopy(TREX_IDENTITY)  # pylint: disable=protected-access
 
     async def _invoke_remote(self, spec):  # pylint: disable=arguments-differ
         """Inject start ambiguity and admit the exact compensating abort."""
         self._validate_remote_request(spec)  # pylint: disable=protected-access
         self.actions.append(spec["action"])
         if spec["action"] == "generation_start":
-            raise RuntimeError("injected generation-start response loss")
+            raise self.start_failure
         if spec["action"] == "generation_abort":
+            self._active_generation_session = None
             return {
                 "ok": True,
                 "action": "generation_abort",
@@ -481,36 +500,39 @@ class TestTRexTrafficDriver(unittest.TestCase):  # pylint: disable=too-many-publ
 
         self.assertTrue(driver.requires_sustained_generation_overlap)
 
-    def test_probe_records_only_bounded_stateless_server_identity(self):
-        """The setup probe alone records bounded stateless provenance."""
+    def test_probe_records_complete_stateless_instrument_identity(self):
+        """Setup retains the reported server and every selected port capability."""
         driver = _CapturingTRexDriver(initialized=False)
         asyncio.run(driver.setup())
         self.assertEqual(driver.traffic_generator_identity, TREX_IDENTITY)
-        self.assertIn(
-            "trex_identity(client.get_server_version())",
-            trex_module._REMOTE_TREX_SCRIPT,  # pylint: disable=protected-access
-        )
         response_contracts = trex_module._REMOTE_SUCCESS_KEYS  # pylint: disable=protected-access
-        self.assertIn("trex_identity", response_contracts["probe"])
-        self.assertTrue(
-            all(
-                "trex_identity" not in fields
-                for action, fields in response_contracts.items()
-                if action != "probe"
-            )
-        )
-        remote_script = trex_module._REMOTE_TREX_SCRIPT  # pylint: disable=protected-access
-        self.assertEqual(remote_script.count("client.get_server_version()"), 1)
+        for action in ("probe", "run", "generation_start", "generation_finish", "exchange_udp"):
+            self.assertIn("trex_identity", response_contracts[action])
         asyncio.run(driver.teardown())
         self.assertIsNone(driver.traffic_generator_identity)
 
-        malformed_identities = (
-            {"version": "", "mode": "STL"},
-            {"version": "v3.06", "mode": "ASTF"},
-            {"version": "v3.06", "mode": "STL", "extra": "x"},
-            {"version": "x" * 129, "mode": "STL"},
-            {"version": "v3.\N{SNOWMAN}", "mode": "STL"},
-        )
+        malformed_identities = [
+            {**TREX_IDENTITY, "version": ""},
+            {**TREX_IDENTITY, "mode": "ASTF"},
+            {**TREX_IDENTITY, "extra": "x"},
+            {**TREX_IDENTITY, "version": "x" * 129},
+            {**TREX_IDENTITY, "version": "v3.\N{SNOWMAN}"},
+            {"version": "v3.06", "mode": "STL"},
+        ]
+        for fault in ("missing counter", "boolean counter", "duplicate port", "foreign port", "duplicate capability"):
+            identity = copy.deepcopy(TREX_IDENTITY)
+            port = identity["ports"][-1]
+            if fault == "missing counter":
+                del port["rx_counters"]
+            elif fault == "boolean counter":
+                port["rx_counters"] = True
+            elif fault == "duplicate port":
+                identity["ports"].append(copy.deepcopy(port))
+            elif fault == "foreign port":
+                port["port_id"] = 3
+            else:
+                port["rx_caps"] = ["flow_stats", "flow_stats"]
+            malformed_identities.append(identity)
         for identity in malformed_identities:
             with self.subTest(identity=identity):
                 malformed = _CapturingTRexDriver(identity, initialized=False)
@@ -721,39 +743,55 @@ class TestTRexTrafficDriver(unittest.TestCase):  # pylint: disable=too-many-publ
             ],
         )
 
-    def test_generation_finish_releases_session_before_result_normalization(self):
-        """Malformed terminal counters cannot trigger a second remote abort."""
-        driver = _CapturingTRexDriver()
-        sender = driver.make_sender(PacketConfig())
-
-        async def run_session() -> None:
-            """Complete remote ownership, then inject malformed terminal data."""
+    def test_generation_terminal_exit_retires_before_local_result_rejection(self):
+        """A proven endpoint exit retires ownership even when local decoding or delivery fails."""
+        async def run_session(action, failure):
+            """Exercise production transport retirement and the sender's normal failure cleanup."""
+            driver = _CapturingTRexDriver()
+            sender = driver.make_sender(PacketConfig())
+            process = _FakeRemoteProcess()
+            process.returncode = 0
+            launch = AsyncMock(return_value=process)
+            output = b"invalid JSON" if failure == "json" else b'{"ok":true}'
+            diagnostic = b"\xff" if failure == "diagnostic" else b""
+            receive = AsyncMock(return_value=(output, diagnostic))
+            if failure == "delivery":
+                receive.side_effect = RuntimeError("local result delivery failed")
             await sender.begin_generation_tags(15.0, 1, 2)
             await sender.start_generation_overlap(2)
             await sender.end_generation_overlap()
-
-            async def malformed_finish(**_kwargs):
-                """Publish remote retirement followed by malformed counters."""
-                driver._active_generation_session = None  # pylint: disable=protected-access
-                return {}
-
             with patch.object(
-                driver, "finish_generation_session", new=malformed_finish
-            ):
-                with self.assertRaisesRegex(RuntimeError, "omitted required"):
-                    await sender.finish_generation_tags()
-            sender.cleanup()
+                _CapturingTRexDriver, "_invoke_remote",
+                TRexTrafficDriver._invoke_remote,  # pylint: disable=protected-access
+            ), patch.object(
+                trex_module.asyncio, "create_subprocess_exec", new=launch,
+            ), patch.object(trex_module, "communicate_bounded_subprocess", new=receive):
+                with self.assertRaises((RuntimeError, JsonContractError)):
+                    if action == "finish":
+                        await sender.finish_generation_tags()
+                    else:
+                        await sender.abort()
+                await sender.abort()
+                sender.cleanup()
+                await driver.teardown()
+            launch.assert_awaited_once()
 
-        asyncio.run(run_session())
-        self.assertNotIn("generation_abort", [row["action"] for row in driver.specs])
+        for action in ("finish", "abort"):
+            for failure in ("json", "fields", "diagnostic", "delivery"):
+                with self.subTest(action=action, failure=failure):
+                    asyncio.run(run_session(action, failure))
 
     def test_udp_exchange_preserves_exact_request_and_capture_bytes(self):
         """A complete endpoint result returns packet evidence without replacing measurement state."""
         driver = TRexTrafficDriver(_trex_config())
+        driver._trex_identity = copy.deepcopy(TREX_IDENTITY)  # pylint: disable=protected-access
         marker = b"e" * 16
         packet = bytes.fromhex("4500002c00000000401100000a000001c63364094e20c34f00180000") + marker
         frame = bytes.fromhex("001122334455024b4e4154000800") + packet
-        response = {"ok": True, "action": "exchange_udp", "frames": [frame.hex()]}
+        response = {
+            "ok": True, "action": "exchange_udp", "frames": [frame.hex()],
+            "trex_identity": copy.deepcopy(TREX_IDENTITY), "pgid_demand": 0,
+        }
         process = _FakeRemoteProcess()
         process.returncode = 0
         receive = AsyncMock(return_value=(json.dumps(response).encode("ascii"), b""))
@@ -776,6 +814,7 @@ class TestTRexTrafficDriver(unittest.TestCase):  # pylint: disable=too-many-publ
     def test_udp_exchange_launch_failure_has_no_remote_capture_owner(self):
         """A local SSH launch failure must not manufacture unresolved remote capture ownership."""
         driver = TRexTrafficDriver(_trex_config())
+        driver._trex_identity = copy.deepcopy(TREX_IDENTITY)  # pylint: disable=protected-access
         marker = b"e" * 16
         packet = bytes.fromhex("4500002c00000000401100000a000001c63364094e20c34f00180000") + marker
 
@@ -790,9 +829,34 @@ class TestTRexTrafficDriver(unittest.TestCase):  # pylint: disable=too-many-publ
 
         asyncio.run(exchange())
 
+    def test_udp_exchange_before_effects_rejection_leaves_no_capture_owner(self):
+        """An exact admission refusal cannot manufacture an unresolved NAT capture."""
+        driver = TRexTrafficDriver(_trex_config())
+        driver._trex_identity = copy.deepcopy(TREX_IDENTITY)  # pylint: disable=protected-access
+        marker = b"e" * 16
+        packet = bytes.fromhex("4500002c00000000401100000a000001c63364094e20c34f00180000") + marker
+        response = {"ok": False, "error": "instrument changed", "mutation_attempted": False}
+        process = _FakeRemoteProcess()
+        process.returncode = 1
+
+        async def exchange():
+            """Reject before remote mutation, then retire the local driver normally."""
+            with patch.object(
+                trex_module.asyncio, "create_subprocess_exec", new=AsyncMock(return_value=process),
+            ), patch.object(
+                trex_module, "communicate_bounded_subprocess",
+                new=AsyncMock(return_value=(json.dumps(response).encode("ascii"), b"")),
+            ):
+                with self.assertRaisesRegex(TRexRemoteFailure, "instrument changed"):
+                    await driver.exchange_udp_packets("wan0", (packet,), marker)
+            await driver.teardown()
+
+        asyncio.run(exchange())
+
     def test_udp_exchange_ambiguity_cannot_report_capture_retired(self):
         """A lost endpoint result keeps capture retirement unproved while local cleanup still runs."""
         driver = TRexTrafficDriver(_trex_config())
+        driver._trex_identity = copy.deepcopy(TREX_IDENTITY)  # pylint: disable=protected-access
         marker = b"e" * 16
         packet = bytes.fromhex("4500002c00000000401100000a000001c63364094e20c34f00180000") + marker
         cancel = MagicMock()
@@ -894,6 +958,15 @@ class TestTRexTrafficDriver(unittest.TestCase):  # pylint: disable=too-many-publ
         self.assertEqual(driver.actions, ["generation_start", "generation_abort"])
         self.assertIsNone(driver._active_generation_session)  # pylint: disable=protected-access
 
+    def test_known_preflight_rejection_never_starts_a_compensating_abort(self):
+        """An explicit before-effects rejection clears intent without taking remote ports."""
+        driver = _FailedGenerationStartDriver()
+        driver.start_failure = TRexRemoteFailure("instrument changed before acquisition", False)
+        with self.assertRaisesRegex(TRexRemoteFailure, "before acquisition"):
+            asyncio.run(driver.start_generation_session(PacketConfig(), 15.0, 1, 2))
+        self.assertEqual(driver.actions, ["generation_start"])
+        self.assertIsNone(driver._active_generation_session)  # pylint: disable=protected-access
+
     def test_stream_identity_is_port_qualified_on_both_transport_sides(self):
         """Cross-port reuse is valid; duplicates and role overlap inside one port reject."""
         remote = _remote_helper(
@@ -963,6 +1036,7 @@ class TestTRexTrafficDriver(unittest.TestCase):  # pylint: disable=too-many-publ
                             "action": action, "spec": request, "ports": [0, 1],
                             "client": client, "emit": emit, "contextlib": contextlib,
                             "sys": sys, "time": time,
+                            "acquire_ports": _remote_helper("acquire_ports"),
                         },
                     )
                     client.acquire.assert_called_once_with(ports=[0, 1], force=True)
@@ -1279,26 +1353,15 @@ class TestTRexTrafficDriver(unittest.TestCase):  # pylint: disable=too-many-publ
             135.0,
         )
 
-    def test_remote_runner_acquires_ports_before_stats(self):
-        """TRex v3.08 requires explicit port ownership for stats calls."""
+    def test_remote_transport_keeps_request_bytes_on_standard_input(self):
+        """Endpoint requests retain bounded stdin transport instead of shell interpolation."""
         script = trex_module._REMOTE_TREX_SCRIPT  # pylint: disable=protected-access
         transport = inspect.getsource(TRexTrafficDriver._invoke_remote)  # pylint: disable=protected-access
 
-        self.assertIn("set(spec) != spec_keys[action]", script)
+        self.assertIn("set(spec) != set(spec_keys[action])", script)
         self.assertIn("sys.stdin.buffer.read", script)
         self.assertIn("stdin=asyncio.subprocess.PIPE", transport)
         self.assertIn("spec_bytes", transport)
-        self.assertIn("client.acquire(ports=ports, force=True)", script)
-        self.assertIn("client.get_stats(ports=ports)", script)
-        self.assertIn("client.release(ports=[int(p) for p in spec[\"ports\"]])", script)
-
-    def test_remote_runner_enables_egress_promiscuous_temporarily(self):
-        """TRex egress observation ports should accept forwarded L2 frames."""
-        script = trex_module._REMOTE_TREX_SCRIPT  # pylint: disable=protected-access
-
-        self.assertIn("promisc_ports = list(egress_ports)", script)
-        self.assertIn("client.set_port_attr(ports=egress_ports, promiscuous=True)", script)
-        self.assertIn("client.set_port_attr(ports=promisc_ports, promiscuous=False)", script)
 
     def test_remote_runner_uses_pgid_flow_stats_for_generation_evidence(self):
         """Generation-overlap runs rely on TRex PGID counters."""
@@ -1363,7 +1426,7 @@ class TestTRexTrafficDriver(unittest.TestCase):  # pylint: disable=too-many-publ
 
     def test_remote_generation_retains_absolute_baseline_across_clients(self):
         """Previous traffic and errors do not enter a reconnected epoch session."""
-        driver = TRexTrafficDriver(_trex_config())
+        driver = _CapturingTRexDriver()
         request = {
             **driver._generation_run_spec(PacketConfig(), 15.0, 1, 2),  # pylint: disable=protected-access
             "action": "generation_start",
@@ -1431,7 +1494,7 @@ class TestTRexTrafficDriver(unittest.TestCase):  # pylint: disable=too-many-publ
 
     def test_remote_run_retains_absolute_snapshots_around_traffic(self):
         """Ordinary runs retain measured snapshots without counting historical errors."""
-        driver = TRexTrafficDriver(_trex_config())
+        driver = _CapturingTRexDriver()
         request = {
             **driver._packet_run_spec(PacketConfig(), 1.0, 0),  # pylint: disable=protected-access
             "action": "run",
@@ -1701,21 +1764,45 @@ class TestTRexTrafficDriver(unittest.TestCase):  # pylint: disable=too-many-publ
         with self.assertRaisesRegex(RuntimeError, "PGID traffic achievement"):
             driver._validate_generation_finish(payload)  # pylint: disable=protected-access
 
-    def test_remote_generation_pgid_base_is_unique_for_many_flows(self):
-        """Generation PGID allocation does not collide across ports or flows."""
-        generation_pg_id_base = _remote_helper("generation_pg_id_base")
+    def test_shared_generation_pgid_layout_preserves_unique_ids_and_demand(self):
+        """The projected function and local authority agree with independent ID populations."""
+        remote_layout = _remote_helper("generation_pgid_layout")
+        for ingress, flows in ((1, 1), (2, 64), (3, 17)):
+            with self.subTest(ingress=ingress, flows=flows):
+                local = generation_pgid_layout(ingress, flows)
+                self.assertEqual(remote_layout(ingress, flows), local)
+                expected = set(range(1000, 1000 + 2 * ingress * flows))
+                self.assertEqual(set(local["initial"]) | set(local["next"]), expected)
+                self.assertFalse(set(local["initial"]) & set(local["next"]))
+                self.assertEqual(local["demand"], len(expected))
+        exact = generation_pgid_layout(1, ((1 << 32) - 1000) // 2)
+        self.assertEqual(exact["next"][-1], (1 << 32) - 1)
+        with self.assertRaisesRegex(RuntimeError, "range overflows"):
+            generation_pgid_layout(1, ((1 << 32) - 1000) // 2 + 1)
 
-        pg_ids = set()
-        for stream_index in range(2):
-            for flow_id in range(64):
-                initial = generation_pg_id_base(stream_index, flow_id, 64)
-                next_generation = initial + 1
-                self.assertNotIn(initial, pg_ids)
-                self.assertNotIn(next_generation, pg_ids)
-                pg_ids.add(initial)
-                pg_ids.add(next_generation)
-
-        self.assertEqual(len(pg_ids), 256)
+    def test_instrument_capacity_is_per_observation_port_and_excludes_id_offset(self):
+        """One observation port needs every distinct PGID regardless of other ports' capacity."""
+        demand = generation_pgid_layout(2, 64)["demand"]
+        self.assertEqual(demand, 256)
+        remote_capacity = _remote_helper("require_trex_capacity")
+        for capacity in (255, 256, 1023):
+            identity = complete_trex_identity(counters=capacity, filter_mode="fetch all")
+            for admit in (require_trex_capacity, remote_capacity):
+                with self.subTest(capacity=capacity, consumer=admit):
+                    if capacity < demand:
+                        with self.assertRaisesRegex(RuntimeError, "requires 256 distinct PGID"):
+                            admit(identity, [2], demand)
+                    else:
+                        admit(identity, [2], demand)
+        identity = complete_trex_identity(counters=4096)
+        identity["ports"][2]["rx_counters"] = 0
+        with self.assertRaisesRegex(RuntimeError, "reports 0"):
+            require_trex_capacity(identity, [2], demand)
+        identity["ports"][2]["rx_caps"] = []
+        require_trex_capacity(identity, [2], 0)
+        identity["ports"][2]["rx_counters"] = 4096
+        with self.assertRaises(RuntimeError):
+            require_trex_capacity(identity, [2], demand)
 
     def test_remote_shell_command_quotes_python_bootstrap(self):
         """OpenSSH remote commands must survive the endpoint shell boundary."""

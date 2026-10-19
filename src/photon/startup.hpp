@@ -25,8 +25,8 @@
  * bounded waits. It must never execute on a packet worker.
  *
  * @par Thread Safety
- * One startup thread owns a transaction, observer, and process controller.
- * Distinct transactions may use distinct controller instances concurrently.
+ * One startup thread owns a transaction, observer, process controller, and clock.
+ * Distinct transactions may use distinct dependencies concurrently.
  * A shutdown predicate must synchronize any state it reads.
  */
 
@@ -173,6 +173,7 @@ using startup_shutdown_check = std::function<bool()>;
  * @param spec Complete validated startup input.
  * @param observer Health observer bound to `spec.dp_endpoint`.
  * @param processes Process spawn/check/terminate authority.
+ * @param clock Monotonic time and waiting shared by both readiness gates.
  * @param shutdown_requested Optional synchronized shutdown predicate.
  * @return Both running children after exact packet readiness, or the original
  *         validation, spawn, readiness, liveness, cancellation, or timeout
@@ -186,7 +187,8 @@ using startup_shutdown_check = std::function<bool()>;
  */
 [[nodiscard]] kinetum::common::status_or<supervised_children>
 start_supervised_children(const supervised_startup_spec &spec, dp_health_observer &observer,
-			  startup_process_controller &processes, const startup_shutdown_check &shutdown_requested = {});
+			  startup_process_controller &processes, readiness_clock &clock,
+			  const startup_shutdown_check &shutdown_requested = {});
 
 /**
  * @brief Scope-bound owner of one packet-ready supervised pair.
@@ -244,12 +246,14 @@ class supervised_pair_owner {
 	 * A policy-declined replacement is FAILED_PRECONDITION after cleanup.
 	 *
 	 * @param observer Health observer bound to the retained DP endpoint.
+	 * @param clock Monotonic time and waiting for any replacement startup.
 	 * @param shutdown_requested Optional synchronized cancellation predicate.
 	 * @return OK only with a complete packet-ready replacement pair; otherwise
 	 *         the policy, cleanup, startup, cancellation, or count failure.
 	 */
 	[[nodiscard]] kinetum::common::status
-	resolve_observed_exit(dp_health_observer &observer, const startup_shutdown_check &shutdown_requested = {});
+	resolve_observed_exit(dp_health_observer &observer, readiness_clock &clock,
+			      const startup_shutdown_check &shutdown_requested = {});
 
 	/**
 	 * @brief Terminate and reap the owned pair exactly once.

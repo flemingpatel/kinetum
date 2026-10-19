@@ -84,14 +84,16 @@ kinetum_provider_host_proof_request proof_request(facility_fixture &fixture)
 /**
  * @brief Return a complete injected host-probe API.
  * @param state Fixture state retained through all callback uses.
- * @return Probe API borrowing the supplied state.
+ * @param fixture Owner of the complete injected PCI observations.
+ * @return Probe API borrowing both supplied owners.
  */
-dpdk_host_probe_api probe_api(host_probe_state &state)
+dpdk_host_probe_api probe_api(host_probe_state &state, facility_fixture &fixture)
 {
 	return dpdk_host_probe_api{
 		.state = &state,
 		.runtime_version = probe_runtime_version,
 		.read_meminfo = read_meminfo,
+		.pci = fixture.api().pci,
 	};
 }
 
@@ -116,7 +118,7 @@ TEST(dpdk_host_probe, exact_unreserved_hugepage_floor_succeeds_without_materiali
 		.meminfo = "HugePages_Free: 1\nHugePages_Rsvd: 0\nHugepagesize: 272 kB\n",
 	};
 	const auto request = proof_request(fixture);
-	const auto api = probe_api(state);
+	const auto api = probe_api(state, fixture);
 
 	const auto status = prove_dpdk_host(request, api, nullptr);
 
@@ -133,7 +135,7 @@ TEST(dpdk_host_probe, reserved_hugepages_cannot_satisfy_the_payload_floor)
 		.meminfo = "HugePages_Free: 2\nHugePages_Rsvd: 2\nHugepagesize: 2048 kB\n",
 	};
 	const auto request = proof_request(fixture);
-	const auto api = probe_api(state);
+	const auto api = probe_api(state, fixture);
 	std::array<char, 256> bytes{};
 	kinetum_provider_diagnostic diagnostic{bytes.data(), static_cast<uint32_t>(bytes.size()), 0};
 
@@ -152,7 +154,7 @@ TEST(dpdk_host_probe, duplicate_hugepage_inventory_fields_fail_closed)
 			   "Hugepagesize: 2048 kB\n",
 	};
 	const auto request = proof_request(fixture);
-	const auto api = probe_api(state);
+	const auto api = probe_api(state, fixture);
 
 	const auto status = prove_dpdk_host(request, api, nullptr);
 
@@ -168,7 +170,7 @@ TEST(dpdk_host_probe, missing_runtime_identity_precedes_meminfo_access)
 		.meminfo = "HugePages_Free: 4\nHugePages_Rsvd: 0\nHugepagesize: 2048 kB\n",
 	};
 	const auto request = proof_request(fixture);
-	const auto api = probe_api(state);
+	const auto api = probe_api(state, fixture);
 
 	const auto status = prove_dpdk_host(request, api, nullptr);
 
@@ -186,13 +188,32 @@ TEST(dpdk_host_probe, incomplete_memory_facts_precede_meminfo_access)
 		.meminfo = "HugePages_Free: 4\nHugePages_Rsvd: 0\nHugepagesize: 2048 kB\n",
 	};
 	const auto request = proof_request(fixture);
-	const auto api = probe_api(state);
+	const auto api = probe_api(state, fixture);
 
 	const auto status = prove_dpdk_host(request, api, nullptr);
 
 	EXPECT_EQ(status, KINETUM_PROVIDER_STATUS_INVALID_ARGUMENT);
 	EXPECT_EQ(state.runtime_queries, 1u);
 	EXPECT_EQ(state.meminfo_reads, 0u);
+}
+
+/** @brief Facility creation rechecks ownership after a successful component host proof. */
+TEST(dpdk_host_probe, changed_pci_ownership_rejects_before_eal)
+{
+	facility_fixture fixture;
+	host_probe_state state{
+		.meminfo = "HugePages_Free: 1\nHugePages_Rsvd: 0\nHugepagesize: 272 kB\n",
+	};
+	ASSERT_EQ(prove_dpdk_host(proof_request(fixture), probe_api(state, fixture), nullptr),
+		  KINETUM_PROVIDER_STATUS_OK);
+	EXPECT_EQ(fixture.api_state().pci_reads, 8u);
+	fixture.api_state().pci_functions.at("0000:01:00.0").binding = dpdk_pci_binding::FOREIGN;
+	EXPECT_EQ(fixture.create(), KINETUM_PROVIDER_STATUS_FAILED_PRECONDITION);
+	EXPECT_EQ(fixture.api_state().pci_reads, 9u);
+	EXPECT_EQ(fixture.api_state().eal_init_calls, 0u);
+	EXPECT_EQ(fixture.api_state().eal_cleanup_calls, 0u);
+	EXPECT_EQ(fixture.api_state().log_stream, nullptr);
+	EXPECT_EQ(fixture.facility(), nullptr);
 }
 
 }  // namespace kinetum::provider::dpdk_component

@@ -439,7 +439,8 @@ status validate_supervised_startup_spec(const supervised_startup_spec &spec)
 
 kinetum::common::status_or<supervised_children>
 start_supervised_children(const supervised_startup_spec &spec, dp_health_observer &observer,
-			  startup_process_controller &processes, const startup_shutdown_check &shutdown_requested)
+			  startup_process_controller &processes, readiness_clock &clock,
+			  const startup_shutdown_check &shutdown_requested)
 {
 	const auto validation_status = validate_supervised_startup_spec(spec);
 	if (!validation_status.is_ok()) {
@@ -453,9 +454,9 @@ start_supervised_children(const supervised_startup_spec &spec, dp_health_observe
 	}
 	transaction.set_dp(std::move(dp_or).value());
 
-	const auto control_status = wait_for_exact_readiness(observer, readiness_gate::CONTROL, spec.control_wait,
-							     make_progress_check(transaction, processes, false,
-										 "CONTROL_READY", shutdown_requested));
+	const auto control_status = wait_for_exact_readiness(
+		observer, readiness_gate::CONTROL, spec.control_wait, clock,
+		make_progress_check(transaction, processes, false, "CONTROL_READY", shutdown_requested));
 	if (!control_status.is_ok()) {
 		return transaction.rollback(control_status.error());
 	}
@@ -466,7 +467,7 @@ start_supervised_children(const supervised_startup_spec &spec, dp_health_observe
 	}
 	transaction.set_cp(std::move(cp_or).value());
 
-	const auto packet_status = wait_for_exact_readiness(observer, readiness_gate::PACKET, spec.packet_wait,
+	const auto packet_status = wait_for_exact_readiness(observer, readiness_gate::PACKET, spec.packet_wait, clock,
 							    make_progress_check(transaction, processes, true,
 										"PACKET_READY", shutdown_requested));
 	if (!packet_status.is_ok()) {
@@ -565,7 +566,7 @@ status supervised_pair_owner::stop()
 	return stopped;
 }
 
-status supervised_pair_owner::resolve_observed_exit(dp_health_observer &observer,
+status supervised_pair_owner::resolve_observed_exit(dp_health_observer &observer, readiness_clock &clock,
 						    const startup_shutdown_check &shutdown_requested)
 {
 	const bool dp_exited = !children_.dp.is_running();
@@ -595,7 +596,7 @@ status supervised_pair_owner::resolve_observed_exit(dp_health_observer &observer
 	}
 
 	const uint32_t next_restart_count = children_.restart_count + 1u;
-	auto replacement_or = start_supervised_children(startup_spec_, observer, processes_, shutdown_requested);
+	auto replacement_or = start_supervised_children(startup_spec_, observer, processes_, clock, shutdown_requested);
 	if (!replacement_or.is_ok()) {
 		armed_ = false;
 		return replacement_or.error();

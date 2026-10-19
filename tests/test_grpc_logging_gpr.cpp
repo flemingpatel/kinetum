@@ -9,7 +9,9 @@
 
 #include <cstdlib>
 #include <algorithm>
+#include <array>
 #include <filesystem>
+#include <optional>
 #include <string>
 
 #include <grpc/support/log.h>
@@ -34,6 +36,9 @@ void verify_native_capture(const std::filesystem::path &root)
 {
 	log_options options;
 	options.directory = root.string();
+	const auto component = log_component_index("grpc");
+	ASSERT_TRUE(component.has_value());
+	options.component_levels[*component] = log_level::INFO;
 	auto logger_or = log_service::start(options, "kinetum_cp");
 	ASSERT_TRUE(logger_or.is_ok());
 	auto logger = std::move(logger_or).value();
@@ -60,6 +65,51 @@ void verify_native_capture(const std::filesystem::path &root)
 	EXPECT_EQ(records.find("changed-after-callback"), std::string::npos);
 	EXPECT_EQ(records.find("filtered-native-canary"), std::string::npos);
 	EXPECT_EQ(records.find("packet-native-canary"), std::string::npos);
+}
+
+/** @brief Authored filter choices and independently specified native visibility. */
+struct native_filter_case {
+	log_level global_level;			   ///< Ordinary platform threshold.
+	std::optional<log_level> component_level;  ///< Explicit gRPC override, if authored.
+	bool expect_info;			   ///< Whether native INFO must reach the file.
+	bool expect_debug;			   ///< Whether native DEBUG must reach the file.
+};
+
+/**
+ * @brief Prove native verbosity and frontend filtering agree without hiding actual errors.
+ * @param root Protected fixture destination retained through logger retirement.
+ * @param selection Authored filters with independently specified expected visibility.
+ */
+void verify_native_filters(const std::filesystem::path &root, const native_filter_case &selection)
+{
+	log_options options;
+	options.directory = root.string();
+	options.level = selection.global_level;
+	const auto component = log_component_index("grpc");
+	ASSERT_TRUE(component.has_value());
+	options.component_levels[*component] = selection.component_level;
+	auto logger_or = log_service::start(options, "kinetum_cp");
+	ASSERT_TRUE(logger_or.is_ok());
+	auto logger = std::move(logger_or).value();
+	logger->startup_complete();
+	{
+		auto native_or = grpc_logging::create();
+		ASSERT_TRUE(native_or.is_ok());
+		auto native = std::move(native_or).value();
+		EXPECT_EQ(::gpr_should_log(GPR_LOG_SEVERITY_INFO) != 0, selection.expect_info);
+		EXPECT_EQ(::gpr_should_log(GPR_LOG_SEVERITY_DEBUG) != 0, selection.expect_debug);
+		EXPECT_NE(::gpr_should_log(GPR_LOG_SEVERITY_ERROR), 0);
+		::gpr_log_message("native.cc", 81, GPR_LOG_SEVERITY_INFO, "native-info-filter-canary");
+		::gpr_log_message("native.cc", 82, GPR_LOG_SEVERITY_DEBUG, "native-debug-filter-canary");
+		::gpr_log_message("native.cc", 83, GPR_LOG_SEVERITY_ERROR, "native-error-filter-canary");
+		KINETUM_LOG_INFO("cp", "test.platform.info", "ordinary platform information");
+	}
+	logger.reset();
+	const auto records = test_support::read_log_file(root / "kinetum_cp.log");
+	EXPECT_EQ(records.find("native-info-filter-canary") != std::string::npos, selection.expect_info);
+	EXPECT_EQ(records.find("native-debug-filter-canary") != std::string::npos, selection.expect_debug);
+	EXPECT_NE(records.find("native-error-filter-canary"), std::string::npos);
+	EXPECT_EQ(records.find("test.platform.info") != std::string::npos, selection.global_level <= log_level::INFO);
 }
 
 /** @brief Finite commands suppress native startup chatter while preserving native errors. */
@@ -108,6 +158,33 @@ TEST(grpc_logging, native_records_are_captured_and_copied)
 			std::_Exit(::testing::Test::HasFailure() ? 1 : 0);
 		},
 		::testing::ExitedWithCode(0), "");
+}
+
+/** @brief Ordinary runs retain native errors; DEBUG and explicit overrides select connection details. */
+TEST(grpc_logging, native_verbosity_matches_default_debug_and_component_filters)
+{
+	constexpr std::array<native_filter_case, 8> CASES{{
+		{log_level::INFO, std::nullopt, false, false},
+		{log_level::WARN, std::nullopt, false, false},
+		{log_level::DEBUG, std::nullopt, true, true},
+		{log_level::INFO, log_level::INFO, true, false},
+		{log_level::FATAL, log_level::DEBUG, true, true},
+		{log_level::DEBUG, log_level::INFO, true, false},
+		{log_level::DEBUG, log_level::ERROR, false, false},
+		{log_level::FATAL, log_level::FATAL, false, false},
+	}};
+	for (const auto &selection : CASES) {
+		SCOPED_TRACE(static_cast<int>(selection.global_level));
+		SCOPED_TRACE(selection.component_level.has_value() ? static_cast<int>(*selection.component_level) : 0);
+		test_support::log_test_directory directory;
+		ASSERT_FALSE(directory.path().empty());
+		ASSERT_EXIT(
+			{
+				verify_native_filters(directory.path(), selection);
+				std::_Exit(::testing::Test::HasFailure() ? 1 : 0);
+			},
+			::testing::ExitedWithCode(0), "");
+	}
 }
 
 /** @brief The native ERROR-then-abort assertion preserves its explanation without destructor flushing. */

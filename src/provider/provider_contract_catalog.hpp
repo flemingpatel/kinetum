@@ -210,6 +210,7 @@ enum class provider_host_fact : uint8_t {
 	LINUX_IPV4_DATAGRAM_SOCKET,   ///< Linux IPv4 datagram socket facility is available.
 	HOST_NUMA_MEMORY,	      ///< Exact host NUMA placement can be satisfied.
 	CPU_WORKER_SET,		      ///< Compiled CPU worker placement is host-resolvable.
+	DPDK_PCI_ADAPTER_OWNERSHIP,   ///< Declared i40e PFs have exclusive adapter ownership before EAL.
 };
 
 /** @brief Sole phase that must prove one external provider requirement. */

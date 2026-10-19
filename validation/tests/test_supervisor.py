@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -113,6 +114,36 @@ class TestTypedReadinessPoll(unittest.IsolatedAsyncioTestCase):
             with self.assertRaisesRegex(ValueError, "missing logging counters"):
                 await supervisor._wait_runtime_ready(process)  # pylint: disable=protected-access
         dp.is_ready.assert_not_awaited()
+
+
+class TestRuntimeLogging(unittest.IsolatedAsyncioTestCase):
+    """The selected diagnostic mode reaches the actual Photon launch command."""
+
+    async def test_debug_selection_reaches_photon_without_changing_output_ownership(self):
+        """Both modes preserve console and file logs while selecting the runtime severity."""
+        for debug_logging, expected_level in ((False, "info"), (True, "debug")):
+            with self.subTest(debug_logging=debug_logging), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary).resolve()
+                runtime = root / "runtime"
+                (runtime / "bin").mkdir(parents=True)
+                photon = runtime / "bin" / "kinetum_photon"
+                photon.write_text("fixture", encoding="ascii")
+                photon.chmod(0o700)
+                bundle = root / "bundle"
+                bundle.mkdir()
+                output = root / "output"
+                output.mkdir()
+                supervisor = AsyncProcessSupervisor(
+                    ProcessConfig(runtime_root=runtime, validation_root=root / "kit"), output,
+                )
+                with mock.patch.object(supervisor, "_start_process", new_callable=mock.AsyncMock) as start:
+                    await supervisor.start_runtime(bundle, debug_logging=debug_logging)
+                start.assert_awaited_once_with("kinetum_photon", [
+                    str(photon), "--bundle", str(bundle),
+                    "--cp-listen", "127.0.0.1:50051", "--dp-endpoint", "127.0.0.1:50052",
+                    "--config-store-dir", str(output / "cp_store"),
+                    "--log-dir", str(output / "logs"), "--log-level", expected_level, "--log-console",
+                ])
 
 
 class _ExitedProcess:

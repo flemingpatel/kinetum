@@ -960,6 +960,13 @@ def validate_benchmark_summary(value: Dict[str, Any]) -> None:
     if scenario["traffic_driver"] == "trex":
         if (scenario_metrics or transition_metrics) and trex_identity is None:
             raise JsonContractError("benchmark summary TRex identity is missing")
+        if trex_identity is not None:
+            profile = require_validation_profile(scenario["deployment"], scenario["backend"])
+            expected_ports = set(scenario["trex_ports"]) if scenario["trex_ports"] else {
+                port.traffic_port_id for port in profile.ports
+            }
+            if {row["port_id"] for row in trex_identity["ports"]} != expected_ports:
+                raise JsonContractError("benchmark summary TRex capabilities have foreign port membership")
     elif trex_identity is not None:
         raise JsonContractError("benchmark summary retained inactive TRex identity")
 

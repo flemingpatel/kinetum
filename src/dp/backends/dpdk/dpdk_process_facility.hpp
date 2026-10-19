@@ -15,15 +15,15 @@
  * borrow this owner through the provider-component dependency relation and
  * must be destroyed before it.
  *
- * Native function pointers exist only for cold deterministic conformance
- * tests. Packet RX/TX and storage operations do not dispatch through this
- * table.
+ * Cold native calls use an injectable table for deterministic conformance
+ * tests. Packet RX/TX and storage operations do not dispatch through it.
  */
 
 #include <cstdint>
 #include <cstdio>
 #include <memory>
 
+#include "src/dp/backends/dpdk/dpdk_pci_probe.hpp"
 #include "src/provider/provider_component_abi.h"
 
 namespace kinetum::provider::dpdk_component
@@ -51,6 +51,7 @@ struct dpdk_process_facility_api {
 	int (*eth_port_by_name)(void *state, const char *name, uint16_t *port_id) noexcept;
 	const char *(*runtime_version)(void *state) noexcept;  ///< Return linked DPDK runtime version text.
 	uint32_t unassigned_lcore_id;			       ///< Exact native unassigned-lcore sentinel.
+	dpdk_pci_probe_api pci;	 ///< Same read-only PCI mechanism used by component host proof.
 };
 
 /**

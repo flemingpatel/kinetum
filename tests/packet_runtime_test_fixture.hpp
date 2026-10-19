@@ -705,6 +705,67 @@ struct packet_runtime_test_module_intent {
 };
 
 /**
+ * @brief Run one foreign producer while the bound coordinator services its runtime.
+ *
+ * @tparam operation_type Nullary producer callable returning an owned result.
+ * @param runtime Complete runtime owned by the calling coordinator thread.
+ * @param operation Operation borrowed until its producer thread has joined.
+ * @return Exact operation result after unconditional producer completion.
+ *
+ * The caller retains the runtime throughout command, lifecycle, and deadline
+ * service. This helper owns only the producer thread, never the runtime.
+ */
+template <typename operation_type>
+[[nodiscard]] auto run_packet_runtime_control_producer(dp::partitioned_runtime &runtime, operation_type &&operation)
+	-> std::invoke_result_t<operation_type>
+{
+	using result_type = std::invoke_result_t<operation_type>;
+	static_assert(!std::is_reference_v<result_type>, "control producers must return owned test results");
+	std::optional<result_type> result;
+	std::atomic<bool> completed{false};
+	std::thread producer([&]() noexcept {
+		try {
+			result.emplace(operation());
+			completed.store(true, std::memory_order_release);
+		} catch (...) {
+			std::terminate();
+		}
+	});
+	while (!completed.load(std::memory_order_acquire)) {
+		const auto lifecycle_descriptor = runtime.lifecycle_notification_descriptor();
+		if (!lifecycle_descriptor.has_value()) {
+			break;
+		}
+		pollfd descriptors[2]{
+			pollfd{.fd = runtime.command_notification_descriptor(), .events = POLLIN, .revents = 0},
+			pollfd{.fd = *lifecycle_descriptor, .events = POLLIN, .revents = 0},
+		};
+		const int poll_result = ::poll(descriptors, 2, 10);
+		if (poll_result < 0 && errno == EINTR) {
+			continue;
+		}
+		if (poll_result < 0 || (descriptors[0].revents & (POLLERR | POLLHUP | POLLNVAL)) != 0 ||
+		    (descriptors[1].revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
+			std::terminate();
+		}
+		if ((descriptors[0].revents & POLLIN) != 0 && !runtime.service_command_notifications().is_ok()) {
+			std::terminate();
+		}
+		if ((descriptors[1].revents & POLLIN) != 0 && !runtime.service_lifecycle_notifications().is_ok()) {
+			std::terminate();
+		}
+		if (!runtime.service_control_deadline().is_ok()) {
+			std::terminate();
+		}
+	}
+	producer.join();
+	if (!result.has_value()) {
+		std::terminate();
+	}
+	return std::move(result).value();
+}
+
+/**
  * @brief Own one complete real-component fixed-epoch runtime test generation.
  *
  * The runtime is destroyed before provider fixture artifacts and component
@@ -832,60 +893,13 @@ class packet_runtime_test_owner final {
 	template <typename operation_type>
 	[[nodiscard]] auto run_control_producer(operation_type &&operation) -> std::invoke_result_t<operation_type>
 	{
-		using result_type = std::invoke_result_t<operation_type>;
-		static_assert(!std::is_reference_v<result_type>, "control producers must return owned test results");
-		std::optional<result_type> result;
-		std::atomic<bool> completed{false};
-		std::thread producer([&]() noexcept {
-			try {
-				result.emplace(operation());
-				completed.store(true, std::memory_order_release);
-			} catch (...) {
-				std::terminate();
-			}
-		});
-		while (!completed.load(std::memory_order_acquire)) {
-			const auto lifecycle_descriptor = runtime_->lifecycle_notification_descriptor();
-			if (!lifecycle_descriptor.has_value()) {
-				break;
-			}
-			pollfd descriptors[2]{
-				pollfd{.fd = runtime_->command_notification_descriptor(),
-				       .events = POLLIN,
-				       .revents = 0},
-				pollfd{.fd = *lifecycle_descriptor, .events = POLLIN, .revents = 0},
-			};
-			const int poll_result = ::poll(descriptors, 2, 10);
-			if (poll_result < 0 && errno == EINTR) {
-				continue;
-			}
-			if (poll_result < 0 || (descriptors[0].revents & (POLLERR | POLLHUP | POLLNVAL)) != 0 ||
-			    (descriptors[1].revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
-				std::terminate();
-			}
-			if ((descriptors[0].revents & POLLIN) != 0 &&
-			    !runtime_->service_command_notifications().is_ok()) {
-				std::terminate();
-			}
-			if ((descriptors[1].revents & POLLIN) != 0 &&
-			    !runtime_->service_lifecycle_notifications().is_ok()) {
-				std::terminate();
-			}
-			if (!runtime_->service_control_deadline().is_ok()) {
-				std::terminate();
-			}
-		}
-		producer.join();
-		if (!result.has_value()) {
-			std::terminate();
-		}
-		return std::move(result).value();
+		return run_packet_runtime_control_producer(*runtime_, std::forward<operation_type>(operation));
 	}
 
 	/**
 	 * @brief Submit the fixture's exact Bootstrap through the production mailbox.
 	 *
-	 * @param request Exact request, defaulting to the fixture authority.
+	 * @param request Exact bootstrap request to submit.
 	 * @return Runtime Bootstrap result after owner-thread command service.
 	 */
 	[[nodiscard]] common::status_or<dp::fixed_epoch_bootstrap_result>

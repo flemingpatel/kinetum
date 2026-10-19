@@ -44,6 +44,14 @@ if(NOT IS_DIRECTORY "${_KINETUM_DPDK_INCLUDE_DIR}")
   return()
 endif()
 
+if(NOT EXISTS "${_KINETUM_DPDK_INCLUDE_DIR}/kinetum_i40e_pci_ids.hpp" OR
+   IS_DIRECTORY "${_KINETUM_DPDK_INCLUDE_DIR}/kinetum_i40e_pci_ids.hpp")
+  set(KinetumDPDK_FOUND FALSE)
+  set(KinetumDPDK_NOT_FOUND_MESSAGE
+      "KinetumDPDK package has no generated i40e PCI identity header")
+  return()
+endif()
+
 foreach(_KINETUM_DPDK_ARCHIVE IN LISTS _KINETUM_DPDK_ARCHIVES)
   if(NOT EXISTS "${_KINETUM_DPDK_ARCHIVE}" OR
      IS_DIRECTORY "${_KINETUM_DPDK_ARCHIVE}")

@@ -5,6 +5,30 @@ from collections import Counter
 from kinetum_validation.config.types import AnalysisResult, StreamAnalysisResult
 
 
+def complete_trex_identity(
+    ports=(0, 1, 2), counters=127, filter_mode="hardware match", version="v3.06",
+) -> dict:
+    """Author complete independent instrument observations for selected fixture ports."""
+    return {
+        "version": version,
+        "mode": "STL",
+        "ports": [
+            {"port_id": port, "driver": "net_i40e", "rx_caps": ["flow_stats", "latency"],
+             "rx_counters": counters, "rx_filter_mode": filter_mode}
+            for port in sorted(ports)
+        ],
+    }
+
+
+def native_trex_port_info(identity: dict) -> list:
+    """Represent the fixture's observations in the native get_port_info response shape."""
+    return [
+        {"index": row["port_id"], "driver": row["driver"], "rx_filter_mode": row["rx_filter_mode"],
+         "rx": {"caps": list(row["rx_caps"]), "counters": row["rx_counters"]}}
+        for row in identity["ports"]
+    ]
+
+
 def complete_native_analysis(
     generation_counts: tuple[tuple[int, int], ...], stream_count: int,
 ) -> AnalysisResult:

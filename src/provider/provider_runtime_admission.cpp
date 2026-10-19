@@ -1071,6 +1071,8 @@ status_or<std::size_t> fact_collection::ordinal(provider_contract_role role, uin
 		return uint8_t{1} << 4;
 	case provider_host_fact::CPU_WORKER_SET:
 		return uint8_t{1} << 5;
+	case provider_host_fact::DPDK_PCI_ADAPTER_OWNERSHIP:
+		return uint8_t{1} << 6;
 	}
 	return 0;
 }
