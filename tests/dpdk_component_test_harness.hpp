@@ -17,6 +17,7 @@
 #include <array>
 #include <cstdint>
 #include <memory>
+#include <map>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -76,7 +77,36 @@ struct facility_api_state {
 	uint32_t wait_lcore_calls{0};		      ///< Number of lifecycle joins.
 
 	std::string native_device_name{"0000:01:00.0"};	 ///< Exact native name resolved for the authored attachment.
+	std::string second_native_device_name;	///< Optional second exact attachment resolved to native port eight.
+	std::map<std::string, dpdk_pci_function_observation, std::less<>> pci_functions{
+		{"0000:01:00.0", {.vendor = 0x8086, .device = 0x1572, .binding = dpdk_pci_binding::VFIO}},
+	};  ///< Complete present PCI-function observations; missing rows are absent.
+	std::string unavailable_pci_function;  ///< Function whose observation fails instead of reporting absence.
+	uint32_t pci_reads{0};		       ///< Number of read-only function observations.
 };
+
+/**
+ * @brief Read exact fixture-owned PCI observations without granting admission.
+ * @param opaque Borrowed native API state.
+ * @param address Canonical function requested by the production ownership proof.
+ * @param observation Complete observed facts for a present function.
+ * @return Present, absent, or unavailable exactly as authored by the fixture.
+ */
+inline dpdk_pci_probe_result read_pci_function(void *opaque, const char *address,
+					       dpdk_pci_function_observation *observation) noexcept
+{
+	auto &state = *static_cast<facility_api_state *>(opaque);
+	++state.pci_reads;
+	if (address == nullptr || observation == nullptr || state.unavailable_pci_function == address) {
+		return dpdk_pci_probe_result::UNAVAILABLE;
+	}
+	const auto found = state.pci_functions.find(address);
+	if (found == state.pci_functions.end()) {
+		return dpdk_pci_probe_result::ABSENT;
+	}
+	*observation = found->second;
+	return dpdk_pci_probe_result::PRESENT;
+}
 
 /**
  * @brief Capture one deterministic EAL initialization request.
@@ -243,7 +273,7 @@ inline int current_cpu(void *opaque) noexcept
 }
 
 /**
- * @brief Resolve the fixture's sole exact native attachment.
+ * @brief Resolve one of the fixture's exact native attachments.
  * @param opaque Fixture-owned native identity.
  * @param name Candidate NUL-terminated PCI or TAP device identity.
  * @param port_id Resolved port output written only on success.
@@ -252,11 +282,18 @@ inline int current_cpu(void *opaque) noexcept
 inline int eth_port_by_name(void *opaque, const char *name, uint16_t *port_id) noexcept
 {
 	const auto &state = *static_cast<const facility_api_state *>(opaque);
-	if (name == nullptr || port_id == nullptr || std::string_view(name) != state.native_device_name) {
+	if (name == nullptr || port_id == nullptr) {
 		return -1;
 	}
-	*port_id = 7;
-	return 0;
+	if (std::string_view(name) == state.native_device_name) {
+		*port_id = 7;
+		return 0;
+	}
+	if (!state.second_native_device_name.empty() && std::string_view(name) == state.second_native_device_name) {
+		*port_id = 8;
+		return 0;
+	}
+	return -1;
 }
 
 /**
@@ -272,7 +309,7 @@ inline const char *runtime_version(void *opaque) noexcept
 /**
  * @brief One exact DPDK facility request and its injected native owner.
  *
- * The process facts contain one external packet worker, one EAL-main
+ * The initial facts contain one external packet worker, one EAL-main
  * transition coordinator, one lifecycle executor, one native attachment, and
  * one exact packet-storage requirement. All borrowed storage outlives every
  * request and dependency view produced by the fixture.
@@ -329,7 +366,7 @@ class facility_fixture {
 			.cpu_assignment_count = 3,
 			.cpu_assignment_padding = 0,
 			.attachments = attachments_.data(),
-			.attachment_count = static_cast<uint32_t>(attachments_.size()),
+			.attachment_count = 1,
 			.attachment_padding = 0,
 			.memory_domains = memory_domains_.data(),
 			.memory_domain_count = 1,
@@ -372,6 +409,7 @@ class facility_fixture {
 			.eth_port_by_name = eth_port_by_name,
 			.runtime_version = runtime_version,
 			.unassigned_lcore_id = UINT32_MAX,
+			.pci = {.state = &api_state_, .read_function = read_pci_function},
 		};
 	}
 
@@ -448,10 +486,28 @@ class facility_fixture {
 		api_state_.native_device_name = "net_tap0";
 	}
 
-	/** @return Borrowed mutable native attachment fact. */
-	[[nodiscard]] kinetum_provider_driver_attachment_fact &attachment() noexcept
+	/**
+	 * @brief Declare a second owned PF on the same adapter before facility construction.
+	 * @param io_driver_index Exact driver that will own the second native port.
+	 */
+	void add_pci_attachment(uint32_t io_driver_index)
 	{
-		return attachments_[0];
+		attachments_[1] = attachments_[0];
+		attachments_[1].driver_port_id = text_view("wan1");
+		attachments_[1].attachment_identity = text_view("0000:01:00.1");
+		attachments_[1].io_driver_index = io_driver_index;
+		facts_.attachment_count = 2;
+		api_state_.second_native_device_name = "0000:01:00.1";
+		api_state_.pci_functions.emplace("0000:01:00.1", api_state_.pci_functions.at("0000:01:00.0"));
+	}
+
+	/**
+	 * @param index Declared attachment position, zero unless the second PF was added.
+	 * @return Borrowed mutable native attachment fact.
+	 */
+	[[nodiscard]] kinetum_provider_driver_attachment_fact &attachment(std::size_t index = 0) noexcept
+	{
+		return attachments_[index];
 	}
 
 	/** @return Borrowed mutable native API state and recorded observations. */
@@ -488,7 +544,6 @@ class facility_fixture {
 		};
 	}
 
-    public:
 	/** @return Copied native log evidence whose receiver outlives facility retirement. */
 	[[nodiscard]] kinetum::test_support::provider_log_capture::observation logs() const
 	{
@@ -504,7 +559,7 @@ class facility_fixture {
 	static constexpr std::string_view PCI_BDF = "0000:01:00.0";
 
 	std::array<kinetum_provider_cpu_assignment, 4> cpu_assignments_{};	///< Exact CPU owners.
-	std::array<kinetum_provider_driver_attachment_fact, 1> attachments_{};	///< Exact native attachment.
+	std::array<kinetum_provider_driver_attachment_fact, 2> attachments_{};	///< Declared native attachments.
 	std::array<kinetum_provider_memory_domain_fact, 2> memory_domains_{};	///< Exact storage rows.
 	kinetum_provider_process_facility_facts facts_{};			///< Complete borrowed facility facts.
 	kinetum_provider_factory_request request_{};				///< Exact empty-contract request.

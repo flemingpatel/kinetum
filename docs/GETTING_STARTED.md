@@ -203,6 +203,8 @@ gRPC, Protobuf, and GoogleTest, not their required versions.
 
 Bootstrap verifies and builds DPDK 24.11.7 as a static-PIC package under
 `/opt/kinetum/dependencies`, including the pinned i40e close-status correction.
+The verified package includes the generated i40e PCI identity header consumed
+by the provider's host checks.
 CMake requires that source-policy identity; a missing or stale package fails
 configuration. The default package is root-owned and read-only to the build
 user. Downloads and publication are verified, and conflicting existing bytes
@@ -564,7 +566,8 @@ unprivileged service run, and add `--log-console` for an interactive mirror.
 See [Logging](LOGGING.md) for ownership, retention, reopen, and typed health.
 
 A plan that requires DPDK PCI access normally requires root or equivalent
-device/hugepage permissions. A UDP/host-storage plan does not acquire those
+device/hugepage permissions and [exclusive i40e adapter ownership](PROVIDERS.md#native-construction-and-ownership).
+A UDP/host-storage plan does not acquire those
 native resources. The supervisor first repeats complete runtime-bundle
 admission, then reports the canonical plan and snapshot paths while retaining
 exact child argument vectors internally. It never selects or repairs a provider

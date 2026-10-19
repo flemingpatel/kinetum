@@ -94,11 +94,13 @@ constexpr std::array<provider_facility_dependency, 1> DPDK_FACILITY_DEPENDENCY{
 	provider_facility_dependency{DPDK_FACILITY_TYPE_URL, 1},
 };
 
-/** Non-materializing DPDK runtime and hugepage proofs. */
-constexpr std::array<provider_host_requirement, 2> DPDK_FACILITY_HOST_REQUIREMENTS{
+/** Non-materializing DPDK runtime, hugepage, and PCI ownership proofs. */
+constexpr std::array<provider_host_requirement, 3> DPDK_FACILITY_HOST_REQUIREMENTS{
 	provider_host_requirement{provider_host_fact::DPDK_EAL_RUNTIME,
 				  provider_host_proof_phase::COMPONENT_HOST_PROOF},
 	provider_host_requirement{provider_host_fact::DPDK_HUGEPAGE_PAYLOAD_FLOOR,
+				  provider_host_proof_phase::COMPONENT_HOST_PROOF},
+	provider_host_requirement{provider_host_fact::DPDK_PCI_ADAPTER_OWNERSHIP,
 				  provider_host_proof_phase::COMPONENT_HOST_PROOF},
 };
 /** Native ethdev proof owned by driver materialization. */
@@ -651,7 +653,7 @@ constexpr std::array<provider_contract_row, 8> CONTRACT_ROWS{
 				NONE_AND_RSS_STEERING,
 				DPDK_RSS_HASH_FIELDS,
 				MAX_DPDK_RSS_KEY_BYTES,
-				true,
+				false,
 				static_cast<uint32_t>(std::numeric_limits<uint16_t>::max()) - 1u,
 				std::numeric_limits<uint16_t>::max(),
 				true,
@@ -916,6 +918,7 @@ constexpr std::array<provider_contract_row, 8> CONTRACT_ROWS{
 			case provider_host_fact::LINUX_IPV4_DATAGRAM_SOCKET:
 			case provider_host_fact::HOST_NUMA_MEMORY:
 			case provider_host_fact::CPU_WORKER_SET:
+			case provider_host_fact::DPDK_PCI_ADAPTER_OWNERSHIP:
 				break;
 			default:
 				return false;

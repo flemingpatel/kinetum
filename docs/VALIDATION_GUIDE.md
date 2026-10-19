@@ -148,6 +148,11 @@ host configuration; any authored settings there must agree with the intended
 host setup. See Ubuntu's [package contents](https://packages.ubuntu.com/en/noble-updates/amd64/dpdk/filelist)
 and [DPDK configuration guide](https://ubuntu.com/server/docs/explanation/networking/about-dpdk/).
 
+The DPDK provider requires [exclusive i40e adapter ownership](PROVIDERS.md#native-construction-and-ownership):
+bind declared functions to `vfio-pci` and leave unused siblings unbound. For the
+shipped d430 bindings, `0000:06:00.3` is unused. Repeat NIC preparation after a
+reboot; the runtime checks ownership and never changes bindings itself.
+
 Use the completed native build from [Getting Started](GETTING_STARTED.md#1-build)
 to produce the private wheel, then transfer it to the prepared lab host of the
 same architecture. Documentation rendering and release signing are not
@@ -339,7 +344,7 @@ short option is accepted.
 | `--duration` | `0.0` | Standard-test traffic duration in seconds. `0.0` uses `--count`; a positive duration must schedule at least one packet and keep `pps * duration` inside uint32. |
 | `--packet-size` | `64` | Bytes. Validated to `[64, 9000]`. |
 | `--all-sizes` | off | Run packet test for `(64, 128, 256, 512, 1024, 1514)`. |
-| `--num-flows` | `1` | TRex flows per ingress port, `1..55536`, varying UDP source port from 10000. `rx-rss-2` requires at least 64. Generation-session admission also requires the flow/PGID result to fit the shared 16 MiB JSON limit. Native TAP remains single-flow. |
+| `--num-flows` | `1` | TRex flows per ingress port, `1..55536`, varying UDP source port from 10000. `rx-rss-2` requires at least 64. Generation admission requires enough reported counters at every observation port and a result within the shared 16 MiB JSON limit. Native TAP remains single-flow. |
 | `--src-ip` | `10.0.0.100` | Source IP of generated UDP flow. |
 | `--dst-ip` | `192.168.1.1` | Destination IP. |
 | `--runtime-root` | required | Explicit finalized installed runtime root. It and every consumed `bin/` or `lib/` path component must be absolute and symlink-free. Exact regular runtime executables and, for module deployments, `lib/modules/` are required. |
@@ -351,9 +356,9 @@ short option is accepted.
 | `--epoch-transition-time` | `5.0` | Seconds of baseline epoch traffic before the transition. |
 | `--epoch-overlap-ms` | `500` | TRex sustained initial/next generation-tag overlap in the positive uint32 millisecond domain. Native TAP requests one pre-authored tag transition. |
 | `--output-dir` | `/tmp/kinetum_validation` | Absent absolute final path created once for CP state, logs, captures, and JSON artifacts. Existing output rejects. |
-| `--verbose`, `-v` | off | Uses `ConsoleReporter.log_callback` formatting for the Photon ownership-tree stream. Without it, the same stream uses the generic logger. |
+| `--verbose`, `-v` | off | Starts Photon, CP, and DP at DEBUG instead of INFO; includes ordinary TRex stderr details and CLI error tracebacks. Process output is streamed unchanged in both modes. |
 | `--no-color` | off | Disables ANSI output in `ConsoleReporter`. |
-| `--max-loss` | `1.0` | Loss threshold in percent (`0..100`) for standard, commit-confirmed, and rollback. Epoch uses its fixed 0.1% bound; guardrails checks deliberate degradation and recovery. |
+| `--max-loss` | `1.0` | Maximum loss percentage (`0..100`) for standard, epoch, commit-confirmed, and rollback. Epoch also requires at most 0.1%; `--max-loss 0` requires zero loss. Guardrails checks deliberate degradation and recovery. |
 
 For standard traffic, `--duration 0.0` selects `count / pps` seconds of
 generation. `--count` is therefore a pacing target; successful sends are
@@ -590,10 +595,8 @@ Setup steps, in order:
 3. **Disable kernel forwarding.** Write `0` to
    `/proc/sys/net/ipv4/conf/<iface>/forwarding` and
    `/proc/sys/net/ipv4/conf/<iface>/accept_local` for each TAP. This
-   is critical: without it the Linux kernel will forward packets
-   between `neb_rx` and `neb_tx` in parallel with DPDK, causing
-   duplicates on the wire and capturing un-NATted packets that
-   bypassed the pipeline.
+   prevents host routing from creating a second forwarding path that bypasses
+   the pipeline or duplicates its traffic.
 4. **Return ready.** The backend holds no packet socket or capture
    process. Its lifecycle ends at runtime resource readiness.
 
@@ -622,12 +625,31 @@ selects that release explicitly, while the helper defaults to `latest`.
 Its explicit `--insecure-download` option disables download certificate
 verification for lab hosts with broken CA chains.
 
-The setup probe requires stateless mode and records server version/mode in run
-metadata, sidecars, and benchmark summaries. This is provenance, not a version
-allowlist. Standard tests use port counters and write
+The read-only setup probe requires stateless mode and records the server
+version/mode plus each selected port's driver, RX capabilities, counter
+capacity, and filtering mode. These facts appear in run metadata, sidecars,
+and benchmark summaries. The probe acquires no ports and changes no counters
+or port attributes. This is observed provenance, not a version allowlist.
+Standard tests use port counters and write
 `<capture>.trex_stats.json`, not PCAP. Target-achievement checks pass before any
 sidecar is published. Successful output includes `target_pps`, locally derived
-`expected_tx_count`, `tx_count`, `achievement_ratio`, and `trex_identity`.
+`expected_tx_count`, `tx_count`, `achievement_ratio`, `trex_identity`, and
+`pgid_demand` (zero for ordinary port-counter runs).
+
+Generation sessions derive PGID identities and demand through one calculation
+shared by the local driver and endpoint program. Demand counts distinct IDs,
+not their allocation offset. Both generations of 64 flows on two ingress ports
+require 256 counters on the receiving port. Capacity is read from that port's
+reported capability; capacities on different ports are not added together.
+Before acquiring ports, traffic runs and NAT exchanges recheck the instrument
+facts against setup and verify their demand. NAT exchange uses packet capture
+and requires no PGID counters. Insufficient or changed evidence rejects without
+starting traffic. The kit never reduces the flow count or switches modes.
+
+For the d430 RSS epoch workload, start the prepared TRex server explicitly with
+`t-rex-64 -i -c 2 --software`, then verify reported capacity and achieved traffic.
+Software counting can limit generator throughput; the flag itself establishes
+neither sufficient capacity nor rate achievement.
 
 All sidecars retain `port_counter_baseline` and `port_counter_final`, keyed by
 decimal port ID with explicit uint64 `opackets`, `ipackets`, `oerrors`, and
@@ -678,13 +700,18 @@ agent access, remains caller policy. The endpoint runs in `--traffic-work-dir`.
 Ingress destination MACs come from Gluon's six-byte
 `plan.ports[].resolved_mac_address`; malformed protobuf bytes reject. DUT ingress
 therefore needs no promiscuous mode. TRex observation ports temporarily enable
-promiscuous mode during probe/run and appear in sidecar `promiscuous_ports`.
+promiscuous mode during traffic runs and appear in sidecar `promiscuous_ports`.
 
 **Cleanup.** Killing validation before cleanup may leave the epoch session
 transmitting. The next run resets TRex; immediate manual cleanup uses
 `client.reset()` or a `t-rex-64` restart. Normal SIGINT sends SIGTERM to active
-SSH, tracks/drains delayed SIGKILL escalation, and retains generation ownership
-until finish or abort. Teardown retries abort before releasing that ownership.
+SSH and tracks/drains delayed SIGKILL escalation. Confirmed endpoint cleanup
+retires generation ownership before local result validation; a later evidence
+rejection fails the run without aborting retired ports again. Teardown retries
+abort only while remote retirement is unproved.
+An explicit endpoint rejection before a mutating call clears provisional
+ownership without issuing an abort. Endpoint cleanup stops and releases only
+its acknowledged port claims; a read-only probe's disconnect performs neither.
 
 ### 8.3 DPDKPCIBackend
 
@@ -720,7 +747,7 @@ The d430 selectors choose one complete authored file under
 | `rx-rss-2` | `per-rx-queue` | `fan_in_edge_gateway_cloudlab_d430_rx_rss_2_per_rx_queue_bindings.pbtxt` |
 
 The default topology has one RX queue per ingress. RSS has two lanes and
-symmetric steering on each ingress. Separate storage assigns one pool to each
+ordinary steering on each ingress. Separate storage assigns one pool to each
 RX queue and lets either NAT/TX owner accept every original domain. Setup verifies
 that the emitted plan matches the selected queues, steering, and storage layout
 and has no domain-changing conversion before starting Photon. Unsupported
@@ -734,8 +761,8 @@ admitted, each RX queue carried at least 25% of its ingress port's packets, and
 each final storage-domain observation reported available buffers. This validates
 queue-level RSS stream evidence and runtime worker ownership; physical
 scale-out still depends on the corresponding on-target throughput run. Use
-`--num-flows >= 64`; TRex varies UDP source port per flow so the RSS key has
-enough 5-tuple diversity to distribute.
+`--num-flows >= 64`; TRex varies UDP source ports across flows to exercise both
+RX queues.
 
 Per-queue storage without RSS requires the same stream, pool-pressure, and
 RX-port evidence, without RSS balance or steering predicates. Run metadata records
@@ -905,9 +932,9 @@ rate and burst allowance, as well as the egress link capacity.
    Both drivers then complete their end edge: TRex pauses the initial-tag
    streams; native TAP closes the logical edge without another signal. Await the
    apply completion.
-9. Let traffic finish out the remaining duration, stop capture, and analyze
-   the packet evidence.
-10. After bounded packet drain, take a post-transition stats snapshot.
+9. Let traffic finish out the remaining duration, allow the bounded packet
+   drain, then stop capture and analyze the packet evidence.
+10. Take a post-transition stats snapshot.
 11. Require the latest terminal to be exact COMPLETE for its recorded
     `from_epoch -> to_epoch`, no retirement freeze or success-block latch,
     zero typed fault delta, and every boundary row to carry matching generation/from/to,
@@ -928,7 +955,7 @@ negative control requires its own explicit mechanism and evidence contract; it
 cannot be inferred from missing telemetry or an alternate build label.
 
 **Pass criteria.** Exact sender/capture and two-tag accounting,
-`loss_pct <= EPOCH_LOSS_TOLERANCE_PCT` (0.1%), one observed epoch advance,
+loss within both `--max-loss` and the fixed epoch ceiling (0.1%), one observed epoch advance,
 exact terminal COMPLETE without freeze or a success-block latch, nonzero
 boundary population, `completed_boundaries == boundary_count`, and zero
 protocol-fault delta. The `zero_loss` artifact field remains literal
@@ -1447,7 +1474,7 @@ possible artifact.
 | File | When written | Source |
 |------|--------------|--------|
 | `runtime_bundle/` | every successful setup, including dry-run | Complete self-verified output from the installed `kinetum_pack`; existing output rejects instead of being overwritten. |
-| `run_metadata.json` | after dry-run bundle production or successful live traffic setup | Exact installed roots, bundle/plan paths, selected bindings/profile, resolved ports, installed build-feature evidence, and nullable observed TRex version/mode. A setup failure before live publication may omit it. |
+| `run_metadata.json` | after dry-run bundle production or successful live traffic setup | Exact installed roots, bundle/plan paths, selected bindings/profile, resolved ports, installed build-feature evidence, and nullable observed TRex identity including per-port counter capabilities. A setup failure before live publication may omit it. |
 | `photon.log` | non-dry-run startup | Combined Photon ownership-tree stream, including child output. |
 | `logs/` | non-dry-run startup | Platform-owned Photon/CP/DP files, role locks, and bounded rotations. See [Logging](LOGGING.md). |
 | `cp_store/` | non-dry-run startup | Fresh durable CP authority retained as run evidence after shutdown. |
@@ -1929,7 +1956,7 @@ These options use the defaults and meanings from
 | Packet generation | `--pps`, `--count`, `--packet-size`, `--num-flows` |
 | Epoch traffic | `--epoch-duration`, `--epoch-pps`, `--epoch-transition-time`, `--epoch-overlap-ms` |
 | Installation | `--runtime-root` (required), `--validation-root` |
-| Output detail | `--verbose` (`-v`) |
+| Runtime DEBUG logs and diagnostic detail | `--verbose` (`-v`) |
 
 Standard benchmark traffic is count-based; `run` has no `--duration` option.
 It uses the default source/destination IPs and loss threshold from the
@@ -1941,9 +1968,12 @@ descriptor-created `run_NNN/` children, terminal manifest validation,
 aggregation, and initial CSV export. Every JSON reader uses duplicate-key and
 non-finite rejection plus exact schema validation. Optional artifact absence
 means no directory entry; a dangling or direct symlink is contradictory input,
-never absence. The exit
-code is 0 if every run passed, 1 otherwise, and 130 if the loop was
-interrupted by SIGINT.
+never absence. A failed test verdict permits the next iteration. An execution
+or cleanup exception stops the batch; interruption also stops it. The terminal
+manifest records attempted runs before the error propagates, unless publication
+itself fails. Those partial batches require explicit aggregation after resolving
+the failure. The exit code is 0 if every run passed, 1 for failure, and 130 for
+SIGINT.
 
 ### 18.3 aggregate
 
@@ -1964,8 +1994,9 @@ The command creates `merged_transitions.jsonl` and `benchmark_summary.json`;
 pre-existing aggregate output rejects rather than being overwritten. The
 summary retains the complete scenario identity, including the nullable latency
 source, plus the nullable observed TRex identity. Every TRex run selected for
-one distribution must report the same identity; mixed versions reject rather
-than being averaged. The summary validates each metric-family and transition
+one distribution must report the same identity; different versions, drivers,
+counter capabilities, or filtering modes reject rather than being averaged.
+The summary validates each metric-family and transition
 distribution against the selected run population. Unsupported latency has no distribution. A standalone
 aggregate must repeat the terminal manifest's inclusion policy; a flag cannot
 reinterpret an existing run set.
@@ -2114,7 +2145,7 @@ one combined ownership-tree log, and one shutdown handle.
 
 ### 20.1 Start
 
-`start_runtime(bundle_root)` follows this exact pattern:
+`start_runtime(bundle_root, debug_logging=...)` follows this pattern:
 
 1. Reject a second ownership tree, an indirect/non-executable installed Photon,
    a nonexact bundle, or a non-owned output root.
@@ -2122,7 +2153,7 @@ one combined ownership-tree log, and one shutdown handle.
    `0700`; retain them as run evidence.
 3. Spawn the exact regular installed Photon image with `--bundle`,
    `--cp-listen`, `--dp-endpoint`, `--config-store-dir`, `--log-dir`, and
-   `--log-console`. No plan, module,
+   `--log-console`, plus the selected `--log-level`. No plan, module,
    provider, root, key, or child-image override is present.
 4. Create `photon.log` before spawn, then pipe stdout and stderr into one
    `_stream_output` task. Flush each nonempty line to the file and pass it to

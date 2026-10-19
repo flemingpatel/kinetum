@@ -119,6 +119,7 @@ std::string_view log_option_help() noexcept
 	       "  --log-dir <absolute-dir>       Log directory (default: /var/log/kinetum)\n"
 	       "  --log-level <level>            debug|info|warn|error|fatal (default: info)\n"
 	       "  --log-component-level <name>=<level>  Override one known component\n"
+	       "    grpc defaults to error unless the global level is debug.\n"
 	       "  --log-max-bytes <bytes>        File size limit (default: 16777216)\n"
 	       "  --log-keep-files <count>       Total files, 2..32 (default: 8)\n"
 	       "  --log-console                 Mirror records to stderr\n"

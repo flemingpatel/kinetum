@@ -214,7 +214,7 @@ async def run_epoch_test(context: ScenarioContext) -> EpochTestResult:
     2. Start continuous traffic with driver-owned epoch evidence.
     3. Dispatch one configuration mutation during the traffic window.
     4. Continue traffic through the exact adjacent transition.
-    5. Require exact traffic within the fixed validation loss bound, one
+    5. Require exact traffic within both the authored loss limit and epoch ceiling, one
        COMPLETE terminal identity, every compiled boundary's matching
        CUT/ACK proof, and zero protocol-fault delta.
 
@@ -416,6 +416,7 @@ async def run_epoch_test(context: ScenarioContext) -> EpochTestResult:
         traffic_within_tolerance = (
             context.traffic_observation_is_clean(stats, analysis)
             and loss_pct <= CONSTANTS.EPOCH_LOSS_TOLERANCE_PCT
+            and loss_pct <= context.config.max_loss_pct
         )
 
         expected_generation_tags = {

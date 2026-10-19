@@ -509,6 +509,57 @@ class TestCanonicalBundleConstruction(unittest.IsolatedAsyncioTestCase):
 class TestEpochTiming(unittest.IsolatedAsyncioTestCase):
     """Epoch orchestration must preserve the configured traffic duration."""
 
+    async def test_epoch_honors_authored_loss_limit_without_weakening_its_ceiling(self):
+        """Zero loss is enforceable while a permissive option cannot relax the epoch ceiling."""
+        for limit, received, missing, expected_loss_pct, passed in (
+            (0, 2000, 0, 0.0, True),
+            (0, 1999, 1, 0.05, False),
+            (1, 1999, 1, 0.05, True),
+            (1, 1998, 2, 0.1, True),
+            (1, 1997, 3, 0.15, False),
+        ):
+            with self.subTest(limit=limit, received=received), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                clock = _ObservationClock()
+                config = replace(_config_with_example_dir(root, BackendType.DPDK_PCI), max_loss_pct=limit)
+                config.output_dir.mkdir()
+                candidate = config.process.examples_dir / config.spec.example_dir / config.spec.config_snapshot_v2
+                candidate.parent.mkdir(parents=True)
+                candidate.write_text('snapshot_id: "v2"\n', encoding="ascii")
+                sender = _FakeEpochSender(clock.monotonic)
+                sender_stats = PacketStats(
+                    tx_count=2000, start_time=0.0, end_time=15.0, duration_s=15.0,
+                    generation_tag_counts={1: 1000, 2: 1000},
+                )
+                sender.finish_generation_tags = AsyncMock(return_value=sender_stats)
+                traffic = _FakeEpochTraffic(sender)
+                analysis = AnalysisResult(
+                    total_rx=received, valid=received, missing_count=missing,
+                    tag_counts={1: received - 1000, 2: 1000},
+                )
+                traffic.analyze_capture = AsyncMock(return_value=analysis)
+                orchestrator = ValidationOrchestrator(config)
+                orchestrator._traffic = traffic  # pylint: disable=protected-access
+                orchestrator._kinetumctl = _FakeEpochKinetumCtl()  # pylint: disable=protected-access
+                context = orchestrator.scenario_context()
+                self.assertEqual(sender_stats.tx_count, analysis.valid + analysis.missing_count)
+                self.assertTrue(context.traffic_observation_is_clean(sender_stats, analysis))
+                if missing:
+                    self.assertFalse(context.traffic_observation_is_clean(
+                        sender_stats, replace(analysis, missing_count=0),
+                    ))
+                with patch("kinetum_validation.scenario_context.time", new=clock), patch(
+                    "kinetum_validation.scenarios.time", new=clock,
+                ), patch("kinetum_validation.scenario_context.asyncio.sleep", side_effect=clock.sleep):
+                    result = await run_epoch_test(context)
+                self.assertTrue(result.boundary_ordering_validated, result.message)
+                self.assertEqual(result.total_sent, 2000)
+                self.assertEqual(result.total_received, received)
+                self.assertAlmostEqual(result.loss_pct, expected_loss_pct)
+                self.assertEqual(result.passed, passed, result.message)
+                if not passed:
+                    self.assertIn("TRAFFIC EVIDENCE FAILED", result.message)
+
     async def test_epoch_preserves_packet_configuration_for_both_sender_modes(self):
         """Direct-switch and overlapping traffic preserve packet size and flow identity."""
         for size in (64, 512, 1514):

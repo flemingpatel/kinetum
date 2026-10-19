@@ -37,6 +37,7 @@ import asyncio
 import math
 import os
 import sys
+import traceback
 from pathlib import Path
 
 from kinetum_validation import VALIDATION_ROOT
@@ -201,7 +202,7 @@ def _add_run_args(parser: argparse.ArgumentParser) -> None:
         "--validation-root",
         type=Path,
         default=VALIDATION_ROOT,
-        help="Private kit root (default: root containing the running kit's scripts/)",
+        help="Validation data directory containing examples/ and bin/ (default: %(default)s)",
     )
     # Epoch configuration
     parser.add_argument("--epoch-duration", type=float, default=15.0,
@@ -222,7 +223,7 @@ def _add_run_args(parser: argparse.ArgumentParser) -> None:
                         default=Path("/tmp/kinetum_benchmark"),
                         help="Output directory (default: /tmp/kinetum_benchmark)")
     parser.add_argument("--verbose", "-v", action="store_true",
-                        help="Verbose output")
+                        help="Enable runtime debug logs, endpoint details, and error tracebacks")
 
 
 def _add_aggregate_args(parser: argparse.ArgumentParser) -> None:
@@ -507,8 +508,6 @@ async def cmd_run(args: argparse.Namespace) -> int:
         print("\nExporting CSV...", file=sys.stderr)
         export_csv(config.output_dir)
 
-    if result.interrupted:
-        return 130
     return 0 if result.failed_runs == 0 else 1
 
 
@@ -608,6 +607,8 @@ def main() -> int:
 
     except (RuntimeError, OSError, ValueError) as e:
         print(f"Fatal error: {e}", file=sys.stderr)
+        if args.command == "run" and args.verbose:
+            traceback.print_exc()
         return 1
 
 

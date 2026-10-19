@@ -5,6 +5,7 @@ import io
 import json
 from pathlib import Path
 import shlex
+import struct
 import subprocess
 import tarfile
 import tempfile
@@ -12,6 +13,98 @@ import unittest
 from unittest import mock
 
 from tooling.environment import build_kinetum_dpdk
+
+
+class DpdkPciIdentityTest(unittest.TestCase):
+    """Read real ELF metadata bytes without loading or executing a PMD."""
+
+    @staticmethod
+    def _member(record, symbol_name="net_i40e_pmd_info"):
+        """Construct a minimal ELF64 relocatable with one independently laid-out object."""
+        names = b"\0.shstrtab\0.strtab\0.rodata\0.symtab\0"
+        strings = b"\0" + symbol_name.encode("ascii") + b"\0"
+        document = record if isinstance(record, bytes) else json.dumps(record).encode("ascii")
+        payload = b"PMD_INFO_STRING= " + document + b"\0"
+        symbols = bytes(24) + struct.pack("<IBBHQQ", 1, 0x11, 0, 3, 0, len(payload))
+        image = bytearray(64)
+        sections = [bytes(64)]
+        for name, data, kind, flags, link, info, alignment, entry_size in (
+            (b".shstrtab", names, 3, 0, 0, 0, 1, 0),
+            (b".strtab", strings, 3, 0, 0, 0, 1, 0),
+            (b".rodata", payload, 1, 2, 0, 0, 1, 0),
+            (b".symtab", symbols, 2, 0, 2, 1, 8, 24),
+        ):
+            image.extend(bytes((-len(image)) % alignment))
+            offset = len(image)
+            image.extend(data)
+            sections.append(struct.pack(
+                "<IIQQQQIIQQ", names.index(name), kind, flags, 0,
+                offset, len(data), link, info, alignment, entry_size,
+            ))
+        image.extend(bytes((-len(image)) % 8))
+        section_offset = len(image)
+        image.extend(b"".join(sections))
+        image[:64] = struct.pack(
+            "<16sHHIQQQIHHHHHH", b"\x7fELF\x02\x01\x01" + bytes(9),
+            1, 62, 1, 0, 0, section_offset, 0, 64, 0, 0, 64, 5, 1,
+        )
+        return bytes(image)
+
+    def _read_archive(self, members, render=False):
+        """Inject only archive transport; exercise the production ELF and JSON readers."""
+        build = Path("/unread/native-build")
+        archive = str(build / "drivers/librte_net_i40e.a")
+        contents = {f"member{index}.o": value for index, value in enumerate(members)}
+
+        def read(arguments, _environment, _build, _role):
+            """Supply exact member bytes for the requested ar operation."""
+            self.assertEqual(_build, build)
+            if arguments == ["ar", "t", archive]:
+                return ("\n".join(contents) + "\n").encode("ascii")
+            self.assertEqual(arguments[:3], ["ar", "p", archive])
+            return contents[arguments[3]]
+
+        with mock.patch.object(build_kinetum_dpdk, "_build_metadata_output", side_effect=read):
+            if render:
+                return build_kinetum_dpdk.render_i40e_identity_header(Path(__file__).resolve().parents[2], build, {})
+            return build_kinetum_dpdk.i40e_pci_identities(build, {})
+
+    def test_identity_projection_uses_the_built_record_and_wildcard_subsystems(self):
+        """Only the named built PMD record supplies the sorted vendor/device set."""
+        record = {"name": "net_i40e", "pci_ids": [
+            [0x8086, 0x1583, 0xffff, 0xffff],
+            [0x8086, 0x1572, 0xffff, 0xffff],
+        ]}
+        unrelated = self._member(record, "unrelated_constant")
+        exact = self._member(record)
+        self.assertEqual(self._read_archive([unrelated, exact]), (0x80861572, 0x80861583))
+        header = self._read_archive([unrelated, exact], render=True)
+        self.assertIn("std::array<uint32_t, 2> I40E_PF_PCI_IDS", header)
+        self.assertLess(header.index("0x80861572"), header.index("0x80861583"))
+        self.assertNotIn("unread", header)
+
+    def test_identity_projection_rejects_ambiguous_or_narrower_device_matches(self):
+        """Invalid records never become a broader vendor/device allowlist."""
+        exact_row = [0x8086, 0x1572, 0xffff, 0xffff]
+        malformed = (
+            {"name": "net_other", "pci_ids": [exact_row]},
+            {"name": "net_i40e", "pci_ids": []},
+            {"name": "net_i40e", "pci_ids": [exact_row, exact_row]},
+            {"name": "net_i40e", "pci_ids": [[0x8086, 0x1572, 0x8086, 0xffff]]},
+            {"name": "net_i40e", "pci_ids": [[0x8086, True, 0xffff, 0xffff]]},
+            {"name": "net_i40e", "pci_ids": [[0x8086, 0x1572, 0xffff]]},
+            {"name": "net_i40e", "pci_ids": [[0x8086, 0x10000, 0xffff, 0xffff]]},
+            {"name": "net_i40e", "pci_ids": [exact_row], "unknown": 1},
+            b'{"name":"net_i40e","name":"net_other","pci_ids":[]}',
+        )
+        for record in malformed:
+            with self.subTest(record=record), self.assertRaises(build_kinetum_dpdk.ProducerError):
+                self._read_archive([self._member(record)])
+        exact = self._member({"name": "net_i40e", "pci_ids": [exact_row]})
+        for members in ([exact, exact], [b"not ELF"], [exact[:-1]],
+                        [self._member({}, "unrelated_constant")]):
+            with self.subTest(member_count=len(members)), self.assertRaises(build_kinetum_dpdk.ProducerError):
+                self._read_archive(members)
 
 
 class DpdkBuilderIdentityTest(unittest.TestCase):
@@ -774,11 +867,14 @@ class DpdkDependencyProducerTest(unittest.TestCase):
         payload = root / "include/dpdk/rte_config.h"
         payload.parent.mkdir(parents=True)
         payload.write_text("exact\n", encoding="utf-8")
+        identity_header = root / build_kinetum_dpdk.I40E_IDENTITY_HEADER
+        identity_header.write_text("// exact identity projection\n", encoding="ascii")
         files = {
             "include/dpdk/rte_config.h": hashlib.sha256(b"exact\n").hexdigest(),
+            identity_header.relative_to(root).as_posix(): hashlib.sha256(identity_header.read_bytes()).hexdigest(),
         }
         payload_sha256 = hashlib.sha256(
-            f"include/dpdk/rte_config.h:{files['include/dpdk/rte_config.h']}\n".encode("ascii")
+            "".join(f"{name}:{files[name]}\n" for name in sorted(files)).encode("ascii")
         ).hexdigest()
         tuple_row = {"expected_payload_sha256": payload_sha256}
         policy = {
@@ -1204,11 +1300,10 @@ class DpdkDependencyProducerTest(unittest.TestCase):
                 )
             )
 
-            tampered_files = {
-                "include/dpdk/rte_config.h": hashlib.sha256(b"tampered\n").hexdigest(),
-            }
+            tampered_files = json.loads(original)["files"]
+            tampered_files["include/dpdk/rte_config.h"] = hashlib.sha256(b"tampered\n").hexdigest()
             tampered_payload_sha256 = hashlib.sha256(
-                f"include/dpdk/rte_config.h:{tampered_files['include/dpdk/rte_config.h']}\n".encode("ascii")
+                "".join(f"{name}:{tampered_files[name]}\n" for name in sorted(tampered_files)).encode("ascii")
             ).hexdigest()
             document = json.loads(manifest.read_text(encoding="utf-8"))
             document["payload_sha256"] = tampered_payload_sha256
@@ -1225,6 +1320,24 @@ class DpdkDependencyProducerTest(unittest.TestCase):
                     "linux-gnu-aarch64",
                 )
             )
+
+    def test_installed_package_rejects_missing_or_stale_generated_identity_header(self):
+        """The verified package binds generated identities before CMake can import them."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _payload, _manifest, policy = self._write_exact_package(root)
+            header = root / build_kinetum_dpdk.I40E_IDENTITY_HEADER
+            self.assertTrue(build_kinetum_dpdk.verify_installed_package(
+                root, policy, "a" * 64, "linux-gnu-aarch64",
+            ))
+            header.write_text("// stale identity projection\n", encoding="ascii")
+            self.assertFalse(build_kinetum_dpdk.verify_installed_package(
+                root, policy, "a" * 64, "linux-gnu-aarch64",
+            ))
+            header.unlink()
+            self.assertFalse(build_kinetum_dpdk.verify_installed_package(
+                root, policy, "a" * 64, "linux-gnu-aarch64",
+            ))
 
     def test_complete_candidate_normalizes_to_reader_safe_package_modes(self):
         """A private staging root becomes exact only after complete assembly."""

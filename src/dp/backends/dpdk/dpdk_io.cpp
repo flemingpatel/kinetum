@@ -59,6 +59,51 @@ constexpr uint8_t DPDK_STORAGE_ACCESS_AGENTS = KINETUM_PROVIDER_ACCESS_AGENT_CPU
 					       KINETUM_PROVIDER_ACCESS_AGENT_NIC_DMA;
 
 /**
+ * @brief Report a cold native-port failure with its exact ethdev identity.
+ * @param code Provider status selected by the owning operation.
+ * @param diagnostic Optional caller-owned bounded output.
+ * @param port Exact native port involved in the failed operation.
+ * @param reason Static operation and failure description.
+ * @return The supplied status after composing the bounded diagnostic.
+ */
+[[nodiscard]] kinetum_provider_status fail_port(kinetum_provider_status code, kinetum_provider_diagnostic *diagnostic,
+						uint16_t port, const char *reason) noexcept
+{
+	std::array<char, 256> message{};
+	const int written = std::snprintf(message.data(), message.size(), "DPDK port %u: %s",
+					  static_cast<unsigned int>(port), reason);
+	if (written <= 0 || static_cast<std::size_t>(written) >= message.size()) {
+		std::terminate();
+	}
+	return fail(code, diagnostic, message.data());
+}
+
+/**
+ * @brief Terminate after an uncertain native start without retiring any native owner.
+ * @param logging Instance-bound cold diagnostic capability retained at construction.
+ * @param port Native port whose start failed.
+ * @param result Exact nonzero native return value.
+ */
+[[noreturn]] void fail_stop_native_start(const kinetum_provider_cold_log &logging, uint16_t port, int result) noexcept
+{
+	std::array<char, 256> message{};
+	const int written =
+		std::snprintf(message.data(), message.size(),
+			      "DPDK port %u: ethdev start failed (result=%d); native state is uncertain; terminating",
+			      static_cast<unsigned int>(port), result);
+	if (written <= 0 || static_cast<std::size_t>(written) >= message.size()) {
+		std::fputs("DPDK native start failed; diagnostic construction failed; terminating\n", stderr);
+		std::terminate();
+	}
+	std::fprintf(stderr, "%s\n", message.data());
+	logging.write(logging.context, KINETUM_PROVIDER_LOG_CRITICAL,
+		      component_support::static_text_view("dpdk.port.start_failed"),
+		      component_support::static_text_view("fail_stop_native_start"),
+		      {message.data(), static_cast<uint32_t>(written), 0});
+	std::terminate();
+}
+
+/**
  * @brief Return true only for a complete cold mempool API.
  * @param api Borrowed candidate operation table.
  * @return true only when every required pool operation is present.
@@ -72,15 +117,15 @@ constexpr uint8_t DPDK_STORAGE_ACCESS_AGENTS = KINETUM_PROVIDER_ACCESS_AGENT_CPU
 /**
  * @brief Return true only for a complete cold ethdev API.
  * @param api Borrowed candidate operation table.
- * @return true only when every required port and flow operation is present.
+ * @return true only when every required configuration, readback, and retirement operation is present.
  */
 [[nodiscard]] bool ethdev_api_is_complete(const dpdk_ethdev_api &api) noexcept
 {
 	return api.device_info != nullptr && api.device_socket != nullptr && api.configure != nullptr &&
 	       api.set_mtu != nullptr && api.setup_rx_queue != nullptr && api.setup_tx_queue != nullptr &&
 	       api.start != nullptr && api.stop != nullptr && api.close != nullptr && api.mac_address != nullptr &&
-	       api.update_reta != nullptr && api.validate_flow != nullptr && api.create_flow != nullptr &&
-	       api.destroy_flow != nullptr && api.statistics != nullptr;
+	       api.update_reta != nullptr && api.rss_hash_conf_get != nullptr && api.reta_query != nullptr &&
+	       api.statistics != nullptr;
 }
 
 /**
@@ -307,52 +352,30 @@ int native_update_reta(void *state, uint16_t port_id, rte_eth_rss_reta_entry64 *
 }
 
 /**
- * @brief Production wrapper validating one exact ethdev flow rule.
+ * @brief Read one complete hardware RSS key and enabled hash-class set.
  * @param state Opaque API context; unused by this native wrapper.
  * @param port_id Exact DPDK ethdev port identity.
- * @param attributes Borrowed rule scope and direction.
- * @param pattern Borrowed terminated match-item array.
- * @param actions Borrowed terminated action array.
- * @param error Caller-owned native error description.
+ * @param configuration Caller-owned output with the key buffer and capacity already set.
  * @return Unmodified native result: zero on success, or a native error code.
  */
-int native_validate_flow(void *state, uint16_t port_id, const rte_flow_attr *attributes, const rte_flow_item *pattern,
-			 const rte_flow_action *actions, rte_flow_error *error) noexcept
+int native_rss_hash_conf_get(void *state, uint16_t port_id, rte_eth_rss_conf *configuration) noexcept
 {
 	(void)state;
-	return rte_flow_validate(port_id, attributes, pattern, actions, error);
+	return rte_eth_dev_rss_hash_conf_get(port_id, configuration);
 }
 
 /**
- * @brief Production wrapper installing one exact ethdev flow rule.
+ * @brief Read one complete native RSS redirection table.
  * @param state Opaque API context; unused by this native wrapper.
  * @param port_id Exact DPDK ethdev port identity.
- * @param attributes Borrowed rule scope and direction.
- * @param pattern Borrowed terminated match-item array.
- * @param actions Borrowed terminated action array.
- * @param error Caller-owned native error description.
- * @return Owned native flow handle, or nullptr on rejection.
- */
-rte_flow *native_create_flow(void *state, uint16_t port_id, const rte_flow_attr *attributes,
-			     const rte_flow_item *pattern, const rte_flow_action *actions,
-			     rte_flow_error *error) noexcept
-{
-	(void)state;
-	return rte_flow_create(port_id, attributes, pattern, actions, error);
-}
-
-/**
- * @brief Production wrapper retiring one exact ethdev flow rule.
- * @param state Opaque API context; unused by this native wrapper.
- * @param port_id Exact DPDK ethdev port identity.
- * @param flow Owned flow handle to retire on success.
- * @param error Caller-owned native error description.
+ * @param entries Caller-owned output groups carrying the complete read mask.
+ * @param reta_size Exact device-reported table extent.
  * @return Unmodified native result: zero on success, or a native error code.
  */
-int native_destroy_flow(void *state, uint16_t port_id, rte_flow *flow, rte_flow_error *error) noexcept
+int native_reta_query(void *state, uint16_t port_id, rte_eth_rss_reta_entry64 *entries, uint16_t reta_size) noexcept
 {
 	(void)state;
-	return rte_flow_destroy(port_id, flow, error);
+	return rte_eth_dev_rss_reta_query(port_id, entries, reta_size);
 }
 
 /**
@@ -438,14 +461,16 @@ struct dpdk_port_state {
 	rte_eth_conf configuration{};		     ///< Fully preflighted port configuration.
 	rte_eth_rxconf rx_configuration{};	     ///< PMD-provided RX queue defaults.
 	rte_eth_txconf tx_configuration{};	     ///< PMD-provided TX queue defaults.
-	std::vector<uint8_t> rss_key;		     ///< Owned exact RSS key bytes.
-	std::vector<uint16_t> rss_queues;	     ///< Exact dense queue set used by an RSS flow action.
+	std::vector<uint8_t> rss_expected_key;	     ///< Exact authored bytes, independent of native buffers.
+	std::vector<uint32_t> rss_program_key;	     ///< Aligned native configuration backing retained through close.
+	std::vector<uint32_t> rss_read_key;	     ///< Aligned independent readback destination.
+	uint64_t rss_expected_hf{0};		     ///< Exact native alias set derived from the compiled profile.
+	std::vector<uint16_t> expected_reta;	     ///< Authored queue for each device table position.
 	std::vector<rte_eth_rss_reta_entry64> reta;  ///< Complete exact RETA update.
-	uint16_t reta_size{0};			     ///< Exact PMD RETA size.
-	rte_flow *symmetric_rss_flow{nullptr};	     ///< Owned exact symmetric RSS rule.
-	bool symmetric_rss{false};		     ///< Whether this port requires the exact flow rule.
-	bool configured{false};			     ///< Native configuration ownership exists.
-	bool started{false};			     ///< Native started ownership exists.
+	std::vector<rte_eth_rss_reta_entry64> read_reta;  ///< Independent complete RETA readback destination.
+	uint16_t reta_size{0};				  ///< Exact PMD RETA size.
+	bool configured{false};				  ///< Native configuration ownership exists.
+	bool started{false};				  ///< Native started ownership exists.
 };
 
 }  // namespace
@@ -482,14 +507,15 @@ struct dpdk_io_driver::implementation {
 			storage_by_domain;  ///< O(1) admitted native owners; holes reject.
 	};
 
-	dpdk_ethdev_api api{};						      ///< Complete cold native ethdev API.
-	const dpdk_process_facility *facility{nullptr};			      ///< Borrowed exact facility owner.
-	std::unique_ptr<dpdk_port_state[]> ports;			      ///< Stable port ownership rows.
-	uint32_t port_count{0};						      ///< Exact port row count.
-	std::unique_ptr<rx_queue[]> rx_queues;				      ///< Stable hot RX queue states.
-	uint32_t rx_queue_count{0};					      ///< Exact RX operation count.
-	std::unique_ptr<tx_queue[]> tx_queues;				      ///< Stable hot TX queue states.
-	uint32_t tx_queue_count{0};					      ///< Exact TX operation count.
+	dpdk_ethdev_api api{};				 ///< Complete cold native ethdev API.
+	kinetum_provider_cold_log logging{};		 ///< Exact host capability retained through destruction.
+	const dpdk_process_facility *facility{nullptr};	 ///< Borrowed exact facility owner.
+	std::unique_ptr<dpdk_port_state[]> ports;	 ///< Stable port ownership rows.
+	uint32_t port_count{0};				 ///< Exact port row count.
+	std::unique_ptr<rx_queue[]> rx_queues;		 ///< Stable hot RX queue states.
+	uint32_t rx_queue_count{0};			 ///< Exact RX operation count.
+	std::unique_ptr<tx_queue[]> tx_queues;		 ///< Stable hot TX queue states.
+	uint32_t tx_queue_count{0};			 ///< Exact TX operation count.
 	std::unique_ptr<kinetum_packet_rx_burst_operations[]> rx_operations;  ///< Published RX rows.
 	std::unique_ptr<kinetum_packet_tx_burst_operations[]> tx_operations;  ///< Published TX rows.
 	bool active{false};  ///< Whether every configured port owns live packet I/O.
@@ -642,7 +668,7 @@ void inspect_pool_object(rte_mempool *pool, void *argument, void *object, unsign
  * @param facts Borrowed complete driver facts.
  * @param port Exact compiled port row.
  * @param device_info Native steering capabilities observed for that port.
- * @param native_port Materialization state receiving the owned RSS key, queue set, and RETA.
+ * @param native_port Materialization state receiving independent expected, program, and readback storage.
  * @param diagnostic Optional caller-owned bounded failure diagnostic.
  * @return OK after preparing admitted steering state, or a precise contract/capability failure.
  * @throws std::bad_alloc Steering storage allocation fails; the driver factory owns the exception boundary.
@@ -710,22 +736,45 @@ void inspect_pool_object(rte_mempool *pool, void *argument, void *object, unsign
 			       fail(KINETUM_PROVIDER_STATUS_INVALID_ARGUMENT, diagnostic,
 				    "DPDK NONE steering is not one exact queue");
 	}
+	if (steering->symmetric != 0) {
+		return fail(KINETUM_PROVIDER_STATUS_INVALID_ARGUMENT, diagnostic,
+			    "DPDK driver does not support symmetric RSS");
+	}
 	if (steering->kind != KINETUM_PROVIDER_STEERING_RSS || rx_stream_count < 2 || steering->hash_field_count != 2 ||
 	    !component_support::text_equals(steering->hash_fields[0], RSS_FIELD_IPV4) ||
-	    !component_support::text_equals(steering->hash_fields[1], RSS_FIELD_UDP) || steering->hash_key.size == 0 ||
-	    steering->hash_key.size > std::numeric_limits<uint8_t>::max() || device_info.hash_key_size == 0 ||
-	    steering->hash_key.size != device_info.hash_key_size || device_info.reta_size == 0) {
+	    !component_support::text_equals(steering->hash_fields[1], RSS_FIELD_UDP)) {
 		return fail(KINETUM_PROVIDER_STATUS_INVALID_ARGUMENT, diagnostic,
-			    "DPDK RSS shape or key does not match the exact current contract");
+			    "DPDK RSS shape does not match the exact current contract");
+	}
+	if (steering->hash_key.size == 0 || steering->hash_key.size > std::numeric_limits<uint8_t>::max() ||
+	    device_info.hash_key_size == 0 || steering->hash_key.size != device_info.hash_key_size) {
+		std::array<char, 160> message{};
+		const int written = std::snprintf(
+			message.data(), message.size(),
+			"DPDK port %u RSS key extent mismatch: authored %u bytes, device requires %u bytes",
+			static_cast<unsigned int>(native_port.physical_port), steering->hash_key.size,
+			static_cast<unsigned int>(device_info.hash_key_size));
+		if (written <= 0 || static_cast<std::size_t>(written) >= message.size()) {
+			std::terminate();
+		}
+		return fail(KINETUM_PROVIDER_STATUS_FAILED_PRECONDITION, diagnostic, message.data());
+	}
+	if (device_info.reta_size == 0) {
+		return fail(KINETUM_PROVIDER_STATUS_FAILED_PRECONDITION, diagnostic,
+			    "DPDK PMD exposes no RSS redirection table");
 	}
 	const uint64_t rss_hf = RTE_ETH_RSS_IPV4 | RTE_ETH_RSS_NONFRAG_IPV4_UDP;
 	if ((device_info.flow_type_rss_offloads & rss_hf) != rss_hf) {
 		return fail(KINETUM_PROVIDER_STATUS_FAILED_PRECONDITION, diagnostic,
 			    "DPDK PMD does not support the exact RSS field set");
 	}
-	native_port.rss_key.assign(steering->hash_key.data, steering->hash_key.data + steering->hash_key.size);
-	native_port.rss_queues.clear();
-	native_port.rss_queues.reserve(steering->io_stream_count);
+	native_port.rss_expected_key.assign(steering->hash_key.data, steering->hash_key.data + steering->hash_key.size);
+	const std::size_t key_words = (steering->hash_key.size + sizeof(uint32_t) - 1u) / sizeof(uint32_t);
+	native_port.rss_program_key.resize(key_words);
+	native_port.rss_read_key.resize(key_words);
+	std::memcpy(native_port.rss_program_key.data(), steering->hash_key.data, steering->hash_key.size);
+	native_port.rss_expected_hf = rss_hf | RTE_ETH_RSS_NONFRAG_IPV4_OTHER;
+	std::vector<uint8_t> queue_seen(rx_stream_count, 0);
 	for (uint32_t index = 0; index < steering->io_stream_count; ++index) {
 		const kinetum_provider_io_stream_fact *matched_stream = nullptr;
 		for (uint32_t stream_index = 0; stream_index < facts.stream_count; ++stream_index) {
@@ -740,95 +789,100 @@ void inspect_pool_object(rte_mempool *pool, void *argument, void *object, unsign
 			}
 			matched_stream = &stream;
 		}
-		if (matched_stream == nullptr || matched_stream->driver_queue_id > UINT16_MAX) {
+		if (matched_stream == nullptr || matched_stream->driver_queue_id >= rx_stream_count) {
 			return fail(KINETUM_PROVIDER_STATUS_INVALID_ARGUMENT, diagnostic,
-				    "DPDK steering queue identity is not representable");
+				    "DPDK steering queue is missing or outside the authored RX queue range");
 		}
-		const uint16_t queue = static_cast<uint16_t>(matched_stream->driver_queue_id);
-		if (std::find(native_port.rss_queues.begin(), native_port.rss_queues.end(), queue) !=
-		    native_port.rss_queues.end()) {
+		const uint32_t queue = matched_stream->driver_queue_id;
+		if (queue_seen[queue] != 0) {
 			return fail(KINETUM_PROVIDER_STATUS_INVALID_ARGUMENT, diagnostic,
 				    "DPDK steering queue identity is duplicated");
 		}
-		native_port.rss_queues.push_back(queue);
+		queue_seen[queue] = 1;
 	}
-	native_port.symmetric_rss = steering->symmetric != 0;
 	native_port.configuration.rxmode.mq_mode = RTE_ETH_MQ_RX_RSS;
 	native_port.configuration.rx_adv_conf.rss_conf.rss_hf = rss_hf;
-	native_port.configuration.rx_adv_conf.rss_conf.rss_key = native_port.rss_key.data();
-	native_port.configuration.rx_adv_conf.rss_conf.rss_key_len = static_cast<uint8_t>(native_port.rss_key.size());
+	native_port.configuration.rx_adv_conf.rss_conf.rss_key =
+		reinterpret_cast<uint8_t *>(native_port.rss_program_key.data());
+	native_port.configuration.rx_adv_conf.rss_conf.rss_key_len = static_cast<uint8_t>(steering->hash_key.size);
 	native_port.reta_size = device_info.reta_size;
 	const std::size_t group_count =
 		(static_cast<std::size_t>(native_port.reta_size) + RTE_ETH_RETA_GROUP_SIZE - 1u) /
 		RTE_ETH_RETA_GROUP_SIZE;
 	native_port.reta.assign(group_count, rte_eth_rss_reta_entry64{});
+	native_port.read_reta.assign(group_count, rte_eth_rss_reta_entry64{});
+	native_port.expected_reta.resize(native_port.reta_size);
 	for (uint16_t reta_index = 0; reta_index < native_port.reta_size; ++reta_index) {
 		const std::size_t group = reta_index / RTE_ETH_RETA_GROUP_SIZE;
 		const uint16_t offset = reta_index % RTE_ETH_RETA_GROUP_SIZE;
 		native_port.reta[group].mask |= UINT64_C(1) << offset;
-		native_port.reta[group].reta[offset] = static_cast<uint16_t>(reta_index % native_port.rx_queue_count);
+		const auto queue = static_cast<uint16_t>(reta_index % native_port.rx_queue_count);
+		native_port.expected_reta[reta_index] = queue;
+		native_port.reta[group].reta[offset] = queue;
 	}
 	return KINETUM_PROVIDER_STATUS_OK;
 }
 
 /**
- * @brief Install one exact symmetric-Toeplitz RSS action after port start.
- * @param api Borrowed native flow API.
- * @param port Started port retaining the prepared RSS state and any installed flow owner.
+ * @brief Compare complete RSS readback with independently retained compiled expectations.
+ * @param api Borrowed native readback API.
+ * @param port Started port retaining bounded expected and readback buffers.
  * @param diagnostic Optional caller-owned bounded failure diagnostic.
- * @return OK when no symmetric rule is required or its installation succeeds; otherwise an explicit failure.
+ * @return OK for NONE without native reads, or for exact RSS key, hash classes, and RETA.
  */
-[[nodiscard]] kinetum_provider_status install_symmetric_rss(const dpdk_ethdev_api &api, dpdk_port_state &port,
-							    kinetum_provider_diagnostic *diagnostic) noexcept
+[[nodiscard]] kinetum_provider_status verify_rss_readback(const dpdk_ethdev_api &api, dpdk_port_state &port,
+							  kinetum_provider_diagnostic *diagnostic) noexcept
 {
-	if (!port.symmetric_rss) {
+	if (port.reta_size == 0) {
 		return KINETUM_PROVIDER_STATUS_OK;
 	}
-	if (!port.started || port.symmetric_rss_flow != nullptr || port.rss_key.empty() || port.rss_queues.size() < 2 ||
-	    port.rss_key.size() > UINT32_MAX || port.rss_queues.size() > UINT32_MAX) {
-		return fail(KINETUM_PROVIDER_STATUS_IMPLEMENTATION_ERROR, diagnostic,
-			    "DPDK symmetric RSS retained state is incomplete");
-	}
-
-	rte_flow_attr attributes{};
-	attributes.ingress = 1;
-	const std::array<rte_flow_item, 4> pattern{
-		rte_flow_item{.type = RTE_FLOW_ITEM_TYPE_ETH, .spec = nullptr, .last = nullptr, .mask = nullptr},
-		rte_flow_item{.type = RTE_FLOW_ITEM_TYPE_IPV4, .spec = nullptr, .last = nullptr, .mask = nullptr},
-		rte_flow_item{.type = RTE_FLOW_ITEM_TYPE_UDP, .spec = nullptr, .last = nullptr, .mask = nullptr},
-		rte_flow_item{.type = RTE_FLOW_ITEM_TYPE_END, .spec = nullptr, .last = nullptr, .mask = nullptr},
+	auto reject = [&](const char *reason) noexcept {
+		return fail_port(KINETUM_PROVIDER_STATUS_FAILED_PRECONDITION, diagnostic, port.physical_port, reason);
 	};
-	rte_flow_action_rss rss{};
-	rss.func = RTE_ETH_HASH_FUNCTION_SYMMETRIC_TOEPLITZ;
-	rss.level = 1;
-	rss.types = RTE_ETH_RSS_NONFRAG_IPV4_UDP;
-	rss.key_len = static_cast<uint32_t>(port.rss_key.size());
-	rss.queue_num = static_cast<uint32_t>(port.rss_queues.size());
-	rss.key = port.rss_key.data();
-	rss.queue = port.rss_queues.data();
-	const std::array<rte_flow_action, 2> actions{
-		rte_flow_action{.type = RTE_FLOW_ACTION_TYPE_RSS, .conf = &rss},
-		rte_flow_action{.type = RTE_FLOW_ACTION_TYPE_END, .conf = nullptr},
-	};
-	rte_flow_error error{};
-	if (api.validate_flow(api.state, port.physical_port, &attributes, pattern.data(), actions.data(), &error) !=
-	    0) {
-		return fail(KINETUM_PROVIDER_STATUS_FAILED_PRECONDITION, diagnostic,
-			    "DPDK PMD does not support the exact symmetric RSS rule");
+	if (!port.started || port.rss_expected_key.empty() || port.expected_reta.size() != port.reta_size) {
+		return reject("RSS readback expectations are incomplete");
 	}
-	port.symmetric_rss_flow =
-		api.create_flow(api.state, port.physical_port, &attributes, pattern.data(), actions.data(), &error);
-	if (port.symmetric_rss_flow == nullptr) {
-		return fail(KINETUM_PROVIDER_STATUS_IMPLEMENTATION_ERROR, diagnostic,
-			    "DPDK failed to install the validated symmetric RSS rule");
+	auto *key = reinterpret_cast<uint8_t *>(port.rss_read_key.data());
+	for (std::size_t index = 0; index < port.rss_expected_key.size(); ++index) {
+		key[index] = static_cast<uint8_t>(port.rss_expected_key[index] ^ UINT8_MAX);
+	}
+	rte_eth_rss_conf observed{};
+	observed.rss_key = key;
+	observed.rss_key_len = static_cast<uint8_t>(port.rss_expected_key.size());
+	if (api.rss_hash_conf_get(api.state, port.physical_port, &observed) != 0) {
+		return reject("RSS key/hash query failed");
+	}
+	if (observed.rss_key_len != port.rss_expected_key.size()) {
+		return reject("RSS key readback extent differs from the admitted device extent");
+	}
+	if (!std::equal(port.rss_expected_key.begin(), port.rss_expected_key.end(), key)) {
+		return reject("RSS key readback differs from the authored profile");
+	}
+	if (observed.rss_hf != port.rss_expected_hf) {
+		return reject("RSS hash readback differs from the exact i40e profile");
+	}
+	for (uint16_t index = 0; index < port.reta_size; ++index) {
+		const std::size_t group = index / RTE_ETH_RETA_GROUP_SIZE;
+		const uint16_t offset = index % RTE_ETH_RETA_GROUP_SIZE;
+		port.read_reta[group].mask |= UINT64_C(1) << offset;
+		port.read_reta[group].reta[offset] = UINT16_MAX;
+	}
+	if (api.reta_query(api.state, port.physical_port, port.read_reta.data(), port.reta_size) != 0) {
+		return reject("RSS RETA query failed");
+	}
+	for (uint16_t index = 0; index < port.reta_size; ++index) {
+		if (port.read_reta[index / RTE_ETH_RETA_GROUP_SIZE].reta[index % RTE_ETH_RETA_GROUP_SIZE] !=
+		    port.expected_reta[index]) {
+			return reject("RSS RETA readback differs from the authored queue mapping");
+		}
 	}
 	return KINETUM_PROVIDER_STATUS_OK;
 }
 
 /**
  * @brief Retire one live port without releasing configured ownership.
- * @param api Borrowed native flow and ethdev API.
- * @param port Configured live port whose flow and start ownership are retired in order.
+ * @param api Borrowed native ethdev API.
+ * @param port Configured live port whose started ownership is retired.
  * @param diagnostic Optional caller-owned bounded failure diagnostic.
  * @return OK after stopping the port; failure preserves unresolved ownership in the port state.
  */
@@ -839,17 +893,9 @@ void inspect_pool_object(rte_mempool *pool, void *argument, void *object, unsign
 		return fail(KINETUM_PROVIDER_STATUS_IMPLEMENTATION_ERROR, diagnostic,
 			    "DPDK deactivation found a port outside the exact live state");
 	}
-	if (port.symmetric_rss_flow != nullptr) {
-		rte_flow_error error{};
-		if (api.destroy_flow(api.state, port.physical_port, port.symmetric_rss_flow, &error) != 0) {
-			return fail(KINETUM_PROVIDER_STATUS_IMPLEMENTATION_ERROR, diagnostic,
-				    "DPDK failed to retire an exact symmetric RSS rule");
-		}
-		port.symmetric_rss_flow = nullptr;
-	}
 	if (api.stop(api.state, port.physical_port) != 0) {
-		return fail(KINETUM_PROVIDER_STATUS_IMPLEMENTATION_ERROR, diagnostic,
-			    "DPDK failed to stop an exact ethdev port");
+		return fail_port(KINETUM_PROVIDER_STATUS_IMPLEMENTATION_ERROR, diagnostic, port.physical_port,
+				 "ethdev stop failed");
 	}
 	port.started = false;
 	return KINETUM_PROVIDER_STATUS_OK;
@@ -884,9 +930,8 @@ dpdk_ethdev_api default_dpdk_ethdev_api() noexcept
 		.close = native_close,
 		.mac_address = native_mac_address,
 		.update_reta = native_update_reta,
-		.validate_flow = native_validate_flow,
-		.create_flow = native_create_flow,
-		.destroy_flow = native_destroy_flow,
+		.rss_hash_conf_get = native_rss_hash_conf_get,
+		.reta_query = native_reta_query,
 		.statistics = native_statistics,
 	};
 }
@@ -1178,7 +1223,7 @@ dpdk_io_driver::~dpdk_io_driver() noexcept
 	}
 	for (uint32_t index = 0; index < state_->port_count; ++index) {
 		const auto &port = state_->ports[index];
-		if (port.started || port.symmetric_rss_flow != nullptr) {
+		if (port.started) {
 			std::terminate();
 		}
 	}
@@ -1218,28 +1263,30 @@ kinetum_provider_status dpdk_io_driver::activate_packet_io_(kinetum_provider_dia
 	};
 	for (uint32_t port_index = 0; port_index < state_->port_count; ++port_index) {
 		auto &port = state_->ports[port_index];
-		if (!port.configured || port.started || port.symmetric_rss_flow != nullptr) {
+		if (!port.configured || port.started) {
 			rollback();
 			return fail(KINETUM_PROVIDER_STATUS_IMPLEMENTATION_ERROR, diagnostic,
 				    "DPDK activation found a port outside the exact cold state");
 		}
-		if (state_->api.start(state_->api.state, port.physical_port) != 0) {
-			rollback();
-			return fail(KINETUM_PROVIDER_STATUS_IMPLEMENTATION_ERROR, diagnostic,
-				    "DPDK ethdev start failed");
+		const int started = state_->api.start(state_->api.state, port.physical_port);
+		if (started != 0) {
+			// A failed PMD start may have effects without setting ethdev's
+			// dev_started flag. Stop can then return without entering the PMD;
+			// neither rollback nor a cold-on-return claim is justified.
+			fail_stop_native_start(state_->logging, port.physical_port, started);
 		}
 		port.started = true;
 		++activated_count;
 		if (port.reta_size != 0 && state_->api.update_reta(state_->api.state, port.physical_port,
 								   port.reta.data(), port.reta_size) != 0) {
 			rollback();
-			return fail(KINETUM_PROVIDER_STATUS_FAILED_PRECONDITION, diagnostic,
-				    "DPDK PMD rejected the exact RSS redirection table");
+			return fail_port(KINETUM_PROVIDER_STATUS_FAILED_PRECONDITION, diagnostic, port.physical_port,
+					 "RSS RETA update failed");
 		}
-		const auto flow_status = install_symmetric_rss(state_->api, port, diagnostic);
-		if (flow_status != KINETUM_PROVIDER_STATUS_OK) {
+		const auto readback_status = verify_rss_readback(state_->api, port, diagnostic);
+		if (readback_status != KINETUM_PROVIDER_STATUS_OK) {
 			rollback();
-			return flow_status;
+			return readback_status;
 		}
 	}
 	state_->active = true;
@@ -1380,6 +1427,7 @@ kinetum_provider_status dpdk_io_driver::create(const kinetum_provider_factory_re
 	try {
 		auto state = std::make_unique<implementation>();
 		state->api = api;
+		state->logging = request.logging;
 		state->facility = facility;
 		state->port_count = facts.port_count;
 		state->ports = std::make_unique<dpdk_port_state[]>(facts.port_count);
@@ -1470,8 +1518,16 @@ kinetum_provider_status dpdk_io_driver::create(const kinetum_provider_factory_re
 			if (api.device_info(api.state, native_port.physical_port, &device_info) != 0 ||
 			    native_rx_count > device_info.max_rx_queues ||
 			    native_tx_count > device_info.max_tx_queues) {
-				return fail(KINETUM_PROVIDER_STATUS_FAILED_PRECONDITION, diagnostic,
-					    "DPDK PMD cannot satisfy the exact queue population");
+				return fail_port(KINETUM_PROVIDER_STATUS_FAILED_PRECONDITION, diagnostic,
+						 native_port.physical_port,
+						 "device info cannot satisfy the exact queue population");
+			}
+			if (attachment.kind == KINETUM_PROVIDER_ATTACHMENT_PCI &&
+			    (device_info.driver_name == nullptr ||
+			     std::strcmp(device_info.driver_name, "net_i40e") != 0)) {
+				return fail_port(KINETUM_PROVIDER_STATUS_FAILED_PRECONDITION, diagnostic,
+						 native_port.physical_port,
+						 "PCI attachment did not resolve to the admitted net_i40e driver");
 			}
 			for (uint32_t queue = 0; queue < native_port.rx_queue_count; ++queue) {
 				uint32_t matches = 0;
@@ -1538,15 +1594,17 @@ kinetum_provider_status dpdk_io_driver::create(const kinetum_provider_factory_re
 			const int device_socket = api.device_socket(api.state, native_port.physical_port);
 			if (port.has_host_numa_node != 0 &&
 			    (device_socket < 0 || device_socket != port.host_numa_node)) {
-				return fail(KINETUM_PROVIDER_STATUS_FAILED_PRECONDITION, diagnostic,
-					    "DPDK ethdev NUMA identity disagrees with plan truth");
+				return fail_port(KINETUM_PROVIDER_STATUS_FAILED_PRECONDITION, diagnostic,
+						 native_port.physical_port,
+						 "ethdev NUMA identity disagrees with plan truth");
 			}
 			if (port.has_resolved_mac_address != 0) {
 				rte_ether_addr address{};
 				if (api.mac_address(api.state, native_port.physical_port, &address) != 0 ||
 				    !mac_matches(port.resolved_mac_address, address)) {
-					return fail(KINETUM_PROVIDER_STATUS_FAILED_PRECONDITION, diagnostic,
-						    "DPDK ethdev MAC disagrees with resolved plan truth");
+					return fail_port(KINETUM_PROVIDER_STATUS_FAILED_PRECONDITION, diagnostic,
+							 native_port.physical_port,
+							 "ethdev MAC disagrees with resolved plan truth");
 				}
 			}
 			native_port.configuration.rxmode.mq_mode = RTE_ETH_MQ_RX_NONE;
@@ -1678,15 +1736,15 @@ kinetum_provider_status dpdk_io_driver::create(const kinetum_provider_factory_re
 			if (api.configure(
 				    api.state, port.physical_port, static_cast<uint16_t>(port.native_rx_queues.size()),
 				    static_cast<uint16_t>(port.native_tx_queues.size()), &port.configuration) != 0) {
-				return fail(KINETUM_PROVIDER_STATUS_IMPLEMENTATION_ERROR, diagnostic,
-					    "DPDK ethdev configuration failed");
+				return fail_port(KINETUM_PROVIDER_STATUS_IMPLEMENTATION_ERROR, diagnostic,
+						 port.physical_port, "ethdev configuration failed");
 			}
 			// Claim immediately: every later error must close this port before any
 			// dependent storage domain can retire.
 			port.configured = true;
 			if (api.set_mtu(api.state, port.physical_port, port.mtu) != 0) {
-				return fail(KINETUM_PROVIDER_STATUS_FAILED_PRECONDITION, diagnostic,
-					    "DPDK PMD rejected the exact MTU");
+				return fail_port(KINETUM_PROVIDER_STATUS_FAILED_PRECONDITION, diagnostic,
+						 port.physical_port, "MTU setup failed");
 			}
 			// Native queue order fixes TAP's kernel file-descriptor queue indices.
 			for (std::size_t index = 0; index < port.native_rx_queues.size(); ++index) {
@@ -1695,8 +1753,8 @@ kinetum_provider_status dpdk_io_driver::create(const kinetum_provider_factory_re
 						       queue.descriptors,
 						       static_cast<unsigned int>(queue.storage->host_numa_node()),
 						       &port.rx_configuration, queue.storage->native_pool()) != 0) {
-					return fail(KINETUM_PROVIDER_STATUS_IMPLEMENTATION_ERROR, diagnostic,
-						    "DPDK RX queue setup failed");
+					return fail_port(KINETUM_PROVIDER_STATUS_IMPLEMENTATION_ERROR, diagnostic,
+							 port.physical_port, "RX queue setup failed");
 				}
 			}
 			for (std::size_t index = 0; index < port.native_tx_queues.size(); ++index) {
@@ -1705,8 +1763,8 @@ kinetum_provider_status dpdk_io_driver::create(const kinetum_provider_factory_re
 						       queue.descriptors,
 						       static_cast<unsigned int>(queue.storage->host_numa_node()),
 						       &port.tx_configuration) != 0) {
-					return fail(KINETUM_PROVIDER_STATUS_IMPLEMENTATION_ERROR, diagnostic,
-						    "DPDK TX queue setup failed");
+					return fail_port(KINETUM_PROVIDER_STATUS_IMPLEMENTATION_ERROR, diagnostic,
+							 port.physical_port, "TX queue setup failed");
 				}
 			}
 		}

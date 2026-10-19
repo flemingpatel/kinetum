@@ -2256,14 +2256,16 @@ status provider_topology_compiler::compile_steering_()
 			return status::invalid_argument("I/O-driver contract cannot implement the steering profile");
 		}
 		if (kind == compiled_steering_kind::RSS) {
+			if (profile->symmetric() && !driver.capabilities.supports_symmetric_rss) {
+				return status::invalid_argument("I/O-driver contract does not support symmetric RSS");
+			}
 			if (profile->hash_fields_size() !=
 				    static_cast<int>(driver.capabilities.rss_hash_fields.size()) ||
 			    !std::equal(profile->hash_fields().begin(), profile->hash_fields().end(),
 					driver.capabilities.rss_hash_fields.begin()) ||
-			    profile->hash_key().size() > driver.capabilities.maximum_rss_key_bytes ||
-			    (profile->symmetric() && !driver.capabilities.supports_symmetric_rss)) {
+			    profile->hash_key().size() > driver.capabilities.maximum_rss_key_bytes) {
 				return status::invalid_argument(
-					"RSS field sequence, key size, or symmetry exceeds the exact driver contract");
+					"RSS field sequence or key size exceeds the exact driver contract");
 			}
 		}
 		const uint32_t index = static_cast<uint32_t>(out_.steering_profiles.size());

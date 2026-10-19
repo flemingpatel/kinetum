@@ -336,11 +336,13 @@ TEST(provider_contract_catalog, role_specific_projections_are_exact)
 	EXPECT_TRUE(facility_projection.identical_configuration_required);
 	EXPECT_TRUE(facility_projection.generation_safe_lease_required);
 	EXPECT_TRUE(facility->facility_dependencies.empty());
-	ASSERT_EQ(facility->host_requirements.size(), 2u);
+	ASSERT_EQ(facility->host_requirements.size(), 3u);
 	EXPECT_EQ(facility->host_requirements[0].fact, provider_host_fact::DPDK_EAL_RUNTIME);
 	EXPECT_EQ(facility->host_requirements[0].phase, provider_host_proof_phase::COMPONENT_HOST_PROOF);
 	EXPECT_EQ(facility->host_requirements[1].fact, provider_host_fact::DPDK_HUGEPAGE_PAYLOAD_FLOOR);
 	EXPECT_EQ(facility->host_requirements[1].phase, provider_host_proof_phase::COMPONENT_HOST_PROOF);
+	EXPECT_EQ(facility->host_requirements[2].fact, provider_host_fact::DPDK_PCI_ADAPTER_OWNERSHIP);
+	EXPECT_EQ(facility->host_requirements[2].phase, provider_host_proof_phase::COMPONENT_HOST_PROOF);
 
 	const auto *driver = find_provider_contract(DPDK_DRIVER_TYPE_URL);
 	ASSERT_NE(driver, nullptr);
@@ -358,7 +360,7 @@ TEST(provider_contract_catalog, role_specific_projections_are_exact)
 	EXPECT_EQ(driver_projection.rss_hash_fields[0], "ipv4");
 	EXPECT_EQ(driver_projection.rss_hash_fields[1], "udp");
 	EXPECT_EQ(driver_projection.maximum_rss_key_bytes, 128u);
-	EXPECT_TRUE(driver_projection.supports_symmetric_rss);
+	EXPECT_FALSE(driver_projection.supports_symmetric_rss);
 	EXPECT_EQ(driver_projection.maximum_driver_queue_id,
 		  static_cast<uint32_t>(std::numeric_limits<uint16_t>::max()) - 1u);
 	EXPECT_EQ(driver_projection.maximum_descriptor_count, std::numeric_limits<uint16_t>::max());

@@ -108,7 +108,7 @@ Photon never processes packets.
     note right of DP: DP independently re-admits the bundle,\nconsumes its sole compiled topology,\nproves that artifact through Quark,\nauthenticates required components,\nmaterializes one complete generation,\nthen publishes CONTROL_READY
     loop bounded CONTROL_READY gate
         Photon->DP: Health() with per-RPC deadline
-        DP-->Photon: STARTING or exact CONTROL_READY
+        DP-->Photon: transport unavailable, STARTING,\nor exact CONTROL_READY
     end
     Photon->CP: posix_spawn exact CP image\n~--listen-addr CP_LISTEN\n~--dp-addr DP_ENDPOINT\n~--config-store-dir STORE_DIR\n~--bootstrap-snapshot VERIFIED_SNAPSHOT\n~--bootstrap-plan-content-hash VERIFIED_PLAN_SHA256\nexplicit shared logging settings
     CP->CP: Admit durable store and establish exact restoration authority
@@ -160,6 +160,9 @@ transport failures and exact `STATE_CONTROL_READY`; it accepts only exact
 `STATE_PACKET_READY`. Unknown enum values, skipped phases, regressions,
 application errors, child exits, and cancellation are terminal. Each RPC and
 each complete gate has a named bounded deadline in `readiness.hpp`.
+Health calls wait for the connection within their per-RPC deadline, keeping
+transport progress active while DP constructs its runtime and opens the listener.
+Connection readiness alone cannot satisfy either application gate.
 
 The supervision loop checks child liveness every 1 second
 (`SUPERVISION_POLL_INTERVAL` in `src/photon/photon_main.cpp`). The main thread
@@ -227,11 +230,12 @@ Photon's artifact handling has four steps:
 3. **Retain authority** - use only the verifier-returned canonical plan path,
    canonical snapshot path, and exact lowercase plan hash. Photon does not
    reopen a caller-selected substitute.
-4. **Construct** - validate child-startup inputs, then build the exact DP/CP
-   argv from those retained authorities.
+4. **Construct** - validate the complete startup specification. Each child's
+   exact argv is built from those retained authorities at its ordered spawn step.
 
-These steps finish before child-process construction. Photon passes the
-verifier's canonical bundle root to DP, with no direct-plan or substitute path.
+Bundle admission and specification validation finish before child construction.
+Photon passes the verifier's canonical bundle root to DP, with no direct-plan or
+substitute path.
 DP independently re-admits it and uses the compiled artifact for Quark and
 materialization. DP startup also owns component availability and native
 capability checks; Photon cannot duplicate or repair them.
@@ -357,12 +361,13 @@ When `kinetum_cp` is launched directly, its standalone default is
 
 #### 7.3 IPC
 
-Two gRPC channels at well-known endpoints:
+Control RPCs use these endpoints:
 
 | Channel                  | Endpoint                          | Direction       |
 | ------------------------ | --------------------------------- | --------------- |
 | External -> CP           | `127.0.0.1:50051` (default)       | `kinetumctl` and explicit external clients call CP |
 | CP -> DP                 | `127.0.0.1:50052` (default)       | CP applies snapshots, DP exposes stats             |
+| Photon -> DP             | `127.0.0.1:50052` (default)       | Health observations for the two startup gates      |
 
 Override defaults with `--cp-listen` and `--dp-endpoint`.
 
@@ -521,7 +526,8 @@ Notable lines:
 | ------------------------------------------------- | --------------------------------------------------- |
 | `"verified bundle: <root>"` / `"bootstrap snapshot: <path>"` | Complete runtime-bundle admission succeeded before runtime setup. |
 | `"starting supervisor"` / `"plan=..."`            | After runtime-bundle and startup-spec validation, before spawn. |
-| `"DP startup: ..."` / `"CP startup: ..."`         | Bounded summaries carrying actual admitted paths and endpoints. |
+| `"planned DP inputs: ..."` / `"planned CP inputs: ..."` | Admitted paths and endpoints before spawning; these summaries do not report a running child. |
+| `"spawned process '<role>' (pid=N)"` | The exact child image was spawned and its PID is owned; readiness is still pending. |
 | `"supervised startup failed: ..."`                | Spawn, readiness, cancellation, or startup cleanup failed. |
 | `"supervisor running, press Ctrl+C to stop"`      | Entering the supervision loop.                      |
 | `"<role> process exited (exit_code=N); resolving the complete supervised pair"` | A DP or CP exit selected pair-scoped resolution. |
@@ -554,7 +560,7 @@ kinetum_photon --bundle <bundle_dir> [options]
 | `--dp-endpoint <addr>`                | `127.0.0.1:50052`        | DP gRPC listen address.                                            |
 | `--restart-on-failure`                | off                      | Restart children on non-zero exit.                                 |
 | `--log-dir <absolute-dir>`            | `/var/log/kinetum`        | Shared parent directory for the three independently owned role files. |
-| `--log-level <level>`                 | `info`                   | Minimum severity: `debug`, `info`, `warn`, `error`, or `fatal`. |
+| `--log-level <level>`                 | `info`                   | Ordinary severity threshold; [Logging](LOGGING.md#3-settings) defines native gRPC defaults and component overrides. |
 | `--log-component-level <name>=<level>` | none                     | Override one known component; duplicate components reject. |
 | `--log-max-bytes <bytes>`             | `16777216`               | Maximum complete-record file size before rotation. |
 | `--log-keep-files <count>`            | `8`                      | Total files per role including active; range `2..32`. |
@@ -586,10 +592,10 @@ library contract, not an installed public SDK ABI.
 | `request_process_log_reopen(child_proc)` -> `status` | Send `SIGUSR1` only through a retained child identity; never changes restart policy. |
 | `validate_readiness_wait_policy(policy)` -> `status` | Validate positive, relationally coherent RPC/poll/overall bounds. |
 | `classify_readiness_state(gate, state)` -> `status_or<readiness_progress>` | Accept only a gate's exact target or sole declared pre-state. |
-| `wait_for_exact_readiness(observer, gate, policy, progress)` -> `status_or<dataplane_health_identity>` | Run one bounded, cancellation- and liveness-aware readiness gate and return the exact target identity. |
-| `start_supervised_children(spec, observer, processes, shutdown)` -> `status_or<supervised_children>` | Execute transactional DP-then-CP startup and transfer both child authorities only after exact packet readiness. |
+| `wait_for_exact_readiness(observer, gate, policy, clock, progress)` -> `status_or<dataplane_health_identity>` | Run one bounded, cancellation- and liveness-aware readiness gate and return the exact target identity. |
+| `start_supervised_children(spec, observer, processes, clock, shutdown)` -> `status_or<supervised_children>` | Execute transactional DP-then-CP startup and transfer both child authorities only after exact packet readiness. |
 | `supervised_pair_owner`                              | Hold the packet-ready pair, exact startup specification, and sole restart policy; resolve an observed exit, or perform final ordered cleanup without relinquishing unproven child authority. |
-| `supervised_pair_owner::resolve_observed_exit(observer, shutdown)` -> `status` | Clean the observed pair and return OK only after an authorized replacement completes both readiness gates. |
+| `supervised_pair_owner::resolve_observed_exit(observer, clock, shutdown)` -> `status` | Clean the observed pair and return OK only after an authorized replacement completes both readiness gates. |
 | `restart_policy` enum                              | Exact `NEVER` or `ON_FAILURE` policy. |
 | `process_state` enum                               | `NOT_STARTED`, `RUNNING`, `TERMINATED`, `KILLED`, or `EXITED`. Spawn failure returns status and creates no record. |
 | `child_proc` struct                                | Owns one PID/reaping obligation plus its bounded name, owner-observed state, and retained exit code. |
@@ -617,9 +623,12 @@ standard I/O and every ordinary environment entry, while all `LD_*` entries
 are omitted. Pair replacement reconstructs and revalidates both exact argv
 vectors and repeats the same environment sanitation.
 
-`readiness.hpp` exposes strict state classification, coherent bounded wait
-policies, the `dp_health_observer` interface, and the production gRPC observer.
-`startup.hpp` exposes `supervised_startup_spec`, exact DP/CP argv builders, the
+`readiness.hpp` exposes strict state classification, bounded wait policies,
+health observation, and the `readiness_clock` timing interface. Photon supplies
+`steady_readiness_clock`, which uses the standard monotonic clock and thread
+wait. Both readiness gates and pair replacement use that same timing dependency;
+the APIs borrow it only for the duration of each call.
+`startup.hpp` exposes `supervised_startup_spec`, the
 testable `startup_process_controller`, `start_supervised_children()`, and the
 scope-bound `supervised_pair_owner`. The startup call transfers two
 `child_proc` authorities only after both exact gates; all earlier exits roll
@@ -732,8 +741,9 @@ sudo tail -f /var/log/kinetum/kinetum_photon.log /var/log/kinetum/kinetum_cp.log
 The records include:
 
 - `starting supervisor`
-- `DP startup: ...` with the admitted bundle path and endpoint
-- `CP startup: ...` with the admitted snapshot path and plan content hash
+- `planned DP inputs: ...` with the admitted bundle path and endpoint
+- `planned CP inputs: ...` with the admitted snapshot path and plan content hash
+- `spawned process 'dp' (pid=N)`, then `spawned process 'cp' (pid=N)` after DP control readiness
 - `supervisor running, press Ctrl+C to stop`
 - (After Ctrl+C) `received signal N, shutting down` ->
   `stopping supervised pair (CP before DP)` -> `supervisor shutdown complete`

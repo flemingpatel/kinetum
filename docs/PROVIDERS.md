@@ -197,13 +197,13 @@ Host checks run where the required facts are available:
 | Phase | Owner | Evidence |
 |---|---|---|
 | `QUARK_LIVE_HOST` | Quark, before provider loading. | Planned worker/service CPUs, exact NUMA ownership, and process-allowed host-memory nodes. |
-| `COMPONENT_HOST_PROOF` | Admitted component, before factories. | DPDK runtime/hugepage requirements or Linux UDP socket support. |
+| `COMPONENT_HOST_PROOF` | Admitted component, before factories. | DPDK runtime, hugepage, and PCI adapter ownership requirements, or Linux UDP socket support. |
 | `MATERIALIZATION_PROOF` | Component factory/lifecycle. | Native device and queue capabilities requiring initialized resources. |
 
 A component host proof receives immutable compiled facts and may inspect native
 state ephemerally. It cannot reserve resources, initialize a facility, create a
-persistent thread, or publish operations. Each required instance proof runs
-once. Quark does not call these native proofs or reinterpret their results.
+persistent thread, or publish operations. Each required instance's host-proof
+callback runs once. Quark does not call these native proofs or reinterpret their results.
 
 The compiled result contains indices, normalized payloads, dependency recipes,
 access proofs, routes, budgets, and bounded schedules. Packet workers consume
@@ -530,12 +530,13 @@ cannot be reclaimed while a native device might still reference it.
 | Component-phase host proof after loading | Diagnose and terminate without unloading uncertain component state. |
 | Recoverable factory failure before any facility succeeds | Retire the constructed prefix and return failure. |
 | Construction failure after a facility reports success or an undeclared status | Retire materialized instances in reverse order, then terminate; do not reuse the foreign process runtime. |
-| Driver activation failure | The failed driver remains cold; deactivate the activated prefix in reverse order. Unproven rollback terminates. |
+| Driver activation returns failure with the complete driver cold | Deactivate earlier drivers in reverse order. Production startup terminates before dependencies retire. |
+| Driver activation cannot prove complete cold rollback | The component terminates without returning or reclaiming uncertain native ownership. |
 | Driver deactivation or native retirement failure | Preserve unresolved ownership and fail stop before reclaiming dependencies. |
 
 An invalid factory result is reclaimed only when its ownership can be identified
-completely. Ambiguous partial ownership is fail-stop. DPDK's irreversible EAL
-initialization boundary adds the native constraints described next.
+completely. Ambiguous partial ownership is fail-stop. DPDK's native boundaries
+are described next.
 
 ---
 
@@ -571,6 +572,22 @@ are not registered as DPDK lcores. The complete runtime-service set includes
 the exact coordinator main core. Native identities are reserved before workers
 register, and worker/service aliasing rejects.
 
+PCI attachments are limited to the i40e physical-function identities generated
+from the built PMD's registration metadata. Component host proof and the check
+immediately before EAL use the same read-only sysfs inspection. Every used
+function of an adapter must be declared in that facility and bound to `vfio-pci`;
+unused sibling functions must be unbound. Foreign bindings, virtual functions
+(VFs), active SR-IOV, and unavailable or inconsistent observations reject.
+Both `sriov_totalvfs` and `sriov_numvfs` may be absent when no VF links exist;
+one missing attribute or a failed read rejects. EAL resolves each declared port,
+and the driver separately confirms `net_i40e` before configuration.
+
+This ownership rule covers ordinary and NONE-steered PCI ports because i40e
+startup writes adapter-global defaults. Binding preparation belongs to the
+operator and must be repeated after reboot. Inspection does not reserve an
+unused function against later administrative changes. TAP-only deployments
+perform no PCI inspection.
+
 The storage factory places the 192-byte packet record in each mbuf's private
 area and retains the mbuf pointer only in `native_handle`. It proves both
 private-area capacity and every record's 64-byte alignment before publishing
@@ -585,8 +602,8 @@ Each RX queue binds its declared mempool. A TX queue may accept several DPDK
 pools from the same facility with proven NUMA compatibility. The native driver
 reclaims each completed mbuf through its own pool. Multi-pool TX rejects
 `RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE` before device configuration because that
-mode requires one pool per queue. Writable fan-out uses `rte_pktmbuf_copy`;
-exhaustion never selects host storage.
+mode requires one pool per queue. Writable fan-out allocates another mbuf and
+copies packet bytes and metadata; exhaustion never selects host storage.
 
 The TAP PMD requires paired native RX/TX queues. The provider constructs those
 pairs while publishing only the authored packet directions. On a TX-only port,
@@ -597,18 +614,38 @@ RX queue has an authored owner. PCI ports retain their authored queue counts.
 
 Port configuration immediately records ownership before another fallible
 native call. The factory leaves ports cold. Activation starts ports, programs
-the compiled RETA, and installs requested symmetric RSS flows while worker
-bodies remain closed. Even a single RX queue carries an explicit NONE steering
-row. A live PMD mismatch rejects before packet readiness. Hardware RSS symmetry
+the compiled RETA, and reads back each RSS port's key, hash classes, and complete
+queue mapping while worker bodies remain closed. Expected values come from
+the compiled profile independently of native programming buffers. An extent,
+byte, class, or queue mismatch rejects before packet readiness. NONE-steered
+ports make no RSS read call; even a single RX queue carries an explicit NONE
+steering row.
+
+The current DPDK contract supports ordinary RSS and rejects `symmetric: true`
+both during planning and at the component boundary. Its `ipv4, udp` field
+sequence selects nonfragmented IPv4-other address hashing and nonfragmented
+IPv4/UDP address-and-port hashing. The authored key must equal the PMD's
+reported extent: 52 bytes for i40e PFs. The native readback reports the
+IPv4-other class under both `IPV4` and `NONFRAG_IPV4_OTHER`; no other extra class
+is accepted. Toeplitz comes from the pinned PMD's startup configuration; ethdev
+readback does not report the selected hash algorithm. Hardware RSS symmetry
 does not establish NAT session ownership; that belongs to
 [module context selection](MODULE_SDK.md#session-ownership-across-ingress-queues).
 
-Deactivation destroys RSS flows and stops ports in reverse order. Destruction
-then closes configured cold ports before pools and EAL retire. Invocation of
-`rte_eal_init()` is the native irreversible boundary: failure terminates rather
-than assuming cleanup ownership. After successful initialization, later failure
-claims one cleanup attempt and terminates regardless of its outcome. EAL helper
-state is not proven reusable for another in-process DPDK generation.
+Deactivation stops ports in reverse order. Destruction then closes configured
+cold ports before pools and EAL retire. A RETA or readback failure stops the
+successfully started prefix, checking every stop, before returning cold failure.
+A failed native port start is different: the PMD may have changed hardware while
+ethdev still considers the port stopped. The component reports the port and
+native result, then terminates without stopping or closing any port. All native
+owners remain retained until process exit; activation never returns an uncertain
+driver as cold.
+
+Invocation of `rte_eal_init()` is also irreversible: failure terminates rather
+than assuming cleanup ownership. A facility-admission failure after successful
+initialization claims one cleanup attempt and terminates regardless of its
+outcome. EAL helper state is not proven reusable for another in-process DPDK
+generation.
 
 #### Native observations
 
@@ -629,6 +666,12 @@ The component consumes the verified source-produced
 Meson producer, supported architecture/ISA tuples, generated configuration,
 forced `rte_config.h` include, consumer ISA flags, and the PCI/vdev buses, ring
 mempool, i40e, and TAP archive set.
+
+The producer reads the `net_i40e` `PMD_INFO_STRING` object from the built archive
+with pyelftools and generates the component-private PCI identity header. It
+requires exact vendor/device values and wildcard subsystem IDs. The header is
+included in the package's hashed payload; no separately maintained device list
+or runtime access to DPDK's private PCI bus layout is required.
 
 Static-PIC implementation and PMD archives are whole-archived into this one
 component so registration and DPDK global state have one image owner. libnuma

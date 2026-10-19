@@ -183,6 +183,7 @@ namespace
 		case kinetum::provider::provider_host_fact::DPDK_EAL_RUNTIME:
 		case kinetum::provider::provider_host_fact::DPDK_HUGEPAGE_PAYLOAD_FLOOR:
 		case kinetum::provider::provider_host_fact::DPDK_ETHDEV_PORT:
+		case kinetum::provider::provider_host_fact::DPDK_PCI_ADAPTER_OWNERSHIP:
 		case kinetum::provider::provider_host_fact::LINUX_IPV4_DATAGRAM_SOCKET:
 			report.diagnostics.push_back(
 				"compiled provider requirement assigns a non-Quark host fact to QUARK_LIVE_HOST");

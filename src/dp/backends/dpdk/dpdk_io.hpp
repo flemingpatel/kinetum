@@ -26,7 +26,6 @@
 #include <memory>
 
 #include <rte_ethdev.h>
-#include <rte_flow.h>
 #include <rte_mempool.h>
 
 #include "src/dp/backends/dpdk/dpdk_native_visibility.hpp"
@@ -75,14 +74,11 @@ struct dpdk_ethdev_api {
 			   rte_ether_addr *address) noexcept;  ///< Read exact device MAC.
 	int (*update_reta)(void *state, uint16_t port_id, rte_eth_rss_reta_entry64 *entries,
 			   uint16_t reta_size) noexcept;  ///< Program the complete exact RETA.
-	int (*validate_flow)(void *state, uint16_t port_id, const rte_flow_attr *attributes,
-			     const rte_flow_item *pattern, const rte_flow_action *actions,
-			     rte_flow_error *error) noexcept;  ///< Prove one exact flow rule is supported.
-	rte_flow *(*create_flow)(void *state, uint16_t port_id, const rte_flow_attr *attributes,
-				 const rte_flow_item *pattern, const rte_flow_action *actions,
-				 rte_flow_error *error) noexcept;  ///< Install one validated flow rule.
-	int (*destroy_flow)(void *state, uint16_t port_id, rte_flow *flow,
-			    rte_flow_error *error) noexcept;  ///< Retire one owned flow rule.
+	int (*rss_hash_conf_get)(
+		void *state, uint16_t port_id,
+		rte_eth_rss_conf *configuration) noexcept;  ///< Read the complete native key and hash classes.
+	int (*reta_query)(void *state, uint16_t port_id, rte_eth_rss_reta_entry64 *entries,
+			  uint16_t reta_size) noexcept;	 ///< Read every requested RETA entry.
 	int (*statistics)(void *state, uint16_t port_id,
 			  rte_eth_stats *statistics) noexcept;	///< Read one cold native port snapshot.
 };
@@ -203,8 +199,8 @@ class dpdk_packet_storage final {
  * NUMA relation, RSS field/key, and RETA entry before the first port is
  * configured. Configured ownership is claimed immediately and unwound in
  * reverse order, but every port remains stopped. The cold lifecycle edge
- * starts the complete driver and programs exact RETA/flow state only after
- * fixed-epoch bootstrap. The owner never adjusts descriptor counts, enables
+ * starts each port, programs its exact RETA, and verifies RSS readback before
+ * packet readiness. The owner never adjusts descriptor counts, enables
  * promiscuous mode, infers queue zero, or accepts a PMD default RSS mapping.
  */
 class dpdk_io_driver final {
@@ -249,14 +245,15 @@ class dpdk_io_driver final {
 	explicit dpdk_io_driver(std::unique_ptr<implementation> state) noexcept;
 
 	/**
-	 * @brief Start every configured port and publish exact steering atomically.
+	 * @brief Start and verify every configured port before publishing the live driver.
 	 *
 	 * @param diagnostic Optional caller-owned bounded diagnostic.
-	 * @return OK only after the complete driver is live; otherwise exact rollback status.
+	 * @return OK after complete activation, or failure after checked rollback from cold state.
+	 *         An uncertain native start or rollback terminates without returning.
 	 */
 	[[nodiscard]] kinetum_provider_status activate_packet_io_(kinetum_provider_diagnostic *diagnostic) noexcept;
 	/**
-	 * @brief Retire exact steering and stop every port in reverse order.
+	 * @brief Stop every live port in reverse order.
 	 *
 	 * @param diagnostic Optional caller-owned bounded diagnostic.
 	 * @return OK only after the complete driver is cold.
@@ -304,7 +301,7 @@ class dpdk_io_driver final {
 	 * @brief Transfer exactly the accepted prefix to one native TX queue.
 	 * @param state Borrowed materialized TX queue.
 	 * @param records Candidate records; only the returned prefix transfers to DPDK.
-	 * @param count Candidate extent, capped to the platform burst bound.
+	 * @param count Candidate extent within the platform burst bound; an oversized batch fails stop.
 	 * @return Native accepted count within the valid prefix; the caller retains every suffix record.
 	 */
 	static uint16_t transmit_burst_(void *state, kinetum_packet_record *const *records, uint16_t count) noexcept;

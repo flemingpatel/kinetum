@@ -656,7 +656,7 @@ class TestEpochOverlapCLI(unittest.TestCase):
                 benchmark_cli,
                 "run_benchmark",
                 new=mock.AsyncMock(
-                    return_value=mock.Mock(interrupted=False, failed_runs=0)
+                    return_value=mock.Mock(failed_runs=0)
                 ),
             ) as run_benchmark, mock.patch.object(
                 benchmark_cli,

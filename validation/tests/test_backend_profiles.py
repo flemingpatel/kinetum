@@ -40,6 +40,7 @@ from kinetum_validation.traffic import (
     TRexTrafficDriver,
     make_traffic_driver,
 )
+from tests.traffic_fixtures import complete_trex_identity
 
 
 TEST_PROCESS_CONFIG = ProcessConfig(
@@ -538,15 +539,12 @@ class TestRunMetadata(unittest.TestCase):
             live_payload = copy.deepcopy(payload)
             live_payload["dry_run"] = False
             live_payload["traffic_endpoint"]["host"] = "trex.example"
-            live_payload["traffic_endpoint"]["trex_identity"] = {
-                "version": "v3.06",
-                "mode": "STL",
-            }
+            live_payload["traffic_endpoint"]["trex_identity"] = complete_trex_identity()
             validate_run_metadata(live_payload)
             for malformed_identity in (
                 None,
-                {"version": "", "mode": "STL"},
-                {"version": "v3.06", "mode": "ASTF"},
+                {**complete_trex_identity(), "version": ""},
+                {**complete_trex_identity(), "mode": "ASTF"},
             ):
                 malformed = copy.deepcopy(live_payload)
                 malformed["traffic_endpoint"]["trex_identity"] = malformed_identity

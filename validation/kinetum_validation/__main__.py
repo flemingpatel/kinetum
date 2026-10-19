@@ -11,25 +11,18 @@ Usage:
         --deployment fan-in-edge-gateway --test-type epoch --dry-run
 
 Examples:
-    # Fan-in edge gateway full pipeline test
-    python -m kinetum_validation --runtime-root /opt/kinetum \\
-        --deployment fan-in-edge-gateway \\
-        --validation-root /var/tmp/kinetum-validation
-
-    # Epoch transition test (boundary-ordering validation)
-    python -m kinetum_validation --runtime-root /opt/kinetum \\
-        --deployment fan-in-edge-gateway \\
-        --test-type epoch \\
-        --dry-run \\
-        --validation-root /var/tmp/kinetum-validation
-
     # Canonical TAP gateway test
     python -m kinetum_validation --runtime-root /opt/kinetum \\
         --deployment fan-in-edge-gateway \\
-        --test-type standard \\
-        --validation-root /var/tmp/kinetum-validation
+        --test-type standard
 
-    # Full test suite with high throughput
+    # Preview epoch inputs without starting traffic
+    python -m kinetum_validation --runtime-root /opt/kinetum \\
+        --deployment fan-in-edge-gateway \\
+        --test-type epoch \\
+        --dry-run
+
+    # Preview full-suite inputs with an explicit packet rate
     python -m kinetum_validation --runtime-root /opt/kinetum \\
         --deployment fan-in-edge-gateway \\
         --test-type full \\
@@ -259,8 +252,8 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=VALIDATION_ROOT,
         help=(
-            "Private validation-kit root containing examples/ and bin/ "
-            "(default: root containing the running kit's scripts/)"
+            "Validation data directory containing examples/ and bin/ "
+            "(default: %(default)s)"
         ),
     )
     process_group.add_argument(
@@ -317,7 +310,7 @@ def parse_args() -> argparse.Namespace:
     output_group.add_argument(
         "--verbose", "-v",
         action="store_true",
-        help="Enable verbose output with process logs",
+        help="Enable runtime debug logs, endpoint details, and error tracebacks",
     )
     output_group.add_argument(
         "--no-color",
@@ -330,7 +323,10 @@ def parse_args() -> argparse.Namespace:
         "--max-loss",
         type=float,
         default=CONSTANTS.MAX_ACCEPTABLE_LOSS_PCT,
-        help="Maximum acceptable loss percentage (default: 1.0)",
+        help=(
+            "Maximum acceptable forwarding loss percentage (default: %(default)s; "
+            f"epoch also requires at most {CONSTANTS.EPOCH_LOSS_TOLERANCE_PCT})"
+        ),
     )
 
     return parser.parse_args()

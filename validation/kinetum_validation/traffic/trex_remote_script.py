@@ -2,11 +2,22 @@
 
 from __future__ import annotations
 
-from ..engine.json_contract import MAX_JSON_DOCUMENT_CHARACTERS
+import inspect
+import pprint
+import textwrap
+
+from ..engine.json_contract import (
+    MAX_JSON_DOCUMENT_CHARACTERS,
+    MAX_TREX_CAPABILITY_TEXT_BYTES,
+    MAX_TREX_RX_CAPABILITIES,
+)
 from .base import EXCHANGE_PACKET_BYTES, EXCHANGE_PACKET_LIMIT, EXCHANGE_TIMEOUT_S
+from .trex_protocol import REMOTE_REQUEST_KEYS, generation_pgid_layout, require_trex_capacity
 
 
 _REMOTE_TREX_SCRIPT_TEMPLATE = r"""
+'''Execute one admitted TRex action and retire its exact client and port claims.'''
+
 import contextlib
 import ipaddress
 import json
@@ -20,6 +31,15 @@ JSON_DOCUMENT_CAPACITY = __KINETUM_JSON_DOCUMENT_CAPACITY__
 EXCHANGE_PACKET_CAPACITY = __KINETUM_EXCHANGE_PACKET_LIMIT__
 EXCHANGE_BYTE_CAPACITY = __KINETUM_EXCHANGE_PACKET_BYTES__
 EXCHANGE_TIMEOUT_S = __KINETUM_EXCHANGE_TIMEOUT_S__
+CAPABILITY_TEXT_BYTES = __KINETUM_CAPABILITY_TEXT_BYTES__
+RX_CAPABILITY_LIMIT = __KINETUM_RX_CAPABILITY_LIMIT__
+mutation_attempted = False
+
+
+__KINETUM_GENERATION_PGID_LAYOUT__
+
+
+__KINETUM_REQUIRE_TREX_CAPACITY__
 
 
 def emit(payload, code=0):
@@ -30,7 +50,7 @@ def emit(payload, code=0):
 
 def fail(message, code=1):
     '''Emit one typed failure envelope and terminate the endpoint action.'''
-    emit({"ok": False, "error": message}, code)
+    emit({"ok": False, "error": message, "mutation_attempted": mutation_attempted}, code)
 
 
 def reject_duplicate_pairs(pairs):
@@ -66,48 +86,10 @@ except Exception as exc:  # pragma: no cover - endpoint-side defensive parsing
 if "action" not in spec or not isinstance(spec["action"], str):
     fail("remote spec omitted its action", 2)
 action = spec["action"]
-run_base_keys = {
-    "duration_s", "pps", "packet_size", "num_flows", "src_ip", "dst_ip",
-    "sport", "dport", "ports", "ingress_streams",
-    "egress_ports", "trex_server", "trex_api_path", "work_dir", "action",
-}
-packet_run_keys = run_base_keys | {"generation_tag"}
-generation_run_keys = run_base_keys | {
-    "initial_generation_tag", "next_generation_tag", "transition_time_s",
-    "overlap_window_ms",
-}
-spec_keys = {
-    "exchange_udp": {
-        "action", "ports", "egress_ports", "trex_server", "trex_api_path", "work_dir",
-        "ingress_stream", "packets", "capture_marker",
-    },
-    "probe": {
-        "action", "ports", "egress_ports", "trex_server", "trex_api_path",
-        "work_dir",
-    },
-    "run": packet_run_keys | {"mode"},
-    "generation_start": generation_run_keys,
-    "generation_resume_next": {
-        "action", "ports", "ingress_ports", "generation_stream_ids",
-        "trex_server", "trex_api_path", "work_dir",
-    },
-    "generation_pause_initial": {
-        "action", "ports", "ingress_ports", "generation_stream_ids",
-        "trex_server", "trex_api_path", "work_dir",
-    },
-    "generation_finish": generation_run_keys | {
-        "ingress_ports", "generation_stream_ids", "generation_flow_plan",
-        "port_counter_baseline",
-        "start_time", "start_monotonic", "next_start_time",
-        "next_start_monotonic", "initial_pause_time",
-        "initial_pause_monotonic",
-    },
-    "generation_abort": {
-        "action", "ports", "ingress_ports", "egress_ports", "trex_server",
-        "trex_api_path", "work_dir",
-    },
-}
-if action not in spec_keys or set(spec) != spec_keys[action]:
+spec_keys = (
+__KINETUM_REMOTE_REQUEST_KEYS__
+)
+if action not in spec_keys or set(spec) != set(spec_keys[action]):
     fail("remote spec field membership is inexact", 2)
 
 
@@ -146,17 +128,71 @@ def exact_string(value, name, allow_empty=False):
     return value
 
 
-def trex_identity(value):
-    '''Return the bounded server-reported TRex version and stateless mode.'''
+def instrument_text(value, name):
+    '''Require bounded printable ASCII observation text without rewriting it.'''
+    text = exact_string(value, name)
+    if not text.isascii() or len(text) > CAPABILITY_TEXT_BYTES:
+        fail("{} is malformed".format(name), 1)
+    return text
+
+
+def trex_identity(value, port_info):
+    '''Project exact server identity and complete per-port observation capabilities.'''
     if not isinstance(value, dict) or "version" not in value or "mode" not in value:
         fail("TRex server identity is incomplete", 1)
-    version = exact_string(value["version"], "TRex server version")
+    version = instrument_text(value["version"], "TRex server version")
     mode = exact_string(value["mode"], "TRex server mode")
-    if not version.isascii() or len(version.encode("ascii")) > 128:
-        fail("TRex server version is malformed", 1)
     if mode != "STL":
         fail("TRex server is not in stateless mode", 1)
-    return {"version": version, "mode": mode}
+    if not isinstance(port_info, list) or not port_info:
+        fail("TRex port information is incomplete", 1)
+    ports = []
+    for row in port_info:
+        if not isinstance(row, dict) or not isinstance(row.get("rx"), dict):
+            fail("TRex port capability information is incomplete", 1)
+        rx = row["rx"]
+        raw_caps = rx.get("caps")
+        if not isinstance(raw_caps, list) or len(raw_caps) > RX_CAPABILITY_LIMIT:
+            fail("TRex RX capabilities are malformed", 1)
+        caps = [instrument_text(capability, "TRex RX capability") for capability in raw_caps]
+        if len(caps) != len(set(caps)):
+            fail("TRex RX capabilities are duplicated", 1)
+        ports.append({
+            "port_id": exact_int(row.get("index"), "TRex port index", 0, (1 << 32) - 1),
+            "driver": instrument_text(row.get("driver"), "TRex port driver"),
+            "rx_caps": sorted(caps),
+            "rx_counters": exact_int(rx.get("counters"), "TRex RX counters", 0, (1 << 32) - 1),
+            "rx_filter_mode": instrument_text(row.get("rx_filter_mode"), "TRex RX filter mode"),
+        })
+    ports.sort(key=lambda row: row["port_id"])
+    if len({row["port_id"] for row in ports}) != len(ports):
+        fail("TRex port information repeats an identity", 1)
+    return {"version": version, "mode": mode, "ports": ports}
+
+
+def observe_instrument(client, ports):
+    '''Read the complete selected instrument identity without acquiring ports.'''
+    with contextlib.redirect_stdout(sys.stderr):
+        identity = trex_identity(client.get_server_version(), client.get_port_info(ports=ports))
+    if [row["port_id"] for row in identity["ports"]] != sorted(ports):
+        fail("TRex port capability membership differs from the request", 1)
+    return identity
+
+
+def admit_instrument(client, ports, observation_ports, demand):
+    '''Recheck setup identity and required counters before the first mutating call.'''
+    identity = observe_instrument(client, ports)
+    if json.dumps(identity, sort_keys=True) != json.dumps(spec["trex_identity"], sort_keys=True):
+        fail("TRex instrument capabilities changed after setup", 1)
+    require_trex_capacity(identity, observation_ports, demand)
+    return identity
+
+
+def acquire_ports(client, ports):
+    '''Mark a potentially effectful request before invoking native port acquisition.'''
+    global mutation_attempted
+    mutation_attempted = True
+    client.acquire(ports=ports, force=True)
 
 
 def exact_ipv4(value, name):
@@ -231,6 +267,7 @@ def exact_port_counters(value, port_ids):
         for field, count in row.items():
             exact_int(count, f"port {port_text} {field}", 0, (1 << 64) - 1)
     return value
+
 
 def exchange_input():
     '''Admit one bounded marked datagram prefix and its exact ingress endpoint.'''
@@ -308,14 +345,16 @@ if action in {"run", "generation_start", "generation_finish"}:
         port_id not in ports for port_id in stream_ports
     ):
         fail("TRex ingress stream ownership is inexact", 2)
-    if 1000 + len(stream_ports) * num_flows * 2 > (1 << 32) - 1:
-        fail("TRex generated PGID range overflows", 2)
     if action in {"run", "generation_start"} and not stream_ports:
         fail("TRex run requires at least one ingress stream", 2)
 if action == "run":
     if exact_string(spec["mode"], "mode") not in {"standard", "timed"}:
         fail("one-shot TRex mode is undeclared", 2)
 if action in {"generation_start", "generation_finish"}:
+    try:
+        generation_layout = generation_pgid_layout(len(stream_ports), num_flows)
+    except RuntimeError as exc:
+        fail(str(exc), 2)
     initial_generation_tag = exact_int(
         spec["initial_generation_tag"], "initial_generation_tag", 0, 65535
     )
@@ -410,6 +449,7 @@ try:
     from trex.common.trex_types import RC_OK
 except Exception as exc:  # pragma: no cover - depends on endpoint image
     fail("failed to import exact TRex result type: {}".format(exc), 2)
+
 
 def stat_value(stats, port_id, field):
     '''Read one exact nonnegative TRex port statistic.'''
@@ -530,22 +570,6 @@ def flow_spec(spec, flow_id):
     return flow
 
 
-def flow_count(spec):
-    '''Return the admitted positive flow population.'''
-    try:
-        count = int(spec["num_flows"])
-    except (TypeError, ValueError):
-        fail("TRex num_flows must be an integer", 2)
-    if count < 1:
-        fail("TRex num_flows must be at least 1", 2)
-    return count
-
-
-def generation_pg_id_base(stream_index, flow_id, num_flows):
-    '''Derive the first collision-free PGID for one stream/flow pair.'''
-    return 1000 + (int(stream_index) * int(num_flows) * 2) + (int(flow_id) * 2)
-
-
 def build_packet(stream, spec, generation_tag):
     '''Build one exact Ethernet/IPv4/UDP packet for a stream.'''
     return (
@@ -615,9 +639,10 @@ def generation_counts_from_flow_stats(flow_stats, generation_flow_plan, egress_p
     return tx_by_generation, rx_by_generation, by_pg_id
 
 
-def connect_client():
+def connect_client(client):
     '''Connect without rebasing observations at each generation action.'''
-    client = STLClient(server=spec["trex_server"])
+    if not callable(getattr(client, "_on_connect_clear_stats", None)):
+        fail("TRex API lacks the required read-only connection hook", 2)
     # TRex clear-on-connect creates client-local port and PGID references.
     # A finish-time PGID reference would exclude traffic already sent. Port
     # observations instead use the absolute baseline retained at session start.
@@ -629,7 +654,7 @@ def connect_client():
     client._on_connect_clear_stats = preserve_stats_on_connect
     with contextlib.redirect_stdout(sys.stderr):
         client.connect()
-    return client
+
 
 def exchange_udp(client, ingress, packets, marker, egress_ports):
     '''Own one low-rate capture, send explicit Ethernet frames, and retire capture on every edge.'''
@@ -676,13 +701,13 @@ def exchange_udp(client, ingress, packets, marker, egress_ports):
 
 
 client = None
+# Ports whose promiscuous setting must be retired, including an attempted
+# multi-port attribute call that can fail after changing a prefix.
 promisc_ports = []
-promisc_enabled = False
 release_ports_on_exit = True
-disconnect_stop_traffic = True
-disconnect_release_ports = True
 try:
-    client = connect_client()
+    client = STLClient(server=spec["trex_server"])
+    connect_client(client)
     ports = list(spec["ports"])
 
     if action in {
@@ -694,29 +719,23 @@ try:
         egress_ports = []
 
     if action == "exchange_udp":
+        admitted_identity = admit_instrument(client, ports, egress_ports, 0)
         with contextlib.redirect_stdout(sys.stderr):
-            client.acquire(ports=ports, force=True)
-            client.set_port_attr(ports=egress_ports, promiscuous=True)
+            acquire_ports(client, ports)
             promisc_ports = list(egress_ports)
-            promisc_enabled = True
+            client.set_port_attr(ports=egress_ports, promiscuous=True)
             frames = exchange_udp(client, exchange_ingress, exchange_packets, exchange_marker, egress_ports)
-        emit({"ok": True, "action": "exchange_udp", "frames": frames})
+        emit({
+            "ok": True, "action": "exchange_udp", "frames": frames,
+            "trex_identity": admitted_identity, "pgid_demand": 0,
+        })
 
     if action == "probe":
-        with contextlib.redirect_stdout(sys.stderr):
-            client.acquire(ports=ports, force=True)
-            if egress_ports:
-                client.set_port_attr(ports=egress_ports, promiscuous=True)
-                promisc_ports = list(egress_ports)
-                promisc_enabled = True
-            stats = client.get_stats(ports=ports)
-            server_identity = trex_identity(client.get_server_version())
+        server_identity = observe_instrument(client, ports)
         emit({
             "ok": True,
             "action": "probe",
             "ports": ports,
-            "stats_keys": [str(k) for k in stats.keys()],
-            "promiscuous_ports": promisc_ports,
             "work_dir": os.getcwd(),
             "trex_identity": server_identity,
         })
@@ -730,14 +749,9 @@ try:
         duration_s = float(spec["duration_s"])
         transition_s = float(spec["transition_time_s"])
         overlap_s = float(spec["overlap_window_ms"]) / 1000.0
-        if transition_s <= 0.0:
-            fail("TRex generation overlap requires positive transition_time_s", 2)
-        if overlap_s <= 0.0:
-            fail("TRex generation overlap requires positive overlap_window_ms", 2)
-        if transition_s + overlap_s >= duration_s:
-            fail("TRex generation overlap requires transition + overlap < duration", 2)
-
-        num_flows = flow_count(spec)
+        num_flows = spec["num_flows"]
+        admitted_identity = admit_instrument(client, ports, egress_ports, generation_layout["demand"])
+        pgids = iter(zip(generation_layout["initial"], generation_layout["next"]))
         per_stream_pps = float(spec["pps"]) / float(
             len(ingress_ports) * num_flows
         )
@@ -747,22 +761,19 @@ try:
         generation_stream_ids = {}
 
         with contextlib.redirect_stdout(sys.stderr):
-            client.acquire(ports=ports, force=True)
+            acquire_ports(client, ports)
             client.reset(ports=ports)
             client.clear_stats()
             if egress_ports:
-                client.set_port_attr(ports=egress_ports, promiscuous=True)
                 promisc_ports = list(egress_ports)
-                promisc_enabled = True
+                client.set_port_attr(ports=egress_ports, promiscuous=True)
 
-            for idx, stream in enumerate(ingress_streams):
+            for stream in ingress_streams:
                 port_id = int(stream["port_id"])
                 generation_stream_ids[str(port_id)] = {"initial": [], "next": []}
                 for flow_id in range(num_flows):
                     flow = flow_spec(spec, flow_id)
-                    base_pg_id = generation_pg_id_base(idx, flow_id, num_flows)
-                    initial_pg_id = base_pg_id
-                    next_pg_id = base_pg_id + 1
+                    initial_pg_id, next_pg_id = next(pgids)
                     added = client.add_streams(
                         [
                             build_generation_stream(
@@ -828,11 +839,11 @@ try:
             start_mono = time.monotonic()
 
         release_ports_on_exit = False
-        disconnect_stop_traffic = False
-        disconnect_release_ports = False
         emit({
             "ok": True,
             "action": "generation_start",
+            "trex_identity": admitted_identity,
+            "pgid_demand": generation_layout["demand"],
             "duration_s": duration_s,
             "initial_generation_tag": initial_generation_tag,
             "next_generation_tag": next_generation_tag,
@@ -851,7 +862,7 @@ try:
         stream_ids = spec["generation_stream_ids"]
         next_ids = {}
         with contextlib.redirect_stdout(sys.stderr):
-            client.acquire(ports=ports, force=True)
+            acquire_ports(client, ports)
             for port_id_text, ids in stream_ids.items():
                 port_id = int(port_id_text)
                 port_next_ids = [int(stream_id) for stream_id in ids["next"]]
@@ -860,8 +871,6 @@ try:
         resume_wall = time.time()
         resume_mono = time.monotonic()
         release_ports_on_exit = False
-        disconnect_stop_traffic = False
-        disconnect_release_ports = False
         emit({
             "ok": True,
             "action": "generation_resume_next",
@@ -877,15 +886,13 @@ try:
         pause_wall = time.time()
         pause_mono = time.monotonic()
         with contextlib.redirect_stdout(sys.stderr):
-            client.acquire(ports=ports, force=True)
+            acquire_ports(client, ports)
             for port_id_text, ids in stream_ids.items():
                 port_id = int(port_id_text)
                 port_initial_ids = [int(stream_id) for stream_id in ids["initial"]]
                 client.pause_streams(port_id, port_initial_ids)
                 initial_ids[port_id_text] = port_initial_ids
         release_ports_on_exit = False
-        disconnect_stop_traffic = False
-        disconnect_release_ports = False
         emit({
             "ok": True,
             "action": "generation_pause_initial",
@@ -897,6 +904,7 @@ try:
 
     if action == "generation_finish":
         ingress_ports = [int(p) for p in spec["ingress_ports"]]
+        promisc_ports = list(egress_ports)
         generation_flow_plan = list(spec["generation_flow_plan"])
         stream_ids = spec["generation_stream_ids"]
         start_mono = spec["start_monotonic"]
@@ -906,7 +914,7 @@ try:
         next_pause_wall = time.time()
         next_pause_mono = time.monotonic()
         with contextlib.redirect_stdout(sys.stderr):
-            client.acquire(ports=ports, force=True)
+            acquire_ports(client, ports)
             for port_id_text, ids in stream_ids.items():
                 port_id = int(port_id_text)
                 port_next_ids = [int(stream_id) for stream_id in ids["next"]]
@@ -918,8 +926,6 @@ try:
                 port_counter_final, spec["port_counter_baseline"]
             )
             client.stop(ports=ingress_ports)
-        promisc_ports = list(egress_ports)
-        promisc_enabled = bool(promisc_ports)
         elapsed_s = time.monotonic() - start_mono
         end_time = time.time()
 
@@ -959,6 +965,8 @@ try:
         payload_out = {
             "ok": True,
             "action": "generation_finish",
+            "trex_identity": spec["trex_identity"],
+            "pgid_demand": generation_layout["demand"],
             "tx_count": tx_count,
             "rx_count": rx_count,
             "errors": error_count,
@@ -997,11 +1005,10 @@ try:
         emit(payload_out)
 
     if action == "generation_abort":
-        with contextlib.redirect_stdout(sys.stderr):
-            client.acquire(ports=ports, force=True)
-            client.stop(ports=spec["ingress_ports"])
         promisc_ports = list(egress_ports)
-        promisc_enabled = bool(promisc_ports)
+        with contextlib.redirect_stdout(sys.stderr):
+            acquire_ports(client, ports)
+            client.stop(ports=spec["ingress_ports"])
         emit({
             "ok": True,
             "action": "generation_abort",
@@ -1013,16 +1020,16 @@ try:
     duration_s = float(spec["duration_s"])
     mode = spec["mode"]
 
-    num_flows = flow_count(spec)
+    num_flows = spec["num_flows"]
     per_stream_pps = float(spec["pps"]) / float(len(ingress_ports) * num_flows)
+    admitted_identity = admit_instrument(client, ports, egress_ports, 0)
     with contextlib.redirect_stdout(sys.stderr):
-        client.acquire(ports=ports, force=True)
+        acquire_ports(client, ports)
         client.reset(ports=ports)
         client.clear_stats()
         if egress_ports:
-            client.set_port_attr(ports=egress_ports, promiscuous=True)
             promisc_ports = list(egress_ports)
-            promisc_enabled = True
+            client.set_port_attr(ports=egress_ports, promiscuous=True)
 
         for stream in ingress_streams:
             port_id = int(stream["port_id"])
@@ -1066,6 +1073,8 @@ try:
     payload_out = {
         "ok": True,
         "action": "run",
+        "trex_identity": admitted_identity,
+        "pgid_demand": 0,
         "tx_count": tx_count,
         "rx_count": rx_count,
         "errors": error_count,
@@ -1088,23 +1097,25 @@ except Exception as exc:  # pragma: no cover - depends on endpoint runtime
 finally:
     if client is not None:
         cleanup_errors = []
-        if promisc_enabled and release_ports_on_exit:
+        if mutation_attempted and release_ports_on_exit:
             try:
                 with contextlib.redirect_stdout(sys.stderr):
-                    client.set_port_attr(ports=promisc_ports, promiscuous=False)
+                    acquired = client.get_acquired_ports()
+                    if any(port not in spec["ports"] for port in acquired):
+                        raise RuntimeError("client acquired a port outside this action")
+                    if acquired:
+                        client.stop(ports=acquired)
+                        restore_ports = [port for port in promisc_ports if port in acquired]
+                        if restore_ports:
+                            client.set_port_attr(ports=restore_ports, promiscuous=False)
+                        client.release(ports=acquired)
             except Exception as exc:
-                cleanup_errors.append("promiscuous reset failed: {}".format(exc))
-        if release_ports_on_exit:
-            try:
-                with contextlib.redirect_stdout(sys.stderr):
-                    client.release(ports=[int(p) for p in spec["ports"]])
-            except Exception as exc:
-                cleanup_errors.append("port release failed: {}".format(exc))
+                cleanup_errors.append("claimed port retirement failed: {}".format(exc))
         try:
             with contextlib.redirect_stdout(sys.stderr):
                 client.disconnect(
-                    stop_traffic=disconnect_stop_traffic,
-                    release_ports=disconnect_release_ports,
+                    stop_traffic=False,
+                    release_ports=False,
                 )
         except Exception as exc:
             cleanup_errors.append("client disconnect failed: {}".format(exc))
@@ -1117,4 +1128,13 @@ REMOTE_TREX_SCRIPT = _REMOTE_TREX_SCRIPT_TEMPLATE.replace(
     str(MAX_JSON_DOCUMENT_CHARACTERS),
 ).replace("__KINETUM_EXCHANGE_PACKET_LIMIT__", str(EXCHANGE_PACKET_LIMIT)).replace(
     "__KINETUM_EXCHANGE_PACKET_BYTES__", str(EXCHANGE_PACKET_BYTES)
-).replace("__KINETUM_EXCHANGE_TIMEOUT_S__", str(EXCHANGE_TIMEOUT_S))
+).replace("__KINETUM_EXCHANGE_TIMEOUT_S__", str(EXCHANGE_TIMEOUT_S)).replace(
+    "__KINETUM_REMOTE_REQUEST_KEYS__",
+    textwrap.indent(
+        pprint.pformat({action: sorted(keys) for action, keys in REMOTE_REQUEST_KEYS.items()}, width=100), "    ",
+    ),
+).replace("__KINETUM_GENERATION_PGID_LAYOUT__", inspect.getsource(generation_pgid_layout).rstrip("\n")).replace(
+    "__KINETUM_REQUIRE_TREX_CAPACITY__", inspect.getsource(require_trex_capacity).rstrip("\n")
+).replace("__KINETUM_CAPABILITY_TEXT_BYTES__", str(MAX_TREX_CAPABILITY_TEXT_BYTES)).replace(
+    "__KINETUM_RX_CAPABILITY_LIMIT__", str(MAX_TREX_RX_CAPABILITIES)
+)

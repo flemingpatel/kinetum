@@ -27,6 +27,10 @@ _UINT32_MAX = (1 << 32) - 1
 _UINT64_MAX = (1 << 64) - 1
 # Four-byte UTF-8 code points keep the decoded document below 64 MiB.
 MAX_JSON_DOCUMENT_CHARACTERS = 16 * 1024 * 1024
+MAX_TREX_CAPABILITY_TEXT_BYTES = 128
+MAX_TREX_RX_CAPABILITIES = 16
+# ASCII quotes and backslashes require two bytes each when JSON-escaped.
+MAX_TREX_PORT_RECORD_BYTES = (MAX_TREX_RX_CAPABILITIES + 2) * (2 * MAX_TREX_CAPABILITY_TEXT_BYTES + 3) + 256
 EXPECTED_BUILD_FEATURES = frozenset(
     {"axiom_mlir_frontend", "axiom_mlir_dialect"}
 )
@@ -235,21 +239,48 @@ def require_optional_string(value: object, context: str) -> str | None:
     return None if value is None else require_string(value, context)
 
 
-def require_trex_identity(value: object, context: str) -> Dict[str, str]:
-    """Return one bounded observed TRex server version and stateless mode."""
-    identity = require_object(value, context)
-    require_exact_keys(identity, {"version", "mode"}, context)
-    version = require_string(identity["version"], f"{context} version")
-    mode = require_string(identity["mode"], f"{context} mode")
+def _require_trex_text(value: object, context: str) -> str:
+    """Return one bounded printable ASCII instrument observation without rewriting it."""
+    text = require_string(value, context)
     if (
-        not version.isascii()
-        or not version.isprintable()
-        or len(version.encode("ascii")) > 128
+        not text.isascii()
+        or not text.isprintable()
+        or len(text) > MAX_TREX_CAPABILITY_TEXT_BYTES
     ):
-        raise JsonContractError(f"{context} version is malformed")
+        raise JsonContractError(f"{context} is malformed")
+    return text
+
+
+def require_trex_identity(value: object, context: str) -> Dict[str, Any]:
+    """Return exact observed server identity and sorted per-port counter capabilities."""
+    identity = require_object(value, context)
+    require_exact_keys(identity, {"version", "mode", "ports"}, context)
+    version = _require_trex_text(identity["version"], f"{context} version")
+    mode = require_string(identity["mode"], f"{context} mode")
     if mode != "STL":
         raise JsonContractError(f"{context} mode is not STL")
-    return {"version": version, "mode": mode}
+    ports = []
+    for value_row in require_array(identity["ports"], f"{context} ports"):
+        row = require_object(value_row, f"{context} port")
+        require_exact_keys(row, {"port_id", "driver", "rx_caps", "rx_counters", "rx_filter_mode"}, f"{context} port")
+        port_id = require_int(row["port_id"], f"{context} port ID", minimum=0, maximum=_UINT32_MAX)
+        capabilities = [
+            _require_trex_text(capability, f"{context} RX capability")
+            for capability in require_array(row["rx_caps"], f"{context} RX capabilities")
+        ]
+        if len(capabilities) > MAX_TREX_RX_CAPABILITIES or capabilities != sorted(set(capabilities)):
+            raise JsonContractError(f"{context} RX capabilities are not an exact sorted set")
+        ports.append({
+            "port_id": port_id,
+            "driver": _require_trex_text(row["driver"], f"{context} driver"),
+            "rx_caps": capabilities,
+            "rx_counters": require_int(row["rx_counters"], f"{context} RX counters", minimum=0, maximum=_UINT32_MAX),
+            "rx_filter_mode": _require_trex_text(row["rx_filter_mode"], f"{context} RX filter mode"),
+        })
+    identities = [row["port_id"] for row in ports]
+    if not ports or identities != sorted(set(identities)):
+        raise JsonContractError(f"{context} port identities are not a nonempty sorted set")
+    return {"version": version, "mode": mode, "ports": ports}
 
 
 def require_bool(value: object, context: str) -> bool:
@@ -1404,6 +1435,9 @@ def validate_run_metadata(value: Dict[str, Any]) -> None:
             raise JsonContractError("run metadata TRex endpoint host is missing")
         if trex_identity is None:
             raise JsonContractError("run metadata TRex identity is missing")
+        expected_ports = set(trex_ports) if trex_ports else traffic_port_ids
+        if {row["port_id"] for row in trex_identity["ports"]} != expected_ports:
+            raise JsonContractError("run metadata TRex capabilities have foreign port membership")
     if traffic_driver == "native_tap" or value["dry_run"]:
         neutral = TrafficEndpointConfig()
         if endpoint != {

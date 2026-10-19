@@ -4,8 +4,8 @@
 #   wan1 -> 0000:06:00.2, RX queues 0 and 1
 #   lan0 -> 0000:06:00.1, TX queues 0 and 1
 #
-# Both ingress profiles carry the same byte-exact deterministic 40-byte
-# Toeplitz key required by the target PMD. No backend key, entropy source,
+# Both ingress profiles use ordinary RSS with the same deterministic 52-byte
+# Toeplitz key required by the i40e physical function. No backend key, entropy source,
 # queue count, storage domain, or CPU execution owner completes this deployment
 # after authoring.
 
@@ -91,10 +91,10 @@ io_stream_bindings {
   queues { driver_queue_id: 1 descriptor_count: 1024 rx_storage_domain_id: "storage_dpdk_0" }
   steering {
     kind: TRAFFIC_STEERING_KIND_RSS
-    symmetric: true
+    symmetric: false
     hash_fields: "ipv4"
     hash_fields: "udp"
-    hash_key: "\x6d\x5a\x56\xda\x25\x5b\x0e\xc2\x41\x67\x25\x3d\x43\xa3\x8f\xb0\xd0\xca\x2b\xcb\xae\x7b\x30\xb4\x77\xcb\x2d\xa3\x80\x30\xf2\x0c\x6a\x42\xb7\x3b\xbe\xac\x01\xfa"
+    hash_key: "\x6d\x5a\x56\xda\x25\x5b\x0e\xc2\x41\x67\x25\x3d\x43\xa3\x8f\xb0\xd0\xca\x2b\xcb\xae\x7b\x30\xb4\x77\xcb\x2d\xa3\x80\x30\xf2\x0c\x6a\x42\xb7\x3b\xbe\xac\x01\xfa\x95\x3d\x24\x17\x3f\x9b\x6a\x62\x11\xd7\xba\x58"
   }
 }
 io_stream_bindings {
@@ -104,10 +104,10 @@ io_stream_bindings {
   queues { driver_queue_id: 1 descriptor_count: 1024 rx_storage_domain_id: "storage_dpdk_0" }
   steering {
     kind: TRAFFIC_STEERING_KIND_RSS
-    symmetric: true
+    symmetric: false
     hash_fields: "ipv4"
     hash_fields: "udp"
-    hash_key: "\x6d\x5a\x56\xda\x25\x5b\x0e\xc2\x41\x67\x25\x3d\x43\xa3\x8f\xb0\xd0\xca\x2b\xcb\xae\x7b\x30\xb4\x77\xcb\x2d\xa3\x80\x30\xf2\x0c\x6a\x42\xb7\x3b\xbe\xac\x01\xfa"
+    hash_key: "\x6d\x5a\x56\xda\x25\x5b\x0e\xc2\x41\x67\x25\x3d\x43\xa3\x8f\xb0\xd0\xca\x2b\xcb\xae\x7b\x30\xb4\x77\xcb\x2d\xa3\x80\x30\xf2\x0c\x6a\x42\xb7\x3b\xbe\xac\x01\xfa\x95\x3d\x24\x17\x3f\x9b\x6a\x62\x11\xd7\xba\x58"
   }
 }
 io_stream_bindings {

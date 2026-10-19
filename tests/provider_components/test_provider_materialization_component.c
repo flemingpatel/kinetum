@@ -32,7 +32,7 @@
 /** Test-only inherited descriptor used for bounded ownership-event records. */
 #define KINETUM_TEST_MATERIALIZER_TRACE_FD "KINETUM_TEST_MATERIALIZER_TRACE_FD"
 
-/** Test-only exact role selected for one recoverable factory failure. */
+/** Test-only role or A0/A1 driver index selected for factory/activation failure. */
 #define KINETUM_TEST_MATERIALIZER_FAIL_ROLE "KINETUM_TEST_MATERIALIZER_FAIL_ROLE"
 
 /** Test-only successful callback selected to return forbidden diagnostic residue. */
@@ -64,7 +64,7 @@ static const uint32_t HOST_STORAGE_CAPABILITIES = KINETUM_PACKET_STORAGE_CPU_CON
 struct materialization_test_instance {
 	int trace_fd;		     ///< Borrowed test descriptor retained for this instance lifetime.
 	kinetum_provider_role role;  ///< Exact role selecting the operation member below.
-	uint8_t packet_io_active;    ///< One only between successful activate/deactivate callbacks.
+	uint8_t packet_io_active;    ///< Retained I/O, including an injected cold-on-failure violation.
 	uint8_t padding[2];	     ///< Zeroed native-structure padding.
 	kinetum_provider_process_facility_operations facility_operations;      ///< Process-facility result.
 	kinetum_packet_storage_domain_operations storage_operations;	       ///< Storage role result.
@@ -531,7 +531,8 @@ static kinetum_provider_status reject_runtime_service_join(void *state, uint32_t
  *
  * @param state Exact I/O-driver instance.
  * @param diagnostic Mutable caller-owned diagnostic.
- * @return OK after one cold-to-live transition, or a valid failure status.
+ * @return OK after one cold-to-live transition; A0/A1 intentionally violate
+ *         cold-on-failure to exercise the launcher's fatal defense.
  */
 static kinetum_provider_status activate_packet_io(void *state, kinetum_provider_diagnostic *diagnostic)
 {
@@ -544,6 +545,13 @@ static kinetum_provider_status activate_packet_io(void *state, kinetum_provider_
 		return KINETUM_PROVIDER_STATUS_IMPLEMENTATION_ERROR;
 	}
 	instance->packet_io_active = UINT8_C(1);
+	// Deliberately violate cold-on-failure to prove the launcher's final defense.
+	// A conforming component must terminate internally if cold state is unprovable.
+	const char *failure = getenv(KINETUM_TEST_MATERIALIZER_FAIL_ROLE);
+	if (failure != NULL && failure[0] == 'A' && instance->io_operations.io_driver_index < 2u &&
+	    failure[1] == (char)('0' + instance->io_operations.io_driver_index) && failure[2] == '\0') {
+		return KINETUM_PROVIDER_STATUS_FAILED_PRECONDITION;
+	}
 	maybe_publish_success_diagnostic(diagnostic, "io-activation");
 	return KINETUM_PROVIDER_STATUS_OK;
 }

@@ -5,8 +5,8 @@
 #   wan1 -> 0000:06:00.2 (Intel X710 port 2)
 #   lan0 -> 0000:06:00.1 (Intel X710 port 1)
 #
-# The fourth experiment port (0000:06:00.3) remains traffic-generator
-# infrastructure and is intentionally absent from the Kinetum deployment.
+# The unused DUT function 0000:06:00.3 must remain unbound. It is intentionally
+# absent from the Kinetum deployment.
 # Queue zero, storage ownership, and every stage execution owner are explicit.
 
 process_facility_instances {

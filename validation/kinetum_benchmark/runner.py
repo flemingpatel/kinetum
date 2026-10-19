@@ -1,13 +1,7 @@
-"""
-Benchmark runner - multi-run iteration over the validation orchestrator.
-
-Each run is isolated in its own output directory (run_001/, run_002/, ...).
-Per-run artifacts are immutable after creation. Aggregation is a separate step.
-"""
+"""Run validation batches with per-run directories and exact attempted-run records."""
 
 from __future__ import annotations
 
-import asyncio
 import json
 import platform
 import sys
@@ -50,12 +44,7 @@ def _system_info() -> dict:
 
 
 def write_manifest(config: BenchmarkConfig, output_dir: Path) -> None:
-    """
-    Write reproducibility manifest at the start of a benchmark run.
-
-    The manifest records everything needed to reproduce the run:
-    exact release identity, system observations, argv, and configuration.
-    """
+    """Record admitted runtime identity, host observations, argv, and configuration before the first run."""
     release_metadata = collect_runtime_release_metadata(
         config.runtime_root,
         config.validation_root,
@@ -205,6 +194,10 @@ async def run_benchmark(
     """
     Execute N benchmark runs, each in an isolated output directory.
 
+    Returned suite verdicts permit the next iteration. An exception or task
+    cancellation stops the batch and propagates after manifest finalization is
+    attempted; a publication failure retains both causes.
+
     Parameters
     ----------
     config : BenchmarkConfig
@@ -232,76 +225,69 @@ async def _run_benchmark_owned(
     config: BenchmarkConfig,
     run_owner: ValidationRunOwner,
 ) -> BenchmarkResult:
-    """Execute all iterations beneath one live lock and fresh batch root."""
+    """Own batch execution and finalize its attempted prefix on every exit."""
 
     output_dir = config.output_dir
 
     # Write manifest before any runs
     write_manifest(config, output_dir)
 
-    result = BenchmarkResult(total_runs=config.runs)
+    result = BenchmarkResult()
     overall_start = time.monotonic()
 
-    for i in range(1, config.runs + 1):
-        run_dir = run_owner.create_artifact_directory(f"run_{i:03d}")
+    try:
+        for i in range(1, config.runs + 1):
+            run_dir = run_owner.create_artifact_directory(f"run_{i:03d}")
 
-        print(
-            f"\n{'='*60}\n"
-            f"  BENCHMARK RUN {i}/{config.runs}\n"
-            f"  Output: {run_dir}\n"
-            f"{'='*60}",
-            file=sys.stderr,
-        )
-
-        run_start = time.monotonic()
-        run_result = RunResult(run_id=i, passed=False, output_dir=run_dir)
-
-        try:
-            test_config = _build_test_config(config, run_dir)
-            suite_result = await run_test_suite(test_config, run_owner)
-            run_result.passed = suite_result.all_passed
-            run_result.duration_s = time.monotonic() - run_start
-
-            if not suite_result.all_passed:
-                run_result.error = f"{suite_result.failed_tests} test(s) failed"
-
-        except KeyboardInterrupt:
-            run_result.duration_s = time.monotonic() - run_start
-            run_result.error = "interrupted by user"
-            result.run_results.append(run_result)
-            result.failed_runs += 1
-            result.interrupted = True
             print(
-                f"\n  Run {i}: INTERRUPTED ({run_result.duration_s:.1f}s)",
+                f"\n{'='*60}\n"
+                f"  BENCHMARK RUN {i}/{config.runs}\n"
+                f"  Output: {run_dir}\n"
+                f"{'='*60}",
                 file=sys.stderr,
             )
-            # Break the loop; the validation orchestrator's finally block
-            # already cleaned up Photon, traffic resources, and capture.
-            break
 
-        except (RuntimeError, OSError, ValueError, asyncio.TimeoutError) as e:
-            run_result.duration_s = time.monotonic() - run_start
-            run_result.error = str(e)
-            print(f"  Run {i} ERROR: {e}", file=sys.stderr)
-
-        result.run_results.append(run_result)
-        if run_result.passed:
-            result.passed_runs += 1
-        else:
-            result.failed_runs += 1
-
-        status = "PASS" if run_result.passed else "FAIL"
-        print(
-            f"  Run {i}: {status} ({run_result.duration_s:.1f}s)"
-            f"{'' if run_result.passed else ' - ' + run_result.error}",
-            file=sys.stderr,
-        )
-
-    result.total_runs = len(result.run_results)
-    result.total_duration_s = time.monotonic() - overall_start
-
-    # Update manifest with run results
-    _update_manifest_with_results(output_dir, result)
+            run_start = time.monotonic()
+            run_result = RunResult(run_id=i, passed=False, output_dir=run_dir)
+            try:
+                test_config = _build_test_config(config, run_dir)
+                suite_result = await run_test_suite(test_config, run_owner)
+                run_result.passed = suite_result.all_passed
+                if not run_result.passed:
+                    run_result.error = "validation suite did not pass"
+            except BaseException as error:
+                # A returned verdict follows successful cleanup. An exception
+                # does not establish that boundary and cannot admit another run.
+                run_result.error = f"{type(error).__name__}: {error}"
+                raise
+            finally:
+                run_result.duration_s = time.monotonic() - run_start
+                result.run_results.append(run_result)
+                if run_result.passed:
+                    result.passed_runs += 1
+                else:
+                    result.failed_runs += 1
+                status = "PASS" if run_result.passed else "FAIL"
+                print(
+                    f"  Run {i}: {status} ({run_result.duration_s:.1f}s)"
+                    f"{'' if run_result.passed else ' - ' + run_result.error}",
+                    file=sys.stderr,
+                )
+    finally:
+        result.total_runs = len(result.run_results)
+        result.total_duration_s = time.monotonic() - overall_start
+        if result.run_results:
+            originating_error = sys.exception()
+            try:
+                _update_manifest_with_results(output_dir, result)
+            except BaseException as publication_error:
+                if originating_error is not None:
+                    raise RuntimeError(
+                        "benchmark execution and manifest publication both failed: "
+                        f"execution={type(originating_error).__name__}: {originating_error}; "
+                        f"publication={type(publication_error).__name__}: {publication_error}"
+                    ) from publication_error
+                raise
 
     print(
         f"\n{'='*60}\n"
@@ -315,7 +301,7 @@ async def _run_benchmark_owned(
 
 
 def _update_manifest_with_results(output_dir: Path, result: BenchmarkResult) -> None:
-    """Update manifest.json with run results after all runs complete."""
+    """Finalize manifest.json with the exact attempted prefix after the batch stops."""
     manifest_path = output_dir / "manifest.json"
     if not manifest_path.is_file() or manifest_path.is_symlink():
         raise RuntimeError("benchmark manifest disappeared before completion")

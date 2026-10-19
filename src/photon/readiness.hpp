@@ -18,8 +18,8 @@
  * messages, gRPC calls, strings, and sleeps are prohibited from packet workers.
  *
  * @par Thread Safety
- * A readiness wait and its observer have one startup-thread owner. Distinct
- * observers may run concurrently. A progress callback may safely inspect
+ * A readiness wait, observer, and clock have one startup-thread owner. Distinct
+ * sets may run concurrently. A progress callback may safely inspect
  * atomics or independently synchronized child state.
  */
 
@@ -87,6 +87,32 @@ struct readiness_wait_policy {
 	std::chrono::milliseconds rpc_timeout;	    ///< Deadline applied to each Health RPC.
 	std::chrono::milliseconds poll_interval;    ///< Delay between retryable observations.
 	std::chrono::milliseconds overall_timeout;  ///< Steady-clock deadline for the complete gate.
+};
+
+/**
+ * @brief Monotonic time and waiting used by one cold readiness operation.
+ *
+ * Observations, progress checks, and retry waits are measured in this one time
+ * domain. A completed wait may resume after its requested delay.
+ * The caller retains this dependency for the complete readiness operation.
+ */
+class readiness_clock {
+    public:
+	/** @brief Release clock-owned resources after all readiness callers retire. */
+	virtual ~readiness_clock() = default;
+	/** @return Current monotonic time in the domain used by sleep_for(). */
+	[[nodiscard]] virtual std::chrono::steady_clock::time_point now() const noexcept = 0;
+	/** @param duration Positive delay before the next readiness observation. */
+	virtual void sleep_for(std::chrono::milliseconds duration) = 0;
+};
+
+/** @brief Production readiness timing through the standard monotonic clock and thread wait. */
+class steady_readiness_clock final : public readiness_clock {
+    public:
+	/** @copydoc readiness_clock::now */
+	[[nodiscard]] std::chrono::steady_clock::time_point now() const noexcept override;
+	/** @copydoc readiness_clock::sleep_for */
+	void sleep_for(std::chrono::milliseconds duration) override;
 };
 
 /** @brief Production policy for the first exact readiness gate. */
@@ -160,7 +186,9 @@ class dp_health_observer {
  * @brief Production unary-gRPC DP Health observer.
  *
  * One startup thread owns the generated stub. Each call creates a fresh
- * ClientContext because gRPC contexts are single-use.
+ * ClientContext because gRPC contexts are single-use. Connection readiness
+ * waits inside the same per-call deadline; only a validated Health response
+ * can satisfy the application readiness gate.
  */
 class grpc_dp_health_observer final : public dp_health_observer {
     public:
@@ -199,12 +227,13 @@ using readiness_progress_check = std::function<kinetum::common::status()>;
  * Only transport UNAVAILABLE/DEADLINE_EXCEEDED and the gate's declared
  * pre-state are retried. Application-level Health errors, unknown states,
  * terminal states, skipped phases, regressions, and progress-check failures are
- * terminal. The overall deadline uses `steady_clock`; each gRPC attempt is
- * capped to the remaining budget.
+ * terminal. One caller-owned monotonic clock measures the overall deadline
+ * and retry waits; each gRPC attempt is capped to the remaining budget.
  *
  * @param observer Single-owner Health observation source.
  * @param gate Exact ordered gate to satisfy.
  * @param policy Coherent per-RPC, polling, and overall timing policy.
+ * @param clock Monotonic timing dependency retained through the complete wait.
  * @param progress_check Optional child-liveness/cancellation check. An empty
  *        callback means no external cancellation source.
  * @return Exact target readiness identity, or the first terminal,
@@ -220,6 +249,6 @@ using readiness_progress_check = std::function<kinetum::common::status()>;
  */
 [[nodiscard]] kinetum::common::status_or<kinetum::common::dataplane_health_identity>
 wait_for_exact_readiness(dp_health_observer &observer, readiness_gate gate, const readiness_wait_policy &policy,
-			 const readiness_progress_check &progress_check = {});
+			 readiness_clock &clock, const readiness_progress_check &progress_check = {});
 
 }  // namespace kinetum::photon

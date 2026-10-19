@@ -1091,6 +1091,9 @@ What Gluon decides:
   shared compiler admits the complete fan-in set and gives the receiving worker
   both inbound indices. RSS2 has six workers and eight boundaries, with four
   inputs per NAT worker. The dataplane never infers a logical-region channel.
+- **RSS authoring**: both d430 RSS2 bindings request ordinary RSS with an exact
+  52-byte i40e key. Symmetric RSS requests are rejected by the DPDK contract;
+  module selection establishes NAT ownership independently of RX queue choice.
 - **No boundary inside a region lane**: each ingress chain stays local, as
   does `nat -> qos -> tx` on the selected owner.
 

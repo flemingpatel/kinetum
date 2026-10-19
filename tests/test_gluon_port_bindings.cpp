@@ -364,7 +364,7 @@ static void set_queue_count(kinetum::gluon::v1::IoStreamBinding &binding, uint32
  * @param symmetric Hardware symmetry for an unchanged tuple.
  */
 static void set_rss(kinetum::gluon::v1::IoStreamBinding &binding, uint32_t queue_count,
-		    std::string_view key = TEST_RSS_KEY, bool symmetric = true)
+		    std::string_view key = TEST_RSS_KEY, bool symmetric = false)
 {
 	set_queue_count(binding, queue_count);
 	auto *steering = binding.mutable_steering();
@@ -544,7 +544,7 @@ TEST(gluon_port_bindings, explicit_rss_queues_lower_deterministic_topology)
 	ASSERT_EQ(emitted.traffic_steering_profiles_size(), 1);
 	const auto &profile = emitted.traffic_steering_profiles(0);
 	EXPECT_EQ(profile.kind(), kinetum::gluon::v1::TRAFFIC_STEERING_KIND_RSS);
-	EXPECT_TRUE(profile.symmetric());
+	EXPECT_FALSE(profile.symmetric());
 	EXPECT_EQ(profile.hash_key(), TEST_RSS_KEY);
 	ASSERT_EQ(profile.hash_fields_size(), 2);
 	EXPECT_EQ(profile.hash_fields(0), "ipv4");
@@ -559,6 +559,24 @@ TEST(gluon_port_bindings, explicit_rss_queues_lower_deterministic_topology)
 	EXPECT_EQ(lane0->driver_queue_id(), 0u);
 	EXPECT_EQ(lane1->driver_queue_id(), 1u);
 	EXPECT_TRUE(emitted.module_context_domains().empty());
+}
+
+/** @brief Unsupported symmetry rejects during planning rather than changing the authored request. */
+TEST(gluon_port_bindings, rejects_explicit_symmetric_rss)
+{
+	const auto pipeline = make_rx_tx_pipeline("wan0", "lan0");
+	const auto hardware = make_hw_inventory({"0000:03:00.0", "0000:03:00.1"});
+	auto bindings = make_dpdk_bindings(pipeline, {{"wan0", "wan_port", "0000:03:00.0", true},
+						      {"lan0", "lan_port", "0000:03:00.1", true}});
+	auto *rx = find_stream_binding(bindings, "wan0", kinetum::gluon::v1::IO_STREAM_DIRECTION_RX);
+	auto *tx = find_stream_binding(bindings, "lan0", kinetum::gluon::v1::IO_STREAM_DIRECTION_TX);
+	ASSERT_NE(rx, nullptr);
+	ASSERT_NE(tx, nullptr);
+	set_rss(*rx, 2, TEST_RSS_KEY, true);
+	set_queue_count(*tx, 2);
+	const auto result = plan(pipeline, hardware, make_options(bindings));
+	ASSERT_FALSE(result.is_ok());
+	EXPECT_NE(result.error().message().find("does not support symmetric RSS"), std::string::npos);
 }
 
 /** @brief RSS queue storage stays attached to its authored queue through lane lowering. */

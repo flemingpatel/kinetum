@@ -802,9 +802,9 @@ class TestConfig:
     output_dir : Path
         Output directory for logs and captures.
     max_loss_pct : float
-        Maximum acceptable loss percentage.
+        Maximum traffic loss percentage; epoch also enforces its fixed 0.1% ceiling.
     verbose : bool
-        Enable verbose output.
+        Enable runtime DEBUG logging, endpoint details, and CLI error tracebacks.
     color : bool
         Permit ANSI color when stderr is a terminal.
     dry_run : bool

@@ -329,20 +329,19 @@ int main(int argc, char **argv)
 		// CONTROL_READY before CP receives the verified bootstrap authority, and
 		// ordinary supervision remains unreachable until DP proves exact
 		// PACKET_READY. Every failed gate reaps CP before DP.
-		KINETUM_LOG_INFO("photon", "photon.dp.startup", "DP startup: {} --bundle {} --listen {} --log-dir {}",
-				 startup_spec.dp_executable, startup_spec.bundle_root, dp_endpoint,
-				 logging_options.directory);
+		KINETUM_LOG_INFO("photon", "photon.dp.startup", "planned DP inputs: image={} bundle={} endpoint={}",
+				 startup_spec.dp_executable, startup_spec.bundle_root, dp_endpoint);
 		KINETUM_LOG_INFO(
 			"photon", "photon.cp.startup",
-			"CP startup: {} --listen-addr {} --dp-addr {} --config-store-dir {} --bootstrap-snapshot {} --bootstrap-plan-content-hash {} --log-dir {}",
+			"planned CP inputs: image={} endpoint={} dp_endpoint={} config_store={} bootstrap_snapshot={} plan_hash={}",
 			startup_spec.cp_executable, cp_listen, dp_endpoint, store_dir,
-			startup_spec.bootstrap_snapshot_path, startup_spec.plan_content_hash,
-			logging_options.directory);
+			startup_spec.bootstrap_snapshot_path, startup_spec.plan_content_hash);
 
 		kinetum::photon::grpc_dp_health_observer health_observer(dp_endpoint);
 		kinetum::photon::posix_startup_process_controller process_controller;
-		auto children_or = kinetum::photon::start_supervised_children(startup_spec, health_observer,
-									      process_controller, shutdown_requested);
+		kinetum::photon::steady_readiness_clock readiness_clock;
+		auto children_or = kinetum::photon::start_supervised_children(
+			startup_spec, health_observer, process_controller, readiness_clock, shutdown_requested);
 		if (!children_or.is_ok()) {
 			if (received_signal != 0 && !signal_failed &&
 			    children_or.error().code() == kinetum::common::status_code::CANCELLED) {
@@ -401,8 +400,8 @@ int main(int argc, char **argv)
 				if (shutdown_requested()) {
 					break;
 				}
-				const auto resolution_status =
-					pair_owner.resolve_observed_exit(health_observer, shutdown_requested);
+				const auto resolution_status = pair_owner.resolve_observed_exit(
+					health_observer, readiness_clock, shutdown_requested);
 				if (!resolution_status.is_ok()) {
 					if (received_signal != 0 && !signal_failed &&
 					    resolution_status.code() == kinetum::common::status_code::CANCELLED) {

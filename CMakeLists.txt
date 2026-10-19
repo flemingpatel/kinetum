@@ -1027,6 +1027,7 @@ kinetum_configure_provider_component_target(kinetum_provider_udp_component)
 
 add_library(kinetum_provider_dpdk_impl_objects OBJECT
   src/dp/backends/dpdk/dpdk_host_probe.cpp
+  src/dp/backends/dpdk/dpdk_pci_probe.cpp
   src/dp/backends/dpdk/dpdk_io.cpp
   src/dp/backends/dpdk/dpdk_process_facility.cpp
 )
@@ -1767,6 +1768,7 @@ if(KINETUM_ENABLE_TESTS)
   # domain and may admit the component only through the production loader seam.
   add_library(kinetum_provider_dpdk_test_objects OBJECT
     tests/test_dpdk_host_probe.cpp
+    tests/test_dpdk_pci_probe.cpp
     tests/test_dpdk_io.cpp
     tests/test_dpdk_process_facility.cpp
   )

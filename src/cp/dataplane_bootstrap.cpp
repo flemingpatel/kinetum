@@ -126,8 +126,8 @@ status validate_success_response(const kinetum::dataplane::v1::BootstrapConfigSn
 								 "Data Plane returned malformed Bootstrap response");
 	}
 
-	const auto application = map_dataplane_application_status(
-		response.status(), "Data Plane rejected the durable fixed-epoch bootstrap");
+	auto application = map_dataplane_application_status(response.status(),
+							    "Data Plane rejected the durable fixed-epoch bootstrap");
 	if (!application.is_ok()) {
 		return application;
 	}
@@ -147,7 +147,7 @@ status validate_success_response(const kinetum::dataplane::v1::BootstrapConfigSn
 }
 
 /**
- * @brief Read and validate one Data Plane readiness observation.
+ * @brief Await connection and validate one Data Plane readiness observation within its deadline.
  * @param dataplane Generated Data Plane client.
  * @param timeout Positive per-attempt transport deadline.
  * @return Exact declared readiness or retryable/terminal failure.
@@ -157,6 +157,7 @@ read_health(kinetum::dataplane::v1::DataplaneService::Stub &dataplane, std::chro
 {
 	grpc::ClientContext context;
 	context.set_deadline(std::chrono::system_clock::now() + timeout);
+	context.set_wait_for_ready(true);
 	kinetum::dataplane::v1::HealthRequest request;
 	kinetum::dataplane::v1::HealthResponse response;
 	grpc::Status transport;
@@ -219,7 +220,7 @@ status validate_packet_ready_content(config_store &store, kinetum::dataplane::v1
 	if (!transport.ok()) {
 		return transport_failure(transport, "Data Plane startup telemetry transport did not complete");
 	}
-	const auto application =
+	auto application =
 		map_dataplane_application_status(response.status(), "Data Plane startup telemetry application failed");
 	if (!application.is_ok()) {
 		const auto envelope = kinetum::common::validate_failed_dataplane_stats_response(response);

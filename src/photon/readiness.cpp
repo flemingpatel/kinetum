@@ -105,6 +105,16 @@ status readiness_deadline_exceeded(const std::string &last_observation)
 
 }  // namespace
 
+std::chrono::steady_clock::time_point steady_readiness_clock::now() const noexcept
+{
+	return std::chrono::steady_clock::now();
+}
+
+void steady_readiness_clock::sleep_for(std::chrono::milliseconds duration)
+{
+	std::this_thread::sleep_for(duration);
+}
+
 status validate_readiness_wait_policy(const readiness_wait_policy &policy)
 {
 	if (policy.rpc_timeout.count() <= 0 || policy.poll_interval.count() <= 0 ||
@@ -165,6 +175,9 @@ kinetum::common::status_or<health_response> grpc_dp_health_observer::observe(std
 
 	grpc::ClientContext context;
 	context.set_deadline(std::chrono::system_clock::now() + rpc_timeout);
+	// Keep the call's poller attached while the new child opens its listener.
+	// Fail-fast calls can leave reconnection to gRPC's slower backup poller.
+	context.set_wait_for_ready(true);
 	health_response response;
 	kinetum::dataplane::v1::HealthRequest request;
 	const auto wire = stub_->Health(&context, request, &response);
@@ -176,14 +189,14 @@ kinetum::common::status_or<health_response> grpc_dp_health_observer::observe(std
 
 kinetum::common::status_or<kinetum::common::dataplane_health_identity>
 wait_for_exact_readiness(dp_health_observer &observer, readiness_gate gate, const readiness_wait_policy &policy,
-			 const readiness_progress_check &progress_check)
+			 readiness_clock &clock, const readiness_progress_check &progress_check)
 {
 	const auto policy_status = validate_readiness_wait_policy(policy);
 	if (!policy_status.is_ok()) {
 		return policy_status;
 	}
 
-	const auto deadline = std::chrono::steady_clock::now() + policy.overall_timeout;
+	const auto deadline = clock.now() + policy.overall_timeout;
 	std::string last_observation = "no DP Health response observed";
 
 	for (;;) {
@@ -194,7 +207,7 @@ wait_for_exact_readiness(dp_health_observer &observer, readiness_gate gate, cons
 			}
 		}
 
-		const auto now = std::chrono::steady_clock::now();
+		const auto now = clock.now();
 		if (now >= deadline) {
 			return readiness_deadline_exceeded(last_observation);
 		}
@@ -208,7 +221,7 @@ wait_for_exact_readiness(dp_health_observer &observer, readiness_gate gate, cons
 		// The per-RPC deadline bounds the transport, while this steady-clock
 		// check remains the authority for the complete gate. A late target
 		// response is not readiness evidence.
-		if (std::chrono::steady_clock::now() >= deadline) {
+		if (clock.now() >= deadline) {
 			if (observed_or.is_ok()) {
 				last_observation = "observed " + health_state_name(observed_or->state()) +
 						   " after the overall readiness deadline";
@@ -242,7 +255,7 @@ wait_for_exact_readiness(dp_health_observer &observer, readiness_gate gate, cons
 						return progress_status;
 					}
 				}
-				if (std::chrono::steady_clock::now() >= deadline) {
+				if (clock.now() >= deadline) {
 					return readiness_deadline_exceeded(
 						"exact target observed, but the final liveness check completed after "
 						"the overall readiness deadline");
@@ -259,14 +272,14 @@ wait_for_exact_readiness(dp_health_observer &observer, readiness_gate gate, cons
 			}
 		}
 
-		const auto after_observation = std::chrono::steady_clock::now();
+		const auto after_observation = clock.now();
 		if (after_observation >= deadline) {
 			continue;
 		}
 		const auto sleep_budget =
 			std::chrono::duration_cast<std::chrono::milliseconds>(deadline - after_observation);
 		if (sleep_budget.count() > 0) {
-			std::this_thread::sleep_for(std::min(policy.poll_interval, sleep_budget));
+			clock.sleep_for(std::min(policy.poll_interval, sleep_budget));
 		}
 	}
 }

@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Dict, Optional, Protocol, Tuple
+from typing import Any, Dict, Optional, Protocol, Tuple
 
 from ..config.types import (
     AnalysisResult,
@@ -122,7 +122,7 @@ class TrafficDriver(ABC):
         raise NotImplementedError
 
     @property
-    def traffic_generator_identity(self) -> Optional[Dict[str, str]]:
+    def traffic_generator_identity(self) -> Optional[Dict[str, Any]]:
         """Return observed external-generator provenance, when applicable."""
         return None
 
@@ -165,7 +165,7 @@ class TrafficDriver(ABC):
         Analyze the most recent capture window.
 
         Drivers that produce PCAP files use their exact native analyzer.
-        Drivers that rely on generator-side hardware counters return a
+        Drivers that rely on generator-side counters return a
         stats-backed result. The selected profile owns latency availability.
 
         Parameters

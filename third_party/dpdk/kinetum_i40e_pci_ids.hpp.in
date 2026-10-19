@@ -1,0 +1,26 @@
+// Copyright (c) 2026 Fleming Patel. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+#pragma once
+
+/**
+ * @file kinetum_i40e_pci_ids.hpp
+ * @brief Component-private PCI identities projected from the built i40e PMD.
+ * @author Fleming Patel
+ *
+ * Generated from the built net_i40e PMD_INFO_STRING record. Both subsystem
+ * identities must be wildcards before a vendor/device row enters this set.
+ */
+
+#include <array>
+#include <cstdint>
+
+namespace kinetum::provider::dpdk_component
+{
+
+/** Exact sorted vendor/device identities from the pinned PMD. */
+inline constexpr std::array<uint32_t, @KINETUM_I40E_PCI_ID_COUNT@> I40E_PF_PCI_IDS{
+@KINETUM_I40E_PCI_ID_ROWS@
+};
+
+}  // namespace kinetum::provider::dpdk_component

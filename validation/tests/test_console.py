@@ -228,5 +228,5 @@ class HarnessLoggingTest(unittest.TestCase):
         record = "2026-09-26T14:20:03.421000Z [ERROR] dut kinetum_dp[42:73] dp.failed - dp/start: failed"
         output = io.StringIO()
         with redirect_stderr(output):
-            ConsoleReporter(color=False, verbose=True).log_callback("kinetum_photon", record)
+            ConsoleReporter(color=False).log_callback("kinetum_photon", record)
         self.assertEqual(output.getvalue(), record + "\n")

@@ -353,6 +353,12 @@ TEST(quark_runtime_compat, ignores_component_and_materialization_proof_requireme
 		0,
 	});
 	compiled.host_requirements.push_back(kinetum::provider::compiled_provider_host_requirement{
+		kinetum::provider::provider_host_proof_phase::COMPONENT_HOST_PROOF,
+		kinetum::provider::provider_host_fact::DPDK_PCI_ADAPTER_OWNERSHIP,
+		kinetum::provider::provider_contract_role::PROCESS_FACILITY,
+		0,
+	});
+	compiled.host_requirements.push_back(kinetum::provider::compiled_provider_host_requirement{
 		kinetum::provider::provider_host_proof_phase::MATERIALIZATION_PROOF,
 		kinetum::provider::provider_host_fact::DPDK_ETHDEV_PORT,
 		kinetum::provider::provider_contract_role::IO_DRIVER,
@@ -363,6 +369,19 @@ TEST(quark_runtime_compat, ignores_component_and_materialization_proof_requireme
 
 	EXPECT_TRUE(report.compatible);
 	EXPECT_TRUE(report.diagnostics.empty());
+}
+
+/** @brief PCI ownership cannot be reassigned to Quark's provider-neutral host phase. */
+TEST(quark_runtime_compat, rejects_pci_ownership_assigned_to_quark_phase)
+{
+	auto compiled = make_compiled_topology({{0}});
+	compiled.host_requirements.push_back(kinetum::provider::compiled_provider_host_requirement{
+		kinetum::provider::provider_host_proof_phase::QUARK_LIVE_HOST,
+		kinetum::provider::provider_host_fact::DPDK_PCI_ADAPTER_OWNERSHIP,
+		kinetum::provider::provider_contract_role::PROCESS_FACILITY,
+		0,
+	});
+	EXPECT_FALSE(kinetum::quark::validate_runtime_compat(compiled, make_topology({0}, 0)).compatible);
 }
 
 /** @brief Verify malformed proof-phase and host-fact classifications fail closed. */
