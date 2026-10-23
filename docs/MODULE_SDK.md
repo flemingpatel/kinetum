@@ -623,8 +623,9 @@ Layout invariants:
 
 `process(batch)` mutates only the permitted batch lanes and returns one
 `uint64_t` forward mask. Bit `i` set forwards packet `i`; bit `i` clear drops
-it. Bits outside `[0, count)` are invalid. No other packet disposition exists,
-and callbacks cannot access provider-native objects.
+it. Bits outside `[0, count)` are invalid. Passive processing has no retention
+operation; [ACTIVE ingest](#16-active-modules) adds the explicit handle contract.
+Callbacks cannot access provider-native objects.
 
 Active origination uses the separate `kinetum_emit_batch_t`. It has the same
 4224-byte, 64-byte-aligned SoA columns but contains only origin values and
@@ -676,7 +677,8 @@ rules, but it receives no access to platform-owned provider objects.
 
 ### 10. Disposition and Routing Macros
 
-Disposition has one authority: the callback's returned forward mask.
+The callback's returned mask selects forwarded lanes. A clear bit drops an
+unretained lane; [ACTIVE ingest retention](#16-active-modules) uses explicit handles.
 
 | Macro | Effect |
 |---|---|
@@ -692,14 +694,14 @@ Reserved port sentinels:
 - `KINETUM_PORT_UNSET = 0xFFFF` - use the exact egress bound to the TX stage
   reached by this packet.
 - `KINETUM_PORT_DROP = 0xFFFE` - discard at terminal TX dispatch. Clear the
-  forward-mask bit for an immediate module-stage drop; the port sentinel does
-  not replace the return-mask contract.
+  forward-mask bit on an unretained lane for an immediate module-stage drop;
+  the port sentinel does not replace the return-mask contract.
 
 The normal permit-unless-denied shape initializes
 `uint64_t mask = KINETUM_FORWARD_MASK(batch->count)`, clears rejected lanes,
-and returns `mask`. Returning zero drops the complete occupied prefix. A module
-must not set a bit at or above `batch->count`; runtime treats that as an ABI
-contract fault rather than masking it away.
+and returns `mask`. Returning zero drops every unretained lane. A module must
+not set a bit at or above `batch->count`; runtime treats that as an ABI contract
+fault rather than masking it away.
 
 Routing semantics:
 
@@ -1581,15 +1583,20 @@ packet bytes establish eligibility, while the post-rewrite SoA lanes supply
 the semantic identity. An unlimited profile without remarking needs neither
 step.
 
-`policer_.police` receives the worker processing time, selected profile,
-GC tuning, semantic key, and `batch->len[i]` byte cost. It composes the shared
+The first traversal prepares copied map-query facts. The second calls
+`policer_.police` in packet order with the worker processing time, selected
+profile, GC tuning, prepared query, and `batch->len[i]` byte cost. Each call
+services GC before looking up current flow state. It composes the shared
 [`byte_credit` arithmetic](ALGORITHM_LIBRARY.md#ratelimithpp) with its own flow
 storage and clock ownership. Allowed packets retain their forward-mask bits;
-remarking updates both `batch->dscp[i]` and the IPv4 DS field and checksum.
+remarking updates both `batch->dscp[i]` and the IPv4 DS field, then recomputes
+the full header checksum through `algo::net::internet_checksum`.
 Rejections clear the corresponding bits.
 
-**Context lifetime.** The constructor allocates `policer_` and its slab,
-cuckoo map, and index pool through `context_memory_resource()`. The map hashes
+**Context lifetime.** The constructor allocates `policer_` and its credit slab,
+reclamation keys, cuckoo map, and index pool through `context_memory_resource()`.
+Query scratch lives with the module object and holds no packet or policy borrow.
+The map hashes
 semantic fields and compares keys for equality; a steering-hash collision
 cannot merge balances. New-flow admission claims one fixed index and returns
 it if map insertion fails. ACTIVATE leaves the table intact, so the next
@@ -1663,7 +1670,7 @@ not mutate live context state.
 | `KINETUM_ALIGNED`, `KINETUM_CACHE_LINE` | Cache-line layout authority. |
 | `KINETUM_ALWAYS_INLINE` | Force a tiny ABI helper inline. |
 | `KINETUM_SIMD_WIDTH` | Width actually compiled into this image: 32-byte AVX2, 16-byte SSE2/AArch64 NEON, or 1-byte scalar. |
-| `KINETUM_FORWARD_MASK`, `KINETUM_FORWARD`, `KINETUM_DROP` | Construct and update the callback's sole packet-disposition mask. |
+| `KINETUM_FORWARD_MASK`, `KINETUM_FORWARD`, `KINETUM_DROP` | Construct and update the callback's forward mask. |
 
 The pure C header and C++ algorithm umbrella expose the same five direct
 prefetch classes. Neither surface adds a range loop, ordering fence, or

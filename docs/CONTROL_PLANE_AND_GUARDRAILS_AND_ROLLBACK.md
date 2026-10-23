@@ -523,29 +523,65 @@ An exact retained retry returns the same reconstructed Prepare request without
 rewriting the authority. Same-key/nonexact content, a different nonterminal
 transaction, stale durable state, or one-sided advancement fails closed.
 
-The exact `dataplane_transition_client` then drives only typed observations:
+The exact `dataplane_transition_client` drives typed observations. Durable CP
+intent and the exact DP state select the next action:
 
-```
-CP control_loop                                             DP coordinator / workers
- |                                                          |
- | canonicalize + create-only corpus                        |
- | persist HWM + ALLOCATED                                  |
- |-- Status(exact identity) ------------------------------->|
- |<-- UNKNOWN_FUTURE / active / terminal -------------------|
- |-- Prepare when unknown --------------------------------->| cold module/snapshot staging
- |<-- PREPARING / PREPARED / ABORTED -----------------------|
- | persist PREPARED                                         |
- | persist COMPLETION_PENDING                               |
- |-- Activate(exact identity) ----------------------------->| grace -> COMMITTING -> worker command
- |<-- COMPLETE or update-frozen RETIRING -------------------| CUT/ACK -> certificate -> retirement
- | persist terminal/active truth                            |
+```{uml}
+@startuml
+    hide footbox
+    participant "CP control loop" as CP
+    database "Durable authority" as Store
+    participant "DP coordinator / workers" as DP
+
+    opt new allocation
+        CP->Store: stage canonical corpus;\npersist watermarks + ALLOCATED
+    end
+    CP->DP: Status(exact identity)
+    DP-->CP: UNKNOWN_FUTURE, or exact active / terminal state
+    opt ALLOCATED + UNKNOWN_FUTURE
+        CP->DP: Prepare(exact request)
+        DP->DP: cold module / snapshot preparation
+        DP-->CP: PREPARING / PREPARED / ABORTED
+    end
+    loop ALLOCATED + PREPARING
+        CP->DP: Status(same identity)
+        DP-->CP: PREPARING / PREPARED / ABORTED
+    end
+    opt exact PREPARED under apply intent
+        opt CP phase ALLOCATED
+            CP->Store: persist PREPARED
+        end
+        opt CP phase PREPARED
+            CP->Store: persist COMPLETION_PENDING
+        end
+        CP->DP: Activate(same identity)
+        DP->DP: on commit: request reader grace;\nCOMMITTING -> worker command;\nCUT/ACK -> certificate -> retirement
+        DP-->CP: exact state and typed failure
+    end
+    loop COMMITTING / RETIRING with failure NONE
+        CP->DP: Status(same identity)
+        DP-->CP: exact state and typed failure
+    end
+    alt exact COMPLETE
+        CP->Store: atomically persist COMPLETE\nand promote active content
+    else exact ABORTED
+        CP->Store: persist terminal failure;\nretain active content and consumed watermarks
+    else RETIRING with retirement-grace deadline exceeded
+        CP->CP: retain COMPLETION_PENDING;\nreport update-frozen state requiring recovery
+    end
+
+    note over CP,DP
+        A pending or lost reply is reconciled by Status
+        with the same identity; it never allocates another epoch.
+    end note
+@enduml
 ```
 
 Status reconciles both restart and transport retry. For an `ALLOCATED`
 transaction, `UNKNOWN_FUTURE` permits Prepare; for `ABORT_PENDING` or `ABORTED`,
-it records ABORTED without preparing. PREPARING is polled; PREPARED is persisted
-before Activate. COMMITTING/RETIRING are observation-only polls; exact COMPLETE
-promotes active content; exact ABORTED retains active content and consumed
+it records `ABORTED` without preparing. `PREPARING` is polled; `PREPARED` is persisted
+before Activate. `COMMITTING`/`RETIRING` are observation-only polls; exact `COMPLETE`
+promotes active content; exact `ABORTED` retains active content and consumed
 watermarks. A typed retirement-grace deadline freezes updates and requires
 recovery. `UNAVAILABLE` or `DEADLINE_EXCEEDED` transport ambiguity is followed
 by Status with the same durable identity until one typed observation is available;
@@ -556,13 +592,13 @@ During startup, each transition-client attempt is additionally shortened to
 the remaining 30-second reconciliation budget; ordinary operation retains the
 client's five-second per-attempt ceiling.
 
-Because COMPLETION_PENDING is durable before the Activate attempt,
-COMPLETION_PENDING plus exact remote PREPARED means retry the same Activate; it
+Because `COMPLETION_PENDING` is durable before the Activate attempt,
+`COMPLETION_PENDING` plus exact remote `PREPARED` means retry the same Activate; it
 is the expected CP-restart or lost-request state, not a contradiction.
 
 `COMPLETION_PENDING` records intent before the network send, not proof that DP
 crossed commit. If the prepared lease or another typed pre-commit cause wins in
-that interval, exact terminal ABORTED is a legal durable successor and active
+that interval, exact terminal `ABORTED` is a legal durable successor and active
 content remains unchanged. No text or CP wall clock may manufacture that edge.
 
 A control-only CP host retains the stronger outer fence: it does not start the
@@ -811,10 +847,9 @@ Handlers fall into two patterns:
 **Mutating RPCs** (`SetConfigSnapshot`, `Rollback`, `ConfirmConfig`,
 `ConfigureGuardrails`):
 
-```
 1. Require the shared mutation authority before materializing a mutation.
-   A control-only stopped loop returns application UNAVAILABLE here.
-   ConfigureGuardrails additionally validates its complete nested policy.
+   A control-only stopped loop returns application `UNAVAILABLE` here.
+   `ConfigureGuardrails` additionally validates its complete nested policy.
 2. Construct a `mutation` from the request. Its concrete payload alternative
    is the operation identity; the same object owns the idempotency key and
    optional expected revision.
@@ -828,19 +863,17 @@ Handlers fall into two patterns:
    `ConfigureGuardrails` returns policy generation and raw hash.
 6. Return `grpc::Status::OK`; the embedded application status carries the
    ordinary operation outcome.
-```
 
 **Read RPCs** (`ListSnapshots`, `GetActiveSnapshot`, `GetGuardrails`,
 `HealthCheck`, `GetStats`):
 
-```
-ListSnapshots     -> store_->list_snapshot_page(page_size, page_token)
-GetActiveSnapshot -> store_->active_snapshot()
-GetGuardrails     -> store_->guardrails_policy()
-HealthCheck       -> SERVING + version + uptime + independent logging observation
-GetStats          -> clear output; require DP transport + application success;
-                     then aggregate coherent CP state plus the complete DP observation
-```
+| RPC | Read path |
+| --- | --------- |
+| `ListSnapshots` | `store_->list_snapshot_page(page_size, page_token)` |
+| `GetActiveSnapshot` | `store_->active_snapshot()` |
+| `GetGuardrails` | `store_->guardrails_policy()` |
+| `HealthCheck` | `SERVING`, version, uptime, and independent logging observation. |
+| `GetStats` | Clear output; require DP transport and application success; then aggregate coherent CP state plus the complete DP observation. |
 
 All nine handlers share one representation boundary. Allocation or size
 failure while constructing the final response returns transport
@@ -1319,7 +1352,7 @@ score into a `hysteresis` filter with the exact configured threshold and band:
 
 ```
 if previously is_degraded:
-    is_degraded = degradation_score > (threshold - band/2)
+    is_degraded = degradation_score >= (threshold - band/2)
 else:
     is_degraded = degradation_score > (threshold + band/2)
 ```
@@ -1537,7 +1570,7 @@ For non-boundary rollback paths:
   a neutral factor.
 
 Commit-confirmed deadline rollback is independent of these recommendations.
-It is enforced from the durable PendingConfirm record, not inferred from a
+It is enforced from the durable `PendingConfirm` record, not inferred from a
 medium attribution score.
 
 `GetGuardrails.evaluation` reports state, the bound active identity, accepted
@@ -1566,24 +1599,22 @@ confirms before its deadline.
 
 The RPC and durable pending-record surface are live after packet readiness:
 
-```
-1. Operator calls SetConfigSnapshot(snapshot, confirm_timeout_ms = 5*60*1000).
+1. Operator calls `SetConfigSnapshot(snapshot, confirm_timeout_ms = 5*60*1000)`.
 2. Packet-ready CP validates the existing rollback target, canonicalizes and
    stages the snapshot, and atomically retains `confirm_timeout_ms` beside one
    exact allocation.
-3. CP drives typed Prepare/Activate convergence. Exact COMPLETE atomically
+3. CP drives typed `Prepare`/`Activate` convergence. Exact `COMPLETE` atomically
    promotes active content and creates `PendingConfirm` with the old active
-   snapshot as rollback target. No rollback deadline is armed before COMPLETE.
-```
+   snapshot as rollback target. No rollback deadline is armed before `COMPLETE`.
 
 The confirm and runner mechanics then continue:
 
-```
 4. A started guardrails runner reads the optional pending-confirm record each
    control-service turn, independently of policy state.
 5. When `pending.confirmed == false` and either
    `now_unix_ms >= deadline_unix_ms` or the wall clock has regressed before
    `created_unix_ms`:
+
    - Collect one mandatory CP-fenced DP observation.
    - Persist one commit-confirm rollback intent with exact active hash, epoch,
      revision, runtime generation, target, cause, and retained random key.
@@ -1593,12 +1624,12 @@ The confirm and runner mechanics then continue:
      pending confirmation in the same active-promotion replacement, including
      when an already-running operator rollback used a different key.
    - A terminal transition failure is retained on the intent and never re-arms.
-6. Operator path: ConfirmConfig RPC arrives before deadline.
+6. Operator path: `ConfirmConfig` RPC arrives before deadline.
+
    - the store atomically writes one keyed terminal confirmation result.
-```
 
 A prior active snapshot is required as the rollback target. Without it, CP
-returns `failed_precondition` before staging or DP contact. COMPLETE promotes
+returns `failed_precondition` before staging or DP contact. `COMPLETE` promotes
 active content and creates the pending confirmation in one authority
 replacement. That write preserves both watermarks, recomputes the Bootstrap
 key, and retains terminal success.

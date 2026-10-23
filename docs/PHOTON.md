@@ -277,7 +277,7 @@ Children inherit Photon's standard I/O and environment except all `LD_`-prefixed
 variables, removed before `posix_spawn()`. This excludes preload, library-path,
 audit, and other dynamic-loader controls without a name-by-name list.
 Each process owns its file writer under the admitted log directory. With
-`--log-console`, the same records are also mirrored to the inherited stderr
+`--log-console`, ordinary records are also mirrored to the inherited stderr
 stream. Photon forwards settings; it does not collect or rewrite child records.
 See [Logging](LOGGING.md) for file ownership, rotation, loss accounting, and format.
 
@@ -406,12 +406,12 @@ and its losses observable; supervision continues under the existing policy.
 | Policy                       | Behavior                                                       |
 | ---------------------------- | -------------------------------------------------------------- |
 | `restart_policy::NEVER` (default) | An observed child exit causes CP-before-DP pair cleanup and Photon exits `1`; no replacement pair is started. |
-| `restart_policy::ON_FAILURE` (`--restart-on-failure`) | If either observed child exited nonzero, Photon reaps the complete pair and reruns the full DP CONTROL_READY -> CP bootstrap -> DP PACKET_READY transaction. A zero-exit child does not authorize replacement and Photon exits `1` after pair cleanup. |
+| `restart_policy::ON_FAILURE` (`--restart-on-failure`) | If either observed child exited nonzero, Photon reaps the complete pair and reruns the full DP CONTROL_READY -> CP bootstrap -> DP PACKET_READY transaction. If all observed exits are zero, Photon exits `1` after pair cleanup. |
 
 The scope-bound pair owner holds the sole policy; child records contain no
-policy copy. There is no per-child restart: CP cannot be retried against an
-already `PACKET_READY` DP, and a replacement pair becomes supervisable only
-after both readiness gates close.
+policy copy. There is no per-child restart: Photon never retries CP alone
+against an already `PACKET_READY` DP, and a replacement pair becomes
+supervisable only after both readiness gates close.
 
 `--restart-on-failure` performs immediate whole-pair replacement after an
 eligible exit. Photon supplies neither exponential backoff nor an
@@ -439,7 +439,7 @@ policy.
 | Child `waitpid` observation fails during supervision | Photon logs the explicit liveness error, reaps CP then DP, and exits `1`. |
 | Either child exits, restart disabled              | Photon reaps CP before DP and exits `1`; complete cleanup does not turn service loss into success. |
 | Either child exits non-zero, `--restart-on-failure` | Photon reaps CP before DP and reruns the complete pair startup transaction. Failure to reach both gates is terminal. |
-| Either child exits zero, `--restart-on-failure`   | Photon reaps the pair and exits `1`; a zero exit does not authorize replacement. |
+| All observed child exits are zero, `--restart-on-failure` | Photon reaps the pair and exits `1`; no observed failure authorizes replacement. |
 | `SIGTERM` or `SIGINT`                             | Loop breaks; CP then DP are sent `SIGTERM` and reaped. |
 | Unexpected exception after packet-ready handoff   | The scope-bound pair owner performs CP-before-DP cleanup, then Photon exits `1` if reaping is proven. |
 | Final startup-rollback or pair-owner cleanup cannot prove complete reaping | Photon emits one fixed bounded diagnostic and terminates before relinquishing either retained child authority. |
@@ -528,7 +528,7 @@ Notable lines:
 | `"starting supervisor"` / `"plan=..."`            | After runtime-bundle and startup-spec validation, before spawn. |
 | `"planned DP inputs: ..."` / `"planned CP inputs: ..."` | Admitted paths and endpoints before spawning; these summaries do not report a running child. |
 | `"spawned process '<role>' (pid=N)"` | The exact child image was spawned and its PID is owned; readiness is still pending. |
-| `"supervised startup failed: ..."`                | Spawn, readiness, cancellation, or startup cleanup failed. |
+| `"supervised startup failed: ..."`                | Spawn, readiness, or startup cleanup failed. Clean signal cancellation exits without this error. |
 | `"supervisor running, press Ctrl+C to stop"`      | Entering the supervision loop.                      |
 | `"<role> process exited (exit_code=N); resolving the complete supervised pair"` | A DP or CP exit selected pair-scoped resolution. |
 | `"supervised pair cannot continue: ..."`          | Policy declined replacement, pair retirement failed, or the replacement did not reach packet readiness. |
@@ -564,7 +564,7 @@ kinetum_photon --bundle <bundle_dir> [options]
 | `--log-component-level <name>=<level>` | none                     | Override one known component; duplicate components reject. |
 | `--log-max-bytes <bytes>`             | `16777216`               | Maximum complete-record file size before rotation. |
 | `--log-keep-files <count>`            | `8`                      | Total files per role including active; range `2..32`. |
-| `--log-console`                      | off                      | Mirror the same records to inherited stderr. |
+| `--log-console`                      | off                      | Mirror ordinary records to inherited stderr. |
 | `-h`, `--help`                        | -                        | Show usage.                                                        |
 
 Exit codes:
@@ -573,7 +573,7 @@ Exit codes:
 | ---- | ---------------------------------------------------------------------- |
 | `0`  | Help completed, or SIGINT/SIGTERM during startup or supervision completed exact CP-before-DP shutdown. |
 | `1`  | Process-image or runtime-bundle admission failure, startup/readiness failure, child spawn failure, unrecovered child exit, or supervision/cleanup failure. |
-| `2`  | CLI usage error: invalid durable-state path, malformed or duplicate option, or missing `--bundle`. |
+| `2`  | CLI usage error: invalid durable-state path, unknown or malformed option, duplicate logging option/component, or missing `--bundle`. |
 
 `-h` and `--help` print usage and return `0`.
 

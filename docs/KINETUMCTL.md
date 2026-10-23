@@ -21,7 +21,7 @@ and rollback flows, see
 > attempt, retain the complete request across retryable ambiguity, and validate
 > exact success identity before output. Read commands validate unknown fields,
 > enums, application status, identity, and residue before one TextFormat or
-> protobuf-JSON stdout emission. Failure leaves stdout empty.
+> protobuf-JSON stdout emission. RPC or response-admission failure leaves stdout empty.
 
 Source: `src/ctl/kinetumctl_main.cpp`, the `ControlService` proto, and
 `src/common/`. Field-level CLI limits are identified below.
@@ -113,7 +113,7 @@ These terms recur throughout the CLI and this document.
 | **Snapshot** | An immutable `ConfigSnapshot` with a bounded semantic ID and revision, exact module configuration, and metadata. CP persists exact content and generates revisions for selective rollback snapshots. |
 | **Revision** | Bounded snapshot revision carried by active CP truth. Generated selective rollback advances it; set-config admits the snapshot's exact revision. `--expected-revision` supplies an optional presence-qualified CAS, including zero. |
 | **Epoch** | Monotonically increasing 64-bit identity durably allocated by CP and admitted/activated by DP. Successful `set-config` and `rollback` operations advance it; `confirm` records exact terminal confirmation without an epoch allocation. Gaps from aborted or orphaned allocations are valid and never reused. |
-| **Active snapshot** | The snapshot currently in force on the data plane. There is exactly one. |
+| **Active snapshot** | The snapshot in CP's durable active record. A live update replaces it only after exact DP completion; workers can reach the new epoch at different times during that transition. |
 | **Commit-confirmed** | A pattern where `set-config --confirm-timeout <ms>` applies a snapshot, but CP auto-rolls back unless `confirm <snapshot_id> --epoch <E> --revision <R>` supplies the exact returned identity before the timeout. See Section 12. |
 | **Selective rollback** | A `rollback` that targets a subset of modules (`--modules m1,m2`) rather than the whole pipeline. The CP synthesizes a hybrid snapshot whose `snapshot_id` is `selective_<sha256(domain,key)>`; exact retries reuse that identity and the first generated metadata. See Section 11. |
 | **Guardrails** | The CP runner services commit-confirmed deadlines and one durable explicit telemetry policy. Missing, stale, faulted, or regressing evidence pauses rather than authorizing rollback. See [`CONTROL_PLANE_AND_GUARDRAILS_AND_ROLLBACK.md`](CONTROL_PLANE_AND_GUARDRAILS_AND_ROLLBACK.md). |
@@ -289,8 +289,9 @@ Diagnostic records on `stderr` use the bounded readable format described in
 [Logging](LOGGING.md). Usage and command-result errors remain finite command
 output. On success, every command
 builds one complete response before writing stdout and emits either protobuf
-TextFormat (default) or protobuf JSON (`--format json`). No command prints a
-hand-built success banner or a partial response.
+TextFormat (default) or protobuf JSON (`--format json`). Successful exit requires
+complete delivery. A failed write may leave a prefix on stdout and does not undo
+a completed remote mutation.
 Native gRPC diagnostics admit ERROR and higher; ordinary library startup
 messages are suppressed.
 
@@ -389,8 +390,7 @@ scripts retain the emitted snapshot, revision, and epoch for `confirm`.
 
 #### Where the pbtxt comes from
 
-Operators do not hand-write `ConfigSnapshot` pbtxts in production. The
-typical flow:
+The CLI accepts a complete `ConfigSnapshot` pbtxt. A typical deployment flow is:
 
 1. A pipeline author writes an Axiom pipeline pbtxt (the static DAG) and
    module-owned configuration payloads. See [`AXIOM.md`](AXIOM.md) and
@@ -405,8 +405,7 @@ typical flow:
    `kinetumctl set-config`; they do not replace the bundle's deployment plan,
    provider graph, module-image closure, or installation identity in place.
 
-Hand-edited pbtxt is fine for development and testing; for production,
-treat the pbtxt as a build artifact.
+Hand-edited and generated inputs pass the same snapshot validation.
 
 #### Set-config example
 
@@ -609,14 +608,20 @@ APPLY_REVISION=$(printf '%s\n' "${APPLY_RESULT}" | jq -er '.revision')
 # 2. Verify exact active identity and collect coherent packet evidence.
 test "$(kinetumctl get-active --format json | jq -r '.snapshot.snapshot_id')" = "${SNAP_ID}"
 kinetumctl stats --format json --stage-stats --boundary-epoch-stats > stats.json
+```
 
-# 3a. If healthy, confirm the exact epoch/revision printed by set-config.
+After reviewing deployment-owned traffic and the observations, choose one outcome.
+To retain the change, confirm its exact returned identity:
+
+```bash
 kinetumctl confirm "${SNAP_ID}" \
   --epoch "${APPLY_EPOCH}" --revision "${APPLY_REVISION}"
+```
 
-# 3b. If something is wrong, do nothing. After 5 minutes the CP
-#     auto-rolls back. Or roll back explicitly to short-circuit the
-#     wait.
+To reject it, leave it unconfirmed for deadline rollback, or request full rollback
+to the retained baseline immediately:
+
+```bash
 kinetumctl rollback fan_in_edge_gw_baseline_v1
 ```
 
@@ -769,7 +774,7 @@ kinetumctl guardrails on \
   --min-tx-ratio 0.95 \
   --min-packets 10000
 
-# Disable guardrails entirely.
+# Disable telemetry-based rollback policy; commit-confirmed deadlines remain active.
 kinetumctl guardrails off
 kinetumctl guardrails show --format json
 ```
@@ -811,7 +816,7 @@ Visual reference:
 ### 15. `stats`: Surface and Modes
 
 `stats` returns one coherent generation snapshot: mandatory runtime, engine,
-transition, and protocol-fault summaries plus selected details. Missing, torn,
+worker counters, transition, and protocol-fault summaries plus selected details. Missing, torn,
 or activation-crossing evidence returns application `UNAVAILABLE`; coherent
 contradiction returns `DATA_LOSS`. Neither emits partial or zero-filled output.
 The CLI checks application status before formatting. Failure or malformed status
@@ -1008,6 +1013,8 @@ are decimal strings. Application failure leaves stdout empty.
 The abridged object below shows the permanent nesting. Optional row families
 appear only when selected, and optional scalar timestamps/counters appear only
 when their producer state makes them meaningful.
+Counters and digests are illustrative; the storage budget uses the shipped
+default d430 PCI profile.
 
 ```json
 {
@@ -1202,7 +1209,7 @@ when their producer state makes them meaningful.
         "driver_queue_id": 0,
         "packets": "1600661",
         "bytes": "102442304",
-        "published_monotonic_ns": "1778446450954800",
+        "published_monotonic_ns": "1778446450955000",
         "rejected_packets": "0"
       },
       {
@@ -1223,12 +1230,12 @@ when their producer state makes them meaningful.
         "storage_domain_id": "storage_dpdk_0",
         "host_numa_node": 0,
         "buffer_count": "131071",
-        "required_min_buffers": "12288",
+        "required_min_buffers": "15360",
         "safety_margin": 64,
         "observation_state": "PROVIDER_OBSERVATION_STATE_AVAILABLE_APPROXIMATE",
         "observed_monotonic_ns": "1778446450955300",
-        "in_use": "1024",
-        "available": "130047"
+        "in_use": "5024",
+        "available": "126047"
       }
     ],
     "ports": [
@@ -1450,9 +1457,12 @@ kinetumctl set-config \
 # 2. Confirm durable active identity and inspect runtime truth.
 kinetumctl list-snapshots --format json | jq '.snapshots[] | select(.is_active)'
 kinetumctl stats --format json | jq '{active_config, runtime: .telemetry.runtime}'
+```
 
-# 3. If the policy regressed, roll back to the prior active snapshot.
-kinetumctl list-snapshots
+If validation succeeds, confirm the returned identity as in Section 12. If the
+policy regressed, request full rollback to the prior active snapshot:
+
+```sh
 kinetumctl rollback fan_in_edge_gw_baseline_v1
 ```
 
@@ -1510,8 +1520,11 @@ ROLLOUT_REVISION=$(printf '%s\n' "${ROLLOUT_RESULT}" | jq -er '.revision')
 test "$(kinetumctl get-active --format json | jq -r '.snapshot.snapshot_id')" = \
   "${ROLLOUT_ID}"
 kinetumctl stats --format json --module-health --boundary-epoch-stats > rollout.json
+```
 
-# Confirm only after operator validation passes.
+After deployment-owned validation passes, confirm the captured identity:
+
+```bash
 kinetumctl confirm "${ROLLOUT_ID}" \
   --epoch "${ROLLOUT_EPOCH}" --revision "${ROLLOUT_REVISION}"
 ```

@@ -120,7 +120,7 @@ record; [Section 13](#13-packet-lifecycle) expands drops and backpressure.
     DP->DP: admit logging, native capture, and TLS
     DP->PR: authenticate and load required provider components
     PR-->DP: sealed component catalog
-    DP->DP: create coordinator, module contexts, INIT, lifecycle owners
+    DP->DP: create coordinator and module contexts\nconstruct lifecycle owners; invoke INIT
     DP->PR: materialize facilities, storage, cold I/O, execution, transitions
     PR->S: allocate bounded packet storage
     PR->RX0: configure queue with ingress disabled
@@ -165,7 +165,7 @@ record; [Section 13](#13-packet-lifecycle) expands drops and backpressure.
     PH->PH: supervise pair
 
     note over O,S: FORWARD A WAN0 PACKET AT EPOCH E
-    W0->W0: reserve local queue capacity
+    W0->W0: reserve local role capacity
     W0->RX0: receive bounded burst
     RX0-->W0: record P backed by storage_dpdk_0
     W0->W0: stamp E, ingress, time, and stage\nacquire E credit and stage P
@@ -174,11 +174,11 @@ record; [Section 13](#13-packet-lifecycle) expands drops and backpressure.
     B0-->W0: accepted, enqueue sequence advanced
     W0->W0: retire sender credit and queue reservation
     note over B0: DATA ring owns P between workers
-    W2->B0: peek P
-    W2->W2: validate epoch, endpoint, domain\nreserve local queue capacity
-    W2->B0: pop exact P
-    B0-->W2: transfer P
-    W2->W2: acquire E credit, then complete DATA dequeue sequence
+    W2->B0: receive bounded prefix with local admission callback
+    B0->W2: borrow P for admission
+    W2->W2: validate epoch, endpoint, domain\nreserve capacity, acquire E credit, stage P
+    B0->B0: consume accepted prefix and publish cursor\nadvance completed packet sequence
+    B0-->W2: accepted count
     W2->W2: batch NAT44, then QoS, against exact view E\nresolve TX and retain original owner, length, epoch
     W2->TX: submit records in order
     TX-->W2: accepted prefix
@@ -189,7 +189,7 @@ record; [Section 13](#13-packet-lifecycle) expands drops and backpressure.
         RX1-->W1: record Q backed by the same domain
         W1->W1: stamp E and acquire local credit\nexecute RX, parse1, and ACL1; select NAT owner
         W1->B1: transfer Q, then retire sender credit
-        W2->B1: reserve, pop Q, acquire credit, complete dequeue
+        W2->B1: receive prefix with reservation and credit\ncomplete accepted packet sequence
         W2->W2: same NAT44 / QoS / TX path
     end
     note over RX0,S: Each boundary preserves the original record and storage owner\nTX acceptance transfers ownership; external observation proves delivery
@@ -505,7 +505,7 @@ package "DPDK component" as DPDK {
         uses = facility_dpdk_0 + storage_dpdk_0
         native path = DPDK ethdev + device PMD
         configures = wan0 RX0, wan1 RX0, lan0 TX0
-        descriptors = 1024 per queue
+        descriptors = RX 2048 per queue, TX 1024
         exposes = RX/TX burst + driver lifecycle
     }
     FACILITY -[hidden]down-> STORAGE
@@ -1776,12 +1776,12 @@ group Verify inputs and admit provider components
 end
 group Construct the complete cold generation
     D->D: create coordinator and immutable command owner
-    D->M: admit images and INIT exact contexts
+    D->M: admit images; place context controls on owner NUMA\nINIT exact contexts; place epoch stores on the same node
     D->L: pre-create bounded lifecycle executors
     D->P: reserve resources; construct facilities in dependency order
     P->P: construct storage, cold drivers, execution, and transitions
     D->D: allocate NUMA-local endpoint slabs, DATA/CUT/ACK,\ninput/future queues, holds, telemetry, and active state
-    D->D: bind kernels, activation owners, readers, and certificate graph
+    D->D: freeze kernel roots, tables, and scratch on owner NUMA\nbind activation, lifecycle records, readers, and certificate
     D->L: start planned services
     D->D: revalidate complete generation; publish CONTROL_READY
     note over D,W: No packet source or worker packet body is open
@@ -1893,6 +1893,9 @@ boundaries, TX sinks, module contexts, ledger, and telemetry banks. Construction
 resolves its operations and allocates its state. After bootstrap and startup
 gates, `run()` selects the [worker loop](../DATA_PLANE.md#stage-modes-and-worker-loops)
 once from the admitted stage resources.
+Kernel controls, private execution tables and scratch share a proved worker-node
+mapping; independent worker owners use the same checked layout mechanism.
+Shared generation authorities and channel poller placement remain separate.
 
 ### Worker ownership and input admission
 
@@ -1909,7 +1912,7 @@ queue "wan1 RX queue" as RX1
 node "W0 / CPU" as W0 {
     rectangle "W0 input-order state\nRX0: one input, quantum 64" as ORDER0
     component "Admit input" as ADMIT0
-    queue "Local active staging" as LOCAL0
+    queue "Active role\nStage/continuation queues\nOne shared capacity" as LOCAL0
     component "Packet work\nrx0 -> parse0 -> acl0" as EXEC0
     ORDER0 .right.> ADMIT0 : allowance
     RX0 -down-> ADMIT0 : RX prefix
@@ -1920,7 +1923,7 @@ node "W0 / CPU" as W0 {
 node "W1 / CPU" as W1 {
     rectangle "W1 input-order state\nRX1: one input, quantum 64" as ORDER1
     component "Admit input" as ADMIT1
-    queue "Local active staging" as LOCAL1
+    queue "Active role\nStage/continuation queues\nOne shared capacity" as LOCAL1
     component "Packet work\nrx1 -> parse1 -> acl1" as EXEC1
     ORDER1 .right.> ADMIT1 : allowance
     RX1 -down-> ADMIT1 : RX prefix
@@ -1949,7 +1952,7 @@ node "W2 / CPU" as W2 {
         Empty input: clear the remainder and move on.
     end note
     component "Admit inputs\nRead the selected DATA prefix" as ADMIT2
-    queue "Local active staging\nReceives both input prefixes" as LOCAL2
+    queue "Active role\nNAT, QoS and TX queues\nOne shared capacity" as LOCAL2
     component "Packet work\nNAT -> QoS -> TX" as EXEC2
     ORDER2 .right.> ADMIT2 : next input and allowance
     A -down-> ADMIT2
@@ -1966,9 +1969,11 @@ EXEC2 -down-> TX : accepted TX prefix
 legend bottom
     Ordinary forwarding in the default shared-storage profile; one RX queue per ingress port.
     Each CPU box contains one continuously running packet-worker thread.
+    Private controls and execution tables live on that worker's compiled NUMA node.
     Each worker repeats: control work -> input admission -> packet work -> flush / publish.
     Solid arrows: packet path. Dashed arrows: input-order state controls the worker's reads.
     Input-order state holds input identities and allowances, never packets or threads.
+    Each active storage-domain role dispatches at most 64 records per turn across all its ready keys.
 endlegend
 @enduml
 ```
@@ -2028,21 +2033,26 @@ the existing queues and ledger retain packet ownership.
             RX-->K: transferred records and rejected count
             K->K: stamp source epoch, acquire transferred credits,\nstage prefix and release unused reservations
         else inbound DATA
-            K->B: peek DATA head
-            K->K: admit exact-active-epoch DATA:\nreserve, receive, credit, complete dequeue, stage
+            K->B: consume bounded DATA prefix with local admission
+            B->K: validate each head, reserve destination,\nacquire credit and stage accepted work
+            B-->K: consume prefix, advance completed sequence, return count
         else RX input during STOP
             K->K: yield without polling
         end
         K->IN: account work including rejections\nkeep unfinished allowance or rotate completed/yielding input
     end
-    K->ST: process bounded active queue prefixes\nbatch contiguous same-context/epoch module work, at most 64
-    ST-->K: forward, drop, retain, emit, async, or recirculate
-    K->TX: finish context selection, then flush transition, TX, and release prefixes
+    K->K: finish pending stage output
+    loop each active storage-domain role
+        K->K: snapshot this role's ready-key count
+        K->ST: service initial keys at most once, within 64 record dispatches\nvalidate every record; finish output prefixes between keys
+        ST-->K: forward, drop, retain, emit, async, or recirculate
+    end
+    K->TX: flush transition, TX, and release prefixes
     opt transition active
-        K->B: refresh cuts and seal outbound only after old work drains
+        K->B: require every inbound cut drained and zero old credit\nseal outbound prefixes and submit CUTs
         opt all cuts published and local activation preflight passes
-            K->ST: infallible ACTIVATE for all prepared module views
-            K->K: switch telemetry, rotate source queues, promote ledger/scheduler
+            K->ST: for each context: switch module telemetry bank,\nthen infallible ACTIVATE of its prepared view
+            K->K: switch worker telemetry, exchange source roles, promote ledger/scheduler
             K->PUB: publish exact local activation
             K->B: mark receivers activated and submit exact ACKs
             K->PUB: publish reader safe point
@@ -2129,15 +2139,19 @@ alt Physical RX
     W->P: receive burst, limited by free capacity and burst bound
     P-->W: transferred prefix + rejected count
     note over P,W: Provider already reclaimed rejected native inputs; they acquire no worker credit
+    W->L: acquire exact source-epoch credits for the accepted count
     W->W: stamp source epoch, time, ingress, and stage on transferred records
-    W->L: acquire one credit per record; publish active / future input
+    W->L: publish active / future input
     W->L: release every unused reservation
     W->W: account transferred packets/bytes and native rejections once per burst
 else Active origin
     P->W: borrowed payloads and origin facts
     W->W: validate the complete origin batch
+    W->L: reserve the available local prefix
     W->S: copy accepted prefix into the authored origin domain
-    W->L: acquire active-epoch credits; publish accepted origin work
+    W->L: acquire active-epoch credits for the accepted count
+    W->L: publish accepted origin work
+    W->L: release every unused origin reservation
     W-->P: accepted prefix; remaining origin work stays module-owned
 end
 W->L: take staged work only at the exact active epoch
@@ -2145,18 +2159,22 @@ alt Platform stage
     W->M: execute the exact RX, parser, or TX mechanism
     M-->W: outcome and parsed fields
 else Module stage
-    W->W: take available contiguous work for one context and epoch\nproject at most 64 occupied SoA lanes, without waiting or sorting
+    W->W: take one ready key's FIFO prefix for its exact context\nadmit and project occupied SoA lanes in one traversal
     W->M: invoke one pre-resolved callback with its exact view
     M-->W: occupied-prefix forward mask and mutable fields
     W->W: validate callback authority, bounds, and field coherence
 end
 alt Drop
     W->L: retire credit once
-    W->S: append to the original domain's release burst
+    W->W: append to the original domain's release batch
+    ... grouped release ...
+    W->S: release the owned burst
+    S-->W: release completed
+    W->L: release local capacity
 else Forward
     W->W: resolve compiled routing
 else Retained by ACTIVE ingest
-    W->L: preserve the existing credit under an opaque retained handle
+    W->L: release local capacity; preserve the existing credit\nunder an opaque retained handle
 end
 @enduml
 ```
@@ -2221,7 +2239,7 @@ partition "Dispatch each admitted output" {
     :Stamp the selected executable target
     and apply any authored storage transition;
     if (Target worker is the current owner?) then (yes)
-        :Stage in the bounded local queue,
+        :Stage in the selected work-key queue,
         preserving the same credit;
         :Execute the next stage at the exact active epoch;
     else (no)
@@ -2244,19 +2262,13 @@ publication and completed dequeue are separate transfer edges.
     participant "Receiver worker" as R
 
     alt target output waits for exact ACK
-        S->H: try transfer record to bounded hold
-        alt accepted
-            S->S: release local reservation, retain epoch credit
-        else hold full
-            S->S: queue local retry with record, reservation, and credit
-        end
+        S->H: offer compatible bounded prefix
+        H-->S: accepted count
+        S->S: release accepted local reservations; retain their credits\nretry refused suffix with unchanged ownership
     else gate open with no earlier held prefix
-        S->D: try enqueue record
-        alt accepted
-            S->S: sequence advanced, retire credit and local reservation
-        else DATA full
-            S->S: queue local retry with unchanged ownership
-        end
+        S->D: offer compatible bounded prefix
+        D-->S: accepted count; packet sequence advanced once
+        S->S: retire accepted credits and local reservations\nretry refused suffix without touching transferred records
     end
     opt exact ACK received and held prefix remains
         H-->S: borrow oldest held record
@@ -2270,13 +2282,13 @@ publication and completed dequeue are separate transfer edges.
         end
     end
     note over D: Ring owns records until receiver transfer
-    R->D: peek exact front record
-    R->R: validate epoch/route/domain and reserve destination slot
-    R->D: pop record
-    D-->R: transfer exact pointer
-    R->R: acquire receiver credit
-    R->D: complete dequeue sequence
-    R->R: publish local next-stage work
+    R->D: consume bounded prefix with local admission callback
+    loop each FIFO head until refusal or allowance
+        D->R: borrow record
+        R->R: validate epoch/route/domain, reserve destination\nacquire credit and stage accepted work
+    end
+    D->D: consume accepted prefix, publish cursor once\nadvance completed packet sequence
+    D-->R: accepted count; no completion claim remains
 @enduml
 ```
 
@@ -2315,10 +2327,13 @@ partition "Transfer one bounded burst" {
     :Save original domain, length, epoch,
     and executed TX stage before the provider call;
     :Invoke one bounded provider TX operation;
+    :Validate the complete unaccepted suffix;
     split
         :Accepted prefix;
-        :Count acceptance from saved facts;
-        :Retire worker credits and reservations;
+        :Group saved facts by contiguous
+        epoch, domain and stage in one pass;
+        :Count stage output, retire credits
+        and release reservations per group;
         note right
           The provider already owns accepted records.
           Native completion or teardown returns their
@@ -2443,7 +2458,8 @@ stop
 ### Packet-lifecycle source anchors and detail
 
 `src/provider/provider_component_abi.h::kinetum_packet_record`,
-`src/dp/packet.hpp::packet_record`, `src/dp/packet_work_item.hpp`,
+`src/dp/packet.hpp::packet_record`, `src/dp/packet_work_key.hpp`,
+`src/dp/worker_packet_staging.cpp`,
 `src/dp/packet_mechanism.cpp`, `src/dp/fixed_packet_pool.cpp`,
 `src/dp/epoch/boundary_epoch_channel.cpp`, and
 `src/dp/packet_worker_kernel.cpp`. See [`DATA_PLANE.md`](../DATA_PLANE.md),

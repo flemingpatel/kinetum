@@ -303,13 +303,14 @@ Driver queue arrays preserve compiled order: the kth RX table corresponds to
 the kth RX row in the ascending stream-fact array, and likewise for TX.
 Components cannot reorder these arrays by native queue number.
 
-`kinetum_packet_record` is the sole packet representation: 128 bytes of
-metadata followed by a 64-byte storage descriptor, aligned to 64 bytes.
+`kinetum_packet_record` is the sole packet representation: a 48-byte storage
+descriptor followed by 80 bytes of metadata, in a 128-byte record aligned to
+64 bytes. Timestamp and epoch occupy offsets 48 and 56 in its first line.
 
 | Record area | Contents |
 |---|---|
-| Metadata | Immutable admission epoch and ingress, routing fields, parsed packet facts, and module-persistent data. |
 | Storage descriptor | Native handle, CPU byte view, length/segment shape, domain/generation identity, capabilities, and original storage operations. |
+| Metadata | Immutable admission epoch and ingress, routing fields, parsed packet facts, and module-persistent data. |
 
 Only the creating provider interprets `native_handle`. Modules receive a
 transient SoA projection through the Module SDK, never an mbuf or native
@@ -588,7 +589,7 @@ operator and must be repeated after reboot. Inspection does not reserve an
 unused function against later administrative changes. TAP-only deployments
 perform no PCI inspection.
 
-The storage factory places the 192-byte packet record in each mbuf's private
+The storage factory places the 128-byte packet record in each mbuf's private
 area and retains the mbuf pointer only in `native_handle`. It proves both
 private-area capacity and every record's 64-byte alignment before publishing
 operations.
@@ -716,7 +717,7 @@ same ABI, admission, and ownership rules as DPDK.
 
 | Mechanism | Implementation |
 |---|---|
-| Host storage | One fixed record/payload mapping sized from the plan and shared budget. Exact NUMA binding precedes first touch; the mapping is prefaulted before publication. Cache-line-rounded payload strides prevent adjacent writable slots sharing a line. |
+| Host storage | One fixed mapping for free-credit queue controls/cells, records and payload, sized from the plan and shared budget. Exact NUMA binding precedes first touch; the mapping is prefaulted before publication. Cache-line-rounded payload strides prevent adjacent writable slots sharing a line. |
 | CPU execution | Execution identity and CPU access proof; platform workers execute the stages. |
 | Zero-copy share | Same-domain handoff preserving the original record. |
 | Bounded copy | Preallocated staging plus destination storage, with exact source retirement after accepted copies. |

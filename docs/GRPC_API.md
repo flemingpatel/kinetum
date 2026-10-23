@@ -1076,8 +1076,8 @@ family must sum to the corresponding engine RX/TX packet and byte totals.
 | `available`            | `optional uint64` | Exact or approximate immediately available records. |
 
 For both available states, `in_use + available == buffer_count` in the one
-returned sample. Approximation describes concurrent staleness after return; it
-does not permit an unaccounted record.
+returned sample. An approximate observation may combine readings taken while
+the pool changes; it must still return a complete tuple satisfying that identity.
 
 `TrafficSteeringStats`:
 

@@ -446,12 +446,13 @@ in the admitted flat source. It is empty when every packed image is
 self-contained, as the three built-ins are. Generated host-authoring schemas
 do not appear in it.
 
-`abi_version` is the exact integer `KINETUM_MODULE_ABI_VERSION`; version
-0.2.0 is encoded as `0x00020000`, or `131072` in JSON. It is metadata for
-the ABI against which the bundled images were built, not a compatibility
-range. Failure to write this required file aborts publication. **No tool in the
-current source tree consumes `modules.json`.** It is documented here as an
-operator-inspection contract; see Section 22.
+`abi_version` records the packer's compiled `KINETUM_MODULE_ABI_VERSION`;
+0.2.0 is encoded as `0x00020000`, or `131072` in JSON. Pack does not inspect
+module descriptors to derive this value. Runtime admission independently
+checks each image's descriptor against the exact supported ABI.
+Failure to write this required file aborts publication. Verifiers check its
+manifest-bound bytes but do not parse its fields. It is an operator-inspection
+contract; see Section 22.
 
 ### 8. Output Publication
 
@@ -719,7 +720,7 @@ numeric authority.
 |---|---|---|
 | `MANIFEST_FILENAME` | `"BUNDLE_MANIFEST.txt"` | The expected manifest filename. Both the generator and the verifier use this constant; renaming requires changing one place. |
 | `kinetum::common::SHA256_HEX_LENGTH` | `64` | Platform-wide exact length of a hex-encoded SHA-256 digest. Hash entries with a different length are rejected. |
-| `MAX_MANIFEST_SIZE` | `1024 * 1024` (1 MB) | Inclusive byte ceiling enforced incrementally by generation, before serializer publication, and before parsing. Exactly 1 MB is valid when every row is canonical. |
+| `MAX_MANIFEST_SIZE` | `1024 * 1024` (1 MiB) | Inclusive byte ceiling enforced incrementally by generation, before serializer publication, and before parsing. Exactly 1 MiB is valid when every row is canonical. |
 | `MAX_BUNDLE_NAME_LENGTH` | `255` | Inclusive byte ceiling for the canonical bundle-name atom. Pack checks the same predicate before creating its output directory. |
 | `MAX_BUNDLE_FILES` | `10000` | Inclusive file-entry ceiling enforced during generation, structured serialization, and parsing. The 10001st row rejects before insertion. |
 | `MAX_REL_PATH_LENGTH` | `512` | DoS cap on relative-path length per entry. Long paths are unusual in real bundles; the cap exists to bound parser memory. |
@@ -1418,7 +1419,7 @@ consume, so operators do not infer authority from presence alone.
 | Bundle-manifest authenticity | **Outside the bundle contract.** `BUNDLE_MANIFEST.txt` is unsigned and the verifier establishes content integrity and semantic admission, not producer identity. | `src/pack/bundle_manifest.hpp`; `src/pack/kinetum_bundle_verify_main.cpp`; `kinetum_pack_main.cpp` `write_bundle_readme` function | Authenticate delivery through the deployment channel; an externally published manifest digest may bind exact bytes but does not create an in-format signing authority. |
 | Build provenance attestation | **Outside the bundle contract.** The format carries no provenance statement and the verifier evaluates none. | `src/pack/runtime_bundle.cpp`; `src/pack/kinetum_bundle_verify_main.cpp` | Establish build provenance independently through the trusted release/build channel. Bundle admission makes no provenance claim. |
 | Bundle freshness authority | **Outside the bundle contract.** The format carries no trusted timestamp, expiry, or freshness policy. | `src/pack/bundle_manifest.cpp`; `src/pack/kinetum_bundle_verify_main.cpp` | Enforce age or rollout policy in independently authenticated deployment metadata when required. |
-| `modules.json` consumption | **Generated, not read.** Pack writes the file; no tool in `src/` consumes it. | `kinetum_pack_main.cpp` (writer); no consumers | Use it for operator inspection or external CI scripting. Do not depend on runtime tooling reading it. |
+| `modules.json` consumption | **Informational metadata.** Pack writes it and manifest verification checks its bytes; runtime tools do not parse its fields. | `kinetum_pack_main.cpp` (writer); manifest integrity verification | Use it for operator inspection or external CI scripting. Descriptor admission, not this file, validates module ABI compatibility. |
 | Version injection | **Mandatory.** The top-level CMake authority validates root `VERSION` and privately injects `KINETUM_VERSION_STR` into every owned target. The C++ header and C release marker reject its absence. | `src/common/version.hpp`; `tooling/release/packaging/release_version_marker.c`; top-level `CMakeLists.txt` | A target outside the owning CMake helper is unbuildable. Packaged ELFs must also carry the exact source-version marker. |
 | OpenSSL-backed hashing | **Implemented and mandatory in every build.** CMake requires OpenSSL::Crypto independently of the TLS option; no alternate digest implementation exists. | `src/common/sha256.cpp`; top-level `CMakeLists.txt` | A host without OpenSSL development files fails configuration instead of producing a different content-identity mechanism. |
 | Parallel hash computation | **Sequential only.** `verify_manifest` walks files in declared order and hashes each in turn. | `src/pack/bundle_manifest.cpp` `verify_manifest` | Verification time is linear in total bundle bytes. |

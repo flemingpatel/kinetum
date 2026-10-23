@@ -17,7 +17,8 @@ sequence.
 
 The result is an epoch-exclusive owner handoff:
 
-- old source admission closes before the sender seals its cut;
+- each sender closes old source admission, drains all inbound cuts and retires
+  its local old work before sealing outbound cuts;
 - every old DATA prefix is drained exactly;
 - retained packets, timers, control work, pull readiness, callbacks, and
   tracked asynchronous work remain visible through the same worker ledger;
@@ -96,10 +97,9 @@ node "Receiver worker / receiver NUMA" {
     component K [
       Receiver kernel
       ----
-      Peek and reserve destination capacity
-      Pop record and acquire receiver credit
-      Complete successful dequeue sequence
-      Publish next-stage work
+      Admit a bounded FIFO prefix
+      Reserve destination and acquire receiver credit
+      Stage local work before completed sequence
       Own the local epoch ledger
     ]
     component R [
@@ -117,7 +117,7 @@ node "Receiver worker / receiver NUMA" {
     R --> K
     K --> NEXT
 }
-SP --> DATA : packet_record transfer
+SP --> DATA : counted compatible prefix
 SP --> CUT
 R --> ACK
 note bottom of HOLD
@@ -168,7 +168,7 @@ and asynchronous drain use the additional ownership paths in Section 7.
     S->S: require zero old local credit\ncapture final enqueue sequence q
     S->K: publish CUT(N, q)
     S->S: preflight every module, source queue, ledger, and telemetry owner
-    S->S: ACTIVATE N and switch telemetry banks
+    S->S: switch each module's bank before its ACTIVATE N\nthen switch worker telemetry
     S->I: rotate future input queue into active role
     S->S: promote ledger and publish activation
     S->S: publish reader safe point after final E read
@@ -180,15 +180,18 @@ and asynchronous drain use the additional ownership paths in Section 7.
     R->K: consume CUT only in bounded service
     R->R: validate target N and sequence q
     loop until DATA dequeued through q
-        R->D: peek, reserve destination, pop exact record
-        D-->R: transfer E record
-        R->R: acquire receiver credit before completing dequeue
-        R->D: complete exact successful sequence
+        R->D: consume bounded prefix with local admission callback
+        loop each available head, until refusal or allowance
+            D->R: borrow next E record for admission
+            R->R: validate and reserve destination\nacquire credit and stage accepted record
+        end
+        D->D: consume accepted prefix, publish cursor once\nadvance completed packet sequence
+        D-->R: accepted count
         R->R: execute and retire E ownership
     end
     R->R: require every inbound cut drained\nand zero old worker credit
     note over R: No outbound boundary in this two-worker sink example
-    R->R: activate module views, switch telemetry banks,\npromote ledger, publish activation, mark receiver
+    R->R: switch each module's bank before its ACTIVATE N\nswitch worker telemetry, promote ledger,\npublish activation and mark receiver
     R->A: publish ACK(N, q)
     R->R: publish reader safe point after final E read
     R->R: complete receiver state after ACK ownership transfer
@@ -231,11 +234,15 @@ partition "Join worker: bounded service turn" {
     if (Both cuts drained, old ledger zero,
     and source admission already N?) then (yes)
         :Seal every outbound E prefix
-        and publish every outbound CUT;
-        :Preflight and perform one local activation;
-        :Mark every inbound receiver activated;
-        :Publish ACK(N, qA) to A
-        and ACK(N, qB) to B;
+        and submit its CUT;
+        if (Every outbound CUT published?) then (yes)
+            :Preflight and perform one local activation;
+            :Mark every inbound receiver activated;
+            :Publish ACK(N, qA) to A
+            and ACK(N, qB) to B;
+        else (pending control)
+            :Retry publication in a later bounded turn;
+        endif
     else (not yet)
         :Return to the next bounded turn;
     endif
@@ -397,15 +404,15 @@ slot to be empty. No image, provider, or slab is destroyed under unresolved work
 
 Backpressure preserves ownership instead of spinning:
 
-- a full DATA ring returns `BACKPRESSURED` with the packet, reservation, and
-  credit still together;
+- DATA transfers only its capacity-accepted prefix; every refused suffix
+  record retains its caller reservation, credit and retry continuation;
 - a full CUT or ACK lane retains exactly one pending control record and retries
   once in a later bounded turn;
 - target output behind a sealed boundary enters a finite preallocated hold;
 - after ACK, the held prefix drains before new target output can overtake it.
 
-Capacity is a memory and liveness bound, never a work-per-turn target. Each turn
-services only a burst-bounded prefix in compiled order.
+Queue capacity bounds retained ownership. Per-turn service budgets separately
+bound input admission, local dispatch, and held-output work.
 
 PREPARING and PREPARED may abort without changing live execution. Once commit
 publishes, elapsed time never invents completion or restores epoch E. A
@@ -559,8 +566,8 @@ The safety argument reduces to these invariants:
 
 1. Every worker-owned packet and nonpacket work item has one exact epoch
    credit; a DATA ring owns transferred records between worker handoffs.
-2. A sender seals only after old source admission is closed and its own old
-   credit is zero.
+2. A sender seals only after old source admission is closed, every inbound cut
+   is drained, and its own old credit is zero.
 3. `CUT(N, q)` names the final successful old-DATA enqueue sequence.
 4. A receiver activates only after every inbound dequeue sequence reaches its
    exact cut and its old ledger is zero.
