@@ -46,9 +46,8 @@ using kinetum::common::status_code;
 /** Cache-line alignment required by fixture allocations. */
 constexpr std::size_t TEST_ALIGNMENT = 64u;
 /** Maximum simultaneously tracked context, telemetry, and epoch-arena blocks per context. */
-constexpr std::size_t LIVE_BLOCKS_PER_CONTEXT = LIFECYCLE_MAX_LONG_LIVED_ALLOCATIONS +
-						LIFECYCLE_MAX_INTERNAL_TELEMETRY_ALLOCATIONS +
-						common::EXACT_EPOCH_SLOT_COUNT;
+constexpr std::size_t LIVE_BLOCKS_PER_CONTEXT =
+	LIFECYCLE_MAX_LONG_LIVED_ALLOCATIONS + LIFECYCLE_MAX_INTERNAL_ALLOCATIONS + common::EXACT_EPOCH_SLOT_COUNT;
 
 /** @brief Release one successful test allocation even when a later assertion returns. */
 class lifecycle_block_owner final {

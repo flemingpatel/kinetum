@@ -19,14 +19,17 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <kinetum/kinetum_sdk.h>
 
 #include "src/dp/active/worker_active_stage_scheduler.hpp"
 #include "src/dp/epoch/worker_epoch_ledger.hpp"
+#include "src/dp/thread_affinity.hpp"
 #include "src/provider/compiled_provider_topology.hpp"
 #include "tests/module_abi_test_harness.hpp"
+#include "tests/numa_placement_test_support.hpp"
 #include "tests/packet_record_test_harness.hpp"
 #include "tests/test_active_helpers.hpp"
 #include "tests/test_modules/test_active_async_module_state.hpp"
@@ -121,9 +124,10 @@ struct scheduler_packet_owner {
 
 /**
  * @brief Build one exact single-instance active compiled authority.
+ * @param context Actual admitted module context supplying worker placement.
  * @return Compiled active-stage topology with fixed resource and ownership facts.
  */
-provider::compiled_provider_topology make_active_topology()
+provider::compiled_provider_topology make_active_topology(const kinetum_ctx &context)
 {
 	provider::compiled_provider_topology topology;
 	topology.logical_stages.push_back({
@@ -147,7 +151,7 @@ provider::compiled_provider_topology make_active_topology()
 	});
 	topology.execution_regions.push_back({
 		.region_id = 0,
-		.numa_node = 0,
+		.numa_node = context.numa_node,
 		.logical_stage_indices = {0u},
 		.stage_instance_indices = {0u},
 		.worker_indices = {0u},
@@ -176,9 +180,9 @@ provider::compiled_provider_topology make_active_topology()
 		.stage_instance_index = 0u,
 		.logical_stage_index = 0u,
 		.worker_index = 0u,
-		.cpu_core_id = 0,
+		.cpu_core_id = context.cpu_core_id,
 		.region_id = 0,
-		.numa_node = 0,
+		.numa_node = context.numa_node,
 		.module_id = "kinetum.test_active",
 		.context_memory_capacity_bytes = TEST_CONTEXT_BYTES,
 		.epoch_arena_capacity_bytes = TEST_EPOCH_BYTES,
@@ -213,8 +217,8 @@ provider::compiled_provider_topology make_active_topology()
 		.region_id = 0,
 		.lane_id = "lane_0",
 		.lane_index = 0u,
-		.numa_node = 0,
-		.cpu_core_ids = {0},
+		.numa_node = context.numa_node,
+		.cpu_core_ids = {context.cpu_core_id},
 		.is_source = true,
 		.is_sink = false,
 		.owns_module_context = true,
@@ -227,18 +231,19 @@ provider::compiled_provider_topology make_active_topology()
 		.outbound_boundary_indices = {},
 	});
 	topology.transition_topology.source_worker_indices = {0u};
-	topology.transition_topology.module_context_numa_nodes = {0};
+	topology.transition_topology.module_context_numa_nodes = {context.numa_node};
 	topology.transition_topology.policy.enabled = true;
 	return topology;
 }
 
 /**
  * @brief Build one exact single-instance tracked-async compiled authority.
+ * @param context Actual admitted module context supplying worker placement.
  * @return Active-async topology derived from the canonical active-stage fixture.
  */
-provider::compiled_provider_topology make_async_topology()
+provider::compiled_provider_topology make_async_topology(const kinetum_ctx &context)
 {
-	auto topology = make_active_topology();
+	auto topology = make_active_topology(context);
 	auto &logical = topology.logical_stages.front();
 	logical.module_id = "kinetum.test_active_async";
 	logical.trigger_mask = static_cast<uint32_t>(provider::compiled_active_stage_trigger::LOOP);
@@ -256,9 +261,9 @@ provider::compiled_provider_topology make_async_topology()
 
 /** @brief Own one activated module, ledger, scheduler, and exact test packet services. */
 struct scheduler_fixture {
-	std::unique_ptr<test::exact_module_test_context> module;   ///< Admitted module and lifecycle ownership.
-	std::unique_ptr<worker_epoch_ledger> ledger;		   ///< Exact epoch-credit authority.
-	std::unique_ptr<worker_active_stage_scheduler> scheduler;  ///< Production scheduler under test.
+	std::unique_ptr<test::exact_module_test_context> module;  ///< Admitted module and lifecycle ownership.
+	numa_owner<worker_epoch_ledger> ledger;			  ///< Exact epoch-credit authority.
+	numa_owner<worker_active_stage_scheduler> scheduler;	  ///< Production scheduler under test.
 	scheduler_packet_owner packets;			///< Packet-operation observations and retained test ownership.
 	provider::compiled_provider_topology topology;	///< Compiled facts borrowed by the scheduler.
 	test::test_active_state *state{nullptr};	///< Borrowed active-module callback observations.
@@ -267,15 +272,17 @@ struct scheduler_fixture {
 	 * @brief Build one exact active scheduler through production factories.
 	 * @param retained_capacity Authored retained-packet population for this fixture.
 	 * @param retained_bytes Authored aggregate retained-byte limit.
+	 * @param placement Exact native owner CPU/node.
 	 * @return Complete fixture or the first module, ledger, or scheduler admission error.
 	 */
-	static common::status_or<std::unique_ptr<scheduler_fixture>> create(uint32_t retained_capacity = 4u,
-									    uint64_t retained_bytes = 4096u)
+	static common::status_or<std::unique_ptr<scheduler_fixture>>
+	create(uint32_t retained_capacity = 4u, uint64_t retained_bytes = 4096u,
+	       quark::host_cpu placement = test::required_worker_cpu())
 	{
 		auto fixture = std::unique_ptr<scheduler_fixture>(new scheduler_fixture());
 		auto module_or = test::exact_module_test_context::create(
 			"kinetum.test_active", std::filesystem::path(KINETUM_TEST_ACTIVE_MODULE_PATH),
-			{TEST_CONTEXT_BYTES, TEST_EPOCH_BYTES}, "active0@lane_0", 0u);
+			{TEST_CONTEXT_BYTES, TEST_EPOCH_BYTES}, "active0@lane_0", 0u, UINT32_MAX, placement);
 		if (!module_or.is_ok()) {
 			return module_or.error();
 		}
@@ -290,14 +297,15 @@ struct scheduler_fixture {
 		}
 		fixture->state->emit_on_next_run.store(false, std::memory_order_relaxed);
 		fixture->state->arm_timer_delay_ns.store(0u, std::memory_order_relaxed);
-		auto ledger_or = worker_epoch_ledger::create(0u, TEST_RUNTIME_GENERATION, 128u);
+		auto ledger_or = worker_epoch_ledger::create(0u, TEST_RUNTIME_GENERATION, 128u,
+							     fixture->module->context().packet_context.numa_node);
 		if (!ledger_or.is_ok()) {
 			return ledger_or.error();
 		}
 		fixture->ledger = std::move(ledger_or).value();
 		fixture->ledger->bind_bootstrap_epoch(TEST_ACTIVE_EPOCH);
 		fixture->packets.ledger = fixture->ledger.get();
-		fixture->topology = make_active_topology();
+		fixture->topology = make_active_topology(fixture->module->context().packet_context);
 		fixture->topology.logical_stages.front().retained_packet_capacity = retained_capacity;
 		fixture->topology.logical_stages.front().retained_byte_capacity = retained_bytes;
 		const std::array<active_stage_context_binding, 1> contexts{{
@@ -333,26 +341,28 @@ struct scheduler_fixture {
 
 /** @brief Own one exact tracked-async module, scheduler, ledger, and packet sink. */
 struct async_scheduler_fixture {
-	std::unique_ptr<test::exact_module_test_context> module;   ///< Exact async image/context.
-	std::unique_ptr<worker_epoch_ledger> ledger;		   ///< Sole test credit authority.
-	std::unique_ptr<worker_active_stage_scheduler> scheduler;  ///< Exact active owner.
-	scheduler_packet_owner packets;				   ///< Narrow packet disposition owner.
-	provider::compiled_provider_topology topology;		   ///< Complete compiled authority.
-	test::test_active_async_state *state{nullptr};		   ///< Context-local canary state.
+	std::unique_ptr<test::exact_module_test_context> module;  ///< Exact async image/context.
+	numa_owner<worker_epoch_ledger> ledger;			  ///< Sole test credit authority.
+	numa_owner<worker_active_stage_scheduler> scheduler;	  ///< Exact active owner.
+	scheduler_packet_owner packets;				  ///< Narrow packet disposition owner.
+	provider::compiled_provider_topology topology;		  ///< Complete compiled authority.
+	test::test_active_async_state *state{nullptr};		  ///< Context-local canary state.
 
 	/**
 	 * @brief Construct one async scheduler with an exact caller-selected credit ceiling.
 	 * @param maximum_unretired Exact test ledger ceiling.
 	 * @param async_capacity Authored token-slot population for this fixture.
+	 * @param placement Exact native owner CPU/node.
 	 * @return Complete fixture or production-factory failure.
 	 */
-	static common::status_or<std::unique_ptr<async_scheduler_fixture>> create(uint64_t maximum_unretired = 16u,
-										  uint32_t async_capacity = 1u)
+	static common::status_or<std::unique_ptr<async_scheduler_fixture>>
+	create(uint64_t maximum_unretired = 16u, uint32_t async_capacity = 1u,
+	       quark::host_cpu placement = test::required_worker_cpu())
 	{
 		auto fixture = std::unique_ptr<async_scheduler_fixture>(new async_scheduler_fixture());
 		auto module_or = test::exact_module_test_context::create(
 			"kinetum.test_active_async", std::filesystem::path(KINETUM_TEST_ACTIVE_ASYNC_MODULE_PATH),
-			{TEST_CONTEXT_BYTES, TEST_EPOCH_BYTES}, "active0@lane_0", 0u);
+			{TEST_CONTEXT_BYTES, TEST_EPOCH_BYTES}, "active0@lane_0", 0u, UINT32_MAX, placement);
 		if (!module_or.is_ok()) {
 			return module_or.error();
 		}
@@ -369,14 +379,15 @@ struct async_scheduler_fixture {
 		fixture->state->autonomous.store(false, std::memory_order_relaxed);
 		fixture->state->auto_complete.store(false, std::memory_order_relaxed);
 		fixture->state->completion_action.store(test::async_completion_action::HOLD, std::memory_order_relaxed);
-		auto ledger_or = worker_epoch_ledger::create(0u, TEST_RUNTIME_GENERATION, maximum_unretired);
+		auto ledger_or = worker_epoch_ledger::create(0u, TEST_RUNTIME_GENERATION, maximum_unretired,
+							     fixture->module->context().packet_context.numa_node);
 		if (!ledger_or.is_ok()) {
 			return ledger_or.error();
 		}
 		fixture->ledger = std::move(ledger_or).value();
 		fixture->ledger->bind_bootstrap_epoch(TEST_ACTIVE_EPOCH);
 		fixture->packets.ledger = fixture->ledger.get();
-		fixture->topology = make_async_topology();
+		fixture->topology = make_async_topology(fixture->module->context().packet_context);
 		fixture->topology.logical_stages.front().async_work_capacity = async_capacity;
 		const std::array<active_stage_context_binding, 1> contexts{{
 			active_stage_context_binding{
@@ -600,7 +611,7 @@ TEST(worker_active_stage_scheduler, retained_packet_drain_preserves_one_credit_a
 	auto fixture_or = scheduler_fixture::create();
 	ASSERT_TRUE(fixture_or.is_ok()) << fixture_or.error().message();
 	auto fixture = std::move(fixture_or).value();
-	EXPECT_EQ(fixture->scheduler->numa_node(), 0);
+	EXPECT_EQ(fixture->scheduler->numa_node(), fixture->module->context().packet_context.numa_node);
 	EXPECT_GT(fixture->scheduler->storage_bytes(), 0u);
 	test::packet_record_test_owner invalid_lane_packet(std::vector<uint8_t>(64u, UINT8_C(0x20)), TEST_ACTIVE_EPOCH);
 	ASSERT_TRUE(invalid_lane_packet.valid()) << invalid_lane_packet.error();
@@ -966,7 +977,7 @@ TEST(worker_active_stage_scheduler, control_and_pull_use_exact_same_worker_insta
 		state->retain_on_next_ingest.store(false, std::memory_order_relaxed);
 	}
 
-	auto topology = make_active_topology();
+	auto topology = make_active_topology(first->context().packet_context);
 	auto &source_logical = topology.logical_stages[0];
 	source_logical.trigger_mask = static_cast<uint32_t>(provider::compiled_active_stage_trigger::LOOP) |
 				      static_cast<uint32_t>(provider::compiled_active_stage_trigger::PULL_READY);
@@ -1023,7 +1034,8 @@ TEST(worker_active_stage_scheduler, control_and_pull_use_exact_same_worker_insta
 		.subtype = provider::compiled_control_edge_subtype::GENERIC,
 	});
 
-	auto ledger_or = worker_epoch_ledger::create(0u, TEST_RUNTIME_GENERATION, 128u);
+	auto ledger_or = worker_epoch_ledger::create(0u, TEST_RUNTIME_GENERATION, 128u,
+						     topology.transition_topology.workers.front().numa_node);
 	ASSERT_TRUE(ledger_or.is_ok()) << ledger_or.error().message();
 	auto ledger = std::move(ledger_or).value();
 	ledger->bind_bootstrap_epoch(TEST_ACTIVE_EPOCH);
@@ -1153,6 +1165,49 @@ TEST(worker_active_stage_scheduler, control_and_pull_use_exact_same_worker_insta
 	EXPECT_EQ(second_state->control_call_count.load(std::memory_order_relaxed), 3u);
 	EXPECT_TRUE(scheduler->empty());
 	scheduler.reset();
+}
+
+/** @brief Require real distinct nodes for active-owner construction evidence. */
+class ActiveSchedulerNumaPlacementTest : public test::NumaPlacementTest {};
+
+/** @brief Both scheduler modes place their root, invocation and full resource slab on the owner node. */
+TEST_F(ActiveSchedulerNumaPlacementTest, synchronous_and_async_storage_follow_the_owner)
+{
+	std::jthread construction([&] {
+		ASSERT_EQ(bind_current_thread_to_cpu_raw(cpus_[0].core_id), 0);
+		auto synchronous = scheduler_fixture::create(4u, 4096u, cpus_[1]);
+		ASSERT_TRUE(synchronous.is_ok()) << synchronous.error().message();
+		EXPECT_TRUE(test::resident_owner_on_node(synchronous.value()->scheduler, cpus_[1].numa_node));
+		auto asynchronous = async_scheduler_fixture::create(16u, 4u, cpus_[1]);
+		ASSERT_TRUE(asynchronous.is_ok()) << asynchronous.error().message();
+		EXPECT_TRUE(test::resident_owner_on_node(asynchronous.value()->scheduler, cpus_[1].numa_node));
+	});
+}
+
+/** @brief A real store from another node rejects even when compiled facts and the ledger agree with each other. */
+TEST_F(ActiveSchedulerNumaPlacementTest, rejects_module_store_on_a_different_owner_node)
+{
+	auto fixture_or = scheduler_fixture::create(4u, 4096u, cpus_[1]);
+	ASSERT_TRUE(fixture_or.is_ok()) << fixture_or.error().message();
+	auto fixture = std::move(fixture_or).value();
+	auto declared = fixture->module->context().packet_context;
+	declared.numa_node = cpus_[0].numa_node;
+	declared.cpu_core_id = cpus_[0].core_id;
+	auto topology = make_active_topology(declared);
+	auto ledger_or = worker_epoch_ledger::create(0u, TEST_RUNTIME_GENERATION, 128u, declared.numa_node);
+	ASSERT_TRUE(ledger_or.is_ok()) << ledger_or.error().message();
+	auto ledger = std::move(ledger_or).value();
+	scheduler_packet_owner packets;
+	packets.ledger = ledger.get();
+	const std::array<active_stage_context_binding, 1> bindings{{
+		{0u, 0u, fixture->module->context().epoch_store.get(), fixture->module->context().image->descriptor},
+	}};
+	auto refused = worker_active_stage_scheduler::create(0u, topology, bindings, *ledger,
+							     {&packets, &scheduler_packet_owner::emit,
+							      &scheduler_packet_owner::publish,
+							      &scheduler_packet_owner::recirculate});
+	ASSERT_FALSE(refused.is_ok());
+	EXPECT_EQ(refused.error().code(), common::status_code::FAILED_PRECONDITION);
 }
 
 }  // namespace

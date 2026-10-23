@@ -53,34 +53,6 @@ static_assert(ASYNC_COMPLETION_PREFIX_BUDGET > 0u && ASYNC_COMPLETION_PREFIX_BUD
 constexpr uint64_t ACTIVE_TIMER_QUANTUM_NS = UINT64_C(1000000);
 
 /**
- * @brief Add one checked slab extent after required alignment.
- * @param count Number of elements to reserve.
- * @param cursor Current slab end, advanced only on successful arithmetic.
- * @param offset Aligned start of the reserved extent, written on success.
- * @return true after overflow-free alignment and extent addition; false without changing outputs.
- * @tparam value_type Element type defining the extent's size and alignment.
- */
-template <typename value_type>
-[[nodiscard]] bool append_extent(std::size_t count, std::size_t &cursor, std::size_t &offset) noexcept
-{
-	if (count > std::numeric_limits<std::size_t>::max() / sizeof(value_type)) {
-		return false;
-	}
-	const std::size_t alignment = alignof(value_type);
-	const std::size_t remainder = cursor % alignment;
-	const std::size_t padding = remainder == 0u ? 0u : alignment - remainder;
-	const std::size_t bytes = count * sizeof(value_type);
-	if (padding > std::numeric_limits<std::size_t>::max() - cursor ||
-	    bytes > std::numeric_limits<std::size_t>::max() - cursor - padding) {
-		return false;
-	}
-	cursor += padding;
-	offset = cursor;
-	cursor += bytes;
-	return true;
-}
-
-/**
  * @brief Checked multiplication for variable control-payload storage.
  * @param left First size factor.
  * @param right Second size factor.
@@ -269,9 +241,21 @@ class worker_active_stage_scheduler::implementation final {
 	};
 	static_assert(offsetof(invocation, runtime_services) == 0u);
 
-	/** @brief Checked offsets for one exact-NUMA worker slab. */
+	/** @brief Shared checked geometry and semantic populations for one complete worker owner. */
 	struct slab_layout {
-		std::size_t total_bytes{0};		       ///< Complete usable slab extent.
+		numa_layout allocation;			       ///< Sole offset and mapping authority.
+		std::size_t implementation_offset{0u};	       ///< Root execution state.
+		std::size_t facade_offset{0u};		       ///< Public owner view in the same mapping.
+		std::size_t retained_count{0u};		       ///< Complete retained slot population.
+		std::size_t timer_count{0u};		       ///< Complete timer entry population.
+		std::size_t control_count{0u};		       ///< Complete control cell population.
+		std::size_t control_payload_bytes{0u};	       ///< Complete control payload extent.
+		std::size_t pull_count{0u};		       ///< Complete PULL edge population.
+		std::size_t relation_word_count{0u};	       ///< Complete relation bitmap words.
+		std::size_t handle_count{0u};		       ///< All per-row callback prefix entries.
+		std::size_t async_count{0u};		       ///< Complete logical foreign-work population.
+		std::size_t async_queue_capacity{0u};	       ///< Exact derived physical completion queue capacity.
+		std::size_t async_handle_count{0u};	       ///< All async callback prefix entries.
 		std::size_t rows_offset{0};		       ///< Schedule-row array.
 		std::size_t stage_to_row_offset{0};	       ///< Dense global-stage index.
 		std::size_t retained_offset{0};		       ///< Retained slot population.
@@ -371,8 +355,8 @@ class worker_active_stage_scheduler::implementation final {
 		}
 	}
 
-	/** @return Complete cold admission and slab construction status. */
-	[[nodiscard]] common::status initialize();
+	/** @return A complete local owner materialized from this temporary cold construction state. */
+	[[nodiscard]] common::status_or<numa_owner<worker_active_stage_scheduler>> materialize();
 
 	/** @copydoc worker_active_stage_scheduler::worker_index */
 	[[nodiscard]] uint32_t worker_index() const noexcept
@@ -387,15 +371,12 @@ class worker_active_stage_scheduler::implementation final {
 	/** @copydoc worker_active_stage_scheduler::numa_node */
 	[[nodiscard]] int32_t numa_node() const noexcept
 	{
-		if (!slab_.host_numa_node().has_value()) {
-			std::terminate();
-		}
-		return *slab_.host_numa_node();
+		return ledger_.numa_node();
 	}
 	/** @copydoc worker_active_stage_scheduler::storage_bytes */
 	[[nodiscard]] std::size_t storage_bytes() const noexcept
 	{
-		return slab_.size();
+		return storage_bytes_;
 	}
 	/** @copydoc worker_active_stage_scheduler::active_epoch */
 	[[nodiscard]] uint64_t active_epoch() const noexcept
@@ -470,15 +451,16 @@ class worker_active_stage_scheduler::implementation final {
 	/** @return Checked offsets for the sole exact-NUMA worker slab. */
 	[[nodiscard]] common::status_or<slab_layout> compute_layout_() const noexcept;
 	/**
-	 * @brief Allocate and bind the prevalidated slab without later failure.
+	 * @brief Bind the prevalidated mapped slab without later allocation.
+	 * @param storage Complete mapping that also contains this implementation.
 	 * @param layout Complete checked slab layout.
 	 * @param binding_by_stage Dense exact stage-to-context binding index.
 	 * @param source_pull_counts Exact PULL relation count for each active row.
-	 * @return NUMA allocation status, or OK after complete non-failing binding.
+	 * An inconsistent prevalidated input is a construction contradiction.
 	 */
-	[[nodiscard]] common::status bind_slab_(const slab_layout &layout,
-						std::span<const active_stage_context_binding *const> binding_by_stage,
-						std::span<const uint32_t> source_pull_counts);
+	void bind_slab_(numa_memory_region &storage, const slab_layout &layout,
+			std::span<const active_stage_context_binding *const> binding_by_stage,
+			std::span<const uint32_t> source_pull_counts) noexcept;
 	/** @param stage_index Global stage identity. @return Mutable active row, or null. */
 	[[nodiscard]] instance_row *row_for_stage_(uint32_t stage_index) noexcept;
 	/** @param stage_index Global stage identity. @return Immutable active row, or null. */
@@ -745,32 +727,32 @@ class worker_active_stage_scheduler::implementation final {
 	std::span<const active_stage_context_binding> context_bindings_;  ///< Construction-only exact bindings.
 	worker_epoch_ledger &ledger_;					  ///< Sole worker work-credit owner.
 	active_stage_packet_operations packet_operations_;		  ///< Narrow packet-kernel surface.
-	numa_memory_region slab_;					  ///< One exact-NUMA active-worker mapping.
-	instance_row *rows_{nullptr};					  ///< Schedule-ordered slab rows.
-	uint32_t row_count_{0};						  ///< Exact active instance count.
-	uint32_t *stage_to_row_{nullptr};				  ///< Global stage to active-row map.
-	uint32_t stage_count_{0};					  ///< Complete global stage namespace.
-	pull_edge *pull_edges_{nullptr};				  ///< Exact worker-local PULL edge set.
-	uint32_t pull_edge_count_{0};					  ///< Exact PULL edge count.
-	kinetum::algo::timer_wheel_view<> *timer_wheel_{nullptr};	  ///< Shared caller-storage timer core.
-	worker_async_work *async_work_{nullptr};			  ///< Caller-placed foreign-work authority.
-	worker_async_work::slot_storage *async_slots_{nullptr};		  ///< Caller-placed logical token slots.
-	uint32_t timer_entry_capacity_{0};				  ///< Aggregate plan-authored timer capacity.
-	uint32_t timer_drain_cursor_{0};				  ///< Bounded shutdown/transition scan cursor.
-	uint64_t relation_bit_count_{0};				  ///< Exact active-row pair universe.
-	uint64_t *control_edge_bits_{nullptr};				  ///< Immutable authorized control relations.
-	uint64_t *control_feedback_bits_{nullptr};			  ///< Immutable FEEDBACK edge classifications.
-	uint64_t *pull_edge_bits_{nullptr};				  ///< Immutable authorized PULL relations.
-	uint64_t *pull_pending_bits_{nullptr};	     ///< Mutable owner-local pending PULL relations.
-	packet_origin_view *origin_views_{nullptr};  ///< Exact-NUMA active-origin input scratch.
-	packet_record **origin_records_{nullptr};    ///< Exact-NUMA active-origin result scratch.
-	uint32_t *ingest_slots_{nullptr};	     ///< Exact-NUMA provisional slot for each occupied INGEST lane.
-	invocation invocation_{};		     ///< Sole non-nested callback context.
-	phase phase_{phase::UNBOUND};		     ///< Worker-local active scheduling phase.
-	uint64_t active_epoch_{0};		     ///< Exact current callback epoch.
-	uint64_t transition_generation_{0};	     ///< Exact current drain generation.
-	uint64_t transition_from_epoch_{0};	     ///< Exact current drain source.
-	uint64_t transition_to_epoch_{0};	     ///< Exact current drain target.
+	std::size_t storage_bytes_{0u};	   ///< Complete fixed extent retained by the external mapping owner.
+	instance_row *rows_{nullptr};	   ///< Schedule-ordered slab rows.
+	uint32_t row_count_{0};		   ///< Exact active instance count.
+	uint32_t *stage_to_row_{nullptr};  ///< Global stage to active-row map.
+	uint32_t stage_count_{0};	   ///< Complete global stage namespace.
+	pull_edge *pull_edges_{nullptr};   ///< Exact worker-local PULL edge set.
+	uint32_t pull_edge_count_{0};	   ///< Exact PULL edge count.
+	kinetum::algo::timer_wheel_view<> *timer_wheel_{nullptr};  ///< Shared caller-storage timer core.
+	worker_async_work *async_work_{nullptr};		   ///< Caller-placed foreign-work authority.
+	worker_async_work::slot_storage *async_slots_{nullptr};	   ///< Caller-placed logical token slots.
+	uint32_t timer_entry_capacity_{0};			   ///< Aggregate plan-authored timer capacity.
+	uint32_t timer_drain_cursor_{0};			   ///< Bounded shutdown/transition scan cursor.
+	uint64_t relation_bit_count_{0};			   ///< Exact active-row pair universe.
+	uint64_t *control_edge_bits_{nullptr};			   ///< Immutable authorized control relations.
+	uint64_t *control_feedback_bits_{nullptr};		   ///< Immutable FEEDBACK edge classifications.
+	uint64_t *pull_edge_bits_{nullptr};			   ///< Immutable authorized PULL relations.
+	uint64_t *pull_pending_bits_{nullptr};			   ///< Mutable owner-local pending PULL relations.
+	packet_origin_view *origin_views_{nullptr};		   ///< Exact-NUMA active-origin input scratch.
+	packet_record **origin_records_{nullptr};		   ///< Exact-NUMA active-origin result scratch.
+	uint32_t *ingest_slots_{nullptr};    ///< Exact-NUMA provisional slot for each occupied INGEST lane.
+	invocation invocation_{};	     ///< Sole non-nested callback context.
+	phase phase_{phase::UNBOUND};	     ///< Worker-local active scheduling phase.
+	uint64_t active_epoch_{0};	     ///< Exact current callback epoch.
+	uint64_t transition_generation_{0};  ///< Exact current drain generation.
+	uint64_t transition_from_epoch_{0};  ///< Exact current drain source.
+	uint64_t transition_to_epoch_{0};    ///< Exact current drain target.
 };
 
 common::status worker_active_stage_scheduler::implementation::validate_topology_(
@@ -786,7 +768,8 @@ common::status worker_active_stage_scheduler::implementation::validate_topology_
 	const auto &schedule = topology_.worker_schedules[worker_index_];
 	const auto &worker = topology_.transition_topology.workers[worker_index_];
 	if (schedule.worker_index != worker_index_ || worker.worker_index != worker_index_ || worker.numa_node < 0 ||
-	    worker.cpu_core_ids.size() != 1u || schedule.active_stage_instance_indices.empty() ||
+	    worker.cpu_core_ids.size() != 1u || ledger_.numa_node() != worker.numa_node ||
+	    schedule.active_stage_instance_indices.empty() ||
 	    context_bindings_.size() != schedule.active_stage_instance_indices.size() ||
 	    binding_by_stage.size() != topology_.stage_instances.size() ||
 	    source_pull_counts.size() != schedule.active_stage_instance_indices.size()) {
@@ -883,6 +866,7 @@ common::status worker_active_stage_scheduler::implementation::validate_topology_
 		    binding->module_context_index != compiled_context.module_context_index ||
 		    binding->store == nullptr || binding->descriptor == nullptr ||
 		    binding->store->context_index() != compiled_context.module_context_index ||
+		    binding->store->numa_node() != compiled_context.numa_node ||
 		    binding->descriptor->mode != KINETUM_MODULE_ACTIVE || binding->descriptor->run == nullptr ||
 		    tracked_async != async_resources || async_resources != async_grace_present || !async_grace_exact ||
 		    (async_resources && topology_.transition_topology.policy.enabled &&
@@ -1116,112 +1100,132 @@ worker_active_stage_scheduler::implementation::compute_layout_() const noexcept
 	}
 
 	slab_layout layout;
-	std::size_t cursor = 0u;
-	if (!append_extent<instance_row>(rows, cursor, layout.rows_offset) ||
-	    !append_extent<uint32_t>(stages, cursor, layout.stage_to_row_offset) ||
-	    !append_extent<retained_slot>(retained_count, cursor, layout.retained_offset) ||
-	    !append_extent<kinetum::algo::timer_wheel_view<>>(timer_count == 0u ? 0u : 1u, cursor,
-							      layout.timer_wheel_offset) ||
-	    !append_extent<kinetum::algo::timer_wheel_view<>::entry_type>(timer_count, cursor, layout.timers_offset) ||
-	    !append_extent<uint32_t>(timer_count == 0u ? 0u : kinetum::algo::timer_wheel_view<>::FINE_SLOTS, cursor,
-				     layout.timer_fine_heads_offset) ||
-	    !append_extent<uint32_t>(timer_count == 0u ? 0u : kinetum::algo::timer_wheel_view<>::COARSE_SLOTS, cursor,
-				     layout.timer_coarse_heads_offset) ||
-	    !append_extent<kinetum::algo::work_queue_view<control_cell>>(rows, cursor, layout.control_queues_offset) ||
-	    !append_extent<kinetum::algo::work_queue_view<control_cell>::storage_type>(control_count, cursor,
-										       layout.control_storage_offset) ||
-	    !append_extent<uint32_t>(control_count, cursor, layout.control_free_links_offset) ||
-	    !append_extent<std::byte>(control_payload_bytes, cursor, layout.control_payload_offset) ||
-	    !append_extent<control_cell>(handle_count, cursor, layout.control_delivery_offset) ||
-	    !append_extent<uint64_t>(relation_word_count, cursor, layout.control_edge_bits_offset) ||
-	    !append_extent<uint64_t>(relation_word_count, cursor, layout.control_feedback_bits_offset) ||
-	    !append_extent<uint64_t>(relation_word_count, cursor, layout.pull_edge_bits_offset) ||
-	    !append_extent<uint64_t>(relation_word_count, cursor, layout.pull_pending_bits_offset) ||
-	    !append_extent<pull_edge>(pull_count, cursor, layout.pull_edges_offset) ||
-	    !append_extent<uint32_t>(pull_count, cursor, layout.source_pull_indices_offset) ||
-	    !append_extent<uint32_t>(handle_count, cursor, layout.pull_delivery_offset) ||
-	    !append_extent<worker_async_work>(async_count == 0u ? 0u : 1u, cursor, layout.async_tracker_offset) ||
-	    !append_extent<worker_async_work::slot_storage>(async_count, cursor, layout.async_slots_offset) ||
-	    !append_extent<worker_async_work::completion_queue_storage>(async_queue_capacity, cursor,
-									layout.async_queue_offset) ||
-	    !append_extent<worker_async_delivery>(async_handle_count, cursor, layout.async_deliveries_offset) ||
-	    !append_extent<kinetum_async_completion>(async_handle_count, cursor,
-						     layout.async_completion_views_offset) ||
-	    !append_extent<kinetum_active_timer_handle>(handle_count, cursor, layout.expired_offset) ||
-	    !append_extent<kinetum_retained_packet_handle>(handle_count, cursor, layout.drain_retained_offset) ||
-	    !append_extent<packet_origin_view>(WORK_BUDGET, cursor, layout.origin_views_offset) ||
-	    !append_extent<packet_record *>(WORK_BUDGET, cursor, layout.origin_records_offset) ||
-	    !append_extent<uint32_t>(KINETUM_MAX_BURST, cursor, layout.ingest_slots_offset) || cursor == 0u) {
+	if (!layout.allocation.append<implementation>(1u, layout.implementation_offset) ||
+	    !layout.allocation.append<worker_active_stage_scheduler>(1u, layout.facade_offset) ||
+	    !layout.allocation.append<instance_row>(rows, layout.rows_offset) ||
+	    !layout.allocation.append<uint32_t>(stages, layout.stage_to_row_offset) ||
+	    !layout.allocation.append<retained_slot>(retained_count, layout.retained_offset) ||
+	    !layout.allocation.append<kinetum::algo::timer_wheel_view<>>(timer_count == 0u ? 0u : 1u,
+									 layout.timer_wheel_offset) ||
+	    !layout.allocation.append<kinetum::algo::timer_wheel_view<>::entry_type>(timer_count,
+										     layout.timers_offset) ||
+	    !layout.allocation.append<uint32_t>(timer_count == 0u ? 0u : kinetum::algo::timer_wheel_view<>::FINE_SLOTS,
+						layout.timer_fine_heads_offset) ||
+	    !layout.allocation.append<uint32_t>(timer_count == 0u ? 0u :
+								    kinetum::algo::timer_wheel_view<>::COARSE_SLOTS,
+						layout.timer_coarse_heads_offset) ||
+	    !layout.allocation.append<kinetum::algo::work_queue_view<control_cell>>(rows,
+										    layout.control_queues_offset) ||
+	    !layout.allocation.append<kinetum::algo::work_queue_view<control_cell>::storage_type>(
+		    control_count, layout.control_storage_offset) ||
+	    !layout.allocation.append<uint32_t>(control_count, layout.control_free_links_offset) ||
+	    !layout.allocation.append<std::byte>(control_payload_bytes, layout.control_payload_offset) ||
+	    !layout.allocation.append<control_cell>(handle_count, layout.control_delivery_offset) ||
+	    !layout.allocation.append<uint64_t>(relation_word_count, layout.control_edge_bits_offset) ||
+	    !layout.allocation.append<uint64_t>(relation_word_count, layout.control_feedback_bits_offset) ||
+	    !layout.allocation.append<uint64_t>(relation_word_count, layout.pull_edge_bits_offset) ||
+	    !layout.allocation.append<uint64_t>(relation_word_count, layout.pull_pending_bits_offset) ||
+	    !layout.allocation.append<pull_edge>(pull_count, layout.pull_edges_offset) ||
+	    !layout.allocation.append<uint32_t>(pull_count, layout.source_pull_indices_offset) ||
+	    !layout.allocation.append<uint32_t>(handle_count, layout.pull_delivery_offset) ||
+	    !layout.allocation.append<worker_async_work>(async_count == 0u ? 0u : 1u, layout.async_tracker_offset) ||
+	    !layout.allocation.append<worker_async_work::slot_storage>(async_count, layout.async_slots_offset) ||
+	    !layout.allocation.append<worker_async_work::completion_queue_storage>(async_queue_capacity,
+										   layout.async_queue_offset) ||
+	    !layout.allocation.append<worker_async_delivery>(async_handle_count, layout.async_deliveries_offset) ||
+	    !layout.allocation.append<kinetum_async_completion>(async_handle_count,
+								layout.async_completion_views_offset) ||
+	    !layout.allocation.append<kinetum_active_timer_handle>(handle_count, layout.expired_offset) ||
+	    !layout.allocation.append<kinetum_retained_packet_handle>(handle_count, layout.drain_retained_offset) ||
+	    !layout.allocation.append<packet_origin_view>(WORK_BUDGET, layout.origin_views_offset) ||
+	    !layout.allocation.append<packet_record *>(WORK_BUDGET, layout.origin_records_offset) ||
+	    !layout.allocation.append<uint32_t>(KINETUM_MAX_BURST, layout.ingest_slots_offset)) {
 		return common::status(common::status_code::OUT_OF_RANGE,
 				      kinetum::common::static_status_text(
 					      "active scheduler checked slab layout is not representable"));
 	}
-	layout.total_bytes = cursor;
+	layout.retained_count = retained_count;
+	layout.timer_count = timer_count;
+	layout.control_count = control_count;
+	layout.control_payload_bytes = control_payload_bytes;
+	layout.pull_count = pull_count;
+	layout.relation_word_count = relation_word_count;
+	layout.handle_count = handle_count;
+	layout.async_count = async_count;
+	layout.async_queue_capacity = async_queue_capacity;
+	layout.async_handle_count = async_handle_count;
 	return layout;
 }
 
-common::status worker_active_stage_scheduler::implementation::bind_slab_(
-	const slab_layout &layout, std::span<const active_stage_context_binding *const> binding_by_stage,
-	std::span<const uint32_t> source_pull_counts)
+void worker_active_stage_scheduler::implementation::bind_slab_(
+	numa_memory_region &storage, const slab_layout &layout,
+	std::span<const active_stage_context_binding *const> binding_by_stage,
+	std::span<const uint32_t> source_pull_counts) noexcept
 {
 	const auto &schedule = topology_.worker_schedules[worker_index_];
 	const auto &worker = topology_.transition_topology.workers[worker_index_];
-	if (schedule.active_stage_instance_indices.size() > UINT32_MAX ||
+	if (worker.numa_node != ledger_.numa_node() || schedule.active_stage_instance_indices.size() > UINT32_MAX ||
 	    topology_.stage_instances.size() > UINT32_MAX ||
 	    binding_by_stage.size() != topology_.stage_instances.size() ||
 	    source_pull_counts.size() != schedule.active_stage_instance_indices.size()) {
-		return common::status(common::status_code::OUT_OF_RANGE,
-				      "active scheduler compact identity population exceeds uint32");
+		std::terminate();
 	}
-	auto slab_or = numa_memory_region::allocate({
-		.usable_bytes = layout.total_bytes,
-		.alignment_bytes = kinetum::algo::CACHE_LINE_SIZE,
-		.host_numa_node = worker.numa_node,
-	});
-	if (!slab_or.is_ok()) {
-		return slab_or.error();
-	}
-	slab_ = std::move(slab_or).value();
-	auto *base = static_cast<std::byte *>(slab_.data());
-	std::memset(base, 0, layout.total_bytes);
-	const auto at = [base]<typename value_type>(std::size_t offset) noexcept {
-		return reinterpret_cast<value_type *>(base + offset);
+	storage_bytes_ = storage.size();
+	const auto at = [&storage]<typename value_type>(std::size_t offset, std::size_t count) noexcept {
+		return numa_layout::storage<value_type>(storage, offset, count).data();
 	};
 
 	row_count_ = static_cast<uint32_t>(schedule.active_stage_instance_indices.size());
 	stage_count_ = static_cast<uint32_t>(topology_.stage_instances.size());
-	rows_ = at.template operator()<instance_row>(layout.rows_offset);
-	stage_to_row_ = at.template operator()<uint32_t>(layout.stage_to_row_offset);
-	auto *retained_base = at.template operator()<retained_slot>(layout.retained_offset);
-	auto *timer_entries =
-		at.template operator()<kinetum::algo::timer_wheel_view<>::entry_type>(layout.timers_offset);
-	auto *timer_fine_heads = at.template operator()<uint32_t>(layout.timer_fine_heads_offset);
-	auto *timer_coarse_heads = at.template operator()<uint32_t>(layout.timer_coarse_heads_offset);
-	auto *control_queue_base =
-		at.template operator()<kinetum::algo::work_queue_view<control_cell>>(layout.control_queues_offset);
+	rows_ = at.template operator()<instance_row>(layout.rows_offset, row_count_);
+	for (uint32_t index = 0u; index < row_count_; ++index) {
+		std::construct_at(&rows_[index]);
+	}
+	stage_to_row_ = at.template operator()<uint32_t>(layout.stage_to_row_offset, stage_count_);
+	auto *retained_base = at.template operator()<retained_slot>(layout.retained_offset, layout.retained_count);
+	auto *timer_entries = at.template operator()<kinetum::algo::timer_wheel_view<>::entry_type>(
+		layout.timers_offset, layout.timer_count);
+	auto *timer_fine_heads = at.template operator()<uint32_t>(
+		layout.timer_fine_heads_offset,
+		layout.timer_count == 0u ? 0u : kinetum::algo::timer_wheel_view<>::FINE_SLOTS);
+	auto *timer_coarse_heads = at.template operator()<uint32_t>(
+		layout.timer_coarse_heads_offset,
+		layout.timer_count == 0u ? 0u : kinetum::algo::timer_wheel_view<>::COARSE_SLOTS);
+	auto *control_queue_base = at.template operator()<kinetum::algo::work_queue_view<control_cell>>(
+		layout.control_queues_offset, row_count_);
 	auto *control_storage_base = at.template operator()<kinetum::algo::work_queue_view<control_cell>::storage_type>(
-		layout.control_storage_offset);
-	auto *control_free_base = at.template operator()<uint32_t>(layout.control_free_links_offset);
-	auto *payload_base = at.template operator()<std::byte>(layout.control_payload_offset);
-	auto *control_delivery_base = at.template operator()<control_cell>(layout.control_delivery_offset);
-	control_edge_bits_ = at.template operator()<uint64_t>(layout.control_edge_bits_offset);
-	control_feedback_bits_ = at.template operator()<uint64_t>(layout.control_feedback_bits_offset);
-	pull_edge_bits_ = at.template operator()<uint64_t>(layout.pull_edge_bits_offset);
-	pull_pending_bits_ = at.template operator()<uint64_t>(layout.pull_pending_bits_offset);
-	pull_edges_ = at.template operator()<pull_edge>(layout.pull_edges_offset);
-	auto *source_pull_base = at.template operator()<uint32_t>(layout.source_pull_indices_offset);
-	auto *pull_delivery_base = at.template operator()<uint32_t>(layout.pull_delivery_offset);
-	auto *async_slots = at.template operator()<worker_async_work::slot_storage>(layout.async_slots_offset);
-	auto *async_queue_storage =
-		at.template operator()<worker_async_work::completion_queue_storage>(layout.async_queue_offset);
-	auto *async_delivery_base = at.template operator()<worker_async_delivery>(layout.async_deliveries_offset);
-	auto *async_completion_base =
-		at.template operator()<kinetum_async_completion>(layout.async_completion_views_offset);
-	auto *expired_base = at.template operator()<kinetum_active_timer_handle>(layout.expired_offset);
-	auto *drain_base = at.template operator()<kinetum_retained_packet_handle>(layout.drain_retained_offset);
-	origin_views_ = at.template operator()<packet_origin_view>(layout.origin_views_offset);
-	origin_records_ = at.template operator()<packet_record *>(layout.origin_records_offset);
-	ingest_slots_ = at.template operator()<uint32_t>(layout.ingest_slots_offset);
+		layout.control_storage_offset, layout.control_count);
+	auto *control_free_base =
+		at.template operator()<uint32_t>(layout.control_free_links_offset, layout.control_count);
+	auto *payload_base =
+		at.template operator()<std::byte>(layout.control_payload_offset, layout.control_payload_bytes);
+	auto *control_delivery_base =
+		at.template operator()<control_cell>(layout.control_delivery_offset, layout.handle_count);
+	control_edge_bits_ =
+		at.template operator()<uint64_t>(layout.control_edge_bits_offset, layout.relation_word_count);
+	control_feedback_bits_ =
+		at.template operator()<uint64_t>(layout.control_feedback_bits_offset, layout.relation_word_count);
+	pull_edge_bits_ = at.template operator()<uint64_t>(layout.pull_edge_bits_offset, layout.relation_word_count);
+	pull_pending_bits_ =
+		at.template operator()<uint64_t>(layout.pull_pending_bits_offset, layout.relation_word_count);
+	pull_edges_ = at.template operator()<pull_edge>(layout.pull_edges_offset, layout.pull_count);
+	auto *source_pull_base = at.template operator()<uint32_t>(layout.source_pull_indices_offset, layout.pull_count);
+	auto *pull_delivery_base = at.template operator()<uint32_t>(layout.pull_delivery_offset, layout.handle_count);
+	auto *async_slots =
+		at.template operator()<worker_async_work::slot_storage>(layout.async_slots_offset, layout.async_count);
+	auto *async_queue_storage = at.template operator()<worker_async_work::completion_queue_storage>(
+		layout.async_queue_offset, layout.async_queue_capacity);
+	auto *async_delivery_base = at.template operator()<worker_async_delivery>(layout.async_deliveries_offset,
+										  layout.async_handle_count);
+	auto *async_completion_base = at.template operator()<kinetum_async_completion>(
+		layout.async_completion_views_offset, layout.async_handle_count);
+	auto *expired_base =
+		at.template operator()<kinetum_active_timer_handle>(layout.expired_offset, layout.handle_count);
+	auto *drain_base = at.template operator()<kinetum_retained_packet_handle>(layout.drain_retained_offset,
+										  layout.handle_count);
+	origin_views_ = at.template operator()<packet_origin_view>(layout.origin_views_offset, WORK_BUDGET);
+	origin_records_ = at.template operator()<packet_record *>(layout.origin_records_offset, WORK_BUDGET);
+	ingest_slots_ = at.template operator()<uint32_t>(layout.ingest_slots_offset, KINETUM_MAX_BURST);
 	for (std::size_t index = 0u; index < KINETUM_MAX_BURST; ++index) {
 		std::construct_at(&ingest_slots_[index], INVALID_INDEX);
 	}
@@ -1229,53 +1233,50 @@ common::status worker_active_stage_scheduler::implementation::bind_slab_(
 		std::construct_at(&origin_views_[index]);
 		std::construct_at(&origin_records_[index], nullptr);
 	}
-	std::fill_n(pull_delivery_base, static_cast<std::size_t>(row_count_) * WORK_BUDGET, INVALID_INDEX);
-
-	std::fill_n(stage_to_row_, stage_count_, INVALID_INDEX);
+	std::uninitialized_fill_n(pull_delivery_base, layout.handle_count, INVALID_INDEX);
+	std::uninitialized_fill_n(stage_to_row_, stage_count_, INVALID_INDEX);
+	std::uninitialized_value_construct_n(control_free_base, layout.control_count);
+	std::uninitialized_value_construct_n(source_pull_base, layout.pull_count);
+	std::uninitialized_value_construct_n(control_delivery_base, layout.handle_count);
+	std::uninitialized_value_construct_n(expired_base, layout.handle_count);
+	std::uninitialized_value_construct_n(drain_base, layout.handle_count);
+	std::uninitialized_value_construct_n(control_edge_bits_, layout.relation_word_count);
+	std::uninitialized_value_construct_n(control_feedback_bits_, layout.relation_word_count);
+	std::uninitialized_value_construct_n(pull_edge_bits_, layout.relation_word_count);
+	std::uninitialized_value_construct_n(pull_pending_bits_, layout.relation_word_count);
 	relation_bit_count_ = static_cast<uint64_t>(row_count_) * row_count_;
 
 	std::size_t retained_cursor = 0u;
-	std::size_t timer_total = 0u;
-	std::size_t async_total = 0u;
-	for (const uint32_t stage_index : schedule.active_stage_instance_indices) {
-		const auto &logical =
-			topology_.logical_stages[topology_.stage_instances[stage_index].logical_stage_index];
-		timer_total += logical.timer_capacity;
-		async_total += logical.async_work_capacity;
-	}
-	if (timer_total > UINT32_MAX || async_total > UINT32_MAX) {
-		std::terminate();
-	}
-	timer_entry_capacity_ = static_cast<uint32_t>(timer_total);
+	const std::size_t async_total = layout.async_count;
+	timer_entry_capacity_ = static_cast<uint32_t>(layout.timer_count);
 	if (timer_entry_capacity_ != 0u) {
+		std::uninitialized_value_construct_n(timer_fine_heads, algo::timer_wheel_view<>::FINE_SLOTS);
+		std::uninitialized_value_construct_n(timer_coarse_heads, algo::timer_wheel_view<>::COARSE_SLOTS);
 		for (uint32_t index = 0u; index < timer_entry_capacity_; ++index) {
 			std::construct_at(&timer_entries[index]);
 		}
 		timer_wheel_ = std::construct_at(
-			at.template operator()<kinetum::algo::timer_wheel_view<>>(layout.timer_wheel_offset),
+			at.template operator()<kinetum::algo::timer_wheel_view<>>(layout.timer_wheel_offset, 1u),
 			timer_entries, timer_entry_capacity_, timer_fine_heads, timer_coarse_heads);
 	}
 	if (async_total != 0u) {
-		auto queue_capacity_or = worker_async_work::queue_capacity_for(async_total);
-		if (!queue_capacity_or.is_ok()) {
-			std::terminate();
-		}
 		for (std::size_t index = 0u; index < async_total; ++index) {
 			std::construct_at(&async_slots[index]);
 		}
-		for (std::size_t index = 0u; index < queue_capacity_or.value(); ++index) {
+		for (std::size_t index = 0u; index < layout.async_queue_capacity; ++index) {
 			std::construct_at(&async_queue_storage[index]);
 		}
-		async_work_ = std::construct_at(at.template operator()<worker_async_work>(layout.async_tracker_offset),
-						worker_async_work::construction_binding{
-							.runtime_generation = ledger_.runtime_generation(),
-							.worker_index = worker_index_,
-							.ledger = &ledger_,
-							.slots = async_slots,
-							.slot_count = static_cast<uint32_t>(async_total),
-							.queue_storage = async_queue_storage,
-							.queue_capacity = queue_capacity_or.value(),
-						});
+		async_work_ =
+			std::construct_at(at.template operator()<worker_async_work>(layout.async_tracker_offset, 1u),
+					  worker_async_work::construction_binding{
+						  .runtime_generation = ledger_.runtime_generation(),
+						  .worker_index = worker_index_,
+						  .ledger = &ledger_,
+						  .slots = async_slots,
+						  .slot_count = static_cast<uint32_t>(async_total),
+						  .queue_storage = async_queue_storage,
+						  .queue_capacity = layout.async_queue_capacity,
+					  });
 		async_slots_ = async_slots;
 	}
 	std::size_t control_cursor = 0u;
@@ -1283,7 +1284,6 @@ common::status worker_active_stage_scheduler::implementation::bind_slab_(
 	std::size_t async_cursor = 0u;
 	std::size_t async_delivery_cursor = 0u;
 	for (uint32_t row_index = 0u; row_index < row_count_; ++row_index) {
-		std::construct_at(&rows_[row_index]);
 		auto &row = rows_[row_index];
 		const uint32_t stage_index = schedule.active_stage_instance_indices[row_index];
 		const auto &stage = topology_.stage_instances[stage_index];
@@ -1309,7 +1309,7 @@ common::status worker_active_stage_scheduler::implementation::bind_slab_(
 		row.retained_base_index = static_cast<uint32_t>(retained_cursor);
 		row.retained_capacity = logical.retained_packet_capacity;
 		row.retained_byte_capacity = logical.retained_byte_capacity;
-		row.retained = retained_base + retained_cursor;
+		row.retained = row.retained_capacity == 0u ? nullptr : retained_base + retained_cursor;
 		row.retained_free_head = row.retained_capacity == 0u ? INVALID_INDEX : 0u;
 		for (uint32_t index = 0u; index < row.retained_capacity; ++index) {
 			std::construct_at(&row.retained[index]);
@@ -1354,7 +1354,7 @@ common::status worker_active_stage_scheduler::implementation::bind_slab_(
 
 		row.control_capacity = logical.control_mailbox_capacity;
 		row.control_payload_capacity = logical.control_message_capacity_bytes;
-		row.control_payloads = payload_base + payload_cursor;
+		row.control_payloads = layout.control_payload_bytes == 0u ? nullptr : payload_base + payload_cursor;
 		row.control_delivery = control_delivery_base + static_cast<std::size_t>(row_index) * WORK_BUDGET;
 		if (row.control_capacity != 0u) {
 			row.control_queue = std::construct_at(&control_queue_base[row_index],
@@ -1374,9 +1374,9 @@ common::status worker_active_stage_scheduler::implementation::bind_slab_(
 		row.drain_retained = drain_base + static_cast<std::size_t>(row_index) * WORK_BUDGET;
 		row.pull_delivery = pull_delivery_base + static_cast<std::size_t>(row_index) * WORK_BUDGET;
 	}
-	if (async_cursor != async_total ||
-	    async_delivery_cursor != schedule.async_stage_instance_indices.size() * WORK_BUDGET ||
-	    ((async_total == 0u) != (async_work_ == nullptr))) {
+	if (retained_cursor != layout.retained_count || control_cursor != layout.control_count ||
+	    payload_cursor != layout.control_payload_bytes || async_cursor != async_total ||
+	    async_delivery_cursor != layout.async_handle_count || ((async_total == 0u) != (async_work_ == nullptr))) {
 		std::terminate();
 	}
 
@@ -1402,7 +1402,8 @@ common::status worker_active_stage_scheduler::implementation::bind_slab_(
 
 	uint32_t source_pull_cursor = 0u;
 	for (uint32_t row_index = 0u; row_index < row_count_; ++row_index) {
-		rows_[row_index].source_pull_edge_indices = source_pull_base + source_pull_cursor;
+		rows_[row_index].source_pull_edge_indices =
+			source_pull_counts[row_index] == 0u ? nullptr : source_pull_base + source_pull_cursor;
 		rows_[row_index].source_pull_edge_count = 0u;
 		source_pull_cursor += source_pull_counts[row_index];
 	}
@@ -1437,11 +1438,10 @@ common::status worker_active_stage_scheduler::implementation::bind_slab_(
 	if (pull_edge_count_ != source_pull_cursor) {
 		std::terminate();
 	}
-
-	return common::status::ok();
 }
 
-common::status worker_active_stage_scheduler::implementation::initialize()
+common::status_or<numa_owner<worker_active_stage_scheduler>>
+worker_active_stage_scheduler::implementation::materialize()
 {
 	if (worker_index_ >= topology_.worker_schedules.size() ||
 	    worker_index_ >= topology_.transition_topology.workers.size()) {
@@ -1470,11 +1470,19 @@ common::status worker_active_stage_scheduler::implementation::initialize()
 	if (!layout_or.is_ok()) {
 		return layout_or.error();
 	}
-	auto status = bind_slab_(layout_or.value(), binding_by_stage, source_pull_counts);
-	if (status.is_ok()) {
-		context_bindings_ = {};
+	const auto &layout = layout_or.value();
+	auto storage_or = layout.allocation.allocate(ledger_.numa_node());
+	if (!storage_or.is_ok()) {
+		return storage_or.error();
 	}
-	return status;
+	auto storage = std::move(storage_or).value();
+	auto *placed = new (numa_layout::storage<implementation>(storage, layout.implementation_offset).data())
+		implementation(worker_index_, topology_, {}, ledger_, packet_operations_);
+	auto *facade = new (numa_layout::storage<worker_active_stage_scheduler>(storage, layout.facade_offset).data())
+		worker_active_stage_scheduler(placed);
+	auto owner = adopt_numa_owner(facade, std::move(storage));
+	placed->bind_slab_(owner.get_deleter().region, layout, binding_by_stage, source_pull_counts);
+	return owner;
 }
 
 worker_active_stage_scheduler::implementation::instance_row *
@@ -2925,43 +2933,34 @@ bool worker_active_stage_scheduler::implementation::empty() const noexcept
 	       (async_work_ == nullptr || async_work_->empty());
 }
 
-common::status_or<std::unique_ptr<worker_active_stage_scheduler>>
+common::status_or<numa_owner<worker_active_stage_scheduler>>
 worker_active_stage_scheduler::create(uint32_t worker_index, const provider::compiled_provider_topology &topology,
 				      std::span<const active_stage_context_binding> contexts,
 				      worker_epoch_ledger &ledger, active_stage_packet_operations packet_operations)
 {
-	auto implementation = std::unique_ptr<worker_active_stage_scheduler::implementation>(
-		new (std::nothrow) worker_active_stage_scheduler::implementation(worker_index, topology, contexts,
-										 ledger, packet_operations));
-	if (implementation == nullptr) {
-		return common::status::resource_exhausted("active scheduler owner allocation failed");
-	}
 	try {
-		if (const auto status = implementation->initialize(); !status.is_ok()) {
-			return status;
-		}
+		implementation construction(worker_index, topology, contexts, ledger, packet_operations);
+		return construction.materialize();
 	} catch (const std::bad_alloc &) {
 		return common::status::resource_exhausted("active scheduler cold-table allocation failed");
 	} catch (const std::length_error &) {
 		return common::status(common::status_code::OUT_OF_RANGE,
 				      "active scheduler cold-table extent exceeds the host size domain");
-	} catch (...) {
-		return common::status::internal_error("active scheduler cold construction failed unexpectedly");
 	}
-	auto owner = std::unique_ptr<worker_active_stage_scheduler>(
-		new (std::nothrow) worker_active_stage_scheduler(std::move(implementation)));
-	if (owner == nullptr) {
-		return common::status::resource_exhausted("active scheduler public owner allocation failed");
-	}
-	return owner;
 }
 
-worker_active_stage_scheduler::worker_active_stage_scheduler(std::unique_ptr<implementation> implementation) noexcept
-	: implementation_(std::move(implementation))
+worker_active_stage_scheduler::worker_active_stage_scheduler(implementation *implementation) noexcept
+	: implementation_(implementation)
 {
+	if (implementation_ == nullptr) {
+		std::terminate();
+	}
 }
 
-worker_active_stage_scheduler::~worker_active_stage_scheduler() = default;
+worker_active_stage_scheduler::~worker_active_stage_scheduler()
+{
+	std::destroy_at(implementation_);
+}
 
 uint32_t worker_active_stage_scheduler::worker_index() const noexcept
 {

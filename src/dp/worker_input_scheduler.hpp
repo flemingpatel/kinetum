@@ -14,14 +14,13 @@
  */
 
 #include <cstdint>
-#include <memory>
 #include <span>
 #include <type_traits>
 
 #include <kinetum/algo/bounded_service_order.hpp>
 
 #include "src/common/status_or.hpp"
-#include "src/dp/numa_memory.hpp"
+#include "src/dp/numa_layout.hpp"
 
 namespace kinetum::dp
 {
@@ -65,7 +64,7 @@ class worker_input_scheduler final {
 	 * @param numa_node Exact nonnegative worker NUMA node.
 	 * @return Complete scheduler, or an explicit shape/allocation error.
 	 */
-	[[nodiscard]] static common::status_or<std::unique_ptr<worker_input_scheduler>>
+	[[nodiscard]] static common::status_or<numa_owner<worker_input_scheduler>>
 	create(std::span<const worker_input_binding> bindings, int32_t numa_node);
 
 	/** @brief Reject copying a mapping and its mutable service authority. */
@@ -101,14 +100,12 @@ class worker_input_scheduler final {
     private:
 	/**
 	 * @brief Adopt the complete cold materialization, including an empty schedule.
-	 * @param storage Sole mapping containing all nonempty schedule state.
 	 * @param order Placement-constructed ordering owner, null only for no inputs.
 	 * @param endpoints Exact immutable endpoint projection borrowed from storage.
 	 */
-	worker_input_scheduler(numa_memory_region storage, algo::bounded_service_order *order,
+	worker_input_scheduler(algo::bounded_service_order *order,
 			       std::span<const worker_input_endpoint> endpoints) noexcept;
 
-	numa_memory_region storage_;			    ///< Sole mapping; destroyed after every borrowed object.
 	algo::bounded_service_order *order_{nullptr};	    ///< Mutable controls placed on the worker's NUMA node.
 	std::span<const worker_input_endpoint> endpoints_;  ///< Immutable compact input identities.
 };

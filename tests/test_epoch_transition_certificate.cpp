@@ -9,6 +9,8 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
+
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -503,7 +505,9 @@ TEST(epoch_transition_certificate, partial_observations_preserve_available_contr
 /** @brief Separate execution completion from the exact reader-grace leg. */
 TEST(epoch_transition_certificate, single_worker_graph_separates_execution_and_reader_completion)
 {
-	const runtime_fixture::host_selection selection{.numa_node = 0, .cpu_cores = {0, 1, 2}};
+	auto selection_or = runtime_fixture::select_host(quark::probe_host(), 3u);
+	ASSERT_TRUE(selection_or.is_ok()) << selection_or.error().message();
+	const auto &selection = selection_or.value();
 	auto compiled_or = runtime_fixture::compile_runtime_fixture(runtime_fixture::make_pipeline(std::nullopt),
 								    selection, TEST_RX_PORT, TEST_TX_PORT, 0u, 0u);
 	ASSERT_TRUE(compiled_or.is_ok()) << compiled_or.error().message();
@@ -516,13 +520,17 @@ TEST(epoch_transition_certificate, single_worker_graph_separates_execution_and_r
 	ASSERT_EQ(compiled.topology.worker_schedules.size(), 1u);
 	ASSERT_EQ(compiled.topology.transition_topology.workers.size(), 1u);
 
-	auto ledger_or = worker_epoch_ledger::create(0u, TEST_RUNTIME_GENERATION, TEST_MAXIMUM_UNRETIRED);
+	auto ledger_or = worker_epoch_ledger::create(0u, TEST_RUNTIME_GENERATION, TEST_MAXIMUM_UNRETIRED,
+						     compiled.topology.transition_topology.workers.front().numa_node);
 	ASSERT_TRUE(ledger_or.is_ok()) << ledger_or.error().message();
 	auto ledger = std::move(ledger_or).value();
 	std::array<boundary_epoch_channel *, 0> channels{};
 	std::array<boundary_future_output_hold *, 0> holds{};
-	auto sender_or = worker_boundary_sender::create(0u, TEST_RUNTIME_GENERATION, channels, holds);
-	auto receiver_or = worker_boundary_receiver::create(0u, TEST_RUNTIME_GENERATION, channels);
+	auto sender_or =
+		worker_boundary_sender::create(0u, TEST_RUNTIME_GENERATION, channels, holds,
+					       compiled.topology.transition_topology.workers.front().numa_node);
+	auto receiver_or = worker_boundary_receiver::create(
+		0u, TEST_RUNTIME_GENERATION, channels, compiled.topology.transition_topology.workers.front().numa_node);
 	ASSERT_TRUE(sender_or.is_ok()) << sender_or.error().message();
 	ASSERT_TRUE(receiver_or.is_ok()) << receiver_or.error().message();
 	auto sender = std::move(sender_or).value();
@@ -534,19 +542,33 @@ TEST(epoch_transition_certificate, single_worker_graph_separates_execution_and_r
 	const auto &worker = compiled.topology.transition_topology.workers.front();
 	ASSERT_FALSE(schedule.source_storage_domain_indices.empty());
 	ASSERT_GT(worker.source_epoch_staging_capacity, 0u);
-	std::vector<std::unique_ptr<packet_epoch_input_staging>> staging_owners;
+	std::vector<std::vector<packet_work_key>> source_keys(schedule.source_storage_domain_indices.size());
+	std::vector<worker_packet_staging_domain> staging_domains;
 	std::vector<packet_epoch_input_staging *> staging;
-	staging_owners.reserve(schedule.source_storage_domain_indices.size());
+	staging_domains.reserve(schedule.source_storage_domain_indices.size());
 	staging.reserve(schedule.source_storage_domain_indices.size());
 	for (std::size_t index = 0u; index < schedule.source_storage_domain_indices.size(); ++index) {
+		const uint32_t storage_domain = schedule.source_storage_domain_indices[index];
+		for (const uint32_t stream : schedule.rx_stream_indices) {
+			const auto &source = compiled.topology.io_streams[stream];
+			if (source.rx_storage_domain_index == storage_domain) {
+				source_keys[index].push_back(
+					{source.stage_instance_index, packet_work_phase::RX_DELIVER, {}});
+			}
+		}
 		const std::size_t capacity = static_cast<std::size_t>(worker.source_epoch_staging_capacity);
-		auto staging_or = packet_epoch_input_staging::create(capacity, std::optional<std::size_t>{capacity},
-								     worker.numa_node);
-		ASSERT_TRUE(staging_or.is_ok()) << staging_or.error().message();
-		staging.push_back(staging_or->get());
-		staging_owners.push_back(std::move(staging_or).value());
+		ASSERT_FALSE(source_keys[index].empty());
+		std::sort(source_keys[index].begin(), source_keys[index].end());
+		staging_domains.push_back({storage_domain, capacity, capacity, source_keys[index]});
 	}
-	auto telemetry_or = test::worker_telemetry_test_owner::create(0u, TEST_RUNTIME_GENERATION, {});
+	auto staging_or = worker_packet_staging::create(staging_domains, worker.numa_node);
+	ASSERT_TRUE(staging_or.is_ok()) << staging_or.error().message();
+	auto staging_owner = std::move(staging_or).value();
+	for (auto &domain : staging_owner->domains()) {
+		staging.push_back(&domain);
+	}
+	auto telemetry_or =
+		test::worker_telemetry_test_owner::create(0u, TEST_RUNTIME_GENERATION, worker.numa_node, {});
 	ASSERT_TRUE(telemetry_or.is_ok()) << telemetry_or.error().message();
 	auto telemetry = std::move(telemetry_or).value();
 	auto activation_or = worker_epoch_activation::create(0u, TEST_RUNTIME_GENERATION, modules, staging, *ledger,
@@ -565,7 +587,9 @@ TEST(epoch_transition_certificate, single_worker_graph_separates_execution_and_r
 		.receiver = receiver.get(),
 		.reader = &reader,
 	}};
-	auto foreign_ledger_or = worker_epoch_ledger::create(0u, TEST_RUNTIME_GENERATION, TEST_MAXIMUM_UNRETIRED);
+	auto foreign_ledger_or =
+		worker_epoch_ledger::create(0u, TEST_RUNTIME_GENERATION, TEST_MAXIMUM_UNRETIRED,
+					    compiled.topology.transition_topology.workers.front().numa_node);
 	ASSERT_TRUE(foreign_ledger_or.is_ok()) << foreign_ledger_or.error().message();
 	auto foreign_ledger = std::move(foreign_ledger_or).value();
 	auto mismatched_sources = sources;

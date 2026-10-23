@@ -21,8 +21,8 @@
  * readers.
  *
  * @par Packet-path performance
- * Packet metadata occupies two cache lines and the storage descriptor one
- * cache line. Each role-specific operation table is immutable and occupies one
+ * Each packet record occupies two cache lines, with storage followed by metadata.
+ * Each role-specific operation table is immutable and occupies one
  * cache line. The loader and component descriptor are cold-path mechanisms and
  * are never consulted after worker materialization.
  *
@@ -82,10 +82,10 @@
 #define KINETUM_PROVIDER_COMPONENT_QUERY_SYMBOL "kinetum_provider_component_query"
 
 /** Exact packet metadata width in bytes. */
-#define KINETUM_PACKET_PRIVATE_SIZE UINT32_C(128)
+#define KINETUM_PACKET_PRIVATE_SIZE UINT32_C(80)
 
 /** Exact complete packet-record width in bytes. */
-#define KINETUM_PACKET_RECORD_SIZE UINT32_C(192)
+#define KINETUM_PACKET_RECORD_SIZE UINT32_C(128)
 
 /** Invalid compact stage identity. */
 #define KINETUM_INVALID_STAGE_ID UINT16_MAX
@@ -336,16 +336,16 @@ typedef kinetum_provider_status (*kinetum_provider_io_lifecycle_fn)(
 /**
  * @brief Sole per-packet metadata authority shared by every provider.
  *
- * Cache line zero contains routing, epoch, and module-persistent metadata.
- * Cache line one contains parsed Ethernet/IPv4/L4 facts. Foreign code that
- * mutates packet bytes owns updating every parsed field invalidated by that
+ * Timestamp and epoch share the record's first line with its storage descriptor.
+ * Routing, module-persistent state and parsed fields occupy the second line.
+ * Foreign code that mutates packet bytes owns updating every parsed field invalidated by that
  * mutation; the runtime does not reparse between pipeline stages.
  *
  * user_meta is copied into the module ABI before a callback and copied back
- * afterward when user_meta_valid is nonzero. A writable fan-out clone receives
+ * afterward together with user_meta_valid. A writable fan-out clone receives
  * an independent value snapshot; sibling branches may diverge after cloning.
  */
-typedef struct KINETUM_PROVIDER_ALIGNAS(64) kinetum_packet_private {
+typedef struct KINETUM_PROVIDER_ALIGNAS(8) kinetum_packet_private {
 	uint64_t timestamp_ns;		  ///< Owner-cached ingress/origination timestamp.
 	uint64_t epoch;			  ///< Immutable packet-admission epoch.
 	uint64_t user_meta;		  ///< Persistent module-owned user word.
@@ -360,19 +360,16 @@ typedef struct KINETUM_PROVIDER_ALIGNAS(64) kinetum_packet_private {
 	uint16_t current_stage_instance;  ///< Current executable stage-instance index.
 	uint16_t module_next_stage;	  ///< Module-selected stage, or invalid.
 	uint8_t user_meta_valid;	  ///< One when user_meta carries a value.
-	uint8_t padding_hot[13];	  ///< Zeroed cache-line geometry padding.
+	uint8_t padding_hot[1];		  ///< Zeroed field-alignment padding.
 	uint32_t src_ipv4;		  ///< Parsed/module-updated source IPv4 in host order.
 	uint32_t dst_ipv4;		  ///< Parsed/module-updated destination IPv4 in host order.
 	uint16_t src_port;		  ///< Parsed/module-updated source port in host order.
 	uint16_t dst_port;		  ///< Parsed/module-updated destination port in host order.
-	uint16_t eth_type;		  ///< Parsed Ethernet type in host order.
 	uint16_t ip_offset;		  ///< Byte offset of the current IP header.
 	uint16_t l4_offset;		  ///< Byte offset of the current L4 header.
-	uint16_t ip_header_len;		  ///< Parsed IPv4 header length.
-	uint16_t ip_total_len;		  ///< Parsed IPv4 total length.
 	uint8_t l4_proto;		  ///< Parsed/module-updated IP protocol.
 	uint8_t dscp;			  ///< Parsed/module-updated six-bit DSCP.
-	uint8_t padding_parsed[40];	  ///< Zeroed cache-line geometry padding.
+	uint8_t padding_parsed[10];	  ///< Zeroed record-geometry padding.
 } kinetum_packet_private;
 
 struct kinetum_packet_record;
@@ -445,7 +442,7 @@ typedef struct KINETUM_PROVIDER_ALIGNAS(64) kinetum_packet_storage_domain_operat
  * native_handle is interpreted only by the provider that created the record
  * and is never exposed through the module ABI.
  */
-typedef struct KINETUM_PROVIDER_ALIGNAS(64) kinetum_packet_storage_descriptor {
+typedef struct KINETUM_PROVIDER_ALIGNAS(8) kinetum_packet_storage_descriptor {
 	void *native_handle;  ///< Provider-private backing identity.
 	uint8_t *data;	      ///< Mutable contiguous bytes when capability-proven.
 	const kinetum_packet_storage_domain_operations *operations;  ///< Exact storage owner.
@@ -455,13 +452,13 @@ typedef struct KINETUM_PROVIDER_ALIGNAS(64) kinetum_packet_storage_descriptor {
 	uint16_t domain_index;					     ///< Compiled storage-domain index.
 	uint16_t segment_count;					     ///< Native segment count.
 	uint32_t capabilities;					     ///< Materialized capability mask.
-	uint8_t padding[20];					     ///< Zeroed cache-line geometry padding.
+	uint8_t padding[4];					     ///< Zeroed field-alignment padding.
 } kinetum_packet_storage_descriptor;
 
 /** Sole packet representation transferred through the dataplane. */
 typedef struct KINETUM_PROVIDER_ALIGNAS(64) kinetum_packet_record {
-	kinetum_packet_private metadata;	    ///< Sole writable metadata authority.
 	kinetum_packet_storage_descriptor storage;  ///< Exact provider-backed storage.
+	kinetum_packet_private metadata;	    ///< Sole writable metadata authority.
 } kinetum_packet_record;
 
 /**
@@ -1953,8 +1950,8 @@ KINETUM_PROVIDER_STATIC_ASSERT(offsetof(kinetum_provider_diagnostic, capacity) =
 KINETUM_PROVIDER_STATIC_ASSERT(offsetof(kinetum_provider_diagnostic, size) == 12,
 			       "provider diagnostic size offset changed");
 KINETUM_PROVIDER_STATIC_ASSERT(sizeof(kinetum_packet_private) == KINETUM_PACKET_PRIVATE_SIZE,
-			       "packet metadata must remain two cache lines");
-KINETUM_PROVIDER_STATIC_ASSERT(KINETUM_PROVIDER_ALIGNOF(kinetum_packet_private) == 64,
+			       "packet metadata size changed");
+KINETUM_PROVIDER_STATIC_ASSERT(KINETUM_PROVIDER_ALIGNOF(kinetum_packet_private) == 8,
 			       "packet metadata alignment changed");
 KINETUM_PROVIDER_STATIC_ASSERT(offsetof(kinetum_packet_private, timestamp_ns) == 0, "packet timestamp offset changed");
 KINETUM_PROVIDER_STATIC_ASSERT(offsetof(kinetum_packet_private, epoch) == 8, "packet epoch offset changed");
@@ -1981,22 +1978,17 @@ KINETUM_PROVIDER_STATIC_ASSERT(offsetof(kinetum_packet_private, user_meta_valid)
 			       "packet user-metadata-presence offset changed");
 KINETUM_PROVIDER_STATIC_ASSERT(offsetof(kinetum_packet_private, padding_hot) == 51,
 			       "packet hot-padding offset changed");
-KINETUM_PROVIDER_STATIC_ASSERT(offsetof(kinetum_packet_private, src_ipv4) == 64, "packet source-IPv4 offset changed");
-KINETUM_PROVIDER_STATIC_ASSERT(offsetof(kinetum_packet_private, dst_ipv4) == 68,
+KINETUM_PROVIDER_STATIC_ASSERT(offsetof(kinetum_packet_private, src_ipv4) == 52, "packet source-IPv4 offset changed");
+KINETUM_PROVIDER_STATIC_ASSERT(offsetof(kinetum_packet_private, dst_ipv4) == 56,
 			       "packet destination-IPv4 offset changed");
-KINETUM_PROVIDER_STATIC_ASSERT(offsetof(kinetum_packet_private, src_port) == 72, "packet source-port offset changed");
-KINETUM_PROVIDER_STATIC_ASSERT(offsetof(kinetum_packet_private, dst_port) == 74,
+KINETUM_PROVIDER_STATIC_ASSERT(offsetof(kinetum_packet_private, src_port) == 60, "packet source-port offset changed");
+KINETUM_PROVIDER_STATIC_ASSERT(offsetof(kinetum_packet_private, dst_port) == 62,
 			       "packet destination-port offset changed");
-KINETUM_PROVIDER_STATIC_ASSERT(offsetof(kinetum_packet_private, eth_type) == 76, "packet Ethernet-type offset changed");
-KINETUM_PROVIDER_STATIC_ASSERT(offsetof(kinetum_packet_private, ip_offset) == 78, "packet IP-offset field changed");
-KINETUM_PROVIDER_STATIC_ASSERT(offsetof(kinetum_packet_private, l4_offset) == 80, "packet L4-offset field changed");
-KINETUM_PROVIDER_STATIC_ASSERT(offsetof(kinetum_packet_private, ip_header_len) == 82,
-			       "packet IP-header-length offset changed");
-KINETUM_PROVIDER_STATIC_ASSERT(offsetof(kinetum_packet_private, ip_total_len) == 84,
-			       "packet IP-total-length offset changed");
-KINETUM_PROVIDER_STATIC_ASSERT(offsetof(kinetum_packet_private, l4_proto) == 86, "packet L4-protocol offset changed");
-KINETUM_PROVIDER_STATIC_ASSERT(offsetof(kinetum_packet_private, dscp) == 87, "packet DSCP offset changed");
-KINETUM_PROVIDER_STATIC_ASSERT(offsetof(kinetum_packet_private, padding_parsed) == 88,
+KINETUM_PROVIDER_STATIC_ASSERT(offsetof(kinetum_packet_private, ip_offset) == 64, "packet IP-offset field changed");
+KINETUM_PROVIDER_STATIC_ASSERT(offsetof(kinetum_packet_private, l4_offset) == 66, "packet L4-offset field changed");
+KINETUM_PROVIDER_STATIC_ASSERT(offsetof(kinetum_packet_private, l4_proto) == 68, "packet L4-protocol offset changed");
+KINETUM_PROVIDER_STATIC_ASSERT(offsetof(kinetum_packet_private, dscp) == 69, "packet DSCP offset changed");
+KINETUM_PROVIDER_STATIC_ASSERT(offsetof(kinetum_packet_private, padding_parsed) == 70,
 			       "packet parsed-padding offset changed");
 KINETUM_PROVIDER_STATIC_ASSERT(sizeof(kinetum_packet_origin_view) == 16, "packet-origin layout changed");
 KINETUM_PROVIDER_STATIC_ASSERT(KINETUM_PROVIDER_ALIGNOF(kinetum_packet_origin_view) == 8,
@@ -2090,9 +2082,8 @@ KINETUM_PROVIDER_STATIC_ASSERT(offsetof(kinetum_packet_storage_domain_operations
 			       "storage capability offset changed");
 KINETUM_PROVIDER_STATIC_ASSERT(offsetof(kinetum_packet_storage_domain_operations, padding) == 60,
 			       "storage padding offset changed");
-KINETUM_PROVIDER_STATIC_ASSERT(sizeof(kinetum_packet_storage_descriptor) == 64,
-			       "storage descriptor must remain one cache line");
-KINETUM_PROVIDER_STATIC_ASSERT(KINETUM_PROVIDER_ALIGNOF(kinetum_packet_storage_descriptor) == 64,
+KINETUM_PROVIDER_STATIC_ASSERT(sizeof(kinetum_packet_storage_descriptor) == 48, "storage descriptor size changed");
+KINETUM_PROVIDER_STATIC_ASSERT(KINETUM_PROVIDER_ALIGNOF(kinetum_packet_storage_descriptor) == 8,
 			       "storage descriptor alignment changed");
 KINETUM_PROVIDER_STATIC_ASSERT(offsetof(kinetum_packet_storage_descriptor, native_handle) == 0,
 			       "storage native-handle offset changed");
@@ -2114,12 +2105,11 @@ KINETUM_PROVIDER_STATIC_ASSERT(offsetof(kinetum_packet_storage_descriptor, capab
 KINETUM_PROVIDER_STATIC_ASSERT(offsetof(kinetum_packet_storage_descriptor, padding) == 44,
 			       "storage descriptor padding offset changed");
 KINETUM_PROVIDER_STATIC_ASSERT(sizeof(kinetum_packet_record) == KINETUM_PACKET_RECORD_SIZE,
-			       "packet record must remain three cache lines");
+			       "packet record must remain two cache lines");
 KINETUM_PROVIDER_STATIC_ASSERT(KINETUM_PROVIDER_ALIGNOF(kinetum_packet_record) == 64,
 			       "packet record alignment changed");
-KINETUM_PROVIDER_STATIC_ASSERT(offsetof(kinetum_packet_record, metadata) == 0, "packet metadata offset changed");
-KINETUM_PROVIDER_STATIC_ASSERT(offsetof(kinetum_packet_record, storage) == KINETUM_PACKET_PRIVATE_SIZE,
-			       "packet storage offset changed");
+KINETUM_PROVIDER_STATIC_ASSERT(offsetof(kinetum_packet_record, metadata) == 48, "packet metadata offset changed");
+KINETUM_PROVIDER_STATIC_ASSERT(offsetof(kinetum_packet_record, storage) == 0, "packet storage offset changed");
 KINETUM_PROVIDER_STATIC_ASSERT(sizeof(kinetum_packet_rx_burst_result) == 4, "RX result size changed");
 KINETUM_PROVIDER_STATIC_ASSERT(KINETUM_PROVIDER_ALIGNOF(kinetum_packet_rx_burst_result) == 2,
 			       "RX result alignment changed");

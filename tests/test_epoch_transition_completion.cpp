@@ -463,7 +463,8 @@ class claimed_module_completion final : public epoch_transition_module_completio
 		};
 		auto module_or = test::exact_module_test_context::create(
 			context.module_id, std::filesystem::path(KINETUM_TEST_MODULE_PATH), resources,
-			context.context_instance_id, context.module_context_index, context.stage_instance_index);
+			context.context_instance_id, context.module_context_index, context.stage_instance_index,
+			quark::host_cpu{context.cpu_core_id, context.numa_node});
 		if (!module_or.is_ok()) {
 			return module_or.error();
 		}
@@ -885,7 +886,11 @@ class completion_fixture final {
 		} catch (const std::bad_alloc &) {
 			return common::status::resource_exhausted("completion fixture allocation failed");
 		}
-		const runtime_fixture::host_selection selection{.numa_node = 0, .cpu_cores = {0, 1, 2}};
+		auto selection_or = runtime_fixture::select_host(quark::probe_host(), 3u);
+		if (!selection_or.is_ok()) {
+			return selection_or.error();
+		}
+		const auto &selection = selection_or.value();
 		const bool with_module = module_shape != completion_module_shape::MODULE_FREE;
 		const std::optional<std::string> module_id = with_module ? std::optional<std::string>{"test_module"} :
 									   std::nullopt;
@@ -980,15 +985,21 @@ class completion_fixture final {
 		const common::epoch_transition_watermarks bootstrap_watermarks{TEST_BOOTSTRAP_EPOCH,
 									       TEST_BOOTSTRAP_EPOCH};
 
-		auto ledger_or = worker_epoch_ledger::create(0u, TEST_RUNTIME_GENERATION, 4096u);
+		auto ledger_or = worker_epoch_ledger::create(
+			0u, TEST_RUNTIME_GENERATION, 4096u,
+			fixture->compiled_.topology.transition_topology.workers.front().numa_node);
 		if (!ledger_or.is_ok()) {
 			return ledger_or.error();
 		}
 		fixture->ledger_ = std::move(ledger_or).value();
 		std::array<boundary_epoch_channel *, 0> channels{};
 		std::array<boundary_future_output_hold *, 0> holds{};
-		auto sender_or = worker_boundary_sender::create(0u, TEST_RUNTIME_GENERATION, channels, holds);
-		auto receiver_or = worker_boundary_receiver::create(0u, TEST_RUNTIME_GENERATION, channels);
+		auto sender_or = worker_boundary_sender::create(
+			0u, TEST_RUNTIME_GENERATION, channels, holds,
+			fixture->compiled_.topology.transition_topology.workers.front().numa_node);
+		auto receiver_or = worker_boundary_receiver::create(
+			0u, TEST_RUNTIME_GENERATION, channels,
+			fixture->compiled_.topology.transition_topology.workers.front().numa_node);
 		if (!sender_or.is_ok() || !receiver_or.is_ok()) {
 			return common::status::internal_error(
 				"completion fixture endpoint owners rejected empty membership");
@@ -1001,21 +1012,40 @@ class completion_fixture final {
 		}
 		const auto &schedule = fixture->compiled_.topology.worker_schedules.front();
 		const auto &worker = fixture->compiled_.topology.transition_topology.workers.front();
+		std::vector<std::vector<packet_work_key>> source_keys(schedule.source_storage_domain_indices.size());
+		std::vector<worker_packet_staging_domain> staging_domains;
+		staging_domains.reserve(schedule.source_storage_domain_indices.size());
 		for (std::size_t index = 0u; index < schedule.source_storage_domain_indices.size(); ++index) {
-			const std::size_t capacity = static_cast<std::size_t>(worker.source_epoch_staging_capacity);
-			auto staging_or = packet_epoch_input_staging::create(
-				capacity, std::optional<std::size_t>{capacity}, worker.numa_node);
-			if (!staging_or.is_ok()) {
-				return staging_or.error();
+			const uint32_t storage_domain = schedule.source_storage_domain_indices[index];
+			for (const uint32_t stream : schedule.rx_stream_indices) {
+				const auto &source = fixture->compiled_.topology.io_streams[stream];
+				if (source.rx_storage_domain_index == storage_domain) {
+					source_keys[index].push_back(
+						{source.stage_instance_index, packet_work_phase::RX_DELIVER, {}});
+				}
 			}
-			fixture->staging_.push_back(staging_or->get());
-			fixture->staging_owners_.push_back(std::move(staging_or).value());
+			if (source_keys[index].empty()) {
+				return common::status::failed_precondition(
+					"completion fixture lacks its compiled RX source keys");
+			}
+			std::sort(source_keys[index].begin(), source_keys[index].end());
+			const std::size_t capacity = static_cast<std::size_t>(worker.source_epoch_staging_capacity);
+			staging_domains.push_back({storage_domain, capacity, capacity, source_keys[index]});
+		}
+		auto staging_or = worker_packet_staging::create(staging_domains, worker.numa_node);
+		if (!staging_or.is_ok()) {
+			return staging_or.error();
+		}
+		fixture->staging_owner_ = std::move(staging_or).value();
+		for (auto &domain : fixture->staging_owner_->domains()) {
+			fixture->staging_.push_back(&domain);
 		}
 		std::vector<module::module_epoch_store *> module_stores;
 		if (fixture->claimed_modules_ != nullptr) {
 			module_stores.push_back(&fixture->claimed_modules_->store());
 		}
-		auto worker_telemetry_or = test::worker_telemetry_test_owner::create(0u, TEST_RUNTIME_GENERATION, {});
+		auto worker_telemetry_or =
+			test::worker_telemetry_test_owner::create(0u, TEST_RUNTIME_GENERATION, worker.numa_node, {});
 		if (!worker_telemetry_or.is_ok()) {
 			return worker_telemetry_or.error();
 		}
@@ -1216,7 +1246,7 @@ class completion_fixture final {
 	[[nodiscard]] common::status activate_without_reader()
 	{
 		const auto now = std::chrono::steady_clock::now();
-		const auto committed = completion_->begin_commit(identity_, now);
+		auto committed = completion_->begin_commit(identity_, now);
 		if (!committed.is_ok()) {
 			return committed;
 		}
@@ -1232,7 +1262,7 @@ class completion_fixture final {
 			return common::status::internal_error(
 				"completion fixture could not prove zero-inbound activation");
 		}
-		const auto activated =
+		auto activated =
 			activation_->activate(TEST_MUTATION_SEQUENCE, TEST_BOOTSTRAP_EPOCH, TEST_TARGET_EPOCH, 1u);
 		if (!activated.is_ok()) {
 			return activated;
@@ -1339,7 +1369,7 @@ class completion_fixture final {
 				"completion fixture abort requires one module-free PREPARED identity");
 		}
 		const auto identity = identity_;
-		const auto cleanup = coordinator_->begin_prepared_abort_cleanup(identity);
+		auto cleanup = coordinator_->begin_prepared_abort_cleanup(identity);
 		if (!cleanup.is_ok()) {
 			return cleanup;
 		}
@@ -1442,24 +1472,24 @@ class completion_fixture final {
 	runtime_fixture::compiled_runtime_fixture compiled_;	     ///< Exact plan/topology authority.
 	epoch_protocol_fault_latch protocol_faults_;		     ///< Shared transition-safety fault authority.
 	std::unique_ptr<epoch_transition_coordinator> coordinator_;  ///< Sole phase/snapshot owner.
-	std::unique_ptr<worker_epoch_ledger> ledger_;		     ///< Sole worker credit owner.
-	std::unique_ptr<worker_boundary_sender> sender_;	     ///< Zero-boundary sender owner.
-	std::unique_ptr<worker_boundary_receiver> receiver_;	     ///< Zero-boundary receiver owner.
+	numa_owner<worker_epoch_ledger> ledger_;		     ///< Sole worker credit owner.
+	numa_owner<worker_boundary_sender> sender_;		     ///< Zero-boundary sender owner.
+	numa_owner<worker_boundary_receiver> receiver_;		     ///< Zero-boundary receiver owner.
 	std::unique_ptr<test::worker_telemetry_test_owner> worker_telemetry_;  ///< Exact worker banks/channel.
 	completion_telemetry_probe telemetry_probe_;			       ///< Observation-only completion binding.
-	std::vector<std::unique_ptr<packet_epoch_input_staging>> staging_owners_;   ///< Source queue owners.
-	std::vector<packet_epoch_input_staging *> staging_;			    ///< Exact activation projection.
-	module_free_completion module_free_completion_;				    ///< Module-free aggregate owner.
-	std::unique_ptr<claimed_module_completion> claimed_modules_;		    ///< Optional exact module owner.
-	epoch_transition_module_completion *module_completion_{nullptr};	    ///< Selected module authority.
-	std::unique_ptr<module::worker_module_health> module_health_;		    ///< Exact health claim owner.
-	std::unique_ptr<worker_epoch_activation> activation_;			    ///< Sole local activation owner.
-	kinetum::algo::quiescence_reader reader_;				    ///< Sole exact reader record.
-	std::unique_ptr<kinetum::algo::quiescence_domain> domain_;		    ///< Exact reader domain.
-	std::unique_ptr<epoch_transition_certificate> certificate_;		    ///< Immutable proof graph.
-	module_free_prepared_completion prepared_completion_;			    ///< PREPARED bookkeeping owner.
-	runtime_status_publication runtime_status_;				    ///< Exact status projection.
-	std::unique_ptr<epoch_transition_completion> completion_;		    ///< Completion/reclamation owner.
+	std::unique_ptr<worker_packet_staging> staging_owner_;		       ///< One region for all source roles.
+	std::vector<packet_epoch_input_staging *> staging_;		       ///< Exact activation projection.
+	module_free_completion module_free_completion_;			       ///< Module-free aggregate owner.
+	std::unique_ptr<claimed_module_completion> claimed_modules_;	       ///< Optional exact module owner.
+	epoch_transition_module_completion *module_completion_{nullptr};       ///< Selected module authority.
+	numa_owner<module::worker_module_health> module_health_;	       ///< Exact health claim owner.
+	numa_owner<worker_epoch_activation> activation_;		       ///< Sole local activation owner.
+	kinetum::algo::quiescence_reader reader_;			       ///< Sole exact reader record.
+	std::unique_ptr<kinetum::algo::quiescence_domain> domain_;	       ///< Exact reader domain.
+	std::unique_ptr<epoch_transition_certificate> certificate_;	       ///< Immutable proof graph.
+	module_free_prepared_completion prepared_completion_;		       ///< PREPARED bookkeeping owner.
+	runtime_status_publication runtime_status_;			       ///< Exact status projection.
+	std::unique_ptr<epoch_transition_completion> completion_;	       ///< Completion/reclamation owner.
 	kinetum::dataplane::v1::BootstrapConfigSnapshotRequest bootstrap_request_;  ///< Exact Bootstrap request.
 	common::epoch_transition_identity identity_{};				    ///< Exact live identity.
 	std::chrono::steady_clock::time_point last_service_time_{};  ///< Nondecreasing injected clock authority.

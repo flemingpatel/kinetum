@@ -24,8 +24,7 @@
  * one implementation object.
  *
  * @par Performance
- * The metadata occupies two cache lines and the storage descriptor one cache
- * line. Operation tables are immutable after startup. Packet processing uses
+ * The complete record occupies two cache lines. Operation tables are immutable after startup. Packet processing uses
  * no allocation, shared ownership, RTTI, virtual dispatch, strings, or native
  * provider headers.
  *
@@ -38,9 +37,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
-#include <type_traits>
 
 #include <kinetum/algo/platform.hpp>
+#include <kinetum/algo/prefetch.hpp>
 
 #include "src/provider/provider_component_abi.h"
 
@@ -173,6 +172,30 @@ inline void initialize_packet_record(packet_record &record) noexcept
 }
 
 /**
+ * @brief Match one record against the already admitted storage expectation.
+ * @param record Live candidate record, or null.
+ * @param operations Immutable materialized operation table, or null when unscheduled.
+ * @param expected_domain Exact compiled domain selected by the caller.
+ * @param runtime_generation Exact admitted provider generation.
+ * @return True only when every record identity and intrinsic length/capability fact agrees.
+ */
+[[nodiscard]] KINETUM_ALWAYS_INLINE bool
+packet_record_matches_storage(const packet_record *record, const packet_storage_domain_operations *operations,
+			      uint32_t expected_domain, uint64_t runtime_generation) noexcept
+{
+	if (record == nullptr || operations == nullptr) {
+		return false;
+	}
+	const auto &storage = record->storage;
+	return storage.operations == operations && storage.generation == runtime_generation &&
+	       storage.generation == operations->generation && storage.domain_index == expected_domain &&
+	       storage.domain_index == operations->domain_index && storage.length != 0 &&
+	       storage.length <= operations->maximum_packet_length && storage.segment_count != 0 &&
+	       storage.capabilities == operations->capabilities &&
+	       (storage.capabilities & ~packet_storage_capabilities::KNOWN_MASK) == 0;
+}
+
+/**
  * @brief Prove one record has the exact storage shape current CPU stages consume.
  *
  * Current parser and module mechanisms require one nonempty contiguous,
@@ -197,131 +220,23 @@ inline void initialize_packet_record(packet_record &record) noexcept
 }
 
 /**
- * @brief Prefetch the record and first payload cache line for imminent use.
+ * @brief Prefetch the complete live record without reading a payload address.
  *
- * @param record Non-null record already owned by the calling worker.
- * @pre record is non-null.
+ * @param record Nonnull record whose lifetime is retained by the current ownership prefix.
  */
-KINETUM_ALWAYS_INLINE void packet_prefetch(const packet_record *record) noexcept
+KINETUM_ALWAYS_INLINE void packet_prefetch_record(const packet_record *record) noexcept
 {
-	__builtin_prefetch(record, 0, 3);
-	if (record->storage.data != nullptr) {
-		__builtin_prefetch(record->storage.data, 0, 3);
-	}
+	KINETUM_PREFETCH_L1(record);
+	KINETUM_PREFETCH_L1(&record->metadata.src_ipv4);
 }
 
-static_assert(sizeof(packet_private) == PACKET_PRIVATE_SIZE, "packet_private must occupy exactly two cache lines");
-static_assert(alignof(packet_private) == 64, "packet_private must be cache-line aligned");
-static_assert(offsetof(packet_private, timestamp_ns) == 0, "packet timestamp offset changed");
-static_assert(offsetof(packet_private, epoch) == 8, "packet epoch offset changed");
-static_assert(offsetof(packet_private, user_meta) == 16, "packet user metadata offset changed");
-static_assert(offsetof(packet_private, flow_hash) == 24, "packet flow-hash offset changed");
-static_assert(offsetof(packet_private, platform_flags) == 28, "packet platform-flags offset changed");
-static_assert(offsetof(packet_private, user_flags) == 32, "packet user-flags offset changed");
-static_assert(offsetof(packet_private, ingress_port) == 36, "packet ingress-port offset changed");
-static_assert(offsetof(packet_private, egress_port) == 38, "packet egress-port offset changed");
-static_assert(offsetof(packet_private, next_stage) == 40, "packet next-stage offset changed");
-static_assert(offsetof(packet_private, current_stage) == 42, "packet current-stage offset changed");
-static_assert(offsetof(packet_private, next_stage_instance) == 44, "packet next-stage-instance offset changed");
-static_assert(offsetof(packet_private, current_stage_instance) == 46, "packet current-stage-instance offset changed");
-static_assert(offsetof(packet_private, module_next_stage) == 48, "packet module-next-stage offset changed");
-static_assert(offsetof(packet_private, user_meta_valid) == 50, "packet user-metadata-presence offset changed");
-static_assert(offsetof(packet_private, padding_hot) == 51, "packet hot-padding offset changed");
-static_assert(offsetof(packet_private, src_ipv4) == 64, "packet source-IPv4 offset changed");
-static_assert(offsetof(packet_private, dst_ipv4) == 68, "packet destination-IPv4 offset changed");
-static_assert(offsetof(packet_private, src_port) == 72, "packet source-port offset changed");
-static_assert(offsetof(packet_private, dst_port) == 74, "packet destination-port offset changed");
-static_assert(offsetof(packet_private, eth_type) == 76, "packet Ethernet-type offset changed");
-static_assert(offsetof(packet_private, ip_offset) == 78, "packet IP-offset field changed");
-static_assert(offsetof(packet_private, l4_offset) == 80, "packet L4-offset field changed");
-static_assert(offsetof(packet_private, ip_header_len) == 82, "packet IP-header-length offset changed");
-static_assert(offsetof(packet_private, ip_total_len) == 84, "packet IP-total-length offset changed");
-static_assert(offsetof(packet_private, l4_proto) == 86, "packet L4-protocol offset changed");
-static_assert(offsetof(packet_private, dscp) == 87, "packet DSCP offset changed");
-static_assert(offsetof(packet_private, padding_parsed) == 88, "packet parsed-padding offset changed");
-static_assert(std::is_standard_layout_v<packet_private>, "packet_private must retain standard layout");
-static_assert(std::is_trivially_copyable_v<packet_private>, "packet_private must remain trivially copyable");
-static_assert(sizeof(packet_origin_view) == 16, "packet_origin_view ABI changed");
-static_assert(offsetof(packet_origin_view, data) == 0, "packet origin data offset changed");
-static_assert(offsetof(packet_origin_view, length) == 8, "packet origin length offset changed");
-static_assert(offsetof(packet_origin_view, padding) == 12, "packet origin padding offset changed");
-static_assert(std::is_standard_layout_v<packet_origin_view>, "packet_origin_view must retain standard layout");
-static_assert(std::is_trivially_copyable_v<packet_origin_view>, "packet_origin_view must remain trivially copyable");
-static_assert(sizeof(packet_storage_domain_operations) == 64, "storage operation table must be one cache line");
-static_assert(alignof(packet_storage_domain_operations) == 64, "storage operation table alignment changed");
-static_assert(offsetof(packet_storage_domain_operations, state) == 0, "storage state offset changed");
-static_assert(offsetof(packet_storage_domain_operations, acquire_burst) == 8,
-	      "storage acquire operation offset changed");
-static_assert(offsetof(packet_storage_domain_operations, clone_writable) == 16,
-	      "storage clone operation offset changed");
-static_assert(offsetof(packet_storage_domain_operations, copy_origins_burst) == 24,
-	      "storage origin-copy operation offset changed");
-static_assert(offsetof(packet_storage_domain_operations, release_burst) == 32,
-	      "storage release operation offset changed");
-static_assert(offsetof(packet_storage_domain_operations, observe_statistics) == 40,
-	      "storage observation operation offset changed");
-static_assert(offsetof(packet_storage_domain_operations, generation) == 48, "storage generation offset changed");
-static_assert(offsetof(packet_storage_domain_operations, domain_index) == 52, "storage domain-index offset changed");
-static_assert(offsetof(packet_storage_domain_operations, maximum_packet_length) == 54,
-	      "storage maximum-packet-length offset changed");
-static_assert(offsetof(packet_storage_domain_operations, capabilities) == 56, "storage capabilities offset changed");
-static_assert(offsetof(packet_storage_domain_operations, padding) == 60,
-	      "storage operation-table padding offset changed");
-static_assert(std::is_standard_layout_v<packet_storage_domain_operations>,
-	      "storage operation table must retain standard layout");
-static_assert(std::is_trivially_copyable_v<packet_storage_domain_operations>,
-	      "storage operation table must remain trivially copyable");
-static_assert(sizeof(packet_storage_descriptor) == 64, "storage descriptor must be one cache line");
-static_assert(alignof(packet_storage_descriptor) == 64, "storage descriptor alignment changed");
-static_assert(offsetof(packet_storage_descriptor, native_handle) == 0, "storage native-handle offset changed");
-static_assert(offsetof(packet_storage_descriptor, data) == 8, "storage data offset changed");
-static_assert(offsetof(packet_storage_descriptor, operations) == 16, "storage operations offset changed");
-static_assert(offsetof(packet_storage_descriptor, length) == 24, "storage length offset changed");
-static_assert(offsetof(packet_storage_descriptor, contiguous_length) == 28, "storage contiguous-length offset changed");
-static_assert(offsetof(packet_storage_descriptor, generation) == 32, "storage descriptor generation offset changed");
-static_assert(offsetof(packet_storage_descriptor, domain_index) == 36,
-	      "storage descriptor domain-index offset changed");
-static_assert(offsetof(packet_storage_descriptor, segment_count) == 38, "storage segment-count offset changed");
-static_assert(offsetof(packet_storage_descriptor, capabilities) == 40,
-	      "storage descriptor capabilities offset changed");
-static_assert(offsetof(packet_storage_descriptor, padding) == 44, "storage descriptor padding offset changed");
-static_assert(std::is_standard_layout_v<packet_storage_descriptor>, "storage descriptor must retain standard layout");
-static_assert(std::is_trivially_copyable_v<packet_storage_descriptor>,
-	      "storage descriptor must remain trivially copyable");
-static_assert(sizeof(packet_record) == PACKET_RECORD_SIZE, "packet_record must occupy exactly three cache lines");
-static_assert(alignof(packet_record) == 64, "packet_record must be cache-line aligned");
-static_assert(offsetof(packet_record, metadata) == 0, "packet metadata must begin at record offset zero");
-static_assert(offsetof(packet_record, storage) == PACKET_PRIVATE_SIZE,
-	      "packet storage descriptor must begin after exact metadata");
-static_assert(std::is_standard_layout_v<packet_record>, "packet_record must retain standard layout");
-static_assert(std::is_trivially_copyable_v<packet_record>, "packet_record must remain trivially copyable");
-static_assert(sizeof(packet_rx_burst_result) == 4, "RX result size changed");
-static_assert(alignof(packet_rx_burst_result) == 2, "RX result alignment changed");
-static_assert(offsetof(packet_rx_burst_result, transferred_count) == 0, "RX transferred-count offset changed");
-static_assert(offsetof(packet_rx_burst_result, rejected_count) == 2, "RX rejected-count offset changed");
-static_assert(std::is_standard_layout_v<packet_rx_burst_result>, "RX result must retain standard layout");
-static_assert(std::is_trivially_copyable_v<packet_rx_burst_result>, "RX result must remain trivially copyable");
-static_assert(sizeof(packet_rx_burst_operations) == 64, "RX operation table must be one cache line");
-static_assert(alignof(packet_rx_burst_operations) == 64, "RX operation table alignment changed");
-static_assert(offsetof(packet_rx_burst_operations, state) == 0, "RX state offset changed");
-static_assert(offsetof(packet_rx_burst_operations, receive_burst) == 8, "RX burst operation offset changed");
-static_assert(offsetof(packet_rx_burst_operations, maximum_burst) == 16, "RX maximum-burst offset changed");
-static_assert(offsetof(packet_rx_burst_operations, logical_port) == 18, "RX logical-port offset changed");
-static_assert(offsetof(packet_rx_burst_operations, padding) == 20, "RX operation-table padding offset changed");
-static_assert(std::is_standard_layout_v<packet_rx_burst_operations>, "RX operation table must retain standard layout");
-static_assert(std::is_trivially_copyable_v<packet_rx_burst_operations>,
-	      "RX operation table must remain trivially copyable");
-static_assert(sizeof(packet_tx_burst_operations) == 64, "TX operation table must be one cache line");
-static_assert(alignof(packet_tx_burst_operations) == 64, "TX operation table alignment changed");
-static_assert(offsetof(packet_tx_burst_operations, state) == 0, "TX state offset changed");
-static_assert(offsetof(packet_tx_burst_operations, transmit_burst) == 8, "TX burst operation offset changed");
-static_assert(offsetof(packet_tx_burst_operations, flush) == 16, "TX flush operation offset changed");
-static_assert(offsetof(packet_tx_burst_operations, maybe_flush) == 24, "TX conditional-flush operation offset changed");
-static_assert(offsetof(packet_tx_burst_operations, maximum_burst) == 32, "TX maximum-burst offset changed");
-static_assert(offsetof(packet_tx_burst_operations, logical_port) == 34, "TX logical-port offset changed");
-static_assert(offsetof(packet_tx_burst_operations, padding) == 36, "TX operation-table padding offset changed");
-static_assert(std::is_standard_layout_v<packet_tx_burst_operations>, "TX operation table must retain standard layout");
-static_assert(std::is_trivially_copyable_v<packet_tx_burst_operations>,
-	      "TX operation table must remain trivially copyable");
+/**
+ * @brief Prefetch the first payload line after exact CPU-access admission.
+ * @param record Live record already accepted by packet_record_has_current_cpu_shape().
+ */
+KINETUM_ALWAYS_INLINE void packet_prefetch_payload(const packet_record &record) noexcept
+{
+	KINETUM_PREFETCH_L1(record.storage.data);
+}
 
 }  // namespace kinetum::dp

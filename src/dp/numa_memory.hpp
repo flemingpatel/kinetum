@@ -44,9 +44,10 @@ class numa_memory_region final {
 	 *
 	 * @param options Exact usable extent, alignment, and optional NUMA node.
 	 * @return Completed region, or a fail-closed validation/allocation status.
+	 * Failure diagnostics use static storage and cannot allocate.
 	 */
 	[[nodiscard]] static kinetum::common::status_or<numa_memory_region>
-	allocate(const numa_memory_options &options);
+	allocate(const numa_memory_options &options) noexcept;
 
 	/** @brief Construct an empty region with no mapping ownership. */
 	numa_memory_region() noexcept = default;

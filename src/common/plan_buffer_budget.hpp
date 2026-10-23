@@ -35,7 +35,7 @@ namespace kinetum::common
  *
  * Descriptor, worker-staging, boundary, and future-hold counts are complete
  * sums for the domain. `worker_count` selects only the formula-owned burst-
- * slack and per-worker cache terms; active queue capacity is supplied as one
+ * slack and per-worker cache terms; active role capacity is supplied as one
  * exact independently checked aggregate.
  */
 struct storage_domain_buffer_budget_inputs {
@@ -44,7 +44,7 @@ struct storage_domain_buffer_budget_inputs {
 	uint64_t rx_descriptor_count{0};	     ///< RX descriptors retaining domain credits.
 	uint64_t tx_descriptor_count{0};	     ///< TX stream native buffer reservation.
 	uint64_t worker_count{0};		     ///< Exact workers staging this domain.
-	uint64_t worker_staging_capacity{0};	     ///< Exact aggregate active worker-queue credits.
+	uint64_t worker_staging_capacity{0};	     ///< Exact aggregate active-role credits, shared by all work keys.
 	uint64_t handoff_staging_capacity{0};	     ///< Boundary and bounded-copy credits for this domain.
 	uint64_t source_future_staging_capacity{0};  ///< Source-worker future-role credits.
 	uint64_t future_output_capacity{0};	     ///< Boundary future-output credits.

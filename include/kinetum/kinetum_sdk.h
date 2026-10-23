@@ -123,9 +123,9 @@ extern "C" {
  * @brief Select terminal discard if the packet reaches TX dispatch.
  *
  * Setting batch->output_port[i] to this value controls final egress only. It
- * does not replace the callback's return-mask contract: clear the packet's bit
- * for an immediate module-stage drop, or keep it set when intentionally
- * forwarding toward terminal TX discard.
+ * does not replace the callback's return-mask contract: clear an unretained
+ * packet's bit for an immediate module-stage drop, or keep it set when
+ * intentionally forwarding toward terminal TX discard.
  */
 #define KINETUM_PORT_DROP 0xFFFEu
 
@@ -312,9 +312,10 @@ static inline const char *kinetum_strerror(kinetum_error error)
 /**
  * @brief Exact transient view of already-owned packet records.
  *
- * The return mask of the callback is the sole packet-disposition authority.
- * Bit i set means forward record i; bit i clear means consume it as a drop.
- * The callback must not return bits outside `[0, count)`.
+ * The callback's return mask selects forwarded lanes. Bit i clear drops record
+ * i unless active ingest successfully retained that lane through retain_input.
+ * A retained lane must not also be forwarded. The callback must not return
+ * bits outside `[0, count)`.
  *
  * Parsed fields and packet bytes are one coherent contract: a module that
  * mutates bytes must update every parsed field invalidated by that mutation.
@@ -1776,8 +1777,10 @@ kinetum_active_async_completions(const kinetum_active_ctx *ctx, uint32_t *out_co
  * @param ctx Sole-owner live context.
  * @param active_ctx Exact active scheduling and ownership services.
  * @param batch Exact configured packet batch.
- * @return Sole disposition mask: set bits continue through runtime dispatch;
- *         clear bits drop. The callback never acquires packet-record ownership.
+ * @return Forward mask: set bits continue through runtime dispatch; clear bits
+ *         drop unless retain_input successfully retained that lane. Forwarding
+ *         a retained lane is a contract fault. Retention uses opaque handles;
+ *         packet records remain platform-owned.
  */
 typedef uint64_t (*kinetum_ingest_fn)(kinetum_ctx *ctx, kinetum_active_ctx *active_ctx, kinetum_batch_t *batch);
 

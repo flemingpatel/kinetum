@@ -17,6 +17,7 @@
 #include <cstdlib>
 #include <limits>
 #include <memory>
+#include <span>
 #include <thread>
 #include <type_traits>
 #include <utility>
@@ -59,9 +60,9 @@ struct test_channel_owner {
 	std::unique_ptr<boundary_epoch_worker_slab> sender_slab;    ///< Exact sender-worker storage owner.
 	std::unique_ptr<boundary_epoch_worker_slab> receiver_slab;  ///< Exact receiver-worker storage owner.
 	std::unique_ptr<boundary_epoch_channel> channel;	    ///< Sole semantic transport borrower.
-	std::unique_ptr<boundary_future_output_hold> hold;	    ///< Exact sender-NUMA future owner.
-	std::unique_ptr<worker_boundary_sender> sender;		    ///< Sole sender-policy claim.
-	std::unique_ptr<worker_boundary_receiver> receiver;	    ///< Sole receiver-policy claim.
+	numa_owner<boundary_future_output_hold> hold;		    ///< Exact sender-NUMA future owner.
+	numa_owner<worker_boundary_sender> sender;		    ///< Sole sender-policy claim.
+	numa_owner<worker_boundary_receiver> receiver;		    ///< Sole receiver-policy claim.
 
 	/** @brief Test owners cannot be copied because every production owner is linear. */
 	test_channel_owner(const test_channel_owner &) = delete;
@@ -112,12 +113,13 @@ struct test_channel_owner {
  * @tparam channel_owner Pointer-like owner exposing boundary_epoch_channel.
  * @param channel Exact channel owner or pointer.
  * @param record Nonnull record offered to DATA.
- * @return true only for TRANSFERRED; false for any non-transfer result.
+ * @return true only when the singleton transfers without sequence exhaustion.
  */
 template <typename channel_owner>
 [[nodiscard]] bool data_transferred(channel_owner &channel, packet_record *record) noexcept
 {
-	return channel.operator->()->try_send_data(record) == boundary_data_publication_result::TRANSFERRED;
+	const auto result = channel.operator->()->try_send_data(std::array{record});
+	return result.transferred_count == 1u && !result.sequence_exhausted;
 }
 
 /** @return Lowest process-allocatable NUMA node, or -1 when unavailable. */
@@ -194,7 +196,8 @@ template <typename channel_owner>
 	owner.hold = std::move(hold_or).value();
 	std::array<boundary_epoch_channel *, 1> channels{owner.channel.get()};
 	std::array<boundary_future_output_hold *, 1> holds{owner.hold.get()};
-	auto policy_or = worker_boundary_sender::create(facts.sender_worker_index, runtime_generation, channels, holds);
+	auto policy_or = worker_boundary_sender::create(facts.sender_worker_index, runtime_generation, channels, holds,
+							sender_numa);
 	if (!policy_or.is_ok()) {
 		ADD_FAILURE() << policy_or.error().message();
 		owner.hold.reset();
@@ -202,8 +205,8 @@ template <typename channel_owner>
 		return owner;
 	}
 	owner.sender = std::move(policy_or).value();
-	auto receiver_policy_or =
-		worker_boundary_receiver::create(facts.receiver_worker_index, runtime_generation, channels);
+	auto receiver_policy_or = worker_boundary_receiver::create(facts.receiver_worker_index, runtime_generation,
+								   channels, receiver_numa);
 	if (!receiver_policy_or.is_ok()) {
 		ADD_FAILURE() << receiver_policy_or.error().message();
 		owner.sender.reset();
@@ -275,73 +278,57 @@ void send_null_data(int32_t numa_node)
 }
 
 /**
- * @brief Attempt a second DATA receive before completing the first.
+ * @brief Reject nested DATA receive before the outer prefix has completed.
  *
  * @param numa_node Exact endpoint and DATA NUMA node.
  */
-void receive_twice_without_completion(int32_t numa_node)
+void receive_recursively(int32_t numa_node)
 {
 	auto channel = make_channel(numa_node);
 	std::array<packet_record, 2> records{};
-	packet_record *received = nullptr;
-	if (channel == nullptr || !data_transferred(channel, &records[0]) || !data_transferred(channel, &records[1]) ||
-	    channel->try_receive_data(received) != boundary_data_receive_result::RECEIVED) {
+	if (channel == nullptr || !data_transferred(channel, &records[0]) || !data_transferred(channel, &records[1])) {
 		std::_Exit(EXIT_SUCCESS);
 	}
-	(void)channel->try_receive_data(received);
+	(void)channel->receive_data(1u, [&](packet_record *) noexcept -> bool {
+		(void)channel->receive_data(1u, [](packet_record *) noexcept { return true; });
+		std::_Exit(EXIT_SUCCESS);
+	});
 	std::_Exit(EXIT_SUCCESS);
 }
 
 /**
- * @brief Complete one DATA receive with a foreign pointer.
+ * @brief Reject an offered receive prefix above the worker burst bound.
  *
  * @param numa_node Exact endpoint and DATA NUMA node.
  */
-void complete_foreign_data(int32_t numa_node)
+void receive_oversized_prefix(int32_t numa_node)
 {
 	auto channel = make_channel(numa_node);
-	std::array<packet_record, 2> records{};
-	packet_record *received = nullptr;
-	if (channel == nullptr || !data_transferred(channel, &records[0]) ||
-	    channel->try_receive_data(received) != boundary_data_receive_result::RECEIVED) {
+	if (channel == nullptr) {
 		std::_Exit(EXIT_SUCCESS);
 	}
-	channel->complete_data_receive(&records[1]);
+	(void)channel->receive_data(common::runtime_sizing::PACKET_MAX_BURST_SIZE + 1u,
+				    [](packet_record *) noexcept { return true; });
 	std::_Exit(EXIT_SUCCESS);
 }
 
 /**
- * @brief Publish receiver transport while one dequeue remains unsequenced.
+ * @brief Reject receiver publication inside an unfinished admission callback.
  *
  * @param numa_node Exact endpoint and DATA NUMA node.
  */
-void publish_unsequenced_receive(int32_t numa_node)
-{
-	auto channel = make_channel(numa_node);
-	packet_record record{};
-	packet_record *received = nullptr;
-	if (channel == nullptr || !data_transferred(channel, &record) ||
-	    channel->try_receive_data(received) != boundary_data_receive_result::RECEIVED) {
-		std::_Exit(EXIT_SUCCESS);
-	}
-	channel->publish_receiver_transport();
-	std::_Exit(EXIT_SUCCESS);
-}
-
-/**
- * @brief Destroy one channel while dequeue completion remains unresolved.
- *
- * @param numa_node Exact endpoint and DATA NUMA node.
- */
-void destroy_unsequenced_receive(int32_t numa_node)
+void publish_during_receive(int32_t numa_node)
 {
 	auto channel = make_channel(numa_node);
 	packet_record record{};
-	packet_record *received = nullptr;
-	if (channel == nullptr || !data_transferred(channel, &record) ||
-	    channel->try_receive_data(received) != boundary_data_receive_result::RECEIVED) {
+	if (channel == nullptr || !data_transferred(channel, &record)) {
 		std::_Exit(EXIT_SUCCESS);
 	}
+	(void)channel->receive_data(1u, [&](packet_record *) noexcept -> bool {
+		channel->publish_receiver_transport();
+		std::_Exit(EXIT_SUCCESS);
+	});
+	std::_Exit(EXIT_SUCCESS);
 }
 
 /**
@@ -579,13 +566,14 @@ void destroy_sender_slab_before_channel(int32_t numa_node)
 	auto hold = std::move(hold_or).value();
 	std::array<boundary_epoch_channel *, 1> channels{channel.get()};
 	std::array<boundary_future_output_hold *, 1> holds{hold.get()};
-	auto policy_or = worker_boundary_sender::create(TEST_SENDER_WORKER, TEST_RUNTIME_GENERATION, channels, holds);
+	auto policy_or =
+		worker_boundary_sender::create(TEST_SENDER_WORKER, TEST_RUNTIME_GENERATION, channels, holds, numa_node);
 	if (!policy_or.is_ok()) {
 		std::_Exit(EXIT_SUCCESS);
 	}
 	auto policy = std::move(policy_or).value();
 	auto receiver_policy_or =
-		worker_boundary_receiver::create(TEST_RECEIVER_WORKER, TEST_RUNTIME_GENERATION, channels);
+		worker_boundary_receiver::create(TEST_RECEIVER_WORKER, TEST_RUNTIME_GENERATION, channels, numa_node);
 	if (!receiver_policy_or.is_ok()) {
 		std::_Exit(EXIT_SUCCESS);
 	}
@@ -719,11 +707,12 @@ TEST(boundary_epoch_worker_slab, every_slot_and_control_ring_follow_exact_worker
 	auto second_hold = std::move(second_hold_or).value();
 	std::array<boundary_epoch_channel *, 2> channels{first.get(), second.get()};
 	std::array<boundary_future_output_hold *, 2> holds{first_hold.get(), second_hold.get()};
-	auto policy_or = worker_boundary_sender::create(TEST_SENDER_WORKER, TEST_RUNTIME_GENERATION, channels, holds);
+	auto policy_or = worker_boundary_sender::create(TEST_SENDER_WORKER, TEST_RUNTIME_GENERATION, channels, holds,
+							sender_numa);
 	ASSERT_TRUE(policy_or.is_ok()) << policy_or.error().message();
 	auto policy = std::move(policy_or).value();
-	auto receiver_policy_or =
-		worker_boundary_receiver::create(TEST_RECEIVER_WORKER, TEST_RUNTIME_GENERATION, channels);
+	auto receiver_policy_or = worker_boundary_receiver::create(TEST_RECEIVER_WORKER, TEST_RUNTIME_GENERATION,
+								   channels, receiver_numa);
 	ASSERT_TRUE(receiver_policy_or.is_ok()) << receiver_policy_or.error().message();
 	auto receiver_policy = std::move(receiver_policy_or).value();
 	ASSERT_TRUE(sender->seal().is_ok());
@@ -795,16 +784,20 @@ TEST(boundary_epoch_worker_slab, sealing_and_destruction_enforce_the_complete_bo
 		packet_record record{};
 		ASSERT_TRUE(data_transferred(channel, &record));
 		packet_record *received = nullptr;
-		ASSERT_EQ(channel->try_receive_data(received), boundary_data_receive_result::RECEIVED);
+		const auto result = channel->receive_data(1u, [&](packet_record *value) noexcept {
+			received = value;
+			return true;
+		});
+		EXPECT_FALSE(result.sequence_exhausted);
+		EXPECT_EQ(result.transferred_count, 1u);
 		ASSERT_EQ(received, &record);
-		channel->complete_data_receive(received);
 		auto hold_or = boundary_future_output_hold::create(facts, numa_node);
 		ASSERT_TRUE(hold_or.is_ok()) << hold_or.error().message();
 		auto hold = std::move(hold_or).value();
 		std::array<boundary_epoch_channel *, 1> channels{channel.get()};
 		std::array<boundary_future_output_hold *, 1> holds{hold.get()};
-		auto policy_or =
-			worker_boundary_sender::create(TEST_SENDER_WORKER, TEST_RUNTIME_GENERATION, channels, holds);
+		auto policy_or = worker_boundary_sender::create(TEST_SENDER_WORKER, TEST_RUNTIME_GENERATION, channels,
+								holds, numa_node);
 		ASSERT_FALSE(policy_or.is_ok());
 		EXPECT_EQ(policy_or.error().code(), common::status_code::FAILED_PRECONDITION);
 	}
@@ -887,7 +880,6 @@ TEST(boundary_epoch_channel, data_fifo_backpressure_and_sequences_conserve_every
 	}
 	EXPECT_FALSE(data_transferred(channel, &records[4]));
 	EXPECT_EQ(channel->data_enqueued_sequence(), 4u);
-	EXPECT_EQ(channel->peek_data(), &records[0]);
 	channel->publish_sender_transport();
 	boundary_sender_transport_snapshot sender_observation{};
 	ASSERT_EQ(channel->try_read_sender_transport(sender_observation), publication_read_result::AVAILABLE);
@@ -896,16 +888,95 @@ TEST(boundary_epoch_channel, data_fifo_backpressure_and_sequences_conserve_every
 
 	for (std::size_t index = 0; index < 4u; ++index) {
 		packet_record *received = nullptr;
-		ASSERT_EQ(channel->try_receive_data(received), boundary_data_receive_result::RECEIVED);
+		uint64_t sequence_during_admission = UINT64_MAX;
+		const auto result = channel->receive_data(1u, [&](packet_record *value) noexcept {
+			received = value;
+			sequence_during_admission = channel->data_dequeued_sequence();
+			return true;
+		});
+		EXPECT_FALSE(result.sequence_exhausted);
+		EXPECT_EQ(result.transferred_count, 1u);
 		EXPECT_EQ(received, &records[index]);
-		EXPECT_EQ(channel->data_dequeued_sequence(), index);
-		channel->complete_data_receive(received);
+		EXPECT_EQ(sequence_during_admission, index);
 		EXPECT_EQ(channel->data_dequeued_sequence(), index + 1u);
 	}
 	channel->publish_receiver_transport();
 	boundary_receiver_transport_snapshot receiver_observation{};
 	ASSERT_EQ(channel->try_read_receiver_transport(receiver_observation), publication_read_result::AVAILABLE);
 	EXPECT_EQ(receiver_observation.data_dequeued_sequence, 4u);
+	EXPECT_TRUE(channel->data_empty());
+}
+
+/** @brief Count accepted packets once, retain the first refused head, and preserve FIFO across wrap. */
+TEST(boundary_epoch_channel, counted_prefixes_preserve_refusal_and_packet_attempt_accounting)
+{
+	const int32_t numa_node = test_numa_node();
+	ASSERT_GE(numa_node, 0);
+	auto channel = make_channel(numa_node, 4u);
+	ASSERT_NE(channel, nullptr);
+	std::array<packet_record, 6> records{};
+	std::array<packet_record *, 6> offered{};
+	for (std::size_t index = 0u; index < records.size(); ++index) {
+		offered[index] = &records[index];
+	}
+	const auto sent = channel->try_send_data(offered);
+	EXPECT_FALSE(sent.sequence_exhausted);
+	EXPECT_EQ(sent.transferred_count, 4u);
+	const auto blocked = channel->try_send_data(std::span(offered).last(2u));
+	EXPECT_EQ(blocked.transferred_count, 0u);
+	EXPECT_FALSE(blocked.sequence_exhausted);
+	EXPECT_EQ(channel->try_send_data({}).transferred_count, 0u);
+	channel->publish_sender_transport();
+	boundary_sender_transport_snapshot sender{};
+	EXPECT_EQ(channel->try_read_sender_transport(sender), publication_read_result::AVAILABLE);
+	EXPECT_EQ(sender.data_enqueued_sequence, 4u);
+	EXPECT_EQ(sender.data_backpressure_events, 4u);
+	std::size_t attempts = 0u;
+	const auto zero = channel->receive_data(0u, [&](packet_record *) noexcept {
+		++attempts;
+		return true;
+	});
+	EXPECT_EQ(zero.transferred_count, 0u);
+	EXPECT_EQ(attempts, 0u);
+	packet_record *refused = nullptr;
+	const auto refusal = channel->receive_data(4u, [&](packet_record *record) noexcept {
+		refused = record;
+		++attempts;
+		return false;
+	});
+	EXPECT_EQ(refusal.transferred_count, 0u);
+	EXPECT_EQ(attempts, 1u);
+	EXPECT_EQ(refused, &records[0]);
+	EXPECT_EQ(channel->data_dequeued_sequence(), 0u);
+	std::array<packet_record *, 6> received{};
+	std::size_t accepted = 0u;
+	bool sequence_waited_for_prefix = true;
+	const auto partial = channel->receive_data(4u, [&](packet_record *record) noexcept {
+		sequence_waited_for_prefix = sequence_waited_for_prefix && channel->data_dequeued_sequence() == 0u;
+		if (accepted == 2u) {
+			refused = record;
+			return false;
+		}
+		received[accepted++] = record;
+		return true;
+	});
+	EXPECT_FALSE(partial.sequence_exhausted);
+	EXPECT_EQ(partial.transferred_count, 2u);
+	EXPECT_EQ(refused, &records[2]);
+	EXPECT_EQ(channel->data_dequeued_sequence(), 2u);
+	EXPECT_EQ(channel->try_send_data(std::span(offered).last(2u)).transferred_count, 2u);
+	const auto remainder = channel->receive_data(4u, [&](packet_record *record) noexcept {
+		sequence_waited_for_prefix = sequence_waited_for_prefix && channel->data_dequeued_sequence() == 2u;
+		received[accepted++] = record;
+		return true;
+	});
+	EXPECT_FALSE(remainder.sequence_exhausted);
+	EXPECT_EQ(remainder.transferred_count, 4u);
+	EXPECT_EQ(accepted, offered.size());
+	EXPECT_EQ(received, offered);
+	EXPECT_TRUE(sequence_waited_for_prefix);
+	EXPECT_EQ(channel->data_enqueued_sequence(), 6u);
+	EXPECT_EQ(channel->data_dequeued_sequence(), 6u);
 	EXPECT_TRUE(channel->data_empty());
 }
 
@@ -916,8 +987,8 @@ TEST(boundary_epoch_channel, worker_credit_transfer_brackets_successful_sequence
 	ASSERT_GE(numa_node, 0);
 	auto channel = make_channel(numa_node);
 	ASSERT_NE(channel, nullptr);
-	auto sender_or = worker_epoch_ledger::create(TEST_SENDER_WORKER, TEST_RUNTIME_GENERATION, 1u);
-	auto receiver_or = worker_epoch_ledger::create(TEST_RECEIVER_WORKER, TEST_RUNTIME_GENERATION, 1u);
+	auto sender_or = worker_epoch_ledger::create(TEST_SENDER_WORKER, TEST_RUNTIME_GENERATION, 1u, numa_node);
+	auto receiver_or = worker_epoch_ledger::create(TEST_RECEIVER_WORKER, TEST_RUNTIME_GENERATION, 1u, numa_node);
 	ASSERT_TRUE(sender_or.is_ok()) << sender_or.error().message();
 	ASSERT_TRUE(receiver_or.is_ok()) << receiver_or.error().message();
 	auto sender = std::move(sender_or).value();
@@ -937,10 +1008,17 @@ TEST(boundary_epoch_channel, worker_credit_transfer_brackets_successful_sequence
 	sender->retire(TEST_EPOCH);
 
 	packet_record *received = nullptr;
-	ASSERT_EQ(channel->try_receive_data(received), boundary_data_receive_result::RECEIVED);
-	EXPECT_EQ(channel->data_dequeued_sequence(), 0u);
-	receiver->acquire(TEST_EPOCH);
-	channel->complete_data_receive(received);
+	uint64_t sequence_after_credit = UINT64_MAX;
+	const auto result = channel->receive_data(1u, [&](packet_record *value) noexcept {
+		receiver->acquire(value->metadata.epoch);
+		received = value;
+		sequence_after_credit = channel->data_dequeued_sequence();
+		return true;
+	});
+	EXPECT_FALSE(result.sequence_exhausted);
+	EXPECT_EQ(result.transferred_count, 1u);
+	EXPECT_EQ(received, &record);
+	EXPECT_EQ(sequence_after_credit, 0u);
 	EXPECT_EQ(channel->data_dequeued_sequence(), 1u);
 	worker_epoch_ledger_snapshot receiver_observation{};
 	receiver->publish();
@@ -1115,17 +1193,21 @@ TEST(boundary_epoch_channel, concurrent_data_transfer_and_observation_preserve_e
 	std::thread receiver([&]() {
 		std::size_t count = 0u;
 		while (count < records.size()) {
-			packet_record *record = nullptr;
-			if (channel->try_receive_data(record) == boundary_data_receive_result::EMPTY) {
+			const auto result = channel->receive_data(64u, [&](packet_record *record) noexcept {
+				if (record != &records[count]) {
+					observation_failed.store(true, std::memory_order_release);
+				}
+				++count;
+				return true;
+			});
+			if (result.sequence_exhausted) {
+				std::terminate();
+			}
+			if (result.transferred_count == 0u) {
 				std::this_thread::yield();
 				continue;
 			}
-			if (record == nullptr) {
-				std::terminate();
-			}
-			channel->complete_data_receive(record);
 			channel->publish_receiver_transport();
-			++count;
 		}
 		while (!channel->sender_closed()) {
 			std::this_thread::yield();
@@ -1200,10 +1282,15 @@ TEST(boundary_epoch_channel, fan_in_channels_keep_independent_sequence_and_contr
 	ASSERT_TRUE(left->try_receive_cut(cut));
 	EXPECT_EQ(cut, (boundary_epoch_cut{11u, 1u}));
 	packet_record *received = nullptr;
-	ASSERT_EQ(left->try_receive_data(received), boundary_data_receive_result::RECEIVED);
-	left->complete_data_receive(received);
-	ASSERT_EQ(right->try_receive_data(received), boundary_data_receive_result::RECEIVED);
-	right->complete_data_receive(received);
+	for (auto *channel : {left.channel.get(), right.channel.get()}) {
+		const auto result = channel->receive_data(1u, [&](packet_record *record) noexcept {
+			received = record;
+			return true;
+		});
+		EXPECT_FALSE(result.sequence_exhausted);
+		EXPECT_EQ(result.transferred_count, 1u);
+		EXPECT_EQ(received, channel == left.channel.get() ? &left_record : &right_record);
+	}
 }
 
 /** @brief Preserve packet metadata bytes without a DATA envelope or epoch mirror. */
@@ -1219,9 +1306,14 @@ TEST(boundary_epoch_channel, transfer_preserves_exact_packet_epoch_without_deriv
 	record.metadata.user_meta_valid = 1u;
 	ASSERT_TRUE(data_transferred(channel, &record));
 	packet_record *received = nullptr;
-	ASSERT_EQ(channel->try_receive_data(received), boundary_data_receive_result::RECEIVED);
-	channel->complete_data_receive(received);
+	const auto result = channel->receive_data(1u, [&](packet_record *value) noexcept {
+		received = value;
+		return true;
+	});
+	EXPECT_FALSE(result.sequence_exhausted);
+	EXPECT_EQ(result.transferred_count, 1u);
 	EXPECT_EQ(received, &record);
+	ASSERT_NE(received, nullptr);
 	EXPECT_EQ(received->metadata.epoch, TEST_EPOCH);
 	EXPECT_EQ(received->metadata.user_meta, UINT64_C(0x1122334455667788));
 	EXPECT_EQ(received->metadata.user_meta_valid, 1u);
@@ -1241,9 +1333,13 @@ TEST(boundary_epoch_channel, sender_close_preserves_queued_data_order)
 	EXPECT_TRUE(channel->sender_closed());
 	for (auto &expected : records) {
 		packet_record *received = nullptr;
-		ASSERT_EQ(channel->try_receive_data(received), boundary_data_receive_result::RECEIVED);
+		const auto result = channel->receive_data(1u, [&](packet_record *value) noexcept {
+			received = value;
+			return true;
+		});
+		EXPECT_FALSE(result.sequence_exhausted);
+		EXPECT_EQ(result.transferred_count, 1u);
 		EXPECT_EQ(received, &expected);
-		channel->complete_data_receive(received);
 	}
 	EXPECT_TRUE(channel->empty());
 	EXPECT_DEATH(send_after_close(numa_node), "");
@@ -1255,9 +1351,9 @@ TEST(boundary_epoch_channel, malformed_or_competing_transport_operations_fail_st
 	const int32_t numa_node = test_numa_node();
 	ASSERT_GE(numa_node, 0);
 	EXPECT_DEATH(send_null_data(numa_node), "");
-	EXPECT_DEATH(receive_twice_without_completion(numa_node), "");
-	EXPECT_DEATH(complete_foreign_data(numa_node), "");
-	EXPECT_DEATH(publish_unsequenced_receive(numa_node), "");
+	EXPECT_DEATH(receive_recursively(numa_node), "");
+	EXPECT_DEATH(receive_oversized_prefix(numa_node), "");
+	EXPECT_DEATH(publish_during_receive(numa_node), "");
 	EXPECT_DEATH(submit_invalid_cut(numa_node), "");
 	EXPECT_DEATH(submit_invalid_ack(numa_node), "");
 	EXPECT_DEATH(submit_competing_pending_cut(numa_node), "");
@@ -1267,13 +1363,12 @@ TEST(boundary_epoch_channel, malformed_or_competing_transport_operations_fail_st
 	EXPECT_DEATH(close_with_pending_cut(numa_node), "");
 }
 
-/** @brief Fail stop when any DATA, control, pending, or completion owner survives. */
-TEST(boundary_epoch_channel, live_data_control_pending_or_completion_ownership_fails_stop_at_destruction)
+/** @brief Fail stop when any DATA, control, or pending owner survives. */
+TEST(boundary_epoch_channel, live_data_control_or_pending_ownership_fails_stop_at_destruction)
 {
 	const int32_t numa_node = test_numa_node();
 	ASSERT_GE(numa_node, 0);
 	EXPECT_DEATH(destroy_live_data(numa_node), "");
-	EXPECT_DEATH(destroy_unsequenced_receive(numa_node), "");
 	EXPECT_DEATH(destroy_live_cut(numa_node), "");
 	EXPECT_DEATH(destroy_live_ack(numa_node), "");
 	EXPECT_DEATH(destroy_pending_cut(numa_node), "");

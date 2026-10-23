@@ -24,6 +24,7 @@
 #include "src/dp/epoch/worker_epoch_ledger.hpp"
 #include "src/dp/module/worker_module_health.hpp"
 #include "tests/module_abi_test_harness.hpp"
+#include "tests/numa_placement_test_support.hpp"
 
 #if !defined(KINETUM_TEST_MODULE_PATH)
 #error "Exact passive test-module path is required"
@@ -94,7 +95,8 @@ class worker_health_fixture final {
 		fixture->module_ = std::move(module_or).value();
 		fixture->context_index_ = context_index;
 		fixture->stage_instance_index_ = stage_instance_index;
-		auto ledger_or = worker_epoch_ledger::create(TEST_WORKER_INDEX, TEST_RUNTIME_GENERATION, 8u);
+		auto ledger_or = worker_epoch_ledger::create(TEST_WORKER_INDEX, TEST_RUNTIME_GENERATION, 8u,
+							     fixture->module_->context().packet_context.numa_node);
 		if (!ledger_or.is_ok()) {
 			return ledger_or.error();
 		}
@@ -188,11 +190,57 @@ class worker_health_fixture final {
 	worker_health_fixture() = default;
 
 	std::unique_ptr<test::exact_module_test_context> module_;   ///< Real image/context/store owner.
-	std::unique_ptr<worker_epoch_ledger> ledger_;		    ///< Sole worker credit authority.
-	std::unique_ptr<worker_module_health> health_;		    ///< Linear health scheduler claim.
+	numa_owner<worker_epoch_ledger> ledger_;		    ///< Sole worker credit authority.
+	numa_owner<worker_module_health> health_;		    ///< Linear health scheduler claim.
 	uint32_t context_index_{TEST_CONTEXT_INDEX};		    ///< Exact fixture context identity.
 	uint32_t stage_instance_index_{TEST_STAGE_INSTANCE_INDEX};  ///< Exact fixture stage identity.
 };
+
+/** @brief Require distinct real worker nodes for store-to-health ownership admission. */
+class ModuleHealthNumaPlacementTest : public test::NumaPlacementTest {};
+
+/** @brief A foreign-node store rejects before claims, even when its context index matches the local binding. */
+TEST_F(ModuleHealthNumaPlacementTest, rejects_foreign_store_without_claiming_the_local_context)
+{
+	auto local_or = test::exact_module_test_context::create("test_module", KINETUM_TEST_MODULE_PATH,
+								TEST_MODULE_RESOURCES, "module@lane_0",
+								TEST_CONTEXT_INDEX, TEST_STAGE_INSTANCE_INDEX,
+								cpus_[0]);
+	auto foreign_or = test::exact_module_test_context::create("test_module", KINETUM_TEST_MODULE_PATH,
+								  TEST_MODULE_RESOURCES, "module@lane_0",
+								  TEST_CONTEXT_INDEX, TEST_STAGE_INSTANCE_INDEX,
+								  cpus_[1]);
+	ASSERT_TRUE(local_or.is_ok()) << local_or.error().message();
+	ASSERT_TRUE(foreign_or.is_ok()) << foreign_or.error().message();
+	auto local = std::move(local_or).value();
+	auto foreign = std::move(foreign_or).value();
+	auto ledger_or =
+		worker_epoch_ledger::create(TEST_WORKER_INDEX, TEST_RUNTIME_GENERATION, 8u, cpus_[0].numa_node);
+	ASSERT_TRUE(ledger_or.is_ok()) << ledger_or.error().message();
+	auto ledger = std::move(ledger_or).value();
+	auto &context = local->context();
+	std::array<worker_module_health_binding, 1> bindings{{
+		{
+			.stage_instance_index = TEST_STAGE_INSTANCE_INDEX,
+			.context_index = TEST_CONTEXT_INDEX,
+			.context = &context.packet_context,
+			.store = foreign->context().epoch_store.get(),
+			.descriptor = context.image->descriptor,
+			.publication = context.lifecycle_owner.get(),
+		},
+	}};
+	auto refused = worker_module_health::create(TEST_WORKER_INDEX, TEST_RUNTIME_GENERATION, TEST_CALLBACK_BUDGET_NS,
+						    bindings, *ledger);
+	ASSERT_FALSE(refused.is_ok());
+	EXPECT_EQ(refused.error().code(), common::status_code::FAILED_PRECONDITION);
+	EXPECT_FALSE(context.lifecycle_owner->module_health_owner_claimed());
+	EXPECT_TRUE(ledger->empty());
+
+	bindings[0].store = context.epoch_store.get();
+	auto accepted = worker_module_health::create(TEST_WORKER_INDEX, TEST_RUNTIME_GENERATION,
+						     TEST_CALLBACK_BUDGET_NS, bindings, *ledger);
+	ASSERT_TRUE(accepted.is_ok()) << accepted.error().message();
+}
 
 /** @brief Trigger unresolved-claim destruction through the production method. */
 void unresolved_claim_child()
@@ -295,7 +343,8 @@ TEST(worker_module_health, null_callback_is_unavailable_and_context_claim_is_lin
 	EXPECT_FALSE(fixture->publication().try_read_module_health(observation));
 
 	const auto binding = fixture->binding();
-	auto contender_ledger_or = worker_epoch_ledger::create(TEST_WORKER_INDEX, TEST_RUNTIME_GENERATION, 8u);
+	auto contender_ledger_or = worker_epoch_ledger::create(TEST_WORKER_INDEX, TEST_RUNTIME_GENERATION, 8u,
+							       fixture->ledger().numa_node());
 	ASSERT_TRUE(contender_ledger_or.is_ok()) << contender_ledger_or.error().message();
 	auto contender_ledger = std::move(contender_ledger_or).value();
 	auto duplicate = worker_module_health::create(TEST_WORKER_INDEX, TEST_RUNTIME_GENERATION,
@@ -317,7 +366,8 @@ TEST(worker_module_health, malformed_binding_rejects_without_claim_or_credit)
 	auto fixture = std::move(fixture_or).value();
 	auto malformed = fixture->binding();
 	malformed.context = nullptr;
-	auto contender_ledger_or = worker_epoch_ledger::create(TEST_WORKER_INDEX, TEST_RUNTIME_GENERATION, 8u);
+	auto contender_ledger_or = worker_epoch_ledger::create(TEST_WORKER_INDEX, TEST_RUNTIME_GENERATION, 8u,
+							       fixture->ledger().numa_node());
 	ASSERT_TRUE(contender_ledger_or.is_ok()) << contender_ledger_or.error().message();
 	auto contender_ledger = std::move(contender_ledger_or).value();
 	auto rejected = worker_module_health::create(TEST_WORKER_INDEX, TEST_RUNTIME_GENERATION,
@@ -358,7 +408,8 @@ TEST(worker_module_health, partial_context_claim_failure_releases_complete_prefi
 		},
 		claimed->binding(),
 	}};
-	auto contender_ledger_or = worker_epoch_ledger::create(TEST_WORKER_INDEX, TEST_RUNTIME_GENERATION, 8u);
+	auto contender_ledger_or = worker_epoch_ledger::create(TEST_WORKER_INDEX, TEST_RUNTIME_GENERATION, 8u,
+							       claimed->ledger().numa_node());
 	ASSERT_TRUE(contender_ledger_or.is_ok()) << contender_ledger_or.error().message();
 	auto contender_ledger = std::move(contender_ledger_or).value();
 	auto rejected = worker_module_health::create(TEST_WORKER_INDEX, TEST_RUNTIME_GENERATION,

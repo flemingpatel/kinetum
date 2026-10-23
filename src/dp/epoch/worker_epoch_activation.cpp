@@ -13,6 +13,7 @@
 #include <array>
 #include <exception>
 #include <limits>
+#include <memory>
 #include <new>
 #include <stdexcept>
 #include <unordered_set>
@@ -28,7 +29,7 @@
 namespace kinetum::dp
 {
 
-common::status_or<std::unique_ptr<worker_epoch_activation>>
+common::status_or<numa_owner<worker_epoch_activation>>
 worker_epoch_activation::create(uint32_t worker_index, uint64_t runtime_generation,
 				std::span<module::module_epoch_store *const> module_stores,
 				std::span<packet_epoch_input_staging *const> source_staging,
@@ -38,7 +39,7 @@ worker_epoch_activation::create(uint32_t worker_index, uint64_t runtime_generati
 	if (worker_index == std::numeric_limits<uint32_t>::max() || runtime_generation == 0u ||
 	    runtime_generation > std::numeric_limits<uint32_t>::max() || ledger.worker_index() != worker_index ||
 	    ledger.runtime_generation() != runtime_generation || telemetry.worker_index() != worker_index ||
-	    telemetry.active_epoch() != 0u) {
+	    telemetry.active_epoch() != 0u || telemetry.numa_node() != ledger.numa_node()) {
 		return common::status::invalid_argument(
 			"worker activation requires exact representable worker and runtime identities");
 	}
@@ -58,19 +59,15 @@ worker_epoch_activation::create(uint32_t worker_index, uint64_t runtime_generati
 		have_previous_context = true;
 	}
 	for (const auto *candidate : source_staging) {
-		if (candidate == nullptr || !candidate->has_future()) {
+		if (candidate == nullptr || !candidate->has_future() || candidate->numa_node() != ledger.numa_node()) {
 			return common::status::failed_precondition(
 				"worker activation source staging must be complete and own future roles");
 		}
 	}
-	std::vector<module::module_epoch_store *> stores;
-	std::vector<packet_epoch_input_staging *> staging;
 	try {
-		stores.assign(module_stores.begin(), module_stores.end());
-		staging.assign(source_staging.begin(), source_staging.end());
 		std::unordered_set<packet_epoch_input_staging *> staging_identities;
-		staging_identities.reserve(staging.size());
-		for (auto *candidate : staging) {
+		staging_identities.reserve(source_staging.size());
+		for (auto *candidate : source_staging) {
 			if (!staging_identities.insert(candidate).second) {
 				return common::status::failed_precondition(
 					"worker activation source staging must be unique");
@@ -84,7 +81,7 @@ worker_epoch_activation::create(uint32_t worker_index, uint64_t runtime_generati
 	}
 	if (active_scheduler != nullptr &&
 	    (active_scheduler->worker_index() != worker_index || active_scheduler->active_epoch() != 0u ||
-	     !active_scheduler->owns_ledger(ledger))) {
+	     active_scheduler->numa_node() != ledger.numa_node() || !active_scheduler->owns_ledger(ledger))) {
 		return common::status::failed_precondition(
 			"worker activation active scheduler has foreign, already-bound, or mismatched ledger ownership");
 	}
@@ -104,29 +101,46 @@ worker_epoch_activation::create(uint32_t worker_index, uint64_t runtime_generati
 				"worker activation health rows do not match the exact module-store order");
 		}
 	}
-	auto *owner = new (std::nothrow) worker_epoch_activation(
-		owner_identity{
-			.worker_index = worker_index,
-			.runtime_generation = runtime_generation,
-		},
-		std::move(stores), std::move(staging), ledger, active_scheduler, module_health, telemetry);
-	if (owner == nullptr) {
-		return common::status::resource_exhausted("worker activation owner allocation failed");
+	numa_layout layout;
+	std::size_t root_offset = 0u;
+	std::size_t stores_offset = 0u;
+	std::size_t staging_offset = 0u;
+	if (!layout.append<worker_epoch_activation>(1u, root_offset) ||
+	    !layout.append<module::module_epoch_store *>(module_stores.size(), stores_offset) ||
+	    !layout.append<packet_epoch_input_staging *>(source_staging.size(), staging_offset)) {
+		return common::status(common::status_code::OUT_OF_RANGE, "worker activation layout overflows");
 	}
-	return std::unique_ptr<worker_epoch_activation>(owner);
+	auto region_or = layout.allocate(ledger.numa_node());
+	if (!region_or.is_ok()) {
+		return region_or.error();
+	}
+	auto region = std::move(region_or).value();
+	auto stores = numa_layout::storage<module::module_epoch_store *>(region, stores_offset, module_stores.size());
+	auto staging =
+		numa_layout::storage<packet_epoch_input_staging *>(region, staging_offset, source_staging.size());
+	std::uninitialized_copy(module_stores.begin(), module_stores.end(), stores.begin());
+	std::uninitialized_copy(source_staging.begin(), source_staging.end(), staging.begin());
+	auto *owner = new (numa_layout::storage<worker_epoch_activation>(region, root_offset).data())
+		worker_epoch_activation(
+			owner_identity{
+				.worker_index = worker_index,
+				.runtime_generation = runtime_generation,
+			},
+			stores, staging, ledger, active_scheduler, module_health, telemetry);
+	return adopt_numa_owner(owner, std::move(region));
 }
 
 worker_epoch_activation::worker_epoch_activation(owner_identity identity,
-						 std::vector<module::module_epoch_store *> module_stores,
-						 std::vector<packet_epoch_input_staging *> source_staging,
+						 std::span<module::module_epoch_store *const> module_stores,
+						 std::span<packet_epoch_input_staging *const> source_staging,
 						 worker_epoch_ledger &ledger,
 						 worker_active_stage_scheduler *active_scheduler,
 						 module::worker_module_health *module_health,
 						 worker_runtime_telemetry &telemetry) noexcept
 	: worker_index_(identity.worker_index)
 	, runtime_generation_(identity.runtime_generation)
-	, module_stores_(std::move(module_stores))
-	, source_staging_(std::move(source_staging))
+	, module_stores_(module_stores)
+	, source_staging_(source_staging)
 	, ledger_(&ledger)
 	, active_scheduler_(active_scheduler)
 	, module_health_(module_health)

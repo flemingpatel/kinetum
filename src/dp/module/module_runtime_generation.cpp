@@ -1376,17 +1376,16 @@ class module_runtime_generation::implementation final
 			if (!native_complete.is_ok()) {
 				return native_complete.error();
 			}
-			const std::size_t telemetry_bytes =
-				lifecycle::lifecycle_context_owner::telemetry_storage_bytes();
-			if (actual.context_count > std::numeric_limits<std::size_t>::max() / telemetry_bytes ||
-			    static_cast<std::size_t>(actual.context_count) * telemetry_bytes >
+			const std::size_t platform_bytes = lifecycle::lifecycle_context_owner::platform_storage_bytes();
+			if (actual.context_count > std::numeric_limits<std::size_t>::max() / platform_bytes ||
+			    static_cast<std::size_t>(actual.context_count) * platform_bytes >
 				    std::numeric_limits<std::size_t>::max() - native_complete.value()) {
 				return status(status_code::OUT_OF_RANGE,
-					      "platform telemetry storage exceeds the lifecycle NUMA byte domain");
+					      "platform context storage exceeds the lifecycle NUMA byte domain");
 			}
 			const std::size_t provider_capacity =
 				native_complete.value() +
-				static_cast<std::size_t>(actual.context_count) * telemetry_bytes;
+				static_cast<std::size_t>(actual.context_count) * platform_bytes;
 			narrowed.push_back({
 				.numa_node = compiled.numa_node,
 				.context_count = compiled.context_count,

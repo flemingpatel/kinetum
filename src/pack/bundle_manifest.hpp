@@ -119,7 +119,7 @@ namespace kinetum::pack
 inline constexpr std::string_view MANIFEST_FILENAME = "BUNDLE_MANIFEST.txt";
 
 /** @brief Maximum bundle-manifest size admitted for denial-of-service protection. */
-inline constexpr std::size_t MAX_MANIFEST_SIZE = std::size_t{1024} * 1024;  // 1 MB
+inline constexpr std::size_t MAX_MANIFEST_SIZE = std::size_t{1024} * 1024;  // 1 MiB
 
 /** @brief Maximum byte width of one canonical bundle name. */
 inline constexpr std::size_t MAX_BUNDLE_NAME_LENGTH = 255;

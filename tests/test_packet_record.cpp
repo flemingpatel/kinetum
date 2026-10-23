@@ -12,13 +12,13 @@
 #include <cstdint>
 #include <cstring>
 #include <exception>
-#include <optional>
 #include <string>
 #include <thread>
 #include <type_traits>
 #include <utility>
 
 #include "src/dp/fixed_packet_pool.hpp"
+#include "tests/numa_test_support.hpp"
 
 namespace kinetum::dp
 {
@@ -35,11 +35,11 @@ namespace
  * @param alignment_bytes Required record and packet-data alignment.
  * @param domain_index Exact storage-domain identity.
  * @param generation Exact nonzero materialization generation.
- * @return Complete options with intentionally absent host NUMA placement.
+ * @return Complete options on a proved process-allowed memory node.
  */
 [[nodiscard]] fixed_packet_pool_options provider_free_pool_options(uint32_t record_count, uint32_t data_room_bytes,
 								   uint32_t headroom_bytes, uint32_t alignment_bytes,
-								   uint16_t domain_index, uint32_t generation) noexcept
+								   uint16_t domain_index, uint32_t generation)
 {
 	return fixed_packet_pool_options{
 		.record_count = record_count,
@@ -48,7 +48,7 @@ namespace
 		.alignment_bytes = alignment_bytes,
 		.domain_index = domain_index,
 		.generation = generation,
-		.host_numa_node = std::nullopt,
+		.host_numa_node = kinetum::test::required_memory_numa_node(),
 	};
 }
 
@@ -57,8 +57,8 @@ namespace
 /** @brief Pin the provider-neutral record and role-partitioned operation tables. */
 TEST(packet_record, layout_and_operation_roles_are_exact)
 {
-	EXPECT_EQ(sizeof(packet_private), 128u);
-	EXPECT_EQ(alignof(packet_private), 64u);
+	EXPECT_EQ(sizeof(packet_private), 80u);
+	EXPECT_EQ(alignof(packet_private), 8u);
 	EXPECT_EQ(offsetof(packet_private, timestamp_ns), 0u);
 	EXPECT_EQ(offsetof(packet_private, epoch), 8u);
 	EXPECT_EQ(offsetof(packet_private, user_meta), 16u);
@@ -74,19 +74,16 @@ TEST(packet_record, layout_and_operation_roles_are_exact)
 	EXPECT_EQ(offsetof(packet_private, module_next_stage), 48u);
 	EXPECT_EQ(offsetof(packet_private, user_meta_valid), 50u);
 	EXPECT_EQ(offsetof(packet_private, padding_hot), 51u);
-	EXPECT_EQ(offsetof(packet_private, src_ipv4), 64u);
-	EXPECT_EQ(offsetof(packet_private, dst_ipv4), 68u);
-	EXPECT_EQ(offsetof(packet_private, src_port), 72u);
-	EXPECT_EQ(offsetof(packet_private, dst_port), 74u);
-	EXPECT_EQ(offsetof(packet_private, eth_type), 76u);
-	EXPECT_EQ(offsetof(packet_private, ip_offset), 78u);
-	EXPECT_EQ(offsetof(packet_private, l4_offset), 80u);
-	EXPECT_EQ(offsetof(packet_private, ip_header_len), 82u);
-	EXPECT_EQ(offsetof(packet_private, ip_total_len), 84u);
-	EXPECT_EQ(offsetof(packet_private, l4_proto), 86u);
-	EXPECT_EQ(offsetof(packet_private, dscp), 87u);
-	EXPECT_EQ(offsetof(packet_private, padding_parsed), 88u);
-	EXPECT_EQ(sizeof(packet_storage_descriptor), 64u);
+	EXPECT_EQ(offsetof(packet_private, src_ipv4), 52u);
+	EXPECT_EQ(offsetof(packet_private, dst_ipv4), 56u);
+	EXPECT_EQ(offsetof(packet_private, src_port), 60u);
+	EXPECT_EQ(offsetof(packet_private, dst_port), 62u);
+	EXPECT_EQ(offsetof(packet_private, ip_offset), 64u);
+	EXPECT_EQ(offsetof(packet_private, l4_offset), 66u);
+	EXPECT_EQ(offsetof(packet_private, l4_proto), 68u);
+	EXPECT_EQ(offsetof(packet_private, dscp), 69u);
+	EXPECT_EQ(offsetof(packet_private, padding_parsed), 70u);
+	EXPECT_EQ(sizeof(packet_storage_descriptor), 48u);
 	EXPECT_EQ(offsetof(packet_storage_descriptor, native_handle), 0u);
 	EXPECT_EQ(offsetof(packet_storage_descriptor, data), 8u);
 	EXPECT_EQ(offsetof(packet_storage_descriptor, operations), 16u);
@@ -97,7 +94,7 @@ TEST(packet_record, layout_and_operation_roles_are_exact)
 	EXPECT_EQ(offsetof(packet_storage_descriptor, segment_count), 38u);
 	EXPECT_EQ(offsetof(packet_storage_descriptor, capabilities), 40u);
 	EXPECT_EQ(offsetof(packet_storage_descriptor, padding), 44u);
-	EXPECT_EQ(sizeof(packet_record), 192u);
+	EXPECT_EQ(sizeof(packet_record), 128u);
 	EXPECT_EQ(alignof(packet_record), 64u);
 	EXPECT_TRUE(std::is_standard_layout_v<packet_record>);
 	EXPECT_TRUE(std::is_trivially_copyable_v<packet_record>);

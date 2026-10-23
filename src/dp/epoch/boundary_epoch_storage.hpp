@@ -42,7 +42,7 @@
 #include "src/dp/epoch/boundary_epoch_receiver_types.hpp"
 #include "src/dp/epoch/boundary_epoch_sender_types.hpp"
 #include "src/dp/epoch/ordered_cut.hpp"
-#include "src/dp/numa_memory.hpp"
+#include "src/dp/numa_layout.hpp"
 #include "src/dp/packet.hpp"
 
 namespace kinetum::dp
@@ -75,6 +75,11 @@ class worker_boundary_sender;
  */
 class boundary_epoch_worker_slab final {
     public:
+	/** @return Borrowed slot-allocation geometry for cold inspection until slab destruction. */
+	[[nodiscard]] const numa_memory_region &storage_region() const noexcept
+	{
+		return region_;
+	}
 	/**
 	 * @brief Compute the exact usable bytes for one worker slab.
 	 *
@@ -151,8 +156,8 @@ class boundary_epoch_worker_slab final {
 
 	/** @brief Sender-only hot state occupying one private cache line. */
 	struct alignas(kinetum::algo::CACHE_LINE_SIZE) sender_owner_state {
-		successful_data_sequence data_enqueued;	 ///< Successful DATA publications.
-		uint64_t data_backpressure_events{0};	 ///< Full DATA publication attempts.
+		successful_data_sequence data_enqueued;	 ///< Successful DATA packet transfers.
+		uint64_t data_backpressure_events{0};	 ///< Rejected DATA packet attempts, including retries.
 		boundary_epoch_cut pending_cut{};	 ///< Exact unpublished CUT when present.
 		bool cut_pending{false};		 ///< Whether pending_cut is authoritative.
 		bool closed{false};			 ///< Sole-producer process-shutdown state.
@@ -184,10 +189,10 @@ class boundary_epoch_worker_slab final {
 
 	/** @brief Receiver-only hot state occupying one private cache line. */
 	struct alignas(kinetum::algo::CACHE_LINE_SIZE) receiver_owner_state {
-		successful_data_sequence data_dequeued;	     ///< Credit-completed DATA transfers.
-		boundary_epoch_ack pending_ack{};	     ///< Exact unpublished ACK when present.
-		packet_record *unsequenced_record{nullptr};  ///< Borrowed exact completion identity.
-		bool ack_pending{false};		     ///< Whether pending_ack is authoritative.
+		successful_data_sequence data_dequeued;	 ///< Credit-completed DATA transfers.
+		boundary_epoch_ack pending_ack{};	 ///< Exact unpublished ACK when present.
+		bool receive_in_progress{false};	 ///< One bounded receive owns admission and completion.
+		bool ack_pending{false};		 ///< Whether pending_ack is authoritative.
 	};
 
 	/**
@@ -271,11 +276,11 @@ class boundary_epoch_worker_slab final {
 
 	/** @brief Checked offsets for every array in one mapping. */
 	struct storage_layout {
+		numa_layout allocation;			///< Sole checked allocation geometry.
 		std::size_t sender_slots_offset{0};	///< First sender-slot byte.
 		std::size_t receiver_slots_offset{0};	///< First receiver-slot byte.
 		std::size_t sender_claims_offset{0};	///< First sender-claim byte.
 		std::size_t receiver_claims_offset{0};	///< First receiver-claim byte.
-		std::size_t storage_bytes{0};		///< Complete usable extent.
 	};
 
 	static_assert(sizeof(sender_owner_state) == kinetum::algo::CACHE_LINE_SIZE,

@@ -26,14 +26,13 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <memory>
 #include <optional>
 #include <span>
-#include <vector>
 
 #include <kinetum/kinetum_sdk.h>
 
 #include "src/common/status_or.hpp"
+#include "src/dp/numa_layout.hpp"
 
 namespace kinetum::dp
 {
@@ -137,7 +136,7 @@ class worker_module_health final {
 	 * @param ledger Sole unbound worker epoch-credit authority.
 	 * @return Complete unbound owner or exact admission/allocation failure.
 	 */
-	[[nodiscard]] static common::status_or<std::unique_ptr<worker_module_health>>
+	[[nodiscard]] static common::status_or<numa_owner<worker_module_health>>
 	create(uint32_t worker_index, uint64_t runtime_generation, uint64_t callback_budget_ns,
 	       std::span<const worker_module_health_binding> bindings, worker_epoch_ledger &ledger);
 
@@ -199,7 +198,7 @@ class worker_module_health final {
 	struct owner_identity {
 		uint32_t worker_index{0};	 ///< Exact compact worker identity.
 		uint64_t runtime_generation{0};	 ///< Exact materialized generation.
-		uint64_t callback_budget_ns{0};	 ///< Plan-authored callback budget.
+		uint64_t callback_budget_ns{0};	 ///< Exact compiled callback budget.
 	};
 
 	/**
@@ -208,7 +207,7 @@ class worker_module_health final {
 	 * @param bindings Complete claimed stage/context rows.
 	 * @param ledger Sole worker epoch-credit authority.
 	 */
-	worker_module_health(owner_identity identity, std::vector<worker_module_health_binding> bindings,
+	worker_module_health(owner_identity identity, std::span<const worker_module_health_binding> bindings,
 			     worker_epoch_ledger &ledger) noexcept;
 	/**
 	 * @brief Invoke one exact callback behind a validated live claim.
@@ -228,15 +227,15 @@ class worker_module_health final {
 	 */
 	[[nodiscard]] const worker_module_health_binding &binding_(std::size_t row_ordinal) const noexcept;
 
-	uint32_t worker_index_{0};			      ///< Exact compact worker identity.
-	uint64_t runtime_generation_{0};		      ///< Exact materialized generation.
-	uint64_t callback_budget_ns_{0};		      ///< Plan-authored callback budget.
-	std::vector<worker_module_health_binding> bindings_;  ///< Immutable stage-ordered rows.
-	worker_epoch_ledger *ledger_{nullptr};		      ///< Sole worker credit authority.
-	bool bound_{false};				      ///< Whether fixed Bootstrap established ownership.
-	uint64_t next_claim_id_{1};			      ///< Never-reused invocation sequence.
-	uint64_t live_claim_id_{0};			      ///< Nonzero while one callback is unresolved.
-	std::size_t live_row_ordinal_{0};		      ///< Exact live binding ordinal.
+	uint32_t worker_index_{0};				  ///< Exact compact worker identity.
+	uint64_t runtime_generation_{0};			  ///< Exact materialized generation.
+	uint64_t callback_budget_ns_{0};			  ///< Exact compiled callback budget.
+	std::span<const worker_module_health_binding> bindings_;  ///< Immutable rows in the exact worker mapping.
+	worker_epoch_ledger *ledger_{nullptr};			  ///< Sole worker credit authority.
+	bool bound_{false};					  ///< Whether fixed Bootstrap established ownership.
+	uint64_t next_claim_id_{1};				  ///< Never-reused invocation sequence.
+	uint64_t live_claim_id_{0};				  ///< Nonzero while one callback is unresolved.
+	std::size_t live_row_ordinal_{0};			  ///< Exact live binding ordinal.
 };
 
 }  // namespace kinetum::dp::module

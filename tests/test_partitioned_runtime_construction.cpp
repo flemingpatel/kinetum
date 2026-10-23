@@ -26,6 +26,7 @@
 #include <filesystem>
 #include <memory>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -51,9 +52,10 @@
 #include "tests/test_dp_helpers.hpp"
 #include "tests/packet_runtime_test_fixture.hpp"
 
-#if !defined(KINETUM_TEST_MODULE_PATH) || !defined(KINETUM_TEST_ACTIVE_MODULE_PATH) || \
-	!defined(KINETUM_TEST_ACTIVE_ASYNC_MODULE_PATH)
-#error "Exact passive, active, and tracked-async test-module paths are required"
+#if !defined(KINETUM_TEST_MODULE_PATH) || !defined(KINETUM_TEST_ACTIVE_MODULE_PATH) ||                         \
+	!defined(KINETUM_TEST_ACTIVE_ASYNC_MODULE_PATH) || !defined(KINETUM_TEST_STAGING_BURST_MODULE_PATH) || \
+	!defined(KINETUM_TEST_PARTIAL_TRANSITION_COMPONENT_PATH)
+#error "Exact packet-runtime module and provider fixture paths are required"
 #endif
 
 namespace kinetum::dp
@@ -1288,6 +1290,194 @@ TEST(packet_runtime_construction, multi_region_e2e_epoch_transition)
 		expect_coordinator_idle(owner->runtime(), target_epoch, static_cast<uint32_t>(target_epoch - 1u),
 					epoch_transition_outcome::COMPLETE);
 		ASSERT_NO_FATAL_FAILURE(expect_fanout_forwarding(*owner, target_epoch));
+	}
+}
+
+/** @brief Varying SDK output extents preserve order through full and refused/partial zero-copy handoffs. */
+TEST(packet_runtime_construction, boundary_prefixes_preserve_full_and_short_transition_order)
+{
+	for (const bool partial_transition : {false, true}) {
+		SCOPED_TRACE(partial_transition);
+		kinetum::test::packet_runtime_test_module_intent intent{
+			.module_id = "kinetum.test_staging_burst",
+			.canonical_path = KINETUM_TEST_STAGING_BURST_MODULE_PATH,
+			.config_blob = {},
+			.context_memory_capacity_bytes = TEST_MODULE_CONTEXT_CAPACITY_BYTES,
+			.epoch_arena_capacity_bytes = TEST_MODULE_EPOCH_CAPACITY_BYTES,
+			.execution_mode = kinetum::axiom::v1::EXECUTION_MODE_ACTIVE,
+			.trigger_mask = static_cast<uint32_t>(kinetum::axiom::v1::TRIGGER_MODE_LOOP),
+		};
+		auto pipeline = kinetum::test::packet_runtime_fixture_detail::make_pipeline(intent.module_id);
+		for (auto &stage : *pipeline.mutable_stages()) {
+			stage.set_preferred_region(stage.stage_id() == "tx" ? 1 : 0);
+			if (stage.stage_id() == "module") {
+				stage.set_execution_mode(kinetum::axiom::v1::EXECUTION_MODE_ACTIVE);
+				stage.set_trigger_mask(intent.trigger_mask);
+			}
+		}
+		auto bindings = kinetum::test::make_udp_test_deployment_bindings(pipeline);
+		kinetum::test::add_zero_copy_stage_transition_binding(bindings, "module_to_tx_share", "module",
+								      "lane_0", "tx", "lane_0", "storage_host_0");
+		auto owner_or = packet_runtime_test_owner::create(
+			std::move(intent), std::move(pipeline), bindings, 2u,
+			partial_transition ? KINETUM_TEST_PARTIAL_TRANSITION_COMPONENT_PATH :
+					     KINETUM_PROVIDER_HOST_COMPONENT_PATH);
+		ASSERT_TRUE(owner_or.is_ok()) << owner_or.error().message();
+		auto owner = std::move(owner_or).value();
+		ASSERT_TRUE(owner->bootstrap().is_ok());
+		for (uint8_t index = 0u; index < 17u; ++index) {
+			auto received = owner->receive_packet_from_tx(64u, TEST_PACKET_TIMEOUT_MS);
+			ASSERT_TRUE(received.is_ok()) << received.error().message();
+			EXPECT_EQ(received.value(), (std::vector<uint8_t>{index}));
+		}
+		const auto duplicate = owner->receive_packet_from_tx(64u, TEST_NO_PACKET_TIMEOUT_MS);
+		ASSERT_FALSE(duplicate.is_ok());
+		EXPECT_EQ(duplicate.error().code(), status_code::UNAVAILABLE);
+		expect_bootstrap_worker_ownership(owner->runtime(), owner->bootstrap_request().active_epoch());
+		if (!partial_transition) {
+			continue;
+		}
+		// The component reports only after joined-worker teardown. The origin
+		// callback supplies 8, 1 and 8 records together, so this coverage does not rely
+		// on network timing to produce a nonempty accepted prefix and a suffix.
+		::testing::internal::CaptureStderr();
+		owner.reset();
+		const std::string trace = ::testing::internal::GetCapturedStderr();
+		std::istringstream lines(trace);
+		std::string line;
+		std::size_t observations = 0u;
+		while (std::getline(lines, line)) {
+			std::istringstream observation(line);
+			std::string marker;
+			observation >> marker;
+			if (marker != "kinetum-test-partial") {
+				continue;
+			}
+			unsigned transition = 0u;
+			uint64_t refused = 0u;
+			uint64_t partial = 0u;
+			uint64_t accepted = 0u;
+			unsigned maximum = 0u;
+			ASSERT_TRUE(static_cast<bool>(observation >> transition >> refused >> partial >> accepted >>
+						      maximum))
+				<< line;
+			EXPECT_TRUE((observation >> std::ws).eof()) << line;
+			EXPECT_EQ(transition, 0u);
+			EXPECT_EQ(refused, 1u);
+			EXPECT_EQ(partial, 16u);
+			EXPECT_EQ(accepted, 17u);
+			EXPECT_EQ(maximum, 17u);
+			++observations;
+		}
+		EXPECT_EQ(observations, 1u) << trace;
+	}
+}
+
+/** @brief Converted boundary sends retain their source stage while staging in the destination storage domain. */
+TEST(packet_runtime_construction, copied_boundary_records_use_the_destination_domain_continuation)
+{
+	auto pipeline = fanout_pipeline();
+	for (auto &stage : *pipeline.mutable_stages()) {
+		stage.set_preferred_region(stage.stage_id() == "tx" ? 1 : 0);
+	}
+	auto bindings = kinetum::test::make_udp_test_deployment_bindings(pipeline);
+	const auto original = bindings.packet_storage_domains(0);
+	auto *destination = bindings.add_packet_storage_domains();
+	destination->CopyFrom(original);
+	destination->set_storage_domain_id("storage_host_1");
+	for (auto &stream : *bindings.mutable_io_stream_bindings()) {
+		if (stream.direction() == kinetum::gluon::v1::IO_STREAM_DIRECTION_TX) {
+			auto *accepted = stream.mutable_queues(0)->mutable_tx_storage();
+			accepted->clear_storage_domain_ids();
+			accepted->add_storage_domain_ids("storage_host_1");
+		}
+	}
+	for (const char *stage : {"parse_a", "parse_b"}) {
+		auto *copy = bindings.add_storage_transition_bindings();
+		copy->set_transition_id(std::string(stage) + "_to_tx_copy");
+		copy->mutable_from_endpoint()->mutable_stage()->set_logical_stage_id(stage);
+		copy->mutable_from_endpoint()->mutable_stage()->set_lane_id("lane_0");
+		copy->mutable_to_endpoint()->mutable_stage()->set_logical_stage_id("tx");
+		copy->mutable_to_endpoint()->mutable_stage()->set_lane_id("lane_0");
+		copy->set_from_storage_domain_id("storage_host_0");
+		copy->set_to_storage_domain_id("storage_host_1");
+		copy->set_staging_capacity(64u);
+		copy->set_staging_numa_node(0);
+		copy->mutable_configuration()->PackFrom(kinetum::transition::cpu::v1::BoundedCopyConfig{});
+	}
+	auto owner_or = packet_runtime_test_owner::create_with_pipeline(std::move(pipeline), 2u, {}, &bindings);
+	ASSERT_TRUE(owner_or.is_ok()) << owner_or.error().message();
+	auto owner = std::move(owner_or).value();
+	ASSERT_TRUE(owner->bootstrap().is_ok());
+	ASSERT_NO_FATAL_FAILURE(expect_fanout_forwarding(*owner, owner->bootstrap_request().active_epoch()));
+	auto stats = await_packet_telemetry(owner->runtime(), 8u, 16u);
+	ASSERT_TRUE(stats.is_ok()) << stats.error().message();
+	EXPECT_EQ(stats->engine.rx_packets, 8u);
+	EXPECT_EQ(stats->engine.tx_packets, 16u);
+	EXPECT_EQ(stats->engine.dropped_packets, 0u);
+}
+
+/** @brief RX-to-stage and local-stage copies resume exact destination keys without repeating source execution. */
+TEST(packet_runtime_construction, rx_and_local_copies_bind_exact_execution_keys)
+{
+	for (const bool rx_edge : {true, false}) {
+		SCOPED_TRACE(rx_edge);
+		auto pipeline = kinetum::test::packet_runtime_fixture_detail::make_pipeline(std::nullopt);
+		auto bindings = kinetum::test::make_udp_test_deployment_bindings(pipeline);
+		const auto original = bindings.packet_storage_domains(0);
+		auto *destination = bindings.add_packet_storage_domains();
+		destination->CopyFrom(original);
+		destination->set_storage_domain_id("storage_host_1");
+		for (auto &stream : *bindings.mutable_io_stream_bindings()) {
+			if (stream.direction() == kinetum::gluon::v1::IO_STREAM_DIRECTION_TX) {
+				auto *accepted = stream.mutable_queues(0)->mutable_tx_storage();
+				accepted->clear_storage_domain_ids();
+				accepted->add_storage_domain_ids("storage_host_1");
+			}
+		}
+		auto *copy = bindings.add_storage_transition_bindings();
+		copy->set_transition_id("input_storage_copy");
+		if (rx_edge) {
+			auto *input = copy->mutable_from_endpoint()->mutable_io();
+			input->set_logical_name("wan0");
+			input->set_direction(kinetum::gluon::v1::IO_STREAM_DIRECTION_RX);
+			input->set_driver_queue_id(0u);
+			copy->mutable_to_endpoint()->mutable_stage()->set_logical_stage_id("rx");
+		} else {
+			copy->mutable_from_endpoint()->mutable_stage()->set_logical_stage_id("rx");
+			copy->mutable_from_endpoint()->mutable_stage()->set_lane_id("lane_0");
+			copy->mutable_to_endpoint()->mutable_stage()->set_logical_stage_id("parse");
+		}
+		copy->mutable_to_endpoint()->mutable_stage()->set_lane_id("lane_0");
+		copy->set_from_storage_domain_id("storage_host_0");
+		copy->set_to_storage_domain_id("storage_host_1");
+		copy->set_staging_capacity(64u);
+		copy->set_staging_numa_node(0);
+		copy->mutable_configuration()->PackFrom(kinetum::transition::cpu::v1::BoundedCopyConfig{});
+		auto owner_or = packet_runtime_test_owner::create_with_pipeline(std::move(pipeline), 1u, {}, &bindings);
+		ASSERT_TRUE(owner_or.is_ok()) << owner_or.error().message();
+		auto owner = std::move(owner_or).value();
+		ASSERT_TRUE(owner->bootstrap().is_ok());
+		const auto packet =
+			build_eth_ipv4_udp(UINT32_C(0x0a000001), UINT32_C(0x08080808), 1234, 53, 10, {UINT8_C(0x51)});
+		ASSERT_TRUE(owner->send_packet_to_rx(packet).is_ok());
+		auto received = owner->receive_packet_from_tx(2048u, TEST_PACKET_TIMEOUT_MS);
+		ASSERT_TRUE(received.is_ok()) << received.error().message();
+		EXPECT_EQ(received.value(), packet);
+		const auto duplicate = owner->receive_packet_from_tx(2048u, TEST_NO_PACKET_TIMEOUT_MS);
+		ASSERT_FALSE(duplicate.is_ok());
+		EXPECT_EQ(duplicate.error().code(), status_code::UNAVAILABLE);
+		auto stats = await_packet_telemetry(owner->runtime(), 1u, 1u);
+		ASSERT_TRUE(stats.is_ok()) << stats.error().message();
+		EXPECT_EQ(stats->engine.rx_packets, 1u);
+		EXPECT_EQ(stats->engine.tx_packets, 1u);
+		EXPECT_EQ(stats->engine.dropped_packets, 0u);
+		for (const auto &stage : stats->stages) {
+			EXPECT_EQ(stage.in_packets, 1u);
+			EXPECT_EQ(stage.out_packets, 1u);
+			EXPECT_EQ(stage.dropped_packets, 0u);
+		}
+		expect_bootstrap_worker_ownership(owner->runtime(), owner->bootstrap_request().active_epoch());
 	}
 }
 

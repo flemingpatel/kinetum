@@ -24,7 +24,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
-#include <optional>
+#include <span>
 
 #include <kinetum/algo/queue.hpp>
 #include "src/common/status_or.hpp"
@@ -42,8 +42,8 @@ struct fixed_packet_pool_options {
 	uint32_t alignment_bytes{0};			///< Exact record and packet-data alignment.
 	uint16_t domain_index{INVALID_STORAGE_DOMAIN};	///< Compiled storage-domain index.
 	uint32_t generation{1};				///< Nonzero materialization generation.
-	/** Exact Linux memory node for record/payload backing; absent only in provider-free mechanism tests. */
-	std::optional<int32_t> host_numa_node;
+	/** Exact Linux memory node for queue controls, cells, records and payload; negative rejects. */
+	int32_t host_numa_node{-1};
 };
 
 /** @brief Fixed, concurrently reclaimable packet-record and payload pool. */
@@ -100,23 +100,26 @@ class fixed_packet_pool final {
 	/** @return Approximate concurrent free-record count, saturated to uint32_t. */
 	[[nodiscard]] uint32_t available_approx() const noexcept;
 
+	/** @return Complete live queue/record/payload mapping for cold placement inspection. */
+	[[nodiscard]] const numa_memory_region &storage_region() const noexcept
+	{
+		return backing_;
+	}
+
     private:
+	/** @brief Cold checked geometry; all byte offsets are computed by numa_layout. */
+	struct storage_layout;
+	/** @brief Caller-storage free-credit publication mechanism. */
+	using free_queue = algo::mpmc_queue_view<packet_record *>;
 	/**
-	 * @brief Allocate the already validated pool shape and seed its free queue.
+	 * @brief Construct the admitted pool in its complete prefaulted mapping.
 	 *
 	 * @param options Exact storage-domain shape.
-	 * @param free_queue_capacity Power-of-two physical free-queue capacity.
+	 * @param layout Checked queue, record and payload geometry.
 	 * @param backing Complete aligned and prefaulted memory-region owner.
-	 * @param record_stride Aligned bytes between record objects.
-	 * @param payload_storage_offset Bytes from backing_storage to the first payload slot.
-	 * @param payload_stride Cache-line-isolated bytes between payload slots.
-	 * @param payload_data_offset Bytes from each backing slot to aligned packet data.
-	 * @param free_records Preallocated bounded free-credit queue.
 	 */
-	fixed_packet_pool(fixed_packet_pool_options options, std::size_t free_queue_capacity,
-			  numa_memory_region backing, std::size_t record_stride, std::size_t payload_storage_offset,
-			  std::size_t payload_stride, std::size_t payload_data_offset,
-			  std::unique_ptr<kinetum::algo::mpmc_queue_dynamic<packet_record *>> free_records) noexcept;
+	fixed_packet_pool(fixed_packet_pool_options options, const storage_layout &layout,
+			  numa_memory_region backing) noexcept;
 
 	/**
 	 * @brief Acquire through the exact C storage-domain operation table.
@@ -182,16 +185,16 @@ class fixed_packet_pool final {
 	 */
 	[[nodiscard]] packet_record *record_for_index_(std::size_t index) const noexcept;
 
-	fixed_packet_pool_options options_;		 ///< Immutable materialized pool shape.
-	numa_memory_region backing_;			 ///< Complete aligned and prefaulted backing owner.
-	std::size_t record_stride_{0};			 ///< Exact bytes between aligned record objects.
-	std::size_t payload_stride_{0};			 ///< Cache-line-isolated payload-slot stride.
-	std::size_t payload_data_offset_{0};		 ///< Offset preserving headroom before aligned data.
-	packet_storage_domain_operations operations_{};	 ///< Immutable published storage table.
-	uint8_t *record_storage_{nullptr};		 ///< Aligned backing for placement-constructed records.
-	uint8_t *payload_storage_{nullptr};		 ///< Aligned backing for exact payload slots.
-	/** Lock-free bounded free-record credits, allocated completely at construction. */
-	std::unique_ptr<kinetum::algo::mpmc_queue_dynamic<packet_record *>> free_records_;
+	fixed_packet_pool_options options_;		  ///< Immutable materialized pool shape.
+	numa_memory_region backing_;			  ///< Complete aligned and prefaulted backing owner.
+	std::size_t record_stride_{0};			  ///< Exact bytes between aligned record objects.
+	std::size_t payload_stride_{0};			  ///< Cache-line-isolated payload-slot stride.
+	std::size_t payload_data_offset_{0};		  ///< Offset preserving headroom before aligned data.
+	packet_storage_domain_operations operations_{};	  ///< Immutable published storage table.
+	uint8_t *record_storage_{nullptr};		  ///< Aligned backing for placement-constructed records.
+	uint8_t *payload_storage_{nullptr};		  ///< Aligned backing for exact payload slots.
+	free_queue *free_records_{nullptr};		  ///< Mutable queue control placed in backing_.
+	std::span<free_queue::storage_type> free_cells_;  ///< Queue cells sharing the same exact node and lifetime.
 };
 
 }  // namespace kinetum::dp

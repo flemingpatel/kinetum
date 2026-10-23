@@ -101,12 +101,12 @@ constexpr auto LIFECYCLE_CANCELLATION_OBSERVATION_INTERVAL = std::chrono::millis
 
 /** @brief Own one atomically admitted module-image and context generation. */
 struct module_manager::admitted_module_generation {
-	std::vector<module_image_spec> image_specs;			 ///< Canonical exact-retry authority.
-	std::vector<module_context_spec> context_specs;			 ///< Canonical exact-retry authority.
-	lifecycle_memory_provider *memory_provider{nullptr};		 ///< Borrowed generation-lifetime authority.
-	lifecycle_log_provider *log_provider{nullptr};			 ///< Borrowed generation-lifetime authority.
-	std::vector<std::unique_ptr<loaded_module_image>> images;	 ///< Stable image owners.
-	std::vector<std::unique_ptr<module_context_instance>> contexts;	 ///< Stable context owners.
+	std::vector<module_image_spec> image_specs;		    ///< Canonical exact-retry authority.
+	std::vector<module_context_spec> context_specs;		    ///< Canonical exact-retry authority.
+	lifecycle_memory_provider *memory_provider{nullptr};	    ///< Borrowed generation-lifetime authority.
+	lifecycle_log_provider *log_provider{nullptr};		    ///< Borrowed generation-lifetime authority.
+	std::vector<std::unique_ptr<loaded_module_image>> images;   ///< Stable image owners.
+	std::vector<numa_owner<module_context_instance>> contexts;  ///< Stable context owners.
 	std::unordered_map<std::string, loaded_module_image *> image_by_id;	   ///< Exact image index.
 	std::unordered_map<std::string, module_context_instance *> context_by_id;  ///< Exact context index.
 	std::unordered_map<uint32_t, module_context_instance *> context_by_index;  ///< Compact context index.
@@ -197,7 +197,7 @@ module_manager::~module_manager()
 	}
 }
 
-void module_manager::destroy_staged_generation_(std::vector<std::unique_ptr<module_context_instance>> &contexts,
+void module_manager::destroy_staged_generation_(std::vector<numa_owner<module_context_instance>> &contexts,
 						std::vector<std::unique_ptr<loaded_module_image>> &images) noexcept
 {
 	lifecycle_operation_control finish_control(std::chrono::steady_clock::time_point::max());
@@ -284,7 +284,7 @@ status module_manager::admit_generation(std::vector<module_image_spec> images,
 	};
 
 	std::vector<std::unique_ptr<loaded_module_image>> staged_images;
-	std::vector<std::unique_ptr<module_context_instance>> staged_contexts;
+	std::vector<numa_owner<module_context_instance>> staged_contexts;
 	try {
 		staged_images.reserve(images.size());
 		staged_contexts.reserve(contexts.size());
@@ -459,7 +459,14 @@ status module_manager::admit_generation(std::vector<module_image_spec> images,
 		}
 
 		for (const auto &spec : contexts) {
-			auto context = std::make_unique<module_context_instance>();
+			auto context_or =
+				make_numa_owner<module_context_instance>(spec.numa_node, [](void *storage) noexcept {
+					return new (storage) module_context_instance();
+				});
+			if (!context_or.is_ok()) {
+				return fail_staged(context_or.error());
+			}
+			auto context = std::move(context_or).value();
 			context->context_instance_id = spec.context_instance_id;
 			context->context_index = spec.context_index;
 			context->image = staged_images[image_position_by_id.at(spec.module_id)].get();

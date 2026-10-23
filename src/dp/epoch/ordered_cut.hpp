@@ -201,7 +201,7 @@ enum class sequence_cut_progress : uint8_t {
 }
 
 /**
- * @brief Single-owner count of successful DATA-ring operations.
+ * @brief Single-owner count of successful DATA packet transfers.
  *
  * Failed enqueue/dequeue attempts do not call record_success() and therefore
  * do not consume sequence values. UINT64_MAX is permanently reserved so wrap
@@ -226,31 +226,33 @@ class successful_data_sequence {
 	successful_data_sequence &operator=(successful_data_sequence &&) = delete;
 
 	/**
-	 * @brief Determine whether a value can record another success without wrap.
+	 * @brief Determine whether an exact transfer count is representable without wrap.
 	 *
 	 * @param current Existing successful-operation count.
-	 * @return true when current can advance by one and remain below UINT64_MAX.
+	 * @param count Number of packet transfers; one for a scalar operation.
+	 * @return true when the complete increment remains below UINT64_MAX.
 	 */
-	[[nodiscard]] static constexpr bool can_advance(uint64_t current) noexcept
+	[[nodiscard]] static constexpr bool can_advance(uint64_t current, uint64_t count = 1u) noexcept
 	{
-		return current < MAX_VALUE;
+		return current <= MAX_VALUE && count <= MAX_VALUE - current;
 	}
 
 	/**
-	 * @brief Record one successful DATA-ring operation.
+	 * @brief Record an exact successful DATA packet prefix.
 	 *
 	 * The caller invokes this only after queue ownership has transferred
 	 * successfully. Failure leaves the sequence unchanged and requires the
 	 * owning protocol endpoint to fail closed.
 	 *
-	 * @return true when the sequence advanced; false at the wrap guard.
+	 * @param count Completed packet transfers; zero leaves the value unchanged.
+	 * @return true for a representable increment; false before mutation at the wrap guard.
 	 */
-	[[nodiscard]] bool record_success() noexcept
+	[[nodiscard]] bool record_success(uint64_t count = 1u) noexcept
 	{
-		if (!can_advance(value_)) {
+		if (!can_advance(value_, count)) {
 			return false;
 		}
-		++value_;
+		value_ += count;
 		return true;
 	}
 

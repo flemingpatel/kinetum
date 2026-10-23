@@ -37,6 +37,16 @@ namespace kinetum::dp
 /** @brief Exact bidirectional bank-token transport for one packet worker. */
 class worker_telemetry_channel final {
     public:
+	/** @return Borrowed coordinator-poller allocation for cold inspection until channel destruction. */
+	[[nodiscard]] const numa_memory_region &completed_storage_region() const noexcept
+	{
+		return completed_.get_deleter().region;
+	}
+	/** @return Borrowed worker-poller allocation for cold inspection until channel destruction. */
+	[[nodiscard]] const numa_memory_region &returned_storage_region() const noexcept
+	{
+		return returned_.get_deleter().region;
+	}
 	/**
 	 * @brief Derive the exact physical capacity for one worker.
 	 * @param module_context_count Number of module-bank owners on the worker.
@@ -110,13 +120,13 @@ class worker_telemetry_channel final {
 	 * @param returned Worker-poller cleared-bank ring.
 	 */
 	worker_telemetry_channel(uint32_t worker_index, std::size_t capacity,
-				 std::unique_ptr<numa_spsc_ring<runtime_telemetry_bank_token>> completed,
-				 std::unique_ptr<numa_spsc_ring<runtime_telemetry_bank_token>> returned) noexcept;
+				 numa_owner<numa_spsc_ring<runtime_telemetry_bank_token>> completed,
+				 numa_owner<numa_spsc_ring<runtime_telemetry_bank_token>> returned) noexcept;
 
 	uint32_t worker_index_{0};  ///< Exact compact worker identity.
 	std::size_t capacity_{0};   ///< Exact derived capacity in each direction.
-	std::unique_ptr<numa_spsc_ring<runtime_telemetry_bank_token>> completed_;  ///< Coordinator-poller ring.
-	std::unique_ptr<numa_spsc_ring<runtime_telemetry_bank_token>> returned_;   ///< Worker-poller ring.
+	numa_owner<numa_spsc_ring<runtime_telemetry_bank_token>> completed_;  ///< Coordinator-poller ring.
+	numa_owner<numa_spsc_ring<runtime_telemetry_bank_token>> returned_;   ///< Worker-poller ring.
 };
 
 }  // namespace kinetum::dp

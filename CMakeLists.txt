@@ -970,6 +970,7 @@ add_library(kinetum_packet_runtime STATIC
   src/dp/epoch/epoch_protocol_fault.cpp
   src/dp/epoch/epoch_transition_preparation.cpp
   src/dp/epoch/epoch_transition_staging.cpp
+  src/dp/worker_packet_staging.cpp
   src/dp/epoch/frozen_transition_participants.cpp
   src/dp/epoch/worker_boundary_receiver.cpp
   src/dp/epoch/worker_boundary_sender.cpp
@@ -1280,6 +1281,27 @@ if(KINETUM_ENABLE_TESTS)
     OUTPUT_NAME "kinetum_test_provider_component_cpp"
   )
 
+  # The test decorator uses the unchanged host factories through a private
+  # query name. The production host target and its ABI remain unchanged.
+  add_library(kinetum_test_partial_host_base OBJECT
+    src/provider/components/host/host_component.cpp
+  )
+  kinetum_configure_owned_target(kinetum_test_partial_host_base)
+  kinetum_configure_provider_component_input_target(kinetum_test_partial_host_base)
+  target_link_libraries(kinetum_test_partial_host_base PRIVATE kinetum_provider_component_abi)
+  target_compile_definitions(kinetum_test_partial_host_base PRIVATE
+    kinetum_provider_component_query=kinetum_test_host_component_query
+  )
+  add_library(kinetum_test_partial_transition_component SHARED
+    tests/provider_components/test_partial_transition_component.cpp
+  )
+  kinetum_configure_owned_target(kinetum_test_partial_transition_component)
+  kinetum_configure_provider_component_target(kinetum_test_partial_transition_component)
+  target_link_libraries(kinetum_test_partial_transition_component PRIVATE
+    kinetum_test_partial_host_base
+    kinetum_fixed_packet_pool
+  )
+
   # One image owns two canonically ordered rows so descriptor admission and
   # requested-only publication execute their real multi-contract paths.
   kinetum_add_test_provider_component(
@@ -1417,6 +1439,12 @@ if(KINETUM_ENABLE_TESTS)
     OUTPUT_NAME "kinetum_test_active_module"
   )
   set(KINETUM_TEST_ACTIVE_MODULE_PATH "$<TARGET_FILE:kinetum_test_active_module>")
+
+  add_library(kinetum_test_staging_burst_module SHARED
+    tests/test_modules/test_staging_burst_module.cpp
+  )
+  kinetum_configure_owned_target(kinetum_test_staging_burst_module)
+  kinetum_configure_module_target(kinetum_test_staging_burst_module)
 
   # ---- Test tracked-async active module ----
   add_library(kinetum_test_active_async_module SHARED
@@ -1595,6 +1623,9 @@ if(KINETUM_ENABLE_TESTS)
     tests/test_worker_epoch_ledger.cpp
     tests/test_worker_runtime_telemetry.cpp
     tests/test_epoch_transition_staging.cpp
+    tests/test_worker_packet_staging.cpp
+    tests/test_numa_layout.cpp
+    tests/test_worker_numa_placement.cpp
     tests/test_region_worker_launcher.cpp
     tests/test_thread_affinity.cpp
     tests/test_nat44_table.cpp
@@ -1668,6 +1699,7 @@ if(KINETUM_ENABLE_TESTS)
   target_compile_definitions(kinetum_tests PRIVATE
     KINETUM_TEST_MODULE_PATH="${KINETUM_TEST_MODULE_PATH}"
     KINETUM_TEST_ACTIVE_MODULE_PATH="${KINETUM_TEST_ACTIVE_MODULE_PATH}"
+    KINETUM_TEST_STAGING_BURST_MODULE_PATH="$<TARGET_FILE:kinetum_test_staging_burst_module>"
     KINETUM_TEST_ACTIVE_ASYNC_MODULE_PATH="${KINETUM_TEST_ACTIVE_ASYNC_MODULE_PATH}"
     KINETUM_TEST_SERIALIZED_MODULE_PATH="${KINETUM_TEST_SERIALIZED_MODULE_PATH}"
     KINETUM_TEST_OLDER_ABI_MODULE_PATH="${KINETUM_TEST_OLDER_ABI_MODULE_PATH}"
@@ -1681,6 +1713,7 @@ if(KINETUM_ENABLE_TESTS)
     KINETUM_TEST_PROVIDER_COMPONENT_PATH="$<TARGET_FILE:kinetum_test_provider_component>"
     KINETUM_TEST_PROVIDER_HOST_PROOF_FAILURE_PATH="$<TARGET_FILE:kinetum_test_provider_component_host_proof_failure>"
     KINETUM_TEST_PROVIDER_COMPONENT_CPP_PATH="$<TARGET_FILE:kinetum_test_provider_component_cpp>"
+    KINETUM_TEST_PARTIAL_TRANSITION_COMPONENT_PATH="$<TARGET_FILE:kinetum_test_partial_transition_component>"
     KINETUM_TEST_PROVIDER_COMPONENT_MULTI_PATH="$<TARGET_FILE:kinetum_test_provider_component_multi>"
     KINETUM_TEST_PROVIDER_NODELETE_PATH="$<TARGET_FILE:kinetum_test_provider_component_nodelete>"
     KINETUM_TEST_PROVIDER_VERSIONED_PATH="$<TARGET_FILE:kinetum_test_provider_component_versioned>"
@@ -1718,6 +1751,7 @@ if(KINETUM_ENABLE_TESTS)
   add_dependencies(kinetum_tests
     kinetum_test_module
     kinetum_test_active_module
+    kinetum_test_staging_burst_module
     kinetum_test_active_async_module
     kinetum_test_serialized_module
     kinetum_test_older_abi_module
@@ -1728,6 +1762,7 @@ if(KINETUM_ENABLE_TESTS)
     kinetum_test_provider_component
     kinetum_test_provider_component_host_proof_failure
     kinetum_test_provider_component_cpp
+    kinetum_test_partial_transition_component
     kinetum_test_provider_component_multi
     kinetum_test_provider_component_nodelete
     kinetum_test_provider_component_versioned

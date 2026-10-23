@@ -447,8 +447,8 @@ uint64_t nat44_module::do_process(kinetum_batch_t *batch) noexcept
 		uint32_t new_ip = 0;
 		uint16_t new_port = 0;
 
-		// RX stamps the monotonic packet time once. Reusing that authority avoids
-		// a clock read in module code and preserves arrival-time ordering.
+		// Reuse the packet-origin timestamp without reading a module clock.
+		// Session activity retains its maximum; different inputs need not arrive in time order.
 		const uint64_t packet_time_ns = KINETUM_PKT_TS(batch, i);
 		const bool translated = sessions.translate(packet_time_ns, pools, outbound, proto, src_ip, src_port,
 							   dst_ip, dst_port, &new_ip, &new_port);

@@ -42,6 +42,7 @@
 #include "src/dp/module/module_manager.hpp"
 #include "src/dp/packet.hpp"
 #include "src/dp/worker_telemetry_channel.hpp"
+#include "tests/numa_test_support.hpp"
 
 namespace kinetum::test
 {
@@ -180,12 +181,13 @@ class exact_module_test_context {
 	 * @param context_index Exact executable context index.
 	 * @param stage_instance_index Exact telemetry stage identity, or UINT32_MAX
 	 *        to use @p context_index for narrow component fixtures.
+	 * @param placement Exact native CPU/node identity established before construction.
 	 * @return Unique admitted fixture, or the production admission failure.
 	 */
 	[[nodiscard]] static common::status_or<std::unique_ptr<exact_module_test_context>>
 	create(std::string module_id, std::filesystem::path module_path, module_test_resource_contract resources,
 	       std::string context_instance_id = "module@lane_0", uint32_t context_index = 0,
-	       uint32_t stage_instance_index = UINT32_MAX)
+	       uint32_t stage_instance_index = UINT32_MAX, quark::host_cpu placement = required_worker_cpu())
 	{
 		std::unique_ptr<exact_module_test_context> fixture;
 		try {
@@ -198,13 +200,17 @@ class exact_module_test_context {
 		std::vector<dp::module::module_image_spec> images{
 			{module_id, std::move(module_path)},
 		};
+		if (placement.core_id < 0 || placement.numa_node < 0) {
+			return common::status::failed_precondition(
+				"module fixture requires a proved native worker placement");
+		}
 		std::vector<dp::module::module_context_spec> contexts{{
 			.context_instance_id = std::move(context_instance_id),
 			.module_id = module_id,
 			.context_index = context_index,
 			.worker_index = 0,
-			.cpu_core_id = 0,
-			.numa_node = 0,
+			.cpu_core_id = placement.core_id,
+			.numa_node = placement.numa_node,
 			.context_memory_capacity_bytes = resources.context_memory_capacity_bytes,
 			.epoch_arena_capacity_bytes = resources.epoch_arena_capacity_bytes,
 			.module_context_ordinal = 0u,
@@ -221,7 +227,8 @@ class exact_module_test_context {
 			return common::status(common::status_code::INTERNAL_ERROR,
 					      "admitted module fixture lacks an exact context descriptor");
 		}
-		auto channel_or = dp::worker_telemetry_channel::create(0u, 1u, 0, 0);
+		auto channel_or =
+			dp::worker_telemetry_channel::create(0u, 1u, placement.numa_node, placement.numa_node);
 		if (!channel_or.is_ok()) {
 			return channel_or.error();
 		}

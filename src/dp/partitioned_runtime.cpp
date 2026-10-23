@@ -401,7 +401,10 @@ class partitioned_runtime::implementation final {
 		}
 		next_telemetry_service_ = telemetry_deadline.value();
 
-		worker_contexts_ = std::make_unique<worker_lifecycle_context[]>(worker_count);
+		worker_contexts_.reserve(worker_count);
+		for (const auto &kernel : kernels_) {
+			worker_contexts_.push_back(&kernel->lifecycle_record());
+		}
 		worker_count_ = worker_count;
 		auto services = modules_->start_lifecycle_services(*providers_);
 		if (!services.is_ok()) {
@@ -740,7 +743,7 @@ class partitioned_runtime::implementation final {
 			}
 			auto sender_or = worker_boundary_sender::create(static_cast<uint32_t>(worker_index),
 									runtime_generation_, sender_channels,
-									sender_holds);
+									sender_holds, workers[worker_index].numa_node);
 			if (!sender_or.is_ok()) {
 				return sender_or.error();
 			}
@@ -757,7 +760,8 @@ class partitioned_runtime::implementation final {
 				receiver_channels.push_back(boundary_views_[boundary_index]);
 			}
 			auto receiver_or = worker_boundary_receiver::create(static_cast<uint32_t>(worker_index),
-									    runtime_generation_, receiver_channels);
+									    runtime_generation_, receiver_channels,
+									    workers[worker_index].numa_node);
 			if (!receiver_or.is_ok()) {
 				return receiver_or.error();
 			}
@@ -852,6 +856,7 @@ class partitioned_runtime::implementation final {
 		}
 		transition_certificate_.reset();
 		quiescence_domain_.reset();
+		worker_contexts_.clear();
 		kernels_.clear();
 		telemetry_aggregator_.reset();
 		if (modules_ != nullptr && !telemetry_channels_.empty()) {
@@ -867,7 +872,6 @@ class partitioned_runtime::implementation final {
 		boundary_views_.clear();
 		boundaries_.clear();
 		endpoint_slabs_.clear();
-		worker_contexts_.reset();
 		worker_count_ = 0;
 		modules_.reset();
 		providers_.reset();
@@ -1965,14 +1969,14 @@ class partitioned_runtime::implementation final {
 			std::terminate();
 		}
 		worker_commands_->request_stop();
-		request_region_worker_exit(std::span<worker_lifecycle_context>(worker_contexts_.get(), worker_count_));
+		request_region_worker_exit(worker_contexts_);
 		if (telemetry_aggregator_ == nullptr) {
 			std::terminate();
 		}
 		const auto all_workers_exited = [this]() noexcept {
-			return std::all_of(worker_contexts_.get(), worker_contexts_.get() + worker_count_,
-					   [](const worker_lifecycle_context &context) {
-						   return context.get_state() == worker_lifecycle_state::EXITED;
+			return std::all_of(worker_contexts_.begin(), worker_contexts_.end(),
+					   [](const worker_lifecycle_context *context) {
+						   return context->get_state() == worker_lifecycle_state::EXITED;
 					   });
 		};
 		while (!all_workers_exited()) {
@@ -2092,6 +2096,7 @@ class partitioned_runtime::implementation final {
 		telemetry_aggregator_.reset();
 		transition_certificate_.reset();
 		quiescence_domain_.reset();
+		worker_contexts_.clear();
 		kernels_.clear();
 		modules_->unbind_telemetry_channels();
 		worker_telemetry_.clear();
@@ -2104,7 +2109,6 @@ class partitioned_runtime::implementation final {
 		boundary_views_.clear();
 		boundaries_.clear();
 		endpoint_slabs_.clear();
-		worker_contexts_.reset();
 		worker_count_ = 0;
 		modules_.reset();
 		providers_.reset();
@@ -2120,8 +2124,7 @@ class partitioned_runtime::implementation final {
 	{
 		try {
 			region_worker_launch_spec spec{
-				.worker_contexts =
-					std::span<worker_lifecycle_context>(worker_contexts_.get(), worker_count_),
+				.worker_contexts = worker_contexts_,
 				.threads = &worker_threads_,
 				.configure_worker =
 					[this](int worker_id) {
@@ -2232,7 +2235,7 @@ class partitioned_runtime::implementation final {
 	std::unique_ptr<module::module_runtime_generation> modules_;	       ///< Module and lifecycle generation.
 	epoch_protocol_fault_latch protocol_faults_;  ///< Process-generation transition-safety fault authority.
 	std::vector<std::unique_ptr<worker_telemetry_channel>> telemetry_channels_;  ///< Poller-local bank channels.
-	std::vector<std::unique_ptr<worker_runtime_telemetry>> worker_telemetry_;    ///< Exact-NUMA worker banks.
+	std::vector<numa_owner<worker_runtime_telemetry>> worker_telemetry_;	     ///< Exact-NUMA worker banks.
 	std::unique_ptr<runtime_telemetry_aggregator> telemetry_aggregator_;  ///< Sole cold completed-bank merger.
 	std::chrono::steady_clock::duration telemetry_service_interval_{};    ///< Plan-derived cold cadence.
 	std::optional<std::chrono::steady_clock::time_point> next_telemetry_service_;  ///< Next cold service time.
@@ -2240,20 +2243,21 @@ class partitioned_runtime::implementation final {
 	std::unique_ptr<epoch_transition_completion> completion_;    ///< Sole COMMITTING/RETIRING owner.
 	/** Declared before channel borrowers so reverse member destruction retires slabs afterward. */
 	std::vector<std::unique_ptr<boundary_epoch_worker_slab>> endpoint_slabs_;
-	std::vector<std::unique_ptr<boundary_epoch_channel>> boundaries_;  ///< Exact DATA/CUT/ACK owners.
-	std::vector<boundary_epoch_channel *> boundary_views_;		   ///< Compact direct boundary table.
-	std::vector<std::unique_ptr<boundary_future_output_hold>> future_output_holds_;	 ///< Future queues.
-	std::vector<boundary_future_output_hold *> future_output_hold_views_;		 ///< Compact sender table.
-	std::vector<std::unique_ptr<worker_boundary_sender>> boundary_senders_;		 ///< Pre-kernel policy claims.
-	std::vector<std::unique_ptr<worker_boundary_receiver>> boundary_receivers_;  ///< Pre-kernel receiver claims.
-	std::vector<std::unique_ptr<packet_worker_kernel>> kernels_;		     ///< Pre-resolved packet workers.
-	std::unique_ptr<kinetum::algo::quiescence_domain> quiescence_domain_;	     ///< Exact frozen reader domain.
-	std::unique_ptr<epoch_transition_certificate> transition_certificate_;	     ///< Immutable proof graph.
-	std::unique_ptr<worker_lifecycle_context[]> worker_contexts_;		     ///< Dense lifecycle publications.
-	std::size_t worker_count_{0};				 ///< Exact worker array and kernel population.
-	std_thread_worker_launcher worker_launcher_;		 ///< Provider-neutral all-or-none launch gate.
-	std::vector<std::thread> worker_threads_;		 ///< Exact joinable packet-worker owners.
-	runtime_status_publication runtime_status_;		 ///< Sole foreign readiness/epoch observation.
+	std::vector<std::unique_ptr<boundary_epoch_channel>> boundaries_;	    ///< Exact DATA/CUT/ACK owners.
+	std::vector<boundary_epoch_channel *> boundary_views_;			    ///< Compact direct boundary table.
+	std::vector<numa_owner<boundary_future_output_hold>> future_output_holds_;  ///< Future queues.
+	std::vector<boundary_future_output_hold *> future_output_hold_views_;	    ///< Compact sender table.
+	std::vector<numa_owner<worker_boundary_sender>> boundary_senders_;	    ///< Pre-kernel policy claims.
+	std::vector<numa_owner<worker_boundary_receiver>> boundary_receivers_;	    ///< Pre-kernel receiver claims.
+	std::vector<numa_owner<packet_worker_kernel>> kernels_;			    ///< Pre-resolved packet workers.
+	std::unique_ptr<kinetum::algo::quiescence_domain> quiescence_domain_;	    ///< Exact frozen reader domain.
+	std::unique_ptr<epoch_transition_certificate> transition_certificate_;	    ///< Immutable proof graph.
+	std::vector<worker_lifecycle_context *>
+		worker_contexts_;		      ///< Exact ordered borrows into worker-local kernel storage.
+	std::size_t worker_count_{0};		      ///< Exact worker array and kernel population.
+	std_thread_worker_launcher worker_launcher_;  ///< Provider-neutral all-or-none launch gate.
+	std::vector<std::thread> worker_threads_;     ///< Exact joinable packet-worker owners.
+	runtime_status_publication runtime_status_;   ///< Sole foreign readiness/epoch observation.
 	runtime_telemetry_source_owner telemetry_source_owner_;	 ///< Generation-scoped complete source claims.
 	uint64_t runtime_generation_{0};  ///< Exact nonzero provider/runtime generation identity.
 	transaction_command_context *held_prepare_context_{nullptr};   ///< Unresolved original PREPARE producer.

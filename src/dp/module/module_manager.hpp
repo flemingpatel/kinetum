@@ -53,6 +53,7 @@
 #include "src/common/status.hpp"
 #include "src/common/status_or.hpp"
 #include "src/dp/lifecycle/lifecycle_context.hpp"
+#include "src/dp/numa_layout.hpp"
 #include <kinetum/kinetum_sdk.h>
 
 namespace kinetum::dp::module
@@ -214,13 +215,13 @@ struct module_context_instance {
 	/** @brief Destroy only after the exact epoch store has become empty. */
 	~module_context_instance();
 
-	std::string context_instance_id;      ///< Exact executable context identity.
-	uint32_t context_index{0};	      ///< Compiled executable-context index.
-	loaded_module_image *image{nullptr};  ///< Stable owning code image.
-	std::unique_ptr<kinetum::dp::lifecycle::lifecycle_context_owner> lifecycle_owner;  ///< Stable cold-service owner.
-	kinetum_ctx packet_context{};			  ///< One-cache-line owner-worker context.
-	bool initialized{false};			  ///< Whether successful INIT requires FINI.
-	std::unique_ptr<module_epoch_store> epoch_store;  ///< Exact artifact and executable-view owner.
+	std::string context_instance_id;				      ///< Exact executable context identity.
+	uint32_t context_index{0};					      ///< Compiled executable-context index.
+	loaded_module_image *image{nullptr};				      ///< Stable owning code image.
+	kinetum::dp::lifecycle::lifecycle_context_ownership lifecycle_owner;  ///< Stable context and telemetry owner.
+	kinetum_ctx packet_context{};					      ///< One-cache-line owner-worker context.
+	bool initialized{false};		     ///< Whether successful INIT requires FINI.
+	numa_owner<module_epoch_store> epoch_store;  ///< Exact artifact and executable-view owner.
 };
 
 /**
@@ -374,7 +375,7 @@ class module_manager {
 	 * @param contexts Staged contexts finalized in reverse order and cleared.
 	 * @param images Staged images unloaded after every context is cleared.
 	 */
-	static void destroy_staged_generation_(std::vector<std::unique_ptr<module_context_instance>> &contexts,
+	static void destroy_staged_generation_(std::vector<numa_owner<module_context_instance>> &contexts,
 					       std::vector<std::unique_ptr<loaded_module_image>> &images) noexcept;
 
 	mutable std::shared_mutex mutex_;			  ///< Publication and stable lookup guard.

@@ -12,6 +12,7 @@
 #include <array>
 #include <cstdint>
 #include <span>
+#include <vector>
 
 #include <kinetum/algo/net.hpp>
 
@@ -33,6 +34,59 @@ uint16_t reference_checksum(std::span<const uint16_t> words) noexcept
 		sum = (sum & UINT16_MAX) + (sum >> 16u);
 	}
 	return static_cast<uint16_t>(~sum);
+}
+
+/**
+ * @brief Sum network bytes independently, padding an odd final byte in the high position.
+ * @param bytes Complete readable byte extent.
+ * @return Full one's-complement checksum in host integer representation.
+ */
+uint16_t reference_byte_checksum(std::span<const uint8_t> bytes) noexcept
+{
+	uint64_t sum = 0;
+	for (std::size_t index = 0; index < bytes.size(); ++index) {
+		sum += static_cast<uint64_t>(bytes[index]) << (index % 2u == 0u ? 8u : 0u);
+	}
+	while (sum > UINT16_MAX) {
+		sum = (sum & UINT16_MAX) + (sum >> 16u);
+	}
+	return static_cast<uint16_t>(~sum);
+}
+
+/** @brief Full checksums match the byte oracle at every small extent, alignment and maximum carry boundary. */
+TEST(internet_checksum, full_sum_matches_byte_oracle_for_unaligned_and_odd_extents)
+{
+	using kinetum::algo::net::internet_checksum;
+	EXPECT_EQ(internet_checksum(nullptr, 0u), UINT16_MAX);
+	std::vector<uint8_t> bytes(UINT16_MAX + 16u);
+	for (const bool all_ones : {false, true}) {
+		for (std::size_t index = 0; index < bytes.size(); ++index) {
+			bytes[index] = all_ones ? 0xffu : static_cast<uint8_t>((index * 251u + 17u) & 0xffu);
+		}
+		for (std::size_t offset = 0; offset < 16u; ++offset) {
+			for (uint16_t length = 0; length <= 257u; ++length) {
+				EXPECT_EQ(internet_checksum(bytes.data() + offset, length),
+					  reference_byte_checksum({bytes.data() + offset, length}));
+			}
+			for (const uint16_t length : {uint16_t{65534}, uint16_t{65535}}) {
+				EXPECT_EQ(internet_checksum(bytes.data() + offset, length),
+					  reference_byte_checksum({bytes.data() + offset, length}));
+			}
+		}
+	}
+}
+
+/** @brief Full recomputation sees byte mutations and a written checksum verifies to zero. */
+TEST(internet_checksum, full_sum_observes_mutation_and_verifies_network_representation)
+{
+	std::array<uint8_t, 20> header{0x45u, 0x03u, 0u, 20u, 0u, 1u, 0u, 0u, 64u, 17u};
+	const auto first = kinetum::algo::net::internet_checksum(header.data(), header.size());
+	header[1] = 0xbbu;
+	const auto second = kinetum::algo::net::internet_checksum(header.data(), header.size());
+	EXPECT_NE(first, second);
+	kinetum::algo::net::write_be16(header.data() + 10u, second);
+	EXPECT_EQ(reference_byte_checksum(header), 0u);
+	EXPECT_EQ(kinetum::algo::net::internet_checksum(header.data(), header.size()), 0u);
 }
 
 /** @brief Pin the positive-zero result that an incorrect incremental formula turns into negative zero. */

@@ -16,6 +16,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <array>
+#include <optional>
 
 #include "qos_impl.hpp"
 #include <kinetum/kinetum_sdk.hpp>
@@ -159,6 +161,14 @@ class qos_module : public sdk::module_base<qos_module> {
 								const void *active_config) noexcept;
 
     private:
+	/** @brief Copied per-lane facts; no packet or policy pointer escapes a callback. */
+	struct packet_query {
+		std::optional<qos::qos_policer::prepared_query>
+			query;		   ///< Read only after preparation for a valid bounded lane.
+		uint8_t header_length{0};  ///< Proven IPv4 header extent when remarking is required.
+		bool valid{false};	   ///< Packet eligibility for its current profile.
+	};
+
 	/** @brief Context-local allowed-packet counter. */
 	sdk::counter packets_allowed_;
 	/** @brief Context-local dropped-packet counter. */
@@ -179,6 +189,8 @@ class qos_module : public sdk::module_base<qos_module> {
 	sdk::counter invalid_input_drops_;
 	/** @brief Preallocated mutable flow policer owned by the sole worker. */
 	qos::qos_policer policer_;
+	/** @brief Context-lifetime scratch; every consumed field is established for its lane before use. */
+	std::array<packet_query, KINETUM_MAX_BURST> queries_;
 };
 
 }  // namespace kinetum::modules

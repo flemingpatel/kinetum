@@ -17,9 +17,10 @@
 #include <optional>
 #include <span>
 
-#include "src/dp/epoch/epoch_transition_staging.hpp"
+#include "src/dp/worker_packet_staging.hpp"
 #include "src/dp/worker_input_scheduler.hpp"
 #include "src/quark/host_probe.hpp"
+#include "tests/packet_staging_test_harness.hpp"
 
 namespace kinetum::dp
 {
@@ -38,36 +39,6 @@ class WorkerInputSchedulerTest : public ::testing::Test {
 		numa_node_ = host.memory_numa_nodes.front();
 	}
 	int32_t numa_node_{-1};	 ///< Exact host memory node proved by SetUp.
-};
-
-/** @brief Retire both test queue roles even if a later assertion fails. */
-class staging_cleanup final {
-    public:
-	/**
-	 * @brief Borrow the staging owner until the cleanup guard is destroyed.
-	 * @param staging Exact owner with active and future roles and no live reservation.
-	 */
-	explicit staging_cleanup(worker_epoch_input_staging<uint32_t> &staging) noexcept
-		: staging_(staging)
-	{
-	}
-	/** @brief Drain old and future values without changing their ownership outside the fixture. */
-	~staging_cleanup()
-	{
-		std::array<uint32_t, 8> values{};
-		while (staging_.pop_active_batch(values.data(), values.size()) != 0u) {
-		}
-		staging_.rotate_after_activation();
-		while (staging_.pop_active_batch(values.data(), values.size()) != 0u) {
-		}
-	}
-	/** @brief Cleanup ownership cannot be copied. */
-	staging_cleanup(const staging_cleanup &) = delete;
-	/** @brief Cleanup ownership cannot be copy-assigned. */
-	staging_cleanup &operator=(const staging_cleanup &) = delete;
-
-    private:
-	worker_epoch_input_staging<uint32_t> &staging_;	 ///< Both roles remain alive until after this guard.
 };
 
 }  // namespace
@@ -143,13 +114,19 @@ TEST_F(WorkerInputSchedulerTest, carried_allowance_survives_role_swap_and_retire
 	}};
 	auto owner_or = worker_input_scheduler::create(BINDINGS, numa_node_);
 	ASSERT_TRUE(owner_or.is_ok()) << owner_or.error().message();
-	auto staging_or = worker_epoch_input_staging<uint32_t>::create(8u, std::optional<std::size_t>(8u), numa_node_);
+	constexpr std::array<packet_work_key, 1> KEYS{{{0u, packet_work_phase::RX_DELIVER, {}}}};
+	const std::array<worker_packet_staging_domain, 1> DOMAINS{{{0u, 8u, 8u, KEYS}}};
+	std::array<packet_record, 32> records{};
+	std::size_t next_record = 0u;
+	auto staging_or = worker_packet_staging::create(DOMAINS, numa_node_);
 	ASSERT_TRUE(staging_or.is_ok()) << staging_or.error().message();
-	auto &staging = *staging_or.value();
-	staging_cleanup cleanup(staging);
+	auto &staging = staging_or.value()->domains().front();
+	test::packet_staging_cleanup cleanup(*staging_or.value());
 	for (uint32_t index = 0u; index < 4u; ++index) {
 		ASSERT_TRUE(staging.reserve_active());
-		staging.commit_active(uint32_t{1u});
+		auto &record = records[next_record++];
+		record.metadata.epoch = 1u;
+		staging.commit_active(0u, &record);
 	}
 	uint32_t active_epoch = 1u;
 	uint32_t source_epoch = 1u;
@@ -166,14 +143,20 @@ TEST_F(WorkerInputSchedulerTest, carried_allowance_survives_role_swap_and_retire
 		const auto requested = static_cast<uint16_t>(std::min<std::size_t>(available, allowance));
 		uint16_t admitted = 0u;
 		while (admitted < std::min(requested, source_remaining)) {
+			if (next_record == records.size()) {
+				ADD_FAILURE() << "input fixture exhausted its authored packet records";
+				break;
+			}
 			const bool reserved = future ? staging.reserve_future() : staging.reserve_active();
 			if (!reserved) {
 				break;
 			}
+			auto &record = records[next_record++];
+			record.metadata.epoch = source_epoch;
 			if (future) {
-				staging.commit_future(uint32_t{source_epoch});
+				staging.commit_future(0u, &record);
 			} else {
-				staging.commit_active(uint32_t{source_epoch});
+				staging.commit_active(0u, &record);
 			}
 			++admitted;
 		}
@@ -183,9 +166,23 @@ TEST_F(WorkerInputSchedulerTest, carried_allowance_survives_role_swap_and_retire
 	};
 	owner_or.value()->service(admit);
 	EXPECT_EQ(last_rx_allowance, 8u);
-	std::array<uint32_t, 8> values{};
-	EXPECT_EQ(staging.pop_active_batch(values.data(), values.size()), 8u);
-	EXPECT_TRUE(std::all_of(values.begin(), values.end(), [](uint32_t epoch) { return epoch == 1u; }));
+	std::array<uint64_t, 8> values{};
+	/** @brief Observe exact packet epochs while resolving every dequeued capacity claim. */
+	const auto consume = [&]() noexcept {
+		std::array<packet_record *, 8> scratch{};
+		std::size_t count = 0u;
+		staging.service_active(scratch,
+				       [&](const packet_work_key &key, std::span<packet_record *const> batch) noexcept {
+					       EXPECT_EQ(key.phase, packet_work_phase::RX_DELIVER);
+					       for (auto *record : batch) {
+						       values[count++] = record->metadata.epoch;
+						       staging.release_active_reservation();
+					       }
+				       });
+		return count;
+	};
+	EXPECT_EQ(consume(), 8u);
+	EXPECT_TRUE(std::all_of(values.begin(), values.end(), [](uint64_t epoch) { return epoch == 1u; }));
 	source_epoch = 2u;
 	source_remaining = 8u;
 	owner_or.value()->service(admit);
@@ -197,8 +194,8 @@ TEST_F(WorkerInputSchedulerTest, carried_allowance_survives_role_swap_and_retire
 	EXPECT_TRUE(staging.future_empty());
 	stopping = true;
 	owner_or.value()->service(admit);
-	EXPECT_EQ(staging.pop_active_batch(values.data(), values.size()), 8u);
-	EXPECT_TRUE(std::all_of(values.begin(), values.end(), [](uint32_t epoch) { return epoch == 2u; }));
+	EXPECT_EQ(consume(), 8u);
+	EXPECT_TRUE(std::all_of(values.begin(), values.end(), [](uint64_t epoch) { return epoch == 2u; }));
 	EXPECT_TRUE(staging.empty());
 
 	// STOP is terminal for this owner; only a newly constructed generation resumes RX.

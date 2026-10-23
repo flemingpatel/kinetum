@@ -13,6 +13,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <exception>
 #include <limits>
 #include <memory>
@@ -23,6 +24,7 @@
 #include <kinetum/algo/platform.hpp>
 #include "src/common/status.hpp"
 #include "src/dp/epoch/worker_epoch_ledger.hpp"
+#include "tests/numa_test_support.hpp"
 
 namespace kinetum::dp
 {
@@ -98,9 +100,10 @@ TEST(worker_epoch_ledger, compiled_credit_budget_has_exact_async_handoff_terms)
  * @param maximum_unretired Exact credit ceiling for the test.
  * @return Unique ledger, or null after recording a test failure.
  */
-[[nodiscard]] std::unique_ptr<worker_epoch_ledger> make_ledger(uint64_t maximum_unretired = TEST_CREDIT_LIMIT)
+[[nodiscard]] numa_owner<worker_epoch_ledger> make_ledger(uint64_t maximum_unretired = TEST_CREDIT_LIMIT)
 {
-	auto ledger_or = worker_epoch_ledger::create(TEST_WORKER_INDEX, TEST_RUNTIME_GENERATION, maximum_unretired);
+	auto ledger_or = worker_epoch_ledger::create(TEST_WORKER_INDEX, TEST_RUNTIME_GENERATION, maximum_unretired,
+						     kinetum::test::required_memory_numa_node());
 	if (!ledger_or.is_ok()) {
 		ADD_FAILURE() << ledger_or.error().message();
 		return nullptr;
@@ -116,6 +119,7 @@ void acquire_before_bind()
 		return;
 	}
 	ledger->acquire(TEST_BOOTSTRAP_EPOCH);
+	std::_Exit(EXIT_SUCCESS);
 }
 
 /** @brief Trigger publication before exact Bootstrap binding. */
@@ -126,6 +130,7 @@ void publish_before_bind()
 		return;
 	}
 	ledger->publish();
+	std::_Exit(EXIT_SUCCESS);
 }
 
 /** @brief Trigger retirement before exact Bootstrap binding. */
@@ -136,6 +141,7 @@ void retire_before_bind()
 		return;
 	}
 	ledger->retire(TEST_BOOTSTRAP_EPOCH);
+	std::_Exit(EXIT_SUCCESS);
 }
 
 /** @brief Trigger a second Bootstrap binding on one immutable owner. */
@@ -147,6 +153,7 @@ void rebind_bootstrap()
 	}
 	ledger->bind_bootstrap_epoch(TEST_BOOTSTRAP_EPOCH);
 	ledger->bind_bootstrap_epoch(TEST_BOOTSTRAP_EPOCH);
+	std::_Exit(EXIT_SUCCESS);
 }
 
 /** @brief Trigger binding of the reserved epoch wrap sentinel. */
@@ -157,6 +164,7 @@ void bind_reserved_epoch()
 		return;
 	}
 	ledger->bind_bootstrap_epoch(std::numeric_limits<uint64_t>::max());
+	std::_Exit(EXIT_SUCCESS);
 }
 
 /** @brief Bind a future epoch before Bootstrap establishes the active slot. */
@@ -167,6 +175,7 @@ void bind_future_before_bootstrap()
 		return;
 	}
 	ledger->bind_future_epoch(TEST_BOOTSTRAP_EPOCH + 1u);
+	std::_Exit(EXIT_SUCCESS);
 }
 
 /** @brief Bind a stale future epoch equal to the active slot. */
@@ -178,6 +187,7 @@ void bind_stale_future_epoch()
 	}
 	ledger->bind_bootstrap_epoch(TEST_BOOTSTRAP_EPOCH);
 	ledger->bind_future_epoch(TEST_BOOTSTRAP_EPOCH);
+	std::_Exit(EXIT_SUCCESS);
 }
 
 /** @brief Bind a competing second future epoch. */
@@ -190,6 +200,7 @@ void bind_future_epoch_twice()
 	ledger->bind_bootstrap_epoch(TEST_BOOTSTRAP_EPOCH);
 	ledger->bind_future_epoch(TEST_BOOTSTRAP_EPOCH + 1u);
 	ledger->bind_future_epoch(TEST_BOOTSTRAP_EPOCH + 2u);
+	std::_Exit(EXIT_SUCCESS);
 }
 
 /** @brief Advance source identity without one exact future binding. */
@@ -201,6 +212,7 @@ void advance_source_without_future()
 	}
 	ledger->bind_bootstrap_epoch(TEST_BOOTSTRAP_EPOCH);
 	ledger->advance_source_epoch(TEST_BOOTSTRAP_EPOCH + 1u);
+	std::_Exit(EXIT_SUCCESS);
 }
 
 /** @brief Advance source identity twice for one committed epoch. */
@@ -214,6 +226,7 @@ void advance_source_epoch_twice()
 	ledger->bind_future_epoch(TEST_BOOTSTRAP_EPOCH + 1u);
 	ledger->advance_source_epoch(TEST_BOOTSTRAP_EPOCH + 1u);
 	ledger->advance_source_epoch(TEST_BOOTSTRAP_EPOCH + 1u);
+	std::_Exit(EXIT_SUCCESS);
 }
 
 /** @brief Trigger an exact active-slot credit overflow. */
@@ -226,6 +239,7 @@ void overflow_active_slot()
 	ledger->bind_bootstrap_epoch(TEST_BOOTSTRAP_EPOCH);
 	ledger->acquire(TEST_BOOTSTRAP_EPOCH);
 	ledger->acquire(TEST_BOOTSTRAP_EPOCH);
+	std::_Exit(EXIT_SUCCESS);
 }
 
 /** @brief Trigger an active-slot retirement underflow. */
@@ -237,6 +251,7 @@ void underflow_active_slot()
 	}
 	ledger->bind_bootstrap_epoch(TEST_BOOTSTRAP_EPOCH);
 	ledger->retire(TEST_BOOTSTRAP_EPOCH);
+	std::_Exit(EXIT_SUCCESS);
 }
 
 /** @brief Trigger a wrong-epoch acquisition against both exact slots. */
@@ -248,6 +263,7 @@ void acquire_wrong_epoch()
 	}
 	ledger->bind_bootstrap_epoch(TEST_BOOTSTRAP_EPOCH);
 	ledger->acquire(TEST_BOOTSTRAP_EPOCH + 1u);
+	std::_Exit(EXIT_SUCCESS);
 }
 
 /** @brief Trigger a zero-epoch acquisition against one bound ledger. */
@@ -259,6 +275,7 @@ void acquire_zero_epoch()
 	}
 	ledger->bind_bootstrap_epoch(TEST_BOOTSTRAP_EPOCH);
 	ledger->acquire(0u);
+	std::_Exit(EXIT_SUCCESS);
 }
 
 /** @brief Trigger a wrong-epoch retirement against both exact slots. */
@@ -270,6 +287,7 @@ void retire_wrong_epoch()
 	}
 	ledger->bind_bootstrap_epoch(TEST_BOOTSTRAP_EPOCH);
 	ledger->retire(TEST_BOOTSTRAP_EPOCH + 1u);
+	std::_Exit(EXIT_SUCCESS);
 }
 
 /** @brief Trigger a zero-epoch retirement against one bound ledger. */
@@ -281,6 +299,7 @@ void retire_zero_epoch()
 	}
 	ledger->bind_bootstrap_epoch(TEST_BOOTSTRAP_EPOCH);
 	ledger->retire(0u);
+	std::_Exit(EXIT_SUCCESS);
 }
 
 /** @brief Trigger a second retirement of one exact logical credit. */
@@ -294,6 +313,32 @@ void double_retire_active_credit()
 	ledger->acquire(TEST_BOOTSTRAP_EPOCH);
 	ledger->retire(TEST_BOOTSTRAP_EPOCH);
 	ledger->retire(TEST_BOOTSTRAP_EPOCH);
+	std::_Exit(EXIT_SUCCESS);
+}
+
+/**
+ * @brief Exercise counted slot overflow or underflow without destructor-based death.
+ * @param future Select the future rather than active slot.
+ * @param retire Exercise subtraction rather than shared-ceiling acquisition.
+ */
+void violate_counted_credit(bool future, bool retire)
+{
+	auto ledger = make_ledger();
+	if (ledger == nullptr) {
+		std::_Exit(EXIT_SUCCESS);
+	}
+	ledger->bind_bootstrap_epoch(TEST_BOOTSTRAP_EPOCH);
+	ledger->bind_future_epoch(TEST_BOOTSTRAP_EPOCH + 1u);
+	const uint64_t epoch = future ? TEST_BOOTSTRAP_EPOCH + 1u : TEST_BOOTSTRAP_EPOCH;
+	const uint64_t other = future ? TEST_BOOTSTRAP_EPOCH : TEST_BOOTSTRAP_EPOCH + 1u;
+	ledger->acquire(epoch, 2u);
+	if (retire) {
+		ledger->retire(epoch, 3u);
+	} else {
+		ledger->acquire(other, 5u);
+		ledger->acquire(epoch, 2u);
+	}
+	std::_Exit(EXIT_SUCCESS);
 }
 
 /** @brief Destroy one ledger while an executable packet credit remains live. */
@@ -319,20 +364,24 @@ TEST(worker_epoch_ledger, layout_and_configuration_are_exact)
 	EXPECT_EQ(alignof(worker_epoch_ledger), kinetum::algo::CACHE_LINE_SIZE);
 
 	auto sentinel_worker = worker_epoch_ledger::create(std::numeric_limits<uint32_t>::max(),
-							   TEST_RUNTIME_GENERATION, TEST_CREDIT_LIMIT);
+							   TEST_RUNTIME_GENERATION, TEST_CREDIT_LIMIT,
+							   kinetum::test::required_memory_numa_node());
 	ASSERT_FALSE(sentinel_worker.is_ok());
 	EXPECT_EQ(sentinel_worker.error().code(), common::status_code::INVALID_ARGUMENT);
 
-	auto missing_generation = worker_epoch_ledger::create(TEST_WORKER_INDEX, 0u, TEST_CREDIT_LIMIT);
+	auto missing_generation = worker_epoch_ledger::create(TEST_WORKER_INDEX, 0u, TEST_CREDIT_LIMIT,
+							      kinetum::test::required_memory_numa_node());
 	ASSERT_FALSE(missing_generation.is_ok());
 	EXPECT_EQ(missing_generation.error().code(), common::status_code::INVALID_ARGUMENT);
 
 	auto unrepresentable_generation = worker_epoch_ledger::create(
-		TEST_WORKER_INDEX, static_cast<uint64_t>(std::numeric_limits<uint32_t>::max()) + 1u, TEST_CREDIT_LIMIT);
+		TEST_WORKER_INDEX, static_cast<uint64_t>(std::numeric_limits<uint32_t>::max()) + 1u, TEST_CREDIT_LIMIT,
+		kinetum::test::required_memory_numa_node());
 	ASSERT_FALSE(unrepresentable_generation.is_ok());
 	EXPECT_EQ(unrepresentable_generation.error().code(), common::status_code::INVALID_ARGUMENT);
 
-	auto missing_limit = worker_epoch_ledger::create(TEST_WORKER_INDEX, TEST_RUNTIME_GENERATION, 0u);
+	auto missing_limit = worker_epoch_ledger::create(TEST_WORKER_INDEX, TEST_RUNTIME_GENERATION, 0u,
+							 kinetum::test::required_memory_numa_node());
 	ASSERT_FALSE(missing_limit.is_ok());
 	EXPECT_EQ(missing_limit.error().code(), common::status_code::INVALID_ARGUMENT);
 }
@@ -420,6 +469,33 @@ TEST(worker_epoch_ledger, future_binding_and_source_advance_are_exact)
 	ledger->publish();
 }
 
+/** @brief Counted prefixes preserve the shared ceiling, exact slots and zero-count neutrality. */
+TEST(worker_epoch_ledger, counted_prefixes_share_the_active_and_future_credit_ceiling)
+{
+	auto ledger = make_ledger();
+	ASSERT_NE(ledger, nullptr);
+	ledger->bind_bootstrap_epoch(TEST_BOOTSTRAP_EPOCH);
+	ledger->bind_future_epoch(TEST_BOOTSTRAP_EPOCH + 1u);
+	ledger->acquire(TEST_BOOTSTRAP_EPOCH, 3u);
+	ledger->acquire(TEST_BOOTSTRAP_EPOCH + 1u, 5u);
+	ledger->acquire(TEST_BOOTSTRAP_EPOCH, 0u);
+	ledger->retire(TEST_BOOTSTRAP_EPOCH + 1u, 0u);
+	EXPECT_EQ(ledger->active_unretired(), 3u);
+	ledger->publish();
+	worker_epoch_ledger_snapshot observation{};
+	const auto read = ledger->try_read(observation);
+	ledger->retire(TEST_BOOTSTRAP_EPOCH, 3u);
+	ledger->retire(TEST_BOOTSTRAP_EPOCH + 1u, 5u);
+	EXPECT_EQ(read, publication_read_result::AVAILABLE);
+	EXPECT_EQ(observation.active_unretired, 3u);
+	EXPECT_EQ(observation.future_unretired, 5u);
+	EXPECT_TRUE(ledger->empty());
+	for (const bool future : {false, true}) {
+		EXPECT_DEATH(violate_counted_credit(future, false), "");
+		EXPECT_DEATH(violate_counted_credit(future, true), "");
+	}
+}
+
 /** @brief Prove stale or unbound epochs cannot mutate either exact slot. */
 TEST(worker_epoch_ledger, wrong_or_unbound_epoch_cannot_mutate_exact_slots)
 {
@@ -479,8 +555,8 @@ TEST(worker_epoch_ledger, overflow_underflow_rebind_double_retire_and_live_destr
 TEST(worker_epoch_ledger, boundary_handoff_conserves_sender_and_receiver_credits)
 {
 	auto sender = make_ledger();
-	auto receiver_or =
-		worker_epoch_ledger::create(TEST_WORKER_INDEX + 1u, TEST_RUNTIME_GENERATION, TEST_CREDIT_LIMIT);
+	auto receiver_or = worker_epoch_ledger::create(TEST_WORKER_INDEX + 1u, TEST_RUNTIME_GENERATION,
+						       TEST_CREDIT_LIMIT, kinetum::test::required_memory_numa_node());
 	ASSERT_NE(sender, nullptr);
 	ASSERT_TRUE(receiver_or.is_ok()) << receiver_or.error().message();
 	auto receiver = std::move(receiver_or).value();

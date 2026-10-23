@@ -7,8 +7,8 @@
  * @author Fleming Patel
  *
  * This file implements zero-copy packet parsing directly over bounded packet
- * buffers. Every consumed header byte is covered by both the record extent and
- * the protocol-declared IPv4 extent.
+ * buffers. Ethernet reads stay inside the record; IPv4 and transport reads also
+ * stay inside the declared IPv4 extent.
  *
  * Implementation shape:
  * - Early validation: Check buffer bounds before any memory access
@@ -85,11 +85,10 @@ eth_parse_result parse_ethernet(const uint8_t *buf, std::size_t len) noexcept
 		}
 
 		// VLAN tag structure at current offset:
-		// +0-1: TPID (already read into eth_type)
-		// +2-3: TCI (not needed, skip)
-		// +4-5: Next EtherType or TPID
+		// +0-1: TCI (not needed, skip)
+		// +2-3: Next EtherType or TPID
 
-		// Read next EtherType from offset+2 (skipping TPID we already checked)
+		// Read next EtherType from offset+2 (skipping the TCI)
 		// This is the actual EtherType if no more VLAN tags, or next TPID if stacked
 		eth_type = read_be16(buf + offset + 2);
 
@@ -200,8 +199,6 @@ ipv4_parse_result parse_ipv4(const uint8_t *buf, std::size_t len, uint16_t ip_of
 	result.ok = true;
 	result.is_fragment = is_fragmented;
 	result.ip_offset = ip_offset;
-	result.ip_header_len = ihl_bytes;
-	result.ip_total_len = total_length;
 
 	// Extract DSCP (Differentiated Services Code Point) from TOS byte
 	// Byte 1: [7:2] = DSCP (6 bits), [1:0] = ECN (2 bits)

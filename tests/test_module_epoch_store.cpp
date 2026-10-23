@@ -23,12 +23,13 @@
 #include <utility>
 
 #include "src/dp/epoch/worker_epoch_activation.hpp"
+#include "tests/packet_staging_test_harness.hpp"
 #include "src/dp/epoch/worker_epoch_ledger.hpp"
 #include "src/dp/module/module_epoch_store.hpp"
 #include "src/dp/module/worker_module_health.hpp"
 #include "src/dp/worker_telemetry_channel.hpp"
 #include "src/dp/worker_runtime_telemetry.hpp"
-#include "src/quark/host_probe.hpp"
+#include "tests/numa_test_support.hpp"
 
 namespace kinetum::dp::module
 {
@@ -177,14 +178,14 @@ class module_store_fixture {
 	 */
 	explicit module_store_fixture(kinetum_module_mode mode = KINETUM_MODULE_PASSIVE)
 	{
-		const auto host = quark::probe_host();
-		if (!host.valid || host.memory_numa_nodes.empty() || host.cpus.empty()) {
+		const auto placement = kinetum::test::required_worker_cpu();
+		if (placement.core_id < 0 || placement.numa_node < 0) {
 			std::terminate();
 		}
-		const int32_t numa_node = host.memory_numa_nodes.front();
+		const int32_t numa_node = placement.numa_node;
 		context_.state = &state_;
 		context_.numa_node = numa_node;
-		context_.cpu_core_id = host.cpus.front().core_id;
+		context_.cpu_core_id = placement.core_id;
 		context_.worker_index = 5;
 		descriptor_.module_id = MODULE_ID;
 		descriptor_.mode = mode;
@@ -605,16 +606,15 @@ class module_store_fixture {
 		}
 	}
 
-	store_callback_state state_{};	///< Synthetic callback observations.
-	store_memory_provider memory_;	///< Context and epoch allocation owner.
-	store_log_provider log_;	///< Cold lifecycle diagnostic receiver.
-	kinetum_ctx context_{};		///< Exact packet callback shell.
-	kinetum_module descriptor_{};	///< Synthetic module callback authority.
-	std::unique_ptr<lifecycle::lifecycle_context_owner>
-		lifecycle_owner_;				       ///< Lifecycle operations and module telemetry.
+	store_callback_state state_{};				       ///< Synthetic callback observations.
+	store_memory_provider memory_;				       ///< Context and epoch allocation owner.
+	store_log_provider log_;				       ///< Cold lifecycle diagnostic receiver.
+	kinetum_ctx context_{};					       ///< Exact packet callback shell.
+	kinetum_module descriptor_{};				       ///< Synthetic module callback authority.
+	lifecycle::lifecycle_context_ownership lifecycle_owner_;       ///< Lifecycle operations and module telemetry.
 	std::unique_ptr<worker_telemetry_channel> telemetry_channel_;  ///< Worker/aggregator bank-token exchange.
-	std::unique_ptr<worker_runtime_telemetry> worker_telemetry_;   ///< Worker-owned epoch observations.
-	std::unique_ptr<module_epoch_store> store_;		       ///< Exact configuration-slot owner under test.
+	numa_owner<worker_runtime_telemetry> worker_telemetry_;	       ///< Worker-owned epoch observations.
+	numa_owner<module_epoch_store> store_;			       ///< Exact configuration-slot owner under test.
 	uint64_t last_completed_activation_count_{0};		       ///< Latest immutable module-bank callback count.
 };
 
@@ -918,19 +918,19 @@ TEST(worker_epoch_activation, complete_preflight_precedes_module_queue_and_ledge
 	constexpr uint64_t active_epoch = 11u;
 	constexpr uint64_t future_epoch = 13u;
 	constexpr uint64_t transition_generation = 3u;
-	const auto host = quark::probe_host();
-	ASSERT_TRUE(host.valid);
-	ASSERT_FALSE(host.memory_numa_nodes.empty());
-	const int32_t numa_node = host.memory_numa_nodes.front();
-
 	module_store_fixture fixture;
-	auto staging_or = packet_epoch_input_staging::create(4u, 4u, numa_node);
+	const int32_t numa_node = fixture.store().numa_node();
+	constexpr std::array<packet_work_key, 2> KEYS{{
+		{0u, packet_work_phase::RX_DELIVER, {}},
+		{1u, packet_work_phase::EXECUTE, {}},
+	}};
+	const std::array<worker_packet_staging_domain, 2> DOMAINS{{{0u, 4u, 4u, KEYS}, {1u, 8u, 8u, KEYS}}};
+	auto staging_or = worker_packet_staging::create(DOMAINS, numa_node);
 	ASSERT_TRUE(staging_or.is_ok()) << staging_or.error().message();
-	auto staging = std::move(staging_or).value();
-	auto second_staging_or = packet_epoch_input_staging::create(8u, 8u, numa_node);
-	ASSERT_TRUE(second_staging_or.is_ok()) << second_staging_or.error().message();
-	auto second_staging = std::move(second_staging_or).value();
-	auto ledger_or = worker_epoch_ledger::create(worker_index, runtime_generation, 8u);
+	auto staging_owner = std::move(staging_or).value();
+	auto *staging = &staging_owner->domains()[0];
+	auto *second_staging = &staging_owner->domains()[1];
+	auto ledger_or = worker_epoch_ledger::create(worker_index, runtime_generation, 8u, numa_node);
 	ASSERT_TRUE(ledger_or.is_ok()) << ledger_or.error().message();
 	auto ledger = std::move(ledger_or).value();
 	const std::array<worker_module_health_binding, 1> health_bindings{{
@@ -949,9 +949,9 @@ TEST(worker_epoch_activation, complete_preflight_precedes_module_queue_and_ledge
 	fixture.publish(active_epoch);
 	ledger->bind_bootstrap_epoch(active_epoch);
 	std::array<module_epoch_store *, 1> stores{&fixture.store()};
-	std::array<packet_epoch_input_staging *, 2> staging_owners{second_staging.get(), staging.get()};
+	std::array<packet_epoch_input_staging *, 2> staging_owners{second_staging, staging};
 	std::array<module_epoch_store *, 2> duplicate_stores{&fixture.store(), &fixture.store()};
-	std::array<packet_epoch_input_staging *, 2> duplicate_staging{staging.get(), staging.get()};
+	std::array<packet_epoch_input_staging *, 2> duplicate_staging{staging, staging};
 	std::array<packet_epoch_input_staging *, 0> no_staging{};
 	auto duplicate_store_or = worker_epoch_activation::create(worker_index, runtime_generation, duplicate_stores,
 								  no_staging, *ledger, nullptr, health.get(),
@@ -995,8 +995,9 @@ TEST(worker_epoch_activation, complete_preflight_precedes_module_queue_and_ledge
 
 	packet_record record{};
 	record.metadata.epoch = future_epoch;
+	test::packet_staging_cleanup staging_cleanup(*staging_owner, ledger.get());
 	ASSERT_TRUE(staging->reserve_future());
-	staging->commit_future({&record, packet_work_phase::EXECUTE, {}});
+	staging->commit_future(0u, &record);
 	ledger->bind_future_epoch(future_epoch);
 	ledger->advance_source_epoch(future_epoch);
 	ledger->acquire(future_epoch);
@@ -1021,14 +1022,19 @@ TEST(worker_epoch_activation, complete_preflight_precedes_module_queue_and_ledge
 	EXPECT_EQ(ledger->active_epoch(), future_epoch);
 	EXPECT_EQ(ledger->future_epoch(), 0u);
 	EXPECT_EQ(ledger->active_unretired(), 1u);
-	std::array<packet_work_item, 1> observed{{{
-		.record = nullptr,
-		.phase = packet_work_phase::EXECUTE,
-		.padding = {},
-	}}};
-	ASSERT_EQ(staging->pop_active_batch(observed.data(), observed.size()), 1u);
-	EXPECT_EQ(observed[0].record, &record);
-	ledger->retire(future_epoch);
+	std::array<packet_record *, 1> observed{};
+	std::size_t consumed = 0u;
+	staging->service_active(observed,
+				[&](const packet_work_key &key, std::span<packet_record *const> records) noexcept {
+					EXPECT_EQ(key.phase, packet_work_phase::RX_DELIVER);
+					for (auto *value : records) {
+						EXPECT_EQ(value, &record);
+						ledger->retire(value->metadata.epoch);
+						staging->release_active_reservation();
+						++consumed;
+					}
+				});
+	EXPECT_EQ(consumed, 1u);
 	fixture.retire_for_health_owner_test();
 	activation.reset();
 	health.reset();
@@ -1042,16 +1048,18 @@ TEST(worker_epoch_activation, unresolved_old_work_rejects_before_every_irreversi
 	constexpr uint64_t active_epoch = 11u;
 	constexpr uint64_t future_epoch = 13u;
 	constexpr uint64_t transition_generation = 3u;
-	const auto host = quark::probe_host();
-	ASSERT_TRUE(host.valid);
-	ASSERT_FALSE(host.memory_numa_nodes.empty());
-	const int32_t numa_node = host.memory_numa_nodes.front();
-
 	module_store_fixture fixture;
-	auto staging_or = packet_epoch_input_staging::create(4u, 4u, numa_node);
+	const int32_t numa_node = fixture.store().numa_node();
+	constexpr std::array<packet_work_key, 2> KEYS{{
+		{0u, packet_work_phase::RX_DELIVER, {}},
+		{1u, packet_work_phase::EXECUTE, {}},
+	}};
+	const std::array<worker_packet_staging_domain, 1> DOMAINS{{{0u, 4u, 4u, KEYS}}};
+	auto staging_or = worker_packet_staging::create(DOMAINS, numa_node);
 	ASSERT_TRUE(staging_or.is_ok()) << staging_or.error().message();
-	auto staging = std::move(staging_or).value();
-	auto ledger_or = worker_epoch_ledger::create(worker_index, runtime_generation, 8u);
+	auto staging_owner = std::move(staging_or).value();
+	auto *staging = &staging_owner->domains().front();
+	auto ledger_or = worker_epoch_ledger::create(worker_index, runtime_generation, 8u, numa_node);
 	ASSERT_TRUE(ledger_or.is_ok()) << ledger_or.error().message();
 	auto ledger = std::move(ledger_or).value();
 	const std::array<worker_module_health_binding, 1> health_bindings{{
@@ -1070,7 +1078,7 @@ TEST(worker_epoch_activation, unresolved_old_work_rejects_before_every_irreversi
 	fixture.publish(active_epoch);
 	ledger->bind_bootstrap_epoch(active_epoch);
 	std::array<module_epoch_store *, 1> stores{&fixture.store()};
-	std::array<packet_epoch_input_staging *, 1> staging_owners{staging.get()};
+	std::array<packet_epoch_input_staging *, 1> staging_owners{staging};
 	auto activation_or = worker_epoch_activation::create(worker_index, runtime_generation, stores, staging_owners,
 							     *ledger, nullptr, health.get(),
 							     fixture.worker_telemetry());
@@ -1085,8 +1093,11 @@ TEST(worker_epoch_activation, unresolved_old_work_rejects_before_every_irreversi
 
 	packet_record old_record{};
 	old_record.metadata.epoch = active_epoch;
+	old_record.metadata.current_stage_instance = 1u;
+	old_record.metadata.current_stage = 1u;
+	test::packet_staging_cleanup staging_cleanup(*staging_owner, ledger.get());
 	ASSERT_TRUE(staging->reserve_active());
-	staging->commit_active({&old_record, packet_work_phase::EXECUTE, {}});
+	staging->commit_active(1u, &old_record);
 	ledger->acquire(active_epoch);
 	ledger->bind_future_epoch(future_epoch);
 	ledger->advance_source_epoch(future_epoch);
@@ -1097,15 +1108,19 @@ TEST(worker_epoch_activation, unresolved_old_work_rejects_before_every_irreversi
 	EXPECT_EQ(fixture.store().prepared_epoch(), future_epoch);
 	EXPECT_EQ(ledger->active_epoch(), active_epoch);
 	EXPECT_EQ(ledger->future_epoch(), future_epoch);
-	EXPECT_EQ(staging->peek_active()->record, &old_record);
-
-	std::array<packet_work_item, 1> observed{{{
-		.record = nullptr,
-		.phase = packet_work_phase::EXECUTE,
-		.padding = {},
-	}}};
-	ASSERT_EQ(staging->pop_active_batch(observed.data(), observed.size()), 1u);
-	ledger->retire(active_epoch);
+	std::array<packet_record *, 1> observed{};
+	std::size_t consumed = 0u;
+	staging->service_active(observed,
+				[&](const packet_work_key &key, std::span<packet_record *const> records) noexcept {
+					EXPECT_EQ(key.phase, packet_work_phase::EXECUTE);
+					for (auto *value : records) {
+						EXPECT_EQ(value, &old_record);
+						ledger->retire(value->metadata.epoch);
+						staging->release_active_reservation();
+						++consumed;
+					}
+				});
+	EXPECT_EQ(consumed, 1u);
 	ASSERT_TRUE(activation->activate(transition_generation, active_epoch, future_epoch, 1u).is_ok());
 	fixture.drain_telemetry();
 	EXPECT_EQ(fixture.state().activation_count, 2u);

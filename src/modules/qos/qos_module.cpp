@@ -6,12 +6,9 @@
  * @brief SDK-based QoS policer module implementation.
  * @author Fleming Patel
  *
- * Hot-Path Optimizations:
- * - Uses KINETUM_COUNTER_ADD for O(1) counter updates
- * - Uses shared exact byte-credit arithmetic without FP overhead
- * - One preallocated context-local policer with sole-worker ownership
- * - Lazy token refill minimizes per-packet work
- * - Precomputed DSCP->profile array for O(1) lookup
+ * Prepared profiles and copied query facts feed one context-local policer.
+ * GC, credit mutation and remarking follow packet order; telemetry is
+ * accumulated over the occupied batch prefix.
  */
 
 #include "qos_module.hpp"
@@ -160,6 +157,18 @@ struct ipv4_header_view {
 		std::terminate();
 	}
 	return config;
+}
+
+/**
+ * @brief Select the exact prepared DSCP profile, or its mandatory default.
+ * @param config Completely validated prepared packet view.
+ * @param dscp Current packet classification lane.
+ * @return Borrowed profile for this callback only.
+ */
+[[nodiscard]] const qos_profile_compiled &select_profile(const qos_packet_config &config, uint8_t dscp) noexcept
+{
+	return *(dscp < MAX_DSCP && config.dscp_profiles[dscp] != nullptr ? config.dscp_profiles[dscp] :
+									    config.default_profile);
 }
 
 }  // namespace
@@ -321,60 +330,49 @@ uint64_t qos_module::do_process(kinetum_batch_t *batch) noexcept
 	uint64_t local_bytes_allowed = 0;
 	uint64_t local_bytes_dropped = 0;
 
-	const qos_profile_compiled *default_profile = cfg.default_profile;
 	qos_policer &policer = policer_;
 
-	for (uint16_t i = 0; i < count; i++) {
-		// Prefetch next SoA elements
-		if (KINETUM_LIKELY(i + 2 < count)) {
-			__builtin_prefetch(&batch->src_ip[i + 2], 0, 3);
-			__builtin_prefetch(&batch->dscp[i + 2], 0, 3);
-		}
-
-		const std::size_t pkt_bytes = KINETUM_PKT_LEN(batch, i);
-		const uint8_t dscp = KINETUM_PKT_DSCP(batch, i);
-
-		// Determine which profile to use
-		// O(1) DSCP lookup via precomputed array (no snprintf in hot path!)
-		const qos_profile_compiled *profile = default_profile;
-		if (dscp < MAX_DSCP && cfg.dscp_profiles[dscp] != nullptr) {
-			profile = cfg.dscp_profiles[dscp];
-		}
+	// Prepare only immutable lookup facts; GC and mutations stay in packet order.
+	for (uint16_t i = 0; i < count; ++i) {
+		const auto &profile = select_profile(cfg, KINETUM_PKT_DSCP(batch, i));
+		auto &facts = queries_[i];
 		ipv4_header_view header;
 		flow_key key;
-		const bool bounded = profile->cir_bytes_per_s != 0u;
-		if (((bounded || profile->conform_dscp != 0u) && !read_ipv4_header(*batch, i, header)) ||
-		    (bounded && !make_flow_key(*batch, i, header, key))) {
+		const bool bounded = profile.cir_bytes_per_s != 0u;
+		facts.valid = !((bounded || profile.conform_dscp != 0u) && !read_ipv4_header(*batch, i, header)) &&
+			      !(bounded && !make_flow_key(*batch, i, header, key));
+		facts.header_length = header.header_length;
+		if (facts.valid && bounded) {
+			facts.query.emplace(policer.prepare(key));
+		}
+	}
+
+	for (uint16_t i = 0; i < count; i++) {
+		const std::size_t pkt_bytes = KINETUM_PKT_LEN(batch, i);
+		const auto &profile = select_profile(cfg, KINETUM_PKT_DSCP(batch, i));
+		const auto &facts = queries_[i];
+		if (!facts.valid) {
 			KINETUM_DROP(forward_mask, i);
 			++local_invalid_drops;
 			local_bytes_dropped += pkt_bytes;
 			continue;
 		}
 
-		const auto result = policer.police(batch->now_ns, *profile, profiles.runtime, key, pkt_bytes);
+		const auto *query = profile.cir_bytes_per_s != 0u ? &*facts.query : nullptr;
+		const auto result = policer.police(batch->now_ns, profile, profiles.runtime, query, pkt_bytes);
 
 		if (KINETUM_LIKELY(result == policer_result::ALLOWED)) {
 			// DSCP remarking for conforming packets (IPv4 only)
-			if (KINETUM_UNLIKELY(profile->conform_dscp != 0u)) {
-				auto *remark_header = header.data;
-				const uint8_t remark_header_length = header.header_length;
-				const uint8_t new_dscp = profile->conform_dscp;
+			if (KINETUM_UNLIKELY(profile.conform_dscp != 0u)) {
+				auto *remark_header = static_cast<uint8_t *>(batch->data[i]) + batch->l3_off[i];
+				const uint8_t new_dscp = profile.conform_dscp;
 				batch->dscp[i] = new_dscp;
 				const uint8_t ecn = remark_header[1] & 0x03u;
 				remark_header[1] = static_cast<uint8_t>((new_dscp << 2u) | ecn);
 				remark_header[10] = 0u;
 				remark_header[11] = 0u;
-				uint32_t sum = 0u;
-				for (uint8_t j = 0u; j + 1u < remark_header_length; j += 2u) {
-					sum += static_cast<uint32_t>((static_cast<uint16_t>(remark_header[j]) << 8u) |
-								     remark_header[j + 1u]);
-				}
-				while ((sum >> 16u) != 0u) {
-					sum = (sum & 0xffffu) + (sum >> 16u);
-				}
-				const uint16_t checksum = static_cast<uint16_t>(~sum);
-				remark_header[10] = static_cast<uint8_t>(checksum >> 8u);
-				remark_header[11] = static_cast<uint8_t>(checksum & 0xffu);
+				algo::net::write_be16(remark_header + 10u,
+						      algo::net::internet_checksum(remark_header, facts.header_length));
 			}
 
 			// Retain the lane in the forward mask.

@@ -13,9 +13,11 @@
 #include <array>
 #include <exception>
 #include <limits>
+#include <memory>
 #include <new>
 #include <stdexcept>
 #include <utility>
+#include <vector>
 
 #include "src/common/epoch_transition_contract.hpp"
 #include "src/common/status.hpp"
@@ -26,13 +28,13 @@
 namespace kinetum::dp
 {
 
-common::status_or<std::unique_ptr<worker_boundary_receiver>>
+common::status_or<numa_owner<worker_boundary_receiver>>
 worker_boundary_receiver::create(uint32_t worker_index, uint64_t runtime_generation,
-				 std::span<boundary_epoch_channel *const> channels)
+				 std::span<boundary_epoch_channel *const> channels, int32_t numa_node)
 {
 	if (worker_index == std::numeric_limits<uint32_t>::max() || runtime_generation == 0u ||
 	    runtime_generation > std::numeric_limits<uint32_t>::max() ||
-	    channels.size() > std::numeric_limits<uint32_t>::max()) {
+	    channels.size() > std::numeric_limits<uint32_t>::max() || numa_node < 0) {
 		return common::status::invalid_argument(
 			"boundary receiver requires exact representable worker, generation, and endpoint identities");
 	}
@@ -44,7 +46,8 @@ worker_boundary_receiver::create(uint32_t worker_index, uint64_t runtime_generat
 		bool have_previous = false;
 		for (auto *channel : channels) {
 			if (channel == nullptr || channel->receiver_worker_index() != worker_index ||
-			    channel->runtime_generation() != runtime_generation || channel->sender_closed() ||
+			    channel->runtime_generation() != runtime_generation ||
+			    channel->receiver_endpoint_numa_node() != numa_node || channel->sender_closed() ||
 			    !channel->empty() || channel->endpoint_storage_sealed()) {
 				return common::status::failed_precondition(
 					"boundary receiver endpoint does not equal one clean unsealed compiled ownership");
@@ -65,11 +68,23 @@ worker_boundary_receiver::create(uint32_t worker_index, uint64_t runtime_generat
 				      "boundary receiver endpoint table exceeds a bounded host container");
 	}
 
-	auto *raw = new (std::nothrow) worker_boundary_receiver(worker_index, runtime_generation, std::move(endpoints));
-	if (raw == nullptr) {
-		return common::status::resource_exhausted("boundary receiver owner allocation failed");
+	numa_layout layout;
+	std::size_t root_offset = 0u;
+	std::size_t endpoints_offset = 0u;
+	if (!layout.append<worker_boundary_receiver>(1u, root_offset) ||
+	    !layout.append<endpoint>(endpoints.size(), endpoints_offset)) {
+		return common::status(common::status_code::OUT_OF_RANGE, "boundary receiver layout overflows");
 	}
-	std::unique_ptr<worker_boundary_receiver> owner(raw);
+	auto region_or = layout.allocate(numa_node);
+	if (!region_or.is_ok()) {
+		return region_or.error();
+	}
+	auto region = std::move(region_or).value();
+	auto placed = numa_layout::storage<endpoint>(region, endpoints_offset, endpoints.size());
+	std::uninitialized_copy(endpoints.begin(), endpoints.end(), placed.begin());
+	auto *raw = new (numa_layout::storage<worker_boundary_receiver>(region, root_offset).data())
+		worker_boundary_receiver(worker_index, runtime_generation, placed, numa_node);
+	auto owner = adopt_numa_owner(raw, std::move(region));
 	for (auto &entry : owner->endpoints_) {
 		auto policy_or = entry.channel->receiver_slab_->claim_receiver_policy_(
 			entry.channel->receiver_slot_index_, entry.boundary_index);
@@ -86,10 +101,11 @@ worker_boundary_receiver::create(uint32_t worker_index, uint64_t runtime_generat
 }
 
 worker_boundary_receiver::worker_boundary_receiver(uint32_t worker_index, uint64_t runtime_generation,
-						   std::vector<endpoint> endpoints) noexcept
+						   std::span<endpoint> endpoints, int32_t numa_node) noexcept
 	: worker_index_(worker_index)
 	, runtime_generation_(runtime_generation)
-	, endpoints_(std::move(endpoints))
+	, endpoints_(endpoints)
+	, numa_node_(numa_node)
 {
 }
 
@@ -124,7 +140,8 @@ worker_boundary_receiver::~worker_boundary_receiver()
 common::status worker_boundary_receiver::bind_ledger(worker_epoch_ledger &ledger)
 {
 	if (ledger_ != nullptr || ledger.worker_index() != worker_index_ ||
-	    ledger.runtime_generation() != runtime_generation_ || bootstrap_epoch_ != 0u || transition_active_) {
+	    ledger.runtime_generation() != runtime_generation_ || ledger.numa_node() != numa_node_ ||
+	    bootstrap_epoch_ != 0u || transition_active_) {
 		return common::status::failed_precondition(
 			"boundary receiver ledger does not match one unbound worker generation");
 	}

@@ -32,6 +32,7 @@ namespace
 
 using kinetum::common::status;
 using kinetum::common::status_code;
+using kinetum::common::static_status_text;
 
 /** @brief Transactional mapping guard used until all placement proofs pass. */
 class mapping_guard final {
@@ -91,27 +92,30 @@ class mapping_guard final {
 
 }  // namespace
 
-kinetum::common::status_or<numa_memory_region> numa_memory_region::allocate(const numa_memory_options &options)
+kinetum::common::status_or<numa_memory_region> numa_memory_region::allocate(const numa_memory_options &options) noexcept
 {
 	if (options.usable_bytes == 0) {
-		return status(status_code::INVALID_ARGUMENT, "NUMA memory region has zero usable_bytes");
+		return status(status_code::INVALID_ARGUMENT,
+			      static_status_text("NUMA memory region has zero usable_bytes"));
 	}
 	if (options.alignment_bytes == 0 || (options.alignment_bytes & (options.alignment_bytes - 1u)) != 0u) {
 		return status(status_code::INVALID_ARGUMENT,
-			      "NUMA memory region alignment_bytes must be a nonzero power of two");
+			      static_status_text("NUMA memory region alignment_bytes must be a nonzero power of two"));
 	}
 	if (options.host_numa_node.has_value() && options.host_numa_node.value() < 0) {
-		return status(status_code::INVALID_ARGUMENT, "NUMA memory region host node must be nonnegative");
+		return status(status_code::INVALID_ARGUMENT,
+			      static_status_text("NUMA memory region host node must be nonnegative"));
 	}
 
 	const long page_size_result = ::sysconf(_SC_PAGESIZE);
 	if (page_size_result <= 0) {
-		return status(status_code::FAILED_PRECONDITION, "NUMA memory region cannot determine Linux page size");
+		return status(status_code::FAILED_PRECONDITION,
+			      static_status_text("NUMA memory region cannot determine Linux page size"));
 	}
 	const auto page_size = static_cast<std::size_t>(page_size_result);
 	if ((page_size & (page_size - 1u)) != 0u) {
 		return status(status_code::FAILED_PRECONDITION,
-			      "NUMA memory region requires a power-of-two Linux page size");
+			      static_status_text("NUMA memory region requires a power-of-two Linux page size"));
 	}
 	// mmap already returns a page-aligned base. Because both alignments are
 	// powers of two, no slack is needed at or below page alignment; above it,
@@ -119,34 +123,39 @@ kinetum::common::status_or<numa_memory_region> numa_memory_region::allocate(cons
 	const std::size_t alignment_slack = options.alignment_bytes > page_size ? options.alignment_bytes - page_size :
 										  0u;
 	if (options.usable_bytes > std::numeric_limits<std::size_t>::max() - alignment_slack) {
-		return status(status_code::OUT_OF_RANGE, "NUMA memory region alignment overflows size_t");
+		return status(status_code::OUT_OF_RANGE,
+			      static_status_text("NUMA memory region alignment overflows size_t"));
 	}
 	std::size_t mapping_bytes = 0;
 	if (!round_up_checked(options.usable_bytes + alignment_slack, page_size, mapping_bytes)) {
-		return status(status_code::OUT_OF_RANGE, "NUMA memory region mapping extent overflows size_t");
+		return status(status_code::OUT_OF_RANGE,
+			      static_status_text("NUMA memory region mapping extent overflows size_t"));
 	}
 
 	void *mapping = ::mmap(nullptr, mapping_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 	if (mapping == MAP_FAILED) {
-		return status(status_code::RESOURCE_EXHAUSTED, "NUMA memory region anonymous mapping failed");
+		return status(status_code::RESOURCE_EXHAUSTED,
+			      static_status_text("NUMA memory region anonymous mapping failed"));
 	}
 	mapping_guard guard(mapping, mapping_bytes);
 
 	const auto mapping_address = reinterpret_cast<std::uintptr_t>(mapping);
 	if (mapping_bytes > std::numeric_limits<std::uintptr_t>::max() - mapping_address) {
-		return status(status_code::OUT_OF_RANGE, "NUMA memory region mapping end overflows uintptr_t");
+		return status(status_code::OUT_OF_RANGE,
+			      static_status_text("NUMA memory region mapping end overflows uintptr_t"));
 	}
 	const auto mapping_end = mapping_address + mapping_bytes;
 	const auto alignment_mask = static_cast<std::uintptr_t>(options.alignment_bytes - 1u);
 	if (mapping_address > std::numeric_limits<std::uintptr_t>::max() - alignment_mask) {
-		return status(status_code::OUT_OF_RANGE, "NUMA memory region aligned address overflows uintptr_t");
+		return status(status_code::OUT_OF_RANGE,
+			      static_status_text("NUMA memory region aligned address overflows uintptr_t"));
 	}
 	const auto usable_address = (mapping_address + alignment_mask) & ~alignment_mask;
 	std::size_t policy_bytes = 0;
 	if (!round_up_checked(options.usable_bytes, page_size, policy_bytes) || usable_address > mapping_end ||
 	    policy_bytes > mapping_end - usable_address) {
 		return status(status_code::INTERNAL_ERROR,
-			      "NUMA memory mapping cannot contain its aligned usable range");
+			      static_status_text("NUMA memory mapping cannot contain its aligned usable range"));
 	}
 	auto *usable = reinterpret_cast<void *>(usable_address);
 
@@ -155,13 +164,14 @@ kinetum::common::status_or<numa_memory_region> numa_memory_region::allocate(cons
 	if (options.host_numa_node.has_value()) {
 		constexpr std::size_t BITS_PER_MASK_WORD = sizeof(unsigned long) * CHAR_BIT;
 		if (page_size > std::numeric_limits<std::size_t>::max() / CHAR_BIT) {
-			return status(status_code::OUT_OF_RANGE, "NUMA memory kernel nodemask bound overflows size_t");
+			return status(status_code::OUT_OF_RANGE,
+				      static_status_text("NUMA memory kernel nodemask bound overflows size_t"));
 		}
 		const std::size_t kernel_max_node_bits = page_size * CHAR_BIT;
 		const auto node = static_cast<std::size_t>(options.host_numa_node.value());
 		if (node > std::numeric_limits<std::size_t>::max() - 2u) {
 			return status(status_code::OUT_OF_RANGE,
-				      "NUMA memory host node overflows the Linux nodemask ABI");
+				      static_status_text("NUMA memory host node overflows the Linux nodemask ABI"));
 		}
 
 		// Linux interprets maxnode - 1 represented bits. Pass the required
@@ -171,24 +181,34 @@ kinetum::common::status_or<numa_memory_region> numa_memory_region::allocate(cons
 		if (represented_node_bits > kernel_max_node_bits ||
 		    syscall_max_node > static_cast<std::size_t>(std::numeric_limits<unsigned long>::max())) {
 			return status(status_code::OUT_OF_RANGE,
-				      "NUMA memory host node exceeds the Linux nodemask bound");
+				      static_status_text("NUMA memory host node exceeds the Linux nodemask bound"));
 		}
 		if (represented_node_bits > std::numeric_limits<std::size_t>::max() - (BITS_PER_MASK_WORD - 1u)) {
-			return status(status_code::OUT_OF_RANGE, "NUMA memory nodemask extent overflows size_t");
+			return status(status_code::OUT_OF_RANGE,
+				      static_status_text("NUMA memory nodemask extent overflows size_t"));
 		}
 		const std::size_t mask_words = (represented_node_bits + BITS_PER_MASK_WORD - 1u) / BITS_PER_MASK_WORD;
 		node_mask.reset(new (std::nothrow) unsigned long[mask_words]());
 		if (node_mask == nullptr) {
-			return status(status_code::RESOURCE_EXHAUSTED, "NUMA memory nodemask allocation failed");
+			return status(status_code::RESOURCE_EXHAUSTED,
+				      static_status_text("NUMA memory nodemask allocation failed"));
 		}
 		node_mask[node / BITS_PER_MASK_WORD] |= 1ul << (node % BITS_PER_MASK_WORD);
 		max_node = static_cast<unsigned long>(syscall_max_node);
 		const int mode = MPOL_BIND | MPOL_F_STATIC_NODES;
 		if (::syscall(SYS_mbind, usable, policy_bytes, mode, node_mask.get(), max_node, 0ul) != 0) {
-			return status(status_code::FAILED_PRECONDITION, "NUMA memory cannot bind the exact host node");
+			return status(status_code::FAILED_PRECONDITION,
+				      static_status_text("NUMA memory cannot bind the exact host node"));
 		}
 	}
 
+	// Establish C++ byte-array storage explicitly for typed layouts and their
+	// implicit-lifetime arrays. Owners construct nontrivial elements afterward.
+	usable = ::new (usable) std::byte[options.usable_bytes];
+	if (usable == nullptr) {
+		return status(status_code::OUT_OF_RANGE,
+			      static_status_text("NUMA memory byte array exceeds the C++ object-size limit"));
+	}
 	// The cold owner faults every usable page before publication so packet
 	// execution never pays an anonymous-page fault for this region.
 	std::memset(usable, 0, options.usable_bytes);
@@ -197,7 +217,7 @@ kinetum::common::status_or<numa_memory_region> numa_memory_region::allocate(cons
 		if (::syscall(SYS_mbind, usable, policy_bytes, mode, node_mask.get(), max_node,
 			      static_cast<unsigned long>(MPOL_MF_STRICT)) != 0) {
 			return status(status_code::FAILED_PRECONDITION,
-				      "NUMA memory resident pages violate exact host placement");
+				      static_status_text("NUMA memory resident pages violate exact host placement"));
 		}
 	}
 

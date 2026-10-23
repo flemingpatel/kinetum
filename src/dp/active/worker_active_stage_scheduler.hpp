@@ -31,13 +31,13 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <memory>
 #include <span>
 
 #include <kinetum/kinetum_sdk.h>
 
 #include "src/common/status.hpp"
 #include "src/common/status_or.hpp"
+#include "src/dp/numa_layout.hpp"
 #include "src/dp/packet.hpp"
 #include "src/dp/packet_mechanism.hpp"
 
@@ -143,7 +143,7 @@ class worker_active_stage_scheduler final {
 	 * @return Scheduler for a nonempty active schedule, or exact validation,
 	 *         representability, NUMA-allocation, or ownership failure.
 	 */
-	[[nodiscard]] static common::status_or<std::unique_ptr<worker_active_stage_scheduler>>
+	[[nodiscard]] static common::status_or<numa_owner<worker_active_stage_scheduler>>
 	create(uint32_t worker_index, const provider::compiled_provider_topology &topology,
 	       std::span<const active_stage_context_binding> contexts, worker_epoch_ledger &ledger,
 	       active_stage_packet_operations packet_operations);
@@ -284,9 +284,9 @@ class worker_active_stage_scheduler final {
 	 * @brief Adopt one completely validated implementation owner.
 	 * @param implementation Sole validated private implementation.
 	 */
-	explicit worker_active_stage_scheduler(std::unique_ptr<implementation> implementation) noexcept;
+	explicit worker_active_stage_scheduler(implementation *implementation) noexcept;
 
-	std::unique_ptr<implementation> implementation_;  ///< Sole instance-scoped scheduler state.
+	implementation *implementation_{nullptr};  ///< Constructed scheduler state in the same owned NUMA allocation.
 };
 
 }  // namespace kinetum::dp

@@ -87,13 +87,13 @@ logical_port_bindings {
 io_stream_bindings {
   logical_name: "wan0"
   direction: IO_STREAM_DIRECTION_RX
-  queues { driver_queue_id: 0 descriptor_count: 1024 rx_storage_domain_id: "storage_dpdk_0" }
+  queues { driver_queue_id: 0 descriptor_count: 2048 rx_storage_domain_id: "storage_dpdk_0" }
   steering { kind: TRAFFIC_STEERING_KIND_NONE }
 }
 io_stream_bindings {
   logical_name: "wan1"
   direction: IO_STREAM_DIRECTION_RX
-  queues { driver_queue_id: 0 descriptor_count: 1024 rx_storage_domain_id: "storage_dpdk_0" }
+  queues { driver_queue_id: 0 descriptor_count: 2048 rx_storage_domain_id: "storage_dpdk_0" }
   steering { kind: TRAFFIC_STEERING_KIND_NONE }
 }
 io_stream_bindings {

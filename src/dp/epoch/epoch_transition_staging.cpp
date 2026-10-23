@@ -13,10 +13,12 @@
 #include <new>
 #include <utility>
 
+#include "src/common/runtime_sizing.hpp"
+
 namespace kinetum::dp
 {
 
-common::status_or<std::unique_ptr<boundary_future_output_hold>>
+common::status_or<numa_owner<boundary_future_output_hold>>
 boundary_future_output_hold::create(const common::compiled_transition_boundary &facts, int32_t sender_numa_node)
 {
 	if (facts.sender_worker_index == facts.receiver_worker_index) {
@@ -27,71 +29,77 @@ boundary_future_output_hold::create(const common::compiled_transition_boundary &
 		return common::status::failed_precondition(
 			"boundary future-output hold requires an exact sender NUMA node");
 	}
-	auto queue_or = numa_spsc_ring<packet_record *>::create(facts.future_output_hold_capacity, sender_numa_node);
-	if (!queue_or.is_ok()) {
-		return queue_or.error();
+	auto bytes_or = numa_spsc_ring<packet_record *>::required_element_bytes(facts.future_output_hold_capacity);
+	if (!bytes_or.is_ok()) {
+		return bytes_or.error();
 	}
-	auto *hold = new (std::nothrow)
-		boundary_future_output_hold(facts, sender_numa_node, std::move(queue_or).value());
-	if (hold == nullptr) {
-		return common::status::resource_exhausted("boundary future-output hold owner allocation failed");
+	numa_layout layout;
+	std::size_t root_offset = 0u;
+	std::size_t elements_offset = 0u;
+	if (!layout.append<boundary_future_output_hold>(1u, root_offset) ||
+	    !layout.append<std::byte>(bytes_or.value(), elements_offset, algo::CACHE_LINE_SIZE)) {
+		return common::status(common::status_code::OUT_OF_RANGE,
+				      "boundary future-output hold layout overflows");
 	}
-	return std::unique_ptr<boundary_future_output_hold>(hold);
+	auto region_or = layout.allocate(sender_numa_node);
+	if (!region_or.is_ok()) {
+		return region_or.error();
+	}
+	auto region = std::move(region_or).value();
+	auto *hold = new (numa_layout::storage<boundary_future_output_hold>(region, root_offset).data())
+		boundary_future_output_hold(facts, region,
+					    numa_layout::storage<std::byte>(region, elements_offset, bytes_or.value()));
+	return adopt_numa_owner(hold, std::move(region));
 }
 
 boundary_future_output_hold::boundary_future_output_hold(const common::compiled_transition_boundary &facts,
-							 int32_t sender_numa_node,
-							 std::unique_ptr<numa_spsc_ring<packet_record *>> queue) noexcept
+							 const numa_memory_region &region,
+							 std::span<std::byte> elements) noexcept
 	: boundary_index_(facts.boundary_index)
 	, sender_worker_index_(facts.sender_worker_index)
-	, numa_node_(sender_numa_node)
-	, queue_(std::move(queue))
+	, queue_(region, elements, facts.future_output_hold_capacity)
 {
-	if (queue_ == nullptr || !queue_->empty() || queue_->capacity() != facts.future_output_hold_capacity ||
-	    queue_->numa_node() != numa_node_) {
-		std::terminate();
-	}
 }
 
-boundary_future_output_hold::~boundary_future_output_hold()
-{
-	if (queue_ != nullptr && !queue_->empty()) {
-		std::terminate();
-	}
-}
+boundary_future_output_hold::~boundary_future_output_hold() = default;
 
-bool boundary_future_output_hold::try_hold(packet_record *record) noexcept
+std::size_t boundary_future_output_hold::try_hold(std::span<packet_record *const> records) noexcept
 {
-	if (record == nullptr) {
+	if (records.size() > common::runtime_sizing::PACKET_MAX_BURST_SIZE) {
 		std::terminate();
 	}
-	return queue_->try_push(record);
+	for (const auto *record : records) {
+		if (record == nullptr) {
+			std::terminate();
+		}
+	}
+	return queue_.push_batch(records.data(), records.size());
 }
 
 bool boundary_future_output_hold::try_release(packet_record *&record) noexcept
 {
-	return queue_->try_pop(record);
+	return queue_.try_pop(record);
 }
 
 const packet_record *boundary_future_output_hold::peek() const noexcept
 {
-	const auto *slot = queue_->peek();
+	const auto *slot = queue_.peek();
 	return slot != nullptr ? *slot : nullptr;
 }
 
 bool boundary_future_output_hold::empty() const noexcept
 {
-	return queue_->empty();
+	return queue_.empty();
 }
 
 std::size_t boundary_future_output_hold::size_approx() const noexcept
 {
-	return queue_->size_approx();
+	return queue_.size_approx();
 }
 
 std::size_t boundary_future_output_hold::capacity() const noexcept
 {
-	return queue_->capacity();
+	return queue_.capacity();
 }
 
 uint32_t boundary_future_output_hold::boundary_index() const noexcept
@@ -106,7 +114,7 @@ uint32_t boundary_future_output_hold::sender_worker_index() const noexcept
 
 int32_t boundary_future_output_hold::numa_node() const noexcept
 {
-	return numa_node_;
+	return queue_.numa_node();
 }
 
 }  // namespace kinetum::dp

@@ -32,9 +32,7 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <memory>
 #include <span>
-#include <vector>
 
 #include "src/common/status_or.hpp"
 #include "src/dp/epoch/boundary_epoch_channel.hpp"
@@ -43,6 +41,7 @@
 #include "src/dp/epoch/epoch_transition_staging.hpp"
 #include "src/dp/epoch/worker_epoch_ledger.hpp"
 #include "src/dp/publication_read_result.hpp"
+#include "src/dp/numa_layout.hpp"
 
 namespace kinetum::dp
 {
@@ -72,11 +71,12 @@ class worker_boundary_sender final {
 	 * @param runtime_generation Exact nonzero materialized generation.
 	 * @param channels Complete exact outbound channel set.
 	 * @param holds Complete matching outbound future-hold set.
+	 * @param numa_node Exact compiled sender-worker node, including an empty endpoint set.
 	 * @return Unique unbound sender owner or a fail-closed identity/claim status.
 	 */
-	[[nodiscard]] static common::status_or<std::unique_ptr<worker_boundary_sender>>
+	[[nodiscard]] static common::status_or<numa_owner<worker_boundary_sender>>
 	create(uint32_t worker_index, uint64_t runtime_generation, std::span<boundary_epoch_channel *const> channels,
-	       std::span<boundary_future_output_hold *const> holds);
+	       std::span<boundary_future_output_hold *const> holds, int32_t numa_node);
 
 	/** @brief Reject copying because sender policy and policy-slot claims are linear. */
 	worker_boundary_sender(const worker_boundary_sender &) = delete;
@@ -146,18 +146,19 @@ class worker_boundary_sender final {
 					    uint64_t to_epoch) noexcept;
 
 	/**
-	 * @brief Route one cross-worker packet through exact sender policy.
+	 * @brief Route one compatible packet prefix through exact sender policy.
 	 *
-	 * TRANSFERRED means channel publication and enqueue-sequence advancement
-	 * completed before this method retired the worker credit. HELD means the
-	 * hold owns the pointer while the ledger credit remains. BACKPRESSURED
-	 * changes neither caller reservation nor ownership.
+	 * DATA publication advances the exact enqueue sequence before retiring the
+	 * accepted worker credits. A future hold instead retains those credits.
+	 * Both dispositions release the accepted local reservations at the caller;
+	 * the suffix retains its caller ownership and reservations unchanged.
 	 *
 	 * @param sender_ordinal Pre-resolved worker-local outbound ordinal.
-	 * @param record Nonnull exact packet record carrying one live worker credit.
-	 * @return Exact ownership disposition.
+	 * @param records Nonnull records from one epoch and storage domain, at most
+	 *        one worker burst. Every offered record carries one live worker credit.
+	 * @return Exact prefix accepted into DATA or the future hold; zero on refusal.
 	 */
-	[[nodiscard]] boundary_epoch_send_result try_send(uint32_t sender_ordinal, packet_record *record) noexcept;
+	[[nodiscard]] std::size_t try_send(uint32_t sender_ordinal, std::span<packet_record *const> records) noexcept;
 
 	/**
 	 * @brief Seal every outbound edge after exact old worker-credit drain.
@@ -343,6 +344,7 @@ class worker_boundary_sender final {
 	struct sender_identity {
 		uint32_t worker_index{0};	 ///< Exact compact sender-worker identity.
 		uint64_t runtime_generation{0};	 ///< Exact materialized generation.
+		int32_t numa_node{-1};		 ///< Exact proved owner node.
 	};
 
 	/** @brief One immutable transport binding plus its borrowed policy line. */
@@ -362,7 +364,7 @@ class worker_boundary_sender final {
 	 * @param identity Exact compact worker and materialized generation.
 	 * @param endpoints Strictly sorted complete outbound endpoint set.
 	 */
-	worker_boundary_sender(sender_identity identity, std::vector<endpoint> endpoints) noexcept;
+	worker_boundary_sender(sender_identity identity, std::span<endpoint> endpoints) noexcept;
 
 	/**
 	 * @param sender_ordinal Exact owner-local outbound ordinal.
@@ -403,10 +405,11 @@ class worker_boundary_sender final {
 			   epoch_protocol_fault_disposition disposition, uint64_t observed_epoch,
 			   uint64_t expected_value, uint64_t observed_value) noexcept;
 
-	uint32_t worker_index_{0};			///< Exact compact worker identity.
-	uint64_t runtime_generation_{0};		///< Exact materialized generation.
-	std::vector<endpoint> endpoints_;		///< Stable sorted owner-local endpoint table.
-	worker_epoch_ledger *ledger_{nullptr};		///< Bound sole worker credit authority.
+	uint32_t worker_index_{0};		///< Exact compact worker identity.
+	uint64_t runtime_generation_{0};	///< Exact materialized generation.
+	std::span<endpoint> endpoints_;		///< Stable sorted owner-local endpoint table in the root mapping.
+	int32_t numa_node_{-1};			///< Compiled node shared by root, bindings and endpoint policy storage.
+	worker_epoch_ledger *ledger_{nullptr};	///< Bound sole worker credit authority.
 	worker_runtime_telemetry *telemetry_{nullptr};	///< Sole owner-local protocol counters.
 	epoch_protocol_fault_latch *faults_{nullptr};	///< Process-generation first-fault authority.
 	std::size_t round_robin_cursor_{0};		///< Next held-output service ordinal.

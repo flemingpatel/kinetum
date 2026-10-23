@@ -90,21 +90,26 @@ struct receiver_test_owner {
 	std::unique_ptr<boundary_epoch_worker_slab> sender_slab;       ///< Exact sender storage.
 	std::unique_ptr<boundary_epoch_worker_slab> receiver_slab;     ///< Exact receiver storage.
 	std::unique_ptr<boundary_epoch_channel> channel;	       ///< Exact transport owner.
-	std::unique_ptr<boundary_future_output_hold> hold;	       ///< Required sender hold owner.
+	numa_owner<boundary_future_output_hold> hold;		       ///< Required sender hold owner.
 	std::unique_ptr<test::worker_telemetry_test_owner> telemetry;  ///< Production-shaped telemetry banks.
 	std::unique_ptr<epoch_protocol_fault_latch> faults;	       ///< Process-generation first-fault authority.
-	std::unique_ptr<worker_epoch_ledger> sender_ledger;	       ///< Exact sender credit owner.
-	std::unique_ptr<worker_epoch_ledger> ledger;		       ///< Exact receiver credit owner.
-	std::unique_ptr<worker_boundary_sender> sender_claim;	       ///< Mirrored sender-policy claim.
-	std::unique_ptr<worker_boundary_receiver> receiver;	       ///< Sole receiver policy.
-	std::unique_ptr<worker_epoch_activation> activation;	       ///< Exact local activation order.
+	numa_owner<worker_epoch_ledger> sender_ledger;		       ///< Exact sender credit owner.
+	numa_owner<worker_epoch_ledger> ledger;			       ///< Exact receiver credit owner.
+	numa_owner<worker_boundary_sender> sender_claim;	       ///< Mirrored sender-policy claim.
+	numa_owner<worker_boundary_receiver> receiver;		       ///< Sole receiver policy.
+	numa_owner<worker_epoch_activation> activation;		       ///< Exact local activation order.
 
+	/** @brief Construct an empty fixture ownership graph. */
 	receiver_test_owner() noexcept = default;
+	/** @brief Reject copying linear fixture ownership. */
 	receiver_test_owner(const receiver_test_owner &) = delete;
+	/** @brief Reject copy assignment of linear fixture ownership. */
 	receiver_test_owner &operator=(const receiver_test_owner &) = delete;
 	/** Transfer complete fixture resource ownership. */
 	receiver_test_owner(receiver_test_owner &&) noexcept = default;
+	/** @brief Reject replacement that would destroy dependencies before borrowers. */
 	receiver_test_owner &operator=(receiver_test_owner &&) = delete;
+	/** @brief Retire borrowers before their backing storage. */
 	~receiver_test_owner() = default;
 
 	/** @return true when every exact owner is present. */
@@ -150,8 +155,10 @@ struct receiver_test_owner {
 	owner.hold = std::move(hold_or).value();
 	std::array<boundary_epoch_channel *, 1> channels{owner.channel.get()};
 	std::array<boundary_future_output_hold *, 1> holds{owner.hold.get()};
-	auto sender_or = worker_boundary_sender::create(TEST_SENDER_WORKER, TEST_RUNTIME_GENERATION, channels, holds);
-	auto receiver_or = worker_boundary_receiver::create(TEST_RECEIVER_WORKER, TEST_RUNTIME_GENERATION, channels);
+	auto sender_or =
+		worker_boundary_sender::create(TEST_SENDER_WORKER, TEST_RUNTIME_GENERATION, channels, holds, numa_node);
+	auto receiver_or =
+		worker_boundary_receiver::create(TEST_RECEIVER_WORKER, TEST_RUNTIME_GENERATION, channels, numa_node);
 	if (!sender_or.is_ok() || !receiver_or.is_ok()) {
 		ADD_FAILURE() << (sender_or.is_ok() ? receiver_or.error().message() : sender_or.error().message());
 		return owner;
@@ -164,8 +171,9 @@ struct receiver_test_owner {
 		ADD_FAILURE() << (sender_sealed.is_ok() ? receiver_sealed.message() : sender_sealed.message());
 		return owner;
 	}
-	auto sender_ledger_or = worker_epoch_ledger::create(TEST_SENDER_WORKER, TEST_RUNTIME_GENERATION, 32u);
-	auto ledger_or = worker_epoch_ledger::create(TEST_RECEIVER_WORKER, TEST_RUNTIME_GENERATION, 32u);
+	auto sender_ledger_or =
+		worker_epoch_ledger::create(TEST_SENDER_WORKER, TEST_RUNTIME_GENERATION, 32u, numa_node);
+	auto ledger_or = worker_epoch_ledger::create(TEST_RECEIVER_WORKER, TEST_RUNTIME_GENERATION, 32u, numa_node);
 	if (!sender_ledger_or.is_ok() || !ledger_or.is_ok()) {
 		ADD_FAILURE() << (sender_ledger_or.is_ok() ? ledger_or.error().message() :
 							     sender_ledger_or.error().message());
@@ -174,7 +182,7 @@ struct receiver_test_owner {
 	owner.sender_ledger = std::move(sender_ledger_or).value();
 	owner.ledger = std::move(ledger_or).value();
 	auto telemetry_or =
-		test::worker_telemetry_test_owner::create(TEST_RECEIVER_WORKER, TEST_RUNTIME_GENERATION, {});
+		test::worker_telemetry_test_owner::create(TEST_RECEIVER_WORKER, TEST_RUNTIME_GENERATION, numa_node, {});
 	if (!telemetry_or.is_ok()) {
 		ADD_FAILURE() << telemetry_or.error().message();
 		return owner;
@@ -279,13 +287,19 @@ void begin_transition_for_death(receiver_test_owner &owner)
 void receive_data(receiver_test_owner &owner, packet_record &record, bool retire)
 {
 	packet_record *received = nullptr;
-	ASSERT_EQ(owner.channel->try_receive_data(received), boundary_data_receive_result::RECEIVED);
-	ASSERT_EQ(received, &record);
-	owner.ledger->acquire(record.metadata.epoch);
-	owner.channel->complete_data_receive(received);
+	const auto result = owner.channel->receive_data(1u, [&](packet_record *value) noexcept {
+		owner.ledger->acquire(value->metadata.epoch);
+		received = value;
+		return true;
+	});
 	if (retire) {
-		owner.ledger->retire(record.metadata.epoch);
+		if (received != nullptr) {
+			owner.ledger->retire(received->metadata.epoch);
+		}
 	}
+	EXPECT_FALSE(result.sequence_exhausted);
+	EXPECT_EQ(result.transferred_count, 1u);
+	EXPECT_EQ(received, &record);
 }
 
 /**
@@ -470,7 +484,7 @@ TEST(worker_boundary_receiver, exact_cut_progress_duplicate_and_contradiction_ar
 		ASSERT_TRUE(owner);
 		packet_record record{};
 		record.metadata.epoch = TEST_ACTIVE_EPOCH;
-		ASSERT_EQ(owner.channel->try_send_data(&record), boundary_data_publication_result::TRANSFERRED);
+		ASSERT_EQ(owner.channel->try_send_data(std::array{&record}).transferred_count, 1u);
 		begin_transition(owner);
 		ASSERT_EQ(owner.channel->submit_cut({TEST_FUTURE_EPOCH, 1u}),
 			  boundary_control_publication_result::PUBLISHED);
@@ -496,16 +510,18 @@ TEST(worker_boundary_receiver, exact_cut_progress_duplicate_and_contradiction_ar
 			}
 			packet_record record{};
 			record.metadata.epoch = TEST_ACTIVE_EPOCH;
-			if (owner.channel->try_send_data(&record) != boundary_data_publication_result::TRANSFERRED) {
+			if (owner.channel->try_send_data(std::array{&record}).transferred_count != 1u) {
 				std::_Exit(EXIT_SUCCESS);
 			}
 			packet_record *received = nullptr;
-			if (owner.channel->try_receive_data(received) != boundary_data_receive_result::RECEIVED ||
-			    received != &record) {
+			const auto result = owner.channel->receive_data(1u, [&](packet_record *value) noexcept {
+				owner.ledger->acquire(value->metadata.epoch);
+				received = value;
+				return true;
+			});
+			if (result.sequence_exhausted || result.transferred_count != 1u || received != &record) {
 				std::_Exit(EXIT_SUCCESS);
 			}
-			owner.ledger->acquire(record.metadata.epoch);
-			owner.channel->complete_data_receive(received);
 			owner.ledger->retire(record.metadata.epoch);
 			begin_transition_for_death(owner);
 			if (owner.channel->submit_cut({TEST_FUTURE_EPOCH, 0u}) !=
@@ -513,6 +529,7 @@ TEST(worker_boundary_receiver, exact_cut_progress_duplicate_and_contradiction_ar
 				std::_Exit(EXIT_SUCCESS);
 			}
 			owner.receiver->service_control();
+			std::_Exit(EXIT_SUCCESS);
 		},
 		"");
 }
@@ -522,18 +539,19 @@ TEST(worker_boundary_receiver, fan_in_requires_every_cut_zero_old_credit_and_tar
 {
 	const int32_t numa_node = test_numa_node();
 	ASSERT_GE(numa_node, 0);
-	auto ledger_or = worker_epoch_ledger::create(TEST_RECEIVER_WORKER, TEST_RUNTIME_GENERATION, 8u);
+	auto ledger_or = worker_epoch_ledger::create(TEST_RECEIVER_WORKER, TEST_RUNTIME_GENERATION, 8u, numa_node);
 	ASSERT_TRUE(ledger_or.is_ok()) << ledger_or.error().message();
 	auto ledger = std::move(ledger_or).value();
 	std::array<boundary_epoch_channel *, 0> no_channels{};
-	auto receiver_or = worker_boundary_receiver::create(TEST_RECEIVER_WORKER, TEST_RUNTIME_GENERATION, no_channels);
+	auto receiver_or =
+		worker_boundary_receiver::create(TEST_RECEIVER_WORKER, TEST_RUNTIME_GENERATION, no_channels, numa_node);
 	ASSERT_TRUE(receiver_or.is_ok()) << receiver_or.error().message();
 	auto receiver = std::move(receiver_or).value();
 	ASSERT_TRUE(receiver->bind_ledger(*ledger).is_ok());
 	ledger->bind_bootstrap_epoch(TEST_ACTIVE_EPOCH);
 	receiver->bind_bootstrap_epoch(TEST_ACTIVE_EPOCH);
 	auto telemetry_or =
-		test::worker_telemetry_test_owner::create(TEST_RECEIVER_WORKER, TEST_RUNTIME_GENERATION, {});
+		test::worker_telemetry_test_owner::create(TEST_RECEIVER_WORKER, TEST_RUNTIME_GENERATION, numa_node, {});
 	ASSERT_TRUE(telemetry_or.is_ok()) << telemetry_or.error().message();
 	auto telemetry = std::move(telemetry_or).value();
 	std::array<module::module_epoch_store *, 0> no_modules{};
@@ -580,7 +598,7 @@ TEST(worker_boundary_receiver, multiboundary_fan_in_is_exact_and_region_aggregat
 	auto sender_slab = std::move(sender_slab_or).value();
 	auto receiver_slab = std::move(receiver_slab_or).value();
 	std::vector<std::unique_ptr<boundary_epoch_channel>> channel_owners;
-	std::vector<std::unique_ptr<boundary_future_output_hold>> hold_owners;
+	std::vector<numa_owner<boundary_future_output_hold>> hold_owners;
 	std::vector<boundary_epoch_channel *> channels;
 	std::vector<boundary_future_output_hold *> holds;
 	for (std::size_t index = 0u; index < 2u; ++index) {
@@ -595,11 +613,13 @@ TEST(worker_boundary_receiver, multiboundary_fan_in_is_exact_and_region_aggregat
 		channel_owners.push_back(std::move(channel_or).value());
 		hold_owners.push_back(std::move(hold_or).value());
 	}
-	auto ledger_or = worker_epoch_ledger::create(TEST_RECEIVER_WORKER, TEST_RUNTIME_GENERATION, 8u);
+	auto ledger_or = worker_epoch_ledger::create(TEST_RECEIVER_WORKER, TEST_RUNTIME_GENERATION, 8u, numa_node);
 	ASSERT_TRUE(ledger_or.is_ok()) << ledger_or.error().message();
 	auto ledger = std::move(ledger_or).value();
-	auto sender_or = worker_boundary_sender::create(TEST_SENDER_WORKER, TEST_RUNTIME_GENERATION, channels, holds);
-	auto receiver_or = worker_boundary_receiver::create(TEST_RECEIVER_WORKER, TEST_RUNTIME_GENERATION, channels);
+	auto sender_or =
+		worker_boundary_sender::create(TEST_SENDER_WORKER, TEST_RUNTIME_GENERATION, channels, holds, numa_node);
+	auto receiver_or =
+		worker_boundary_receiver::create(TEST_RECEIVER_WORKER, TEST_RUNTIME_GENERATION, channels, numa_node);
 	ASSERT_TRUE(sender_or.is_ok()) << sender_or.error().message();
 	ASSERT_TRUE(receiver_or.is_ok()) << receiver_or.error().message();
 	auto sender = std::move(sender_or).value();
@@ -611,7 +631,7 @@ TEST(worker_boundary_receiver, multiboundary_fan_in_is_exact_and_region_aggregat
 	ledger->bind_bootstrap_epoch(TEST_ACTIVE_EPOCH);
 	receiver->bind_bootstrap_epoch(TEST_ACTIVE_EPOCH);
 	auto telemetry_or =
-		test::worker_telemetry_test_owner::create(TEST_RECEIVER_WORKER, TEST_RUNTIME_GENERATION, {});
+		test::worker_telemetry_test_owner::create(TEST_RECEIVER_WORKER, TEST_RUNTIME_GENERATION, numa_node, {});
 	ASSERT_TRUE(telemetry_or.is_ok()) << telemetry_or.error().message();
 	auto telemetry = std::move(telemetry_or).value();
 	std::array<module::module_epoch_store *, 0> no_modules{};

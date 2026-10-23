@@ -32,13 +32,6 @@ enum class boundary_epoch_sender_phase : uint8_t {
 	WAITING_ACK,  ///< CUT is published and future DATA awaits its exact ACK.
 };
 
-/** @brief Exact ownership result from one sender-policy packet operation. */
-enum class boundary_epoch_send_result : uint8_t {
-	TRANSFERRED = 0,  ///< Channel owns DATA and the worker credit retired.
-	HELD,		  ///< Future hold owns the pointer; worker credit remains.
-	BACKPRESSURED,	  ///< Caller retains pointer, reservation, and credit.
-};
-
 /**
  * @brief Coherent sender-policy edge proof for one exact transition.
  *
@@ -65,8 +58,6 @@ struct alignas(kinetum::algo::CACHE_LINE_SIZE) boundary_sender_transition_snapsh
 };
 
 static_assert(sizeof(boundary_epoch_sender_phase) == sizeof(uint8_t), "boundary sender phase must remain one byte");
-static_assert(sizeof(boundary_epoch_send_result) == sizeof(uint8_t),
-	      "boundary sender packet result must remain one byte");
 static_assert(sizeof(boundary_sender_transition_snapshot) == 2u * kinetum::algo::CACHE_LINE_SIZE,
 	      "boundary sender transition observation must occupy two cache lines");
 static_assert(alignof(boundary_sender_transition_snapshot) == kinetum::algo::CACHE_LINE_SIZE,

@@ -17,6 +17,7 @@
 #include <exception>
 #include <limits>
 #include <map>
+#include <memory>
 #include <new>
 #include <optional>
 #include <set>
@@ -48,8 +49,10 @@
 #include "src/dp/numa_memory.hpp"
 #include "src/dp/packet.hpp"
 #include "src/dp/packet_mechanism.hpp"
-#include "src/dp/packet_work_item.hpp"
+#include "src/dp/packet_work_key.hpp"
+#include "src/dp/worker_packet_staging.hpp"
 #include "src/dp/worker_input_scheduler.hpp"
+#include "src/dp/worker_lifecycle.hpp"
 #include "src/dp/worker_runtime_command.hpp"
 #include "src/dp/worker_runtime_telemetry.hpp"
 #include "src/provider/compiled_provider_topology.hpp"
@@ -124,50 +127,20 @@ template <typename value_type>
 
 /** @brief Complete pre-resolved state and sole execution owner for one packet worker. */
 class packet_worker_kernel::implementation final {
+	struct execution_views;
+
     public:
+	class construction;
 	/**
-	 * @brief Bind one empty implementation to immutable generation authorities.
-	 *
-	 * @param worker_index Exact compact worker identity.
-	 * @param topology Sole compiled provider and transition topology.
-	 * @param providers Complete materialized provider generation.
-	 * @param modules Stable admitted module generation.
-	 * @param commands Sole process-generation transition/stop publication.
-	 * @param telemetry Exact worker-local telemetry banks.
-	 * @param protocol_faults Process-generation transition-safety fault authority.
-	 * @param module_telemetry Exact context owners serviced by this worker.
+	 * @brief Adopt complete local tables and transfer the cold builder's independent owners.
+	 * @param source Validated construction state, left without transferred ownership.
+	 * @param views Complete typed views into this implementation's allocation.
 	 */
-	implementation(uint32_t worker_index, const provider::compiled_provider_topology &topology,
-		       const provider::materialized_provider_runtime &providers, module::module_manager &modules,
-		       worker_runtime_command_publication &commands, worker_runtime_telemetry &telemetry,
-		       epoch_protocol_fault_latch &protocol_faults,
-		       std::span<lifecycle::lifecycle_context_owner *const> module_telemetry) noexcept
-		: worker_index_(worker_index)
-		, topology_(topology)
-		, providers_(providers)
-		, modules_(modules)
-		, commands_(&commands)
-		, telemetry_(&telemetry)
-		, protocol_faults_(&protocol_faults)
-		, module_telemetry_(module_telemetry)
-	{
-	}
+	implementation(construction &source, const execution_views &views) noexcept;
 
 	/** @brief Fail stop if worker-owned packet state survives kernel teardown. */
 	~implementation() noexcept;
 
-	/**
-	 * @brief Allocate and validate every direct worker table.
-	 *
-	 * @param boundaries Complete compact-indexed boundary-channel table.
-	 * @param boundary_sender Sole complete outbound sender-policy authority.
-	 * @param boundary_receiver Sole complete inbound receiver-policy authority.
-	 * @return OK after all tables agree with compiled truth; otherwise an exact
-	 *         cold construction failure.
-	 */
-	[[nodiscard]] common::status initialize(const std::vector<boundary_epoch_channel *> &boundaries,
-						std::unique_ptr<worker_boundary_sender> boundary_sender,
-						std::unique_ptr<worker_boundary_receiver> boundary_receiver);
 	/**
 	 * @brief Bind and revalidate one already activated owner-local epoch.
 	 *
@@ -198,6 +171,11 @@ class packet_worker_kernel::implementation final {
 	{
 		return quiescence_reader_;
 	}
+	/** @copydoc packet_worker_kernel::lifecycle_record */
+	[[nodiscard]] worker_lifecycle_context &lifecycle_record() noexcept
+	{
+		return lifecycle_;
+	}
 
 	/** @copydoc packet_worker_kernel::transition_certificate_source */
 	[[nodiscard]] epoch_transition_certificate_worker_source transition_certificate_source() const noexcept
@@ -216,15 +194,24 @@ class packet_worker_kernel::implementation final {
 	}
 
     private:
+	/** @brief Borrow immutable execution tables after their cold construction completes. */
+	template <typename value_type>
+	using execution_array = std::span<const value_type>;
+	/** @brief Temporary construction storage, never retained by packet execution. */
+	template <typename value_type>
+	using construction_array = std::vector<value_type>;
+
 	/** @brief One exact pre-resolved directed stage target. */
-	struct route_target {
+	template <template <typename> class sequence>
+	struct route_target_record {
 		uint32_t stage_instance_index{provider::INVALID_COMPILED_PROVIDER_INDEX};  ///< Destination stage.
 		uint16_t logical_stage_index{
 			provider::INVALID_COMPILED_STAGE_INSTANCE_INDEX};	     ///< Destination logical stage.
 		uint32_t boundary_index{provider::INVALID_COMPILED_PROVIDER_INDEX};  ///< Exact cross-worker edge.
-		uint32_t sender_ordinal{INVALID_RUNTIME_ORDINAL};    ///< Direct owner-local sender policy.
-		std::vector<uint32_t> transition_by_storage_domain;  ///< Direct transition or invalid sentinel.
+		uint32_t sender_ordinal{INVALID_RUNTIME_ORDINAL};  ///< Direct owner-local sender policy.
+		sequence<uint32_t> transition_by_storage_domain;   ///< Direct transition or invalid sentinel.
 	};
+	using route_target = route_target_record<execution_array>;  ///< Published immutable target projection.
 
 	/** @brief One priority matcher referring to a pre-resolved target ordinal. */
 	struct priority_route {
@@ -235,20 +222,23 @@ class packet_worker_kernel::implementation final {
 	};
 
 	/** @brief Cold-proved logical destination and its complete permitted context set. */
-	struct route_group {
+	template <template <typename> class sequence>
+	struct route_group_record {
 		uint16_t logical_stage_index{
 			provider::INVALID_COMPILED_STAGE_INSTANCE_INDEX};  ///< Exact logical successor.
 		uint32_t direct_target_ordinal{INVALID_RUNTIME_ORDINAL};   ///< Same-lane or explicit PULL target.
 		kinetum_select_contexts_fn select_contexts{
-			nullptr};				  ///< Exact declared selector; null for direct routes.
-		uint32_t context_count{0};			  ///< Complete generation-fixed module population.
-		std::vector<uint32_t> permitted_ordinals;	  ///< Canonical permitted context set.
-		std::vector<uint64_t> permitted_bitmap;		  ///< Read-only exact membership projection.
-		std::vector<uint32_t> target_by_context_ordinal;  ///< Direct context-to-concrete-target lookup.
+			nullptr};			       ///< Exact declared selector; null for direct routes.
+		uint32_t context_count{0};		       ///< Complete generation-fixed module population.
+		sequence<uint32_t> permitted_ordinals;	       ///< Canonical permitted context set.
+		sequence<uint64_t> permitted_bitmap;	       ///< Read-only exact membership projection.
+		sequence<uint32_t> target_by_context_ordinal;  ///< Direct context-to-concrete-target lookup.
 	};
+	using route_group = route_group_record<execution_array>;  ///< Published immutable selector projection.
 
 	/** @brief One exact worker-owned stage mechanism and routing table. */
-	struct stage_runtime {
+	template <template <typename> class sequence, typename membership_type>
+	struct stage_record {
 		bool owned{false};			 ///< Whether this global compact slot belongs to the worker.
 		uint32_t telemetry_ordinal{UINT32_MAX};	 ///< Direct owner-local telemetry row.
 		const provider::compiled_provider_stage_instance *facts{nullptr};     ///< Immutable stage facts.
@@ -259,30 +249,33 @@ class packet_worker_kernel::implementation final {
 		uint32_t rx_stream_index{provider::INVALID_COMPILED_PROVIDER_INDEX};  ///< Exact ingress source.
 		uint32_t stage_bound_tx_stream_index{
 			provider::INVALID_COMPILED_PROVIDER_INDEX};  ///< Exact TX-stage egress.
-		std::vector<route_target> targets;		     ///< Unique authored outgoing targets.
-		std::vector<uint32_t> target_by_stage_instance;	     ///< Global target to local ordinal.
-		std::vector<uint32_t> group_by_logical_stage;	     ///< Explicit logical successor lookup.
-		std::vector<route_group> groups;	      ///< One exact destination group per logical successor.
-		std::vector<uint32_t> fanout_group_ordinals;  ///< Authored logical branch order.
-		std::vector<priority_route> priority_routes;  ///< Compiler-established evaluation order.
-		kinetum::algo::compact_index_set reachable_storage_domains;  ///< O(1) executable-domain gate.
+		sequence<route_target_record<sequence>> targets;     ///< Unique authored outgoing targets.
+		sequence<uint32_t> target_by_stage_instance;	     ///< Global target to local ordinal.
+		sequence<uint32_t> group_by_logical_stage;	     ///< Explicit logical successor lookup.
+		sequence<route_group_record<sequence>> groups;	///< One exact destination group per logical successor.
+		sequence<uint32_t> fanout_group_ordinals;	///< Authored logical branch order.
+		sequence<priority_route> priority_routes;	///< Compiler-established evaluation order.
+		membership_type reachable_storage_domains;	///< O(1) executable-domain gate.
+		sequence<uint32_t> execution_keys;		///< Pre-resolved EXECUTE key by storage domain.
+		sequence<uint32_t> boundary_send_keys;		///< Post-transition sender key by carried domain.
 	};
+	using stage_runtime = stage_record<execution_array, algo::compact_index_set_view>;  ///< Frozen stage tables.
 
 	/** @brief Transient packet prefixes, placed and prefaulted on the owning worker's NUMA node. */
 	struct alignas(kinetum::algo::CACHE_LINE_SIZE) execution_scratch {
 		std::array<packet_record *, MAX_BURST> rx_records{};	  ///< Exact provider RX prefix.
-		std::array<packet_work_item, MAX_BURST> local_work{};	  ///< Exact dequeued local prefix.
+		std::array<packet_record *, MAX_BURST> local_records{};	  ///< One key's dequeued ownership prefix.
 		std::array<packet_record *, MAX_BURST> module_records{};  ///< Compatible module input prefix.
 		module_batch_scratch module{};				  ///< Sole packet ABI projection.
 		kinetum_context_selection_batch selection{};		  ///< Read-only selector flow projection.
 		std::array<uint32_t, MAX_BURST> selected_contexts{};	  ///< Selector output ordinals.
 		std::array<packet_record *, MAX_BURST>
-			pending_records{};		///< Contiguous selection prefix retaining reservations.
-		stage_runtime *pending_stage{nullptr};	///< Exact source of the pending prefix.
-		route_group *pending_group{nullptr};	///< Exact pending logical destination.
+			pending_records{};  ///< Contiguous output group retaining reservations until dispatch.
+		stage_runtime *pending_stage{nullptr};	    ///< Exact source of the pending prefix.
+		const route_group *pending_group{nullptr};  ///< Exact pending logical destination.
 		uint32_t pending_domain{
 			provider::INVALID_COMPILED_PROVIDER_INDEX};  ///< Retained local reservation owner.
-		uint16_t pending_count{0};			     ///< Occupied selection prefix.
+		uint16_t pending_count{0};  ///< Occupied output prefix; bounds every scratch read.
 	};
 	static_assert(std::is_standard_layout_v<execution_scratch>);
 	static_assert(std::is_trivially_destructible_v<execution_scratch>);
@@ -296,19 +289,23 @@ class packet_worker_kernel::implementation final {
 		const packet_rx_burst_operations *operations{nullptr};	      ///< Direct provider burst target.
 		uint32_t stage_instance_index{provider::INVALID_COMPILED_PROVIDER_INDEX};  ///< RX stage.
 		uint32_t storage_domain_index{provider::INVALID_COMPILED_PROVIDER_INDEX};  ///< Native RX storage.
-		uint32_t transition_index{provider::INVALID_COMPILED_PROVIDER_INDEX};	   ///< Stream-to-stage edge.
+		uint32_t delivery_key{INVALID_RUNTIME_ORDINAL};	 ///< Exact RX_DELIVER key in either role.
+		uint32_t transition_index{provider::INVALID_COMPILED_PROVIDER_INDEX};  ///< Stream-to-stage edge.
 	};
 
 	/** @brief One exact worker-owned TX queue and stage-to-stream edge table. */
-	struct tx_stream_runtime {
+	template <template <typename> class sequence, typename membership_type>
+	struct tx_stream_record {
 		uint32_t telemetry_ordinal{UINT32_MAX};	 ///< Pre-resolved owner-local stream counter row.
 		bool owned{false};			 ///< Whether this compact stream is submitted here.
 		const provider::compiled_provider_io_stream *facts{nullptr};  ///< Immutable stream facts.
 		const packet_tx_burst_operations *operations{nullptr};	      ///< Direct provider burst target.
 		uint32_t stage_instance_index{provider::INVALID_COMPILED_PROVIDER_INDEX};  ///< Attached TX stage.
-		kinetum::algo::compact_index_set accepted_storage_domains;  ///< Immutable O(1) TX storage admission.
-		std::vector<uint32_t> transition_by_storage_domain;	    ///< Stage-to-stream transition table.
+		membership_type accepted_storage_domains;	  ///< Immutable O(1) TX storage admission.
+		sequence<uint32_t> transition_by_storage_domain;  ///< Stage-to-stream transition table.
 	};
+	using tx_stream_runtime =
+		tx_stream_record<execution_array, algo::compact_index_set_view>;  ///< Frozen TX input.
 
 	/** @brief One grouped exact provider transition invocation. */
 	struct transition_batch {
@@ -318,6 +315,9 @@ class packet_worker_kernel::implementation final {
 		const provider::compiled_storage_transition *facts{nullptr};  ///< Immutable transition facts.
 		const kinetum_provider_storage_transition_operations *operations{nullptr};  ///< Burst target.
 		packet_work_phase retry_phase{packet_work_phase::STAGE_DELIVER};  ///< Unaccepted suffix state.
+		uint32_t retry_key{INVALID_RUNTIME_ORDINAL};  ///< Exact source-domain continuation key.
+		uint32_t completed_key{
+			INVALID_RUNTIME_ORDINAL};  ///< Exact destination-domain key; absent for direct TX.
 		transition_post_action post_action{transition_post_action::LOCAL_EXECUTE};  ///< Accepted prefix state.
 		std::array<packet_record *, MAX_BURST> sources{};	///< Exact attempted source owners.
 		std::array<packet_record *, MAX_BURST> destinations{};	///< Accepted destination owners.
@@ -337,17 +337,19 @@ class packet_worker_kernel::implementation final {
 	};
 
 	/** @brief One grouped exact provider TX invocation. */
-	struct tx_batch {
+	template <typename stream_type>
+	struct tx_batch_record {
 		std::array<packet_private, MAX_BURST>
-			metadata{};			   ///< Pre-call epoch/stage and suffix-integrity snapshots.
-		bool owned{false};			   ///< Stream belongs to this worker.
-		const tx_stream_runtime *stream{nullptr};  ///< Stable pre-resolved stream.
+			metadata{};		     ///< Pre-call epoch/stage and suffix-integrity snapshots.
+		bool owned{false};		     ///< Stream belongs to this worker.
+		const stream_type *stream{nullptr};  ///< Stable pre-resolved stream.
 		std::array<packet_record *, MAX_BURST> records{};  ///< Exact caller-owned records.
 		std::array<uint32_t, MAX_BURST> lengths{};	   ///< Pre-call byte counts for accepted ownership.
 		std::array<uint16_t, MAX_BURST>
 			storage_domains{};  ///< Pre-call original domains; accepted records may be gone.
 		uint16_t count{0};	    ///< Current bounded group size.
 	};
+	using tx_batch = tx_batch_record<tx_stream_runtime>;  ///< Live TX batch bound to a published stream.
 
 	/** @brief One grouped exact storage-domain retirement invocation. */
 	struct release_batch {
@@ -362,37 +364,35 @@ class packet_worker_kernel::implementation final {
 		local_work_staging *staging{nullptr};  ///< Stable active/future role owner.
 	};
 
-	/** @return OK after allocating formula-sized staging for every scheduled storage domain. */
-	[[nodiscard]] common::status initialize_storage_queues_();
-	/**
-	 * @brief Derive and construct the sole worker epoch ledger.
-	 * @return OK after adopting the exact compiled physical-record ceiling.
-	 */
-	[[nodiscard]] common::status initialize_epoch_ledger_();
-	/**
-	 * @brief Bind the exact complete DATA/CUT/ACK channel table.
-	 *
-	 * @param boundaries Complete compact-indexed boundary authority.
-	 * @param boundary_sender Sole complete outbound sender-policy authority.
-	 * @param boundary_receiver Sole complete inbound receiver-policy authority.
-	 * @return OK after exact sender/receiver coverage is established.
-	 */
-	[[nodiscard]] common::status
-	initialize_boundaries_(const std::vector<boundary_epoch_channel *> &boundaries,
-			       std::unique_ptr<worker_boundary_sender> boundary_sender,
-			       std::unique_ptr<worker_boundary_receiver> boundary_receiver);
+	/** @brief Complete frozen tables and scratch borrowed from the kernel's one allocation. */
+	struct execution_views {
+		std::span<lifecycle::lifecycle_context_owner *> module_telemetry;  ///< Exact worker context projection.
+		std::span<lifecycle::lifecycle_context_owner *>
+			module_telemetry_by_context;			     ///< Direct context return lookup.
+		std::span<local_work_staging *> local_staging_by_domain;     ///< Direct domain role lookup.
+		std::span<release_batch> release_batches;		     ///< Mutable retirement groups.
+		std::span<local_queue_schedule_entry> local_queue_schedule;  ///< Immutable domain service order.
+		std::span<release_batch *> release_flush_schedule;	     ///< Direct retirement order.
+		std::span<stage_runtime> stages;			     ///< Exact stage execution views.
+		std::span<rx_stream_runtime> rx_streams;		     ///< Exact RX operations and identities.
+		std::span<tx_stream_runtime> tx_streams;		  ///< Exact TX operations and admission views.
+		std::span<transition_batch> transition_batches;		  ///< Mutable transfer groups.
+		std::span<transition_batch *> transition_flush_schedule;  ///< Direct transfer order.
+		std::span<tx_batch> tx_batches;				  ///< Mutable transmit groups.
+		std::span<rx_stream_runtime *> rx_inputs;		  ///< Direct RX admission projection.
+		std::span<tx_stream_runtime *> tx_flush_schedule;	  ///< Direct TX flush projection.
+		std::span<boundary_epoch_channel *> inbound_boundaries;	  ///< Shared inbound channel identities.
+		std::span<packet_record *> fanout_clones;		  ///< Mutable clone prefix.
+		execution_scratch *scratch{nullptr};			  ///< Exact local callback and packet scratch.
+	};
+
 	/** @return OK after binding exact module and source-role activation participants. */
 	[[nodiscard]] common::status initialize_epoch_activation_();
 	/** @return OK after materializing the exact active schedule, if any. */
 	[[nodiscard]] common::status initialize_active_scheduler_();
 	/** @return OK after binding every exact module context to owner-worker health. */
 	[[nodiscard]] common::status initialize_module_health_();
-	/** @return OK after binding every owned transition operation and lookup key. */
-	[[nodiscard]] common::status initialize_transition_batches_();
-	/** @return OK after binding all owned RX/TX streams to exact burst tables. */
-	[[nodiscard]] common::status initialize_streams_();
-	/** @return OK after binding every RX stream and inbound boundary to one fair service order. */
-	[[nodiscard]] common::status initialize_input_scheduler_();
+
 	/**
 	 * @brief Refresh and retain the sole timestamp for all work in this turn.
 	 * @return Exact platform monotonic turn timestamp.
@@ -402,45 +402,7 @@ class packet_worker_kernel::implementation final {
 		cached_turn_time_ns_ = common::update_cached_ns();
 		return cached_turn_time_ns_;
 	}
-	/** @return OK after selecting one source polling kernel from callback identity. */
-	[[nodiscard]] common::status select_source_kernel_() noexcept;
-	/** @return OK after binding all owned passive stages and module views. */
-	[[nodiscard]] common::status initialize_stages_();
-	/**
-	 * @brief Compile one owned stage's immutable direct routing tables.
-	 *
-	 * @param stage Mutable cold table for one already bound owned stage.
-	 * @return OK after every authored successor has one exact direct route.
-	 */
-	[[nodiscard]] common::status initialize_stage_routes_(stage_runtime &stage);
-	/** @return OK after binding each stream-adjacent transition to one disposition. */
-	[[nodiscard]] common::status initialize_stream_transitions_();
-	/** @return OK when every scheduled transition and boundary has one executable use. */
-	[[nodiscard]] common::status validate_transition_coverage_() const;
 
-	/**
-	 * @brief Resolve one cold exact endpoint/domain transition.
-	 *
-	 * @param from_kind Source endpoint namespace.
-	 * @param from_index Source compact endpoint identity.
-	 * @param to_kind Destination endpoint namespace.
-	 * @param to_index Destination compact endpoint identity.
-	 * @param from_storage_domain Exact source storage-domain index.
-	 * @return Direct transition index, or the invalid sentinel when absent.
-	 */
-	[[nodiscard]] uint32_t find_transition_(provider::compiled_packet_path_endpoint_kind from_kind,
-						uint32_t from_index,
-						provider::compiled_packet_path_endpoint_kind to_kind, uint32_t to_index,
-						uint32_t from_storage_domain) const noexcept;
-	/**
-	 * @brief Resolve one cold exact directed stage boundary.
-	 *
-	 * @param from_stage_instance Exact source stage-instance index.
-	 * @param to_stage_instance Exact destination stage-instance index.
-	 * @return Exact boundary epoch channel, or null for a local edge.
-	 */
-	[[nodiscard]] boundary_epoch_channel *find_boundary_(uint32_t from_stage_instance,
-							     uint32_t to_stage_instance) const noexcept;
 	/**
 	 * @brief Publish every owned sender/receiver boundary transport once.
 	 *
@@ -463,7 +425,7 @@ class packet_worker_kernel::implementation final {
 	 * @param boundary_index Affected boundary, or UINT32_MAX when unrelated.
 	 * @param context_index Affected module context, or UINT32_MAX when unrelated.
 	 * @param stage_instance_index Affected stage instance, or UINT32_MAX when unrelated.
-	 * @param observed_epoch Packet or control epoch observed at the failure.
+	 * @param observed_epoch Packet, owner, or control epoch observed at the failure.
 	 * @param expected_value Expected sequence, count, or identity selected by the fault code.
 	 * @param observed_value Actual value that violated the expectation.
 	 */
@@ -472,22 +434,13 @@ class packet_worker_kernel::implementation final {
 				    uint64_t observed_epoch, uint64_t expected_value, uint64_t observed_value) noexcept;
 	/** @brief Start or coalesce one bounded module-context publication sweep. */
 	void schedule_module_telemetry_sweep_() noexcept;
-	/**
-	 * @brief Assign one transition its sole retry and accepted-prefix dispositions.
-	 *
-	 * @param transition_index Exact compact transition index.
-	 * @param retry_phase Work phase retained by an unaccepted suffix.
-	 * @param post_action Action applied to the accepted prefix.
-	 * @return OK after the first consistent assignment or repeated exact assignment.
-	 */
-	[[nodiscard]] common::status configure_transition_(uint32_t transition_index, packet_work_phase retry_phase,
-							   transition_post_action post_action);
 
 	/**
 	 * @param storage_domain_index Exact global storage-domain index.
 	 * @return Mutable owner-local queue-role owner, or null when unscheduled/out of range.
 	 */
 	[[nodiscard]] local_work_staging *local_staging_(uint32_t storage_domain_index) noexcept;
+
 	/**
 	 * @param record Candidate packet record.
 	 * @param expected_domain Exact expected compact storage-domain identity.
@@ -505,18 +458,20 @@ class packet_worker_kernel::implementation final {
 	 */
 	[[nodiscard]] bool reserve_local_slot_(uint32_t storage_domain_index) noexcept;
 	/**
-	 * @brief Publish one work item through a previously retained local reservation.
+	 * @brief Publish one packet through a previously retained local reservation.
 	 *
 	 * @param storage_domain_index Exact reserved local queue identity.
-	 * @param item Exact packet work ownership to publish.
+	 * @param key Exact pre-resolved continuation key within this domain.
+	 * @param record Exact packet ownership to publish.
 	 */
-	void commit_local_reservation_(uint32_t storage_domain_index, packet_work_item item) noexcept;
+	void commit_local_reservation_(uint32_t storage_domain_index, uint32_t key, packet_record *record) noexcept;
 	/**
-	 * @brief Release one retained local reservation without publication.
+	 * @brief Release an exact retained local reservation count without publication.
 	 *
 	 * @param storage_domain_index Exact reserved local queue identity.
+	 * @param count Number of retained reservations to return.
 	 */
-	void release_local_reservation_(uint32_t storage_domain_index) noexcept;
+	void release_local_reservation_(uint32_t storage_domain_index, std::size_t count = 1u) noexcept;
 
 	/**
 	 * @brief Poll one exact RX queue through the caller-selected burst target.
@@ -571,31 +526,26 @@ class packet_worker_kernel::implementation final {
 	[[nodiscard]] algo::service_result drain_one_boundary_(boundary_epoch_channel &boundary,
 							       uint16_t allowance) noexcept;
 	/**
-	 * @brief Drain one bounded prefix from every owner-local storage queue.
+	 * @brief Service each active domain's original ready prefix within its 64-record budget.
 	 * @tparam has_active_scheduler Compile-time worker-loop specialization.
 	 * @tparam has_async_scheduler Compile-time tracked-async specialization.
 	 */
 	template <bool has_active_scheduler, bool has_async_scheduler>
 	void process_local_queues_() noexcept;
 	/**
-	 * @brief Execute one already reserved local work item.
+	 * @brief Execute one key's already reserved platform or continuation batch.
 	 *
-	 * @param item Exact packet pointer and current work phase.
+	 * @param phase Exact key's continuation mechanism.
+	 * @param records Validated packet prefix retaining outstanding reservations.
 	 * @param stage Already validated owner-local execution identity.
-	 * @param reserved_domain Storage-domain queue reservation carried by @p item.
+	 * @param reserved_domain Sole storage-domain reservation owner.
 	 */
-	void process_work_item_(packet_work_item item, stage_runtime &stage, uint32_t reserved_domain) noexcept;
-	/**
-	 * @brief Validate a queued record's exact storage and owner-stage identity.
-	 * @param item Borrowed current queue entry.
-	 * @param reserved_domain Sole storage and reservation owner.
-	 * @return Exact owned stage; an internal ownership mismatch terminates.
-	 */
-	[[nodiscard]] stage_runtime &work_stage_(packet_work_item item, uint32_t reserved_domain) noexcept;
+	void process_work_batch_(packet_work_phase phase, std::span<packet_record *const> records, stage_runtime &stage,
+				 uint32_t reserved_domain) noexcept;
 	/**
 	 * @brief Invoke one pre-resolved platform stage mechanism.
 	 *
-	 * @param record Sole packet ownership.
+	 * @param record Sole packet ownership already validated by the active-role dispatcher.
 	 * @param stage Exact current stage runtime.
 	 * @param reserved_domain Current owner-local queue reservation.
 	 */
@@ -604,7 +554,7 @@ class packet_worker_kernel::implementation final {
 	 * @brief Execute one available contiguous module prefix without waiting to fill it.
 	 * @tparam has_active_scheduler Compile-time worker-loop specialization.
 	 * @tparam has_async_scheduler Compile-time tracked-async specialization.
-	 * @param records Exact same-stage and same-epoch records retaining local reservations.
+	 * @param records Prefix validated by the active-role dispatcher, retaining local reservations.
 	 * @param stage Sole executable context for the complete prefix.
 	 * @param reserved_domain Original storage and reservation owner.
 	 */
@@ -620,17 +570,17 @@ class packet_worker_kernel::implementation final {
 	 */
 	void dispatch_stage_result_(packet_record *record, stage_runtime &stage, uint32_t reserved_domain) noexcept;
 	/**
-	 * @brief Stamp and dispatch one exact pre-resolved stage target.
+	 * @brief Stamp and dispatch one nonempty prefix to an exact pre-resolved target.
 	 *
-	 * @param record Sole packet ownership.
+	 * @param records Compatible owned prefix retaining its local reservations.
 	 * @param stage Exact source stage runtime.
 	 * @param target_ordinal Stage-local direct target ordinal.
 	 * @param reserved_domain Current owner-local queue reservation.
 	 */
-	void dispatch_one_target_(packet_record *record, stage_runtime &stage, uint32_t target_ordinal,
-				  uint32_t reserved_domain) noexcept;
+	void dispatch_target_prefix_(std::span<packet_record *const> records, stage_runtime &stage,
+				     uint32_t target_ordinal, uint32_t reserved_domain) noexcept;
 	/**
-	 * @brief Dispatch directly or append to the one contiguous context-selection prefix.
+	 * @brief Append to the existing contiguous output-group prefix without changing packet capacity.
 	 * @param record Sole packet ownership.
 	 * @param stage Exact source stage.
 	 * @param group_ordinal Exact logical destination group.
@@ -638,8 +588,8 @@ class packet_worker_kernel::implementation final {
 	 */
 	void dispatch_one_group_(packet_record *record, stage_runtime &stage, uint32_t group_ordinal,
 				 uint32_t reserved_domain) noexcept;
-	/** @brief Select and validate every occupied lane before transferring any prefix ownership. */
-	void flush_context_selection_() noexcept;
+	/** @brief Resolve each output group and validate every foreign selection before transferring ownership. */
+	void flush_stage_outputs_() noexcept;
 	/**
 	 * @brief Clone and dispatch one exact bounded unconditional fan-out.
 	 *
@@ -660,18 +610,19 @@ class packet_worker_kernel::implementation final {
 	 * @brief Apply the next-stage storage edge before local or boundary delivery.
 	 *
 	 * @param record Sole packet ownership.
-	 * @param stage Exact destination stage.
+	 * @param stage Exact source stage owning the selected route.
 	 * @param reserved_domain Current owner-local queue reservation.
 	 */
 	void deliver_stage_(packet_record *record, stage_runtime &stage, uint32_t reserved_domain) noexcept;
 	/**
-	 * @brief Transfer, hold, or retain one record through exact sender policy.
+	 * @brief Transfer contiguous compatible runs through exact sender policy.
 	 *
-	 * @param record Sole packet ownership.
-	 * @param stage Exact destination stage.
-	 * @param reserved_domain Current owner-local queue reservation.
+	 * @param records Existing owned dispatch prefix, at most one worker burst.
+	 * @param stage Exact source stage.
+	 * @param reserved_domain Sole reservation owner for the prefix.
 	 */
-	void send_boundary_(packet_record *record, stage_runtime &stage, uint32_t reserved_domain) noexcept;
+	void send_boundary_(std::span<packet_record *const> records, stage_runtime &stage,
+			    uint32_t reserved_domain) noexcept;
 	/**
 	 * @brief Resolve and apply the TX-stage-to-stream storage edge.
 	 *
@@ -811,36 +762,35 @@ class packet_worker_kernel::implementation final {
 	worker_runtime_telemetry *telemetry_{nullptr};		    ///< Exact owner-local telemetry banks.
 	epoch_protocol_fault_latch *protocol_faults_{nullptr};	///< Process-generation transition-safety fault latch.
 	std::span<lifecycle::lifecycle_context_owner *const> module_telemetry_;	 ///< Exact context telemetry owners.
-	std::vector<lifecycle::lifecycle_context_owner *> module_telemetry_by_context_;	 ///< O(1) return dispatch.
-	const provider::compiled_provider_worker_schedule *schedule_{nullptr};		 ///< Exact worker schedule.
-	const common::compiled_transition_worker *worker_{nullptr};			 ///< Boundary/CPU ownership.
+	std::span<lifecycle::lifecycle_context_owner *> module_telemetry_by_context_;  ///< O(1) return dispatch.
+	const provider::compiled_provider_worker_schedule *schedule_{nullptr};	       ///< Exact worker schedule.
+	const common::compiled_transition_worker *worker_{nullptr};		       ///< Boundary/CPU ownership.
 
-	std::vector<std::unique_ptr<local_work_staging>> local_staging_owners_;	 ///< Domain-indexed role owners.
-	std::vector<release_batch> release_batches_;			///< Global domain-indexed retirement groups.
-	std::vector<local_queue_schedule_entry> local_queue_schedule_;	///< Fixed owner-local queue iteration.
-	std::vector<release_batch *> release_flush_schedule_;		///< Fixed owner-local retirement order.
-	std::vector<stage_runtime> stages_;				///< Global stage-indexed direct table.
-	std::vector<rx_stream_runtime> rx_streams_;			///< Global stream-indexed RX table.
-	std::vector<tx_stream_runtime> tx_streams_;			///< Global stream-indexed TX table.
-	std::vector<transition_batch> transition_batches_;		///< Global transition-indexed groups.
-	std::vector<transition_batch *> transition_flush_schedule_;	///< Fixed owner-local transition order.
-	std::vector<transition_lookup_entry> transition_lookup_;	///< Sorted owned endpoint/domain lookup.
-	std::vector<tx_batch> tx_batches_;				///< Global stream-indexed TX groups.
-	std::vector<rx_stream_runtime *> rx_inputs_;		     ///< Immutable ordinal-to-RX-operation projection.
-	std::unique_ptr<worker_input_scheduler> input_scheduler_;    ///< Sole fair admission order on worker NUMA.
-	std::vector<tx_stream_runtime *> tx_flush_schedule_;	     ///< Fixed bounded TX flush order.
-	std::vector<boundary_epoch_channel *> boundaries_by_index_;  ///< Complete compact boundary table.
-	std::vector<boundary_epoch_channel *> inbound_boundaries_;   ///< Exact receiver channels.
-	numa_memory_region scratch_storage_;			     ///< Sole owner-NUMA transient-prefix allocation.
-	execution_scratch *scratch_{nullptr};			     ///< Stable view into scratch_storage_.
-	std::vector<packet_record *> fanout_clones_;		     ///< Cold-sized per-packet clone scratch.
-	std::unique_ptr<worker_epoch_ledger> epoch_ledger_;	     ///< Sole owner-local epoch work authority.
-	std::unique_ptr<worker_boundary_sender> boundary_sender_;    ///< Ledger-borrowing sender-policy owner.
-	std::unique_ptr<worker_boundary_receiver> boundary_receiver_;	    ///< Ledger-borrowing receiver policy.
-	std::unique_ptr<worker_active_stage_scheduler> active_scheduler_;   ///< Exact active/async stage owner.
-	std::unique_ptr<module::worker_module_health> module_health_;	    ///< Exact module-health claim owner.
-	std::unique_ptr<worker_epoch_activation> epoch_activation_;	    ///< Exact local activation order.
-	kinetum::algo::quiescence_reader quiescence_reader_;		    ///< Caller-placed exact config reader.
+	std::unique_ptr<worker_packet_staging> staging_owner_;	      ///< Sole region for every worker-local role.
+	std::span<local_work_staging *> local_staging_by_domain_;     ///< Immutable domain-indexed role borrows.
+	std::span<release_batch> release_batches_;		      ///< Global domain-indexed retirement groups.
+	std::span<local_queue_schedule_entry> local_queue_schedule_;  ///< Fixed owner-local queue iteration.
+	std::span<release_batch *> release_flush_schedule_;	      ///< Fixed owner-local retirement order.
+	std::span<stage_runtime> stages_;			      ///< Global stage-indexed direct table.
+	std::span<rx_stream_runtime> rx_streams_;		      ///< Global stream-indexed RX table.
+	std::span<tx_stream_runtime> tx_streams_;		      ///< Global stream-indexed TX table.
+	std::span<transition_batch> transition_batches_;	      ///< Global transition-indexed groups.
+	std::span<transition_batch *> transition_flush_schedule_;     ///< Fixed owner-local transition order.
+	std::span<tx_batch> tx_batches_;			      ///< Global stream-indexed TX groups.
+	std::span<rx_stream_runtime *> rx_inputs_;		      ///< Immutable ordinal-to-RX-operation projection.
+	numa_owner<worker_input_scheduler> input_scheduler_;	      ///< Sole fair admission order on worker NUMA.
+	std::span<tx_stream_runtime *> tx_flush_schedule_;	      ///< Fixed bounded TX flush order.
+	std::span<boundary_epoch_channel *> inbound_boundaries_;      ///< Exact receiver channels.
+	execution_scratch *scratch_{nullptr};		      ///< Scratch in the same mapping as the implementation.
+	std::span<packet_record *> fanout_clones_;	      ///< Cold-sized per-packet clone scratch.
+	numa_owner<worker_epoch_ledger> epoch_ledger_;	      ///< Sole owner-local epoch work authority.
+	numa_owner<worker_boundary_sender> boundary_sender_;  ///< Ledger-borrowing sender-policy owner.
+	numa_owner<worker_boundary_receiver> boundary_receiver_;      ///< Ledger-borrowing receiver policy.
+	numa_owner<worker_active_stage_scheduler> active_scheduler_;  ///< Exact active/async stage owner.
+	numa_owner<module::worker_module_health> module_health_;      ///< Exact module-health claim owner.
+	numa_owner<worker_epoch_activation> epoch_activation_;	      ///< Exact local activation order.
+	worker_lifecycle_context lifecycle_;			      ///< Sole worker-local launch and exit record.
+	kinetum::algo::quiescence_reader quiescence_reader_;	      ///< Caller-placed exact config reader.
 	source_kernel_kind source_kernel_{source_kernel_kind::NO_SOURCES};  ///< Once-selected source loop.
 	receive_burst_function homogeneous_receive_burst_{nullptr};	    ///< Sole homogeneous callback target.
 	bool outbound_closed_{false};					    ///< Exact-once shutdown publication.
@@ -856,10 +806,561 @@ class packet_worker_kernel::implementation final {
 		nullptr};  ///< Last non-STOP command consumed by this owner.
 };
 
+/** @brief Fallible topology construction whose heap-backed tables never enter packet execution. */
+class packet_worker_kernel::implementation::construction final {
+	friend class implementation;
+	using stage_runtime =
+		stage_record<construction_array, algo::compact_index_set>;  ///< Mutable cold stage builder.
+	using route_target = route_target_record<construction_array>;	    ///< Mutable cold directed target.
+	using route_group = route_group_record<construction_array>;	    ///< Mutable cold context-selection group.
+	using tx_stream_runtime =
+		tx_stream_record<construction_array, algo::compact_index_set>;	///< Cold TX admission builder.
+	using tx_batch = tx_batch_record<tx_stream_runtime>;  ///< Cold TX binding, rebased before publication.
+    public:
+	/**
+	 * @brief Build one temporary graph from immutable generation authorities.
+	 *
+	 * @param worker_index Exact compact worker identity.
+	 * @param topology Sole compiled provider and transition topology.
+	 * @param providers Complete materialized provider generation.
+	 * @param modules Stable admitted module generation.
+	 * @param commands Sole process-generation transition/stop publication.
+	 * @param telemetry Exact worker-local telemetry banks.
+	 * @param protocol_faults Process-generation transition-safety fault authority.
+	 * @param module_telemetry Exact context owners serviced by this worker.
+	 */
+	construction(uint32_t worker_index, const provider::compiled_provider_topology &topology,
+		     const provider::materialized_provider_runtime &providers, module::module_manager &modules,
+		     worker_runtime_command_publication &commands, worker_runtime_telemetry &telemetry,
+		     epoch_protocol_fault_latch &protocol_faults,
+		     std::span<lifecycle::lifecycle_context_owner *const> module_telemetry) noexcept
+		: worker_index_(worker_index)
+		, topology_(topology)
+		, providers_(providers)
+		, modules_(modules)
+		, commands_(&commands)
+		, telemetry_(&telemetry)
+		, protocol_faults_(&protocol_faults)
+		, module_telemetry_(module_telemetry)
+	{
+	}
+
+	/**
+	 * @brief Allocate and validate every direct worker table.
+	 *
+	 * @param boundaries Complete compact-indexed boundary-channel table.
+	 * @param boundary_sender Sole complete outbound sender-policy authority.
+	 * @param boundary_receiver Sole complete inbound receiver-policy authority.
+	 * @return OK after all tables agree with compiled truth; otherwise an exact
+	 *         cold construction failure.
+	 */
+	[[nodiscard]] common::status initialize(const std::vector<boundary_epoch_channel *> &boundaries,
+						numa_owner<worker_boundary_sender> boundary_sender,
+						numa_owner<worker_boundary_receiver> boundary_receiver);
+	/** @return Complete stable kernel ownership after freezing every execution-reachable table. */
+	[[nodiscard]] common::status_or<numa_owner<packet_worker_kernel>> materialize();
+
+    private:
+	/** @return OK after validating exact storage ownership and binding release operations. */
+	[[nodiscard]] common::status initialize_storage_();
+	/** @return OK after resolving every producer key and allocating all roles in one worker region. */
+	[[nodiscard]] common::status initialize_work_staging_();
+	/**
+	 * @brief Derive and construct the sole worker epoch ledger.
+	 * @return OK after adopting the exact compiled physical-record ceiling.
+	 */
+	[[nodiscard]] common::status initialize_epoch_ledger_();
+	/**
+	 * @brief Bind the exact complete DATA/CUT/ACK channel table.
+	 *
+	 * @param boundaries Complete compact-indexed boundary authority.
+	 * @param boundary_sender Sole complete outbound sender-policy authority.
+	 * @param boundary_receiver Sole complete inbound receiver-policy authority.
+	 * @return OK after exact sender/receiver coverage is established.
+	 */
+	[[nodiscard]] common::status initialize_boundaries_(const std::vector<boundary_epoch_channel *> &boundaries,
+							    numa_owner<worker_boundary_sender> boundary_sender,
+							    numa_owner<worker_boundary_receiver> boundary_receiver);
+	/** @return OK after binding every owned transition operation and lookup key. */
+	[[nodiscard]] common::status initialize_transition_batches_();
+	/** @return OK after binding all owned RX/TX streams to exact burst tables. */
+	[[nodiscard]] common::status initialize_streams_();
+	/** @return OK after binding every RX stream and inbound boundary to one fair service order. */
+	[[nodiscard]] common::status initialize_input_scheduler_();
+	/** @return OK after selecting one source polling kernel from callback identity. */
+	[[nodiscard]] common::status select_source_kernel_() noexcept;
+	/** @return OK after binding all owned passive stages and module views. */
+	[[nodiscard]] common::status initialize_stages_();
+	/**
+	 * @brief Compile one owned stage's immutable direct routing tables.
+	 *
+	 * @param stage Mutable cold table for one already bound owned stage.
+	 * @return OK after every authored successor has one exact direct route.
+	 */
+	[[nodiscard]] common::status initialize_stage_routes_(stage_runtime &stage);
+	/** @return OK after binding each stream-adjacent transition to one disposition. */
+	[[nodiscard]] common::status initialize_stream_transitions_();
+	/** @return OK when every scheduled transition and boundary has one executable use. */
+	[[nodiscard]] common::status validate_transition_coverage_() const;
+	/**
+	 * @brief Resolve one cold exact endpoint/domain transition.
+	 *
+	 * @param from_kind Source endpoint namespace.
+	 * @param from_index Source compact endpoint identity.
+	 * @param to_kind Destination endpoint namespace.
+	 * @param to_index Destination compact endpoint identity.
+	 * @param from_storage_domain Exact source storage-domain index.
+	 * @return Direct transition index, or the invalid sentinel when absent.
+	 */
+	[[nodiscard]] uint32_t find_transition_(provider::compiled_packet_path_endpoint_kind from_kind,
+						uint32_t from_index,
+						provider::compiled_packet_path_endpoint_kind to_kind, uint32_t to_index,
+						uint32_t from_storage_domain) const noexcept;
+	/**
+	 * @brief Resolve one cold exact directed stage boundary.
+	 *
+	 * @param from_stage_instance Exact source stage-instance index.
+	 * @param to_stage_instance Exact destination stage-instance index.
+	 * @return Exact boundary epoch channel, or null for a local edge.
+	 */
+	[[nodiscard]] boundary_epoch_channel *find_boundary_(uint32_t from_stage_instance,
+							     uint32_t to_stage_instance) const noexcept;
+	/**
+	 * @brief Assign one transition its sole retry and accepted-prefix dispositions.
+	 *
+	 * @param transition_index Exact compact transition index.
+	 * @param retry_phase Work phase retained by an unaccepted suffix.
+	 * @param post_action Action applied to the accepted prefix.
+	 * @return OK after the first consistent assignment or repeated exact assignment.
+	 */
+	[[nodiscard]] common::status configure_transition_(uint32_t transition_index, packet_work_phase retry_phase,
+							   transition_post_action post_action);
+	/**
+	 * @param storage_domain_index Exact compiled domain identity.
+	 * @return Whether cold construction admitted its worker ownership and operations.
+	 */
+	[[nodiscard]] bool owns_storage_domain_(uint32_t storage_domain_index) const noexcept;
+	/** @param domain Compiled domain index. @return Its exact temporary construction binding, or null. */
+	[[nodiscard]] local_work_staging *local_staging_(uint32_t domain) noexcept
+	{
+		return domain < local_staging_by_domain_.size() ? local_staging_by_domain_[domain] : nullptr;
+	}
+
+	uint32_t worker_index_{0};				    ///< Exact compact worker identity.
+	const provider::compiled_provider_topology &topology_;	    ///< Sole immutable graph authority.
+	const provider::materialized_provider_runtime &providers_;  ///< Exact provider generation.
+	module::module_manager &modules_;			    ///< Exact module generation.
+	worker_runtime_command_publication *commands_{nullptr};	    ///< Sole transition/stop publication.
+	worker_runtime_telemetry *telemetry_{nullptr};		    ///< Exact owner-local telemetry banks.
+	epoch_protocol_fault_latch *protocol_faults_{nullptr};	///< Process-generation transition-safety fault latch.
+	std::span<lifecycle::lifecycle_context_owner *const> module_telemetry_;	 ///< Exact context telemetry owners.
+	std::vector<lifecycle::lifecycle_context_owner *> module_telemetry_by_context_;	 ///< O(1) return dispatch.
+	const provider::compiled_provider_worker_schedule *schedule_{nullptr};		 ///< Exact worker schedule.
+	const common::compiled_transition_worker *worker_{nullptr};			 ///< Boundary/CPU ownership.
+
+	std::unique_ptr<worker_packet_staging> staging_owner_;		///< Sole region for every worker-local role.
+	std::vector<local_work_staging *> local_staging_by_domain_;	///< Immutable domain-indexed role borrows.
+	std::vector<release_batch> release_batches_;			///< Global domain-indexed retirement groups.
+	std::vector<local_queue_schedule_entry> local_queue_schedule_;	///< Fixed owner-local queue iteration.
+	std::vector<release_batch *> release_flush_schedule_;		///< Fixed owner-local retirement order.
+	std::vector<stage_runtime> stages_;				///< Global stage-indexed direct table.
+	std::vector<rx_stream_runtime> rx_streams_;			///< Global stream-indexed RX table.
+	std::vector<tx_stream_runtime> tx_streams_;			///< Global stream-indexed TX table.
+	std::vector<transition_batch> transition_batches_;		///< Global transition-indexed groups.
+	std::vector<transition_batch *> transition_flush_schedule_;	///< Fixed owner-local transition order.
+	std::vector<transition_lookup_entry> transition_lookup_;	///< Sorted owned endpoint/domain lookup.
+	std::vector<tx_batch> tx_batches_;				///< Global stream-indexed TX groups.
+	std::vector<rx_stream_runtime *> rx_inputs_;		     ///< Immutable ordinal-to-RX-operation projection.
+	numa_owner<worker_input_scheduler> input_scheduler_;	     ///< Sole fair admission order on worker NUMA.
+	std::vector<tx_stream_runtime *> tx_flush_schedule_;	     ///< Fixed bounded TX flush order.
+	std::vector<boundary_epoch_channel *> boundaries_by_index_;  ///< Complete compact boundary table.
+	std::vector<boundary_epoch_channel *> inbound_boundaries_;   ///< Exact receiver channels.
+	std::vector<packet_record *> fanout_clones_;		     ///< Cold-sized per-packet clone scratch.
+	numa_owner<worker_epoch_ledger> epoch_ledger_;		     ///< Sole owner-local epoch work authority.
+	numa_owner<worker_boundary_sender> boundary_sender_;	     ///< Ledger-borrowing sender-policy owner.
+	numa_owner<worker_boundary_receiver> boundary_receiver_;     ///< Ledger-borrowing receiver policy.
+
+	source_kernel_kind source_kernel_{source_kernel_kind::NO_SOURCES};  ///< Validated polling specialization.
+	receive_burst_function homogeneous_receive_burst_{nullptr};	    ///< Validated common burst callback.
+};
+
+packet_worker_kernel::implementation::implementation(construction &source, const execution_views &views) noexcept
+	: worker_index_(source.worker_index_)
+	, topology_(source.topology_)
+	, providers_(source.providers_)
+	, modules_(source.modules_)
+	, commands_(source.commands_)
+	, telemetry_(source.telemetry_)
+	, protocol_faults_(source.protocol_faults_)
+	, module_telemetry_(views.module_telemetry)
+	, module_telemetry_by_context_(views.module_telemetry_by_context)
+	, schedule_(source.schedule_)
+	, worker_(source.worker_)
+	, staging_owner_(std::move(source.staging_owner_))
+	, local_staging_by_domain_(views.local_staging_by_domain)
+	, release_batches_(views.release_batches)
+	, local_queue_schedule_(views.local_queue_schedule)
+	, release_flush_schedule_(views.release_flush_schedule)
+	, stages_(views.stages)
+	, rx_streams_(views.rx_streams)
+	, tx_streams_(views.tx_streams)
+	, transition_batches_(views.transition_batches)
+	, transition_flush_schedule_(views.transition_flush_schedule)
+	, tx_batches_(views.tx_batches)
+	, rx_inputs_(views.rx_inputs)
+	, input_scheduler_(std::move(source.input_scheduler_))
+	, tx_flush_schedule_(views.tx_flush_schedule)
+	, inbound_boundaries_(views.inbound_boundaries)
+	, scratch_(views.scratch)
+	, fanout_clones_(views.fanout_clones)
+	, epoch_ledger_(std::move(source.epoch_ledger_))
+	, boundary_sender_(std::move(source.boundary_sender_))
+	, boundary_receiver_(std::move(source.boundary_receiver_))
+	, source_kernel_(source.source_kernel_)
+	, homogeneous_receive_burst_(source.homogeneous_receive_burst_)
+{
+	if (worker_ == nullptr || schedule_ == nullptr || scratch_ == nullptr || epoch_ledger_ == nullptr ||
+	    boundary_sender_ == nullptr || boundary_receiver_ == nullptr || input_scheduler_ == nullptr) {
+		std::terminate();
+	}
+}
+
+common::status_or<numa_owner<packet_worker_kernel>> packet_worker_kernel::implementation::construction::materialize()
+{
+	using published_stage = implementation::stage_runtime;
+	using published_target = implementation::route_target;
+	using published_group = implementation::route_group;
+	using published_stream = implementation::tx_stream_runtime;
+	using published_tx_batch = implementation::tx_batch;
+	static_assert(std::is_trivially_destructible_v<published_stage> &&
+		      std::is_trivially_destructible_v<published_target> &&
+		      std::is_trivially_destructible_v<published_group> &&
+		      std::is_trivially_destructible_v<published_stream> &&
+		      std::is_trivially_destructible_v<published_tx_batch>);
+
+	/** @brief Cold geometry of one selector's nested immutable arrays. */
+	struct group_layout {
+		std::size_t permitted_ordinals{0u};  ///< Ordered permitted contexts.
+		std::size_t permitted_bitmap{0u};    ///< Exact context-membership words.
+		std::size_t targets{0u};	     ///< Context-to-target lookup.
+	};
+	/** @brief Cold geometry of one stage's complete nested execution tables. */
+	struct stage_layout {
+		std::size_t targets{0u};		  ///< Directed target records.
+		std::size_t groups{0u};			  ///< Logical successor records.
+		std::size_t by_stage{0u};		  ///< Direct concrete-stage lookup.
+		std::size_t by_logical{0u};		  ///< Direct logical-stage lookup.
+		std::size_t fanout{0u};			  ///< Authored fan-out order.
+		std::size_t priorities{0u};		  ///< Compiled condition order.
+		std::size_t domains{0u};		  ///< Exact reachable-domain words.
+		std::size_t execute_keys{0u};		  ///< Pre-resolved input keys.
+		std::size_t send_keys{0u};		  ///< Pre-resolved send keys.
+		std::vector<std::size_t> target_domains;  ///< One transition-map offset per target.
+		std::vector<group_layout> group_arrays;	  ///< One complete selector layout per group.
+	};
+	/** @brief Cold geometry of one TX stream's admission and conversion arrays. */
+	struct stream_layout {
+		std::size_t domains{0u};      ///< Exact accepted-domain words.
+		std::size_t transitions{0u};  ///< Direct storage-transition lookup.
+	};
+
+	numa_layout layout;
+	std::size_t root_offset = 0u;
+	std::size_t facade_offset = 0u;
+	std::size_t scratch_offset = 0u;
+	std::size_t telemetry_offset = 0u;
+	std::size_t telemetry_map_offset = 0u;
+	std::size_t staging_map_offset = 0u;
+	std::size_t releases_offset = 0u;
+	std::size_t local_order_offset = 0u;
+	std::size_t release_order_offset = 0u;
+	std::size_t stages_offset = 0u;
+	std::size_t rx_offset = 0u;
+	std::size_t tx_offset = 0u;
+	std::size_t transitions_offset = 0u;
+	std::size_t transition_order_offset = 0u;
+	std::size_t tx_batches_offset = 0u;
+	std::size_t rx_order_offset = 0u;
+	std::size_t tx_order_offset = 0u;
+	std::size_t inbound_offset = 0u;
+	std::size_t fanout_offset = 0u;
+	/** @return One exact geometry refusal before any final kernel mapping exists. */
+	const auto overflow = [] {
+		return common::status(common::status_code::OUT_OF_RANGE, "worker execution layout overflows");
+	};
+	if (!layout.append<implementation>(1u, root_offset) ||
+	    !layout.append<packet_worker_kernel>(1u, facade_offset) ||
+	    !layout.append<execution_scratch>(1u, scratch_offset) ||
+	    !layout.append<lifecycle::lifecycle_context_owner *>(module_telemetry_.size(), telemetry_offset) ||
+	    !layout.append<lifecycle::lifecycle_context_owner *>(module_telemetry_by_context_.size(),
+								 telemetry_map_offset) ||
+	    !layout.append<local_work_staging *>(local_staging_by_domain_.size(), staging_map_offset) ||
+	    !layout.append<release_batch>(release_batches_.size(), releases_offset) ||
+	    !layout.append<local_queue_schedule_entry>(local_queue_schedule_.size(), local_order_offset) ||
+	    !layout.append<release_batch *>(release_flush_schedule_.size(), release_order_offset) ||
+	    !layout.append<published_stage>(stages_.size(), stages_offset) ||
+	    !layout.append<rx_stream_runtime>(rx_streams_.size(), rx_offset) ||
+	    !layout.append<published_stream>(tx_streams_.size(), tx_offset) ||
+	    !layout.append<transition_batch>(transition_batches_.size(), transitions_offset) ||
+	    !layout.append<transition_batch *>(transition_flush_schedule_.size(), transition_order_offset) ||
+	    !layout.append<published_tx_batch>(tx_batches_.size(), tx_batches_offset) ||
+	    !layout.append<rx_stream_runtime *>(rx_inputs_.size(), rx_order_offset) ||
+	    !layout.append<published_stream *>(tx_flush_schedule_.size(), tx_order_offset) ||
+	    !layout.append<boundary_epoch_channel *>(inbound_boundaries_.size(), inbound_offset) ||
+	    !layout.append<packet_record *>(fanout_clones_.size(), fanout_offset)) {
+		return overflow();
+	}
+	std::vector<stage_layout> stage_layouts(stages_.size());
+	std::vector<stream_layout> stream_layouts(tx_streams_.size());
+	for (std::size_t index = 0u; index < stages_.size(); ++index) {
+		const auto &stage = stages_[index];
+		auto &placement = stage_layouts[index];
+		placement.target_domains.resize(stage.targets.size());
+		placement.group_arrays.resize(stage.groups.size());
+		if (!layout.append<published_target>(stage.targets.size(), placement.targets) ||
+		    !layout.append<published_group>(stage.groups.size(), placement.groups) ||
+		    !layout.append<uint32_t>(stage.target_by_stage_instance.size(), placement.by_stage) ||
+		    !layout.append<uint32_t>(stage.group_by_logical_stage.size(), placement.by_logical) ||
+		    !layout.append<uint32_t>(stage.fanout_group_ordinals.size(), placement.fanout) ||
+		    !layout.append<priority_route>(stage.priority_routes.size(), placement.priorities) ||
+		    !layout.append<uint64_t>(algo::compact_index_set_view::storage_word_count(
+						     stage.reachable_storage_domains.value_limit()),
+					     placement.domains) ||
+		    !layout.append<uint32_t>(stage.execution_keys.size(), placement.execute_keys) ||
+		    !layout.append<uint32_t>(stage.boundary_send_keys.size(), placement.send_keys)) {
+			return overflow();
+		}
+		for (std::size_t target = 0u; target < stage.targets.size(); ++target) {
+			if (!layout.append<uint32_t>(stage.targets[target].transition_by_storage_domain.size(),
+						     placement.target_domains[target])) {
+				return overflow();
+			}
+		}
+		for (std::size_t group = 0u; group < stage.groups.size(); ++group) {
+			const auto &source = stage.groups[group];
+			auto &destination = placement.group_arrays[group];
+			if (!layout.append<uint32_t>(source.permitted_ordinals.size(),
+						     destination.permitted_ordinals) ||
+			    !layout.append<uint64_t>(source.permitted_bitmap.size(), destination.permitted_bitmap) ||
+			    !layout.append<uint32_t>(source.target_by_context_ordinal.size(), destination.targets)) {
+				return overflow();
+			}
+		}
+	}
+	for (std::size_t index = 0u; index < tx_streams_.size(); ++index) {
+		const auto &stream = tx_streams_[index];
+		auto &placement = stream_layouts[index];
+		if (!layout.append<uint64_t>(algo::compact_index_set_view::storage_word_count(
+						     stream.accepted_storage_domains.value_limit()),
+					     placement.domains) ||
+		    !layout.append<uint32_t>(stream.transition_by_storage_domain.size(), placement.transitions)) {
+			return overflow();
+		}
+	}
+	auto region_or = layout.allocate(worker_->numa_node);
+	if (!region_or.is_ok()) {
+		return region_or.error();
+	}
+	auto region = std::move(region_or).value();
+	/** @brief Copy a non-owning construction value range into its exact mapped extent. */
+	const auto copy = [&region](const auto &source, std::size_t offset) {
+		using value_type = typename std::remove_cvref_t<decltype(source)>::value_type;
+		static_assert(std::is_trivially_copy_constructible_v<value_type> &&
+			      std::is_trivially_destructible_v<value_type>);
+		auto destination = numa_layout::storage<value_type>(region, offset, source.size());
+		if (!source.empty()) {
+			std::uninitialized_copy(source.begin(), source.end(), destination.begin());
+		}
+		return destination;
+	};
+	execution_views views{
+		.module_telemetry = copy(module_telemetry_, telemetry_offset),
+		.module_telemetry_by_context = copy(module_telemetry_by_context_, telemetry_map_offset),
+		.local_staging_by_domain = copy(local_staging_by_domain_, staging_map_offset),
+		.release_batches = copy(release_batches_, releases_offset),
+		.local_queue_schedule = copy(local_queue_schedule_, local_order_offset),
+		.release_flush_schedule = numa_layout::storage<release_batch *>(region, release_order_offset,
+										release_flush_schedule_.size()),
+		.stages = numa_layout::storage<published_stage>(region, stages_offset, stages_.size()),
+		.rx_streams = copy(rx_streams_, rx_offset),
+		.tx_streams = numa_layout::storage<published_stream>(region, tx_offset, tx_streams_.size()),
+		.transition_batches = copy(transition_batches_, transitions_offset),
+		.transition_flush_schedule = numa_layout::storage<transition_batch *>(
+			region, transition_order_offset, transition_flush_schedule_.size()),
+		.tx_batches = numa_layout::storage<published_tx_batch>(region, tx_batches_offset, tx_batches_.size()),
+		.rx_inputs = numa_layout::storage<rx_stream_runtime *>(region, rx_order_offset, rx_inputs_.size()),
+		.tx_flush_schedule =
+			numa_layout::storage<published_stream *>(region, tx_order_offset, tx_flush_schedule_.size()),
+		.inbound_boundaries = copy(inbound_boundaries_, inbound_offset),
+		.fanout_clones = copy(fanout_clones_, fanout_offset),
+		.scratch = std::construct_at(numa_layout::storage<execution_scratch>(region, scratch_offset).data()),
+	};
+	for (std::size_t index = 0u; index < stages_.size(); ++index) {
+		const auto &source = stages_[index];
+		const auto &placement = stage_layouts[index];
+		auto targets = numa_layout::storage<published_target>(region, placement.targets, source.targets.size());
+		for (std::size_t target = 0u; target < source.targets.size(); ++target) {
+			const auto &entry = source.targets[target];
+			std::construct_at(&targets[target], published_target{
+								    .stage_instance_index = entry.stage_instance_index,
+								    .logical_stage_index = entry.logical_stage_index,
+								    .boundary_index = entry.boundary_index,
+								    .sender_ordinal = entry.sender_ordinal,
+								    .transition_by_storage_domain =
+									    copy(entry.transition_by_storage_domain,
+										 placement.target_domains[target]),
+							    });
+		}
+		auto groups = numa_layout::storage<published_group>(region, placement.groups, source.groups.size());
+		for (std::size_t group = 0u; group < source.groups.size(); ++group) {
+			const auto &entry = source.groups[group];
+			const auto &arrays = placement.group_arrays[group];
+			std::construct_at(
+				&groups[group],
+				published_group{
+					.logical_stage_index = entry.logical_stage_index,
+					.direct_target_ordinal = entry.direct_target_ordinal,
+					.select_contexts = entry.select_contexts,
+					.context_count = entry.context_count,
+					.permitted_ordinals = copy(entry.permitted_ordinals, arrays.permitted_ordinals),
+					.permitted_bitmap = copy(entry.permitted_bitmap, arrays.permitted_bitmap),
+					.target_by_context_ordinal =
+						copy(entry.target_by_context_ordinal, arrays.targets),
+				});
+		}
+		const std::size_t limit = source.reachable_storage_domains.value_limit();
+		auto words = numa_layout::storage<uint64_t>(region, placement.domains,
+							    algo::compact_index_set_view::storage_word_count(limit));
+		std::uninitialized_default_construct_n(words.data(), words.size());
+		algo::compact_index_set_view domains(words, limit);
+		if (source.owned) {
+			for (const uint32_t domain : source.facts->reachable_storage_domain_indices) {
+				if (!domains.insert(domain)) {
+					std::terminate();
+				}
+			}
+		}
+		std::construct_at(
+			&views.stages[index],
+			published_stage{
+				.owned = source.owned,
+				.telemetry_ordinal = source.telemetry_ordinal,
+				.facts = source.facts,
+				.logical = source.logical,
+				.module_store = source.module_store,
+				.mechanism = source.mechanism,
+				.region_id = source.region_id,
+				.rx_stream_index = source.rx_stream_index,
+				.stage_bound_tx_stream_index = source.stage_bound_tx_stream_index,
+				.targets = targets,
+				.target_by_stage_instance = copy(source.target_by_stage_instance, placement.by_stage),
+				.group_by_logical_stage = copy(source.group_by_logical_stage, placement.by_logical),
+				.groups = groups,
+				.fanout_group_ordinals = copy(source.fanout_group_ordinals, placement.fanout),
+				.priority_routes = copy(source.priority_routes, placement.priorities),
+				.reachable_storage_domains = domains,
+				.execution_keys = copy(source.execution_keys, placement.execute_keys),
+				.boundary_send_keys = copy(source.boundary_send_keys, placement.send_keys),
+			});
+	}
+	for (std::size_t index = 0u; index < tx_streams_.size(); ++index) {
+		const auto &source = tx_streams_[index];
+		const auto &placement = stream_layouts[index];
+		const std::size_t limit = source.accepted_storage_domains.value_limit();
+		auto words = numa_layout::storage<uint64_t>(region, placement.domains,
+							    algo::compact_index_set_view::storage_word_count(limit));
+		std::uninitialized_default_construct_n(words.data(), words.size());
+		algo::compact_index_set_view domains(words, limit);
+		if (source.owned) {
+			for (const uint32_t domain : source.facts->tx_storage_domain_indices) {
+				if (!domains.insert(domain)) {
+					std::terminate();
+				}
+			}
+		}
+		std::construct_at(&views.tx_streams[index],
+				  published_stream{
+					  .telemetry_ordinal = source.telemetry_ordinal,
+					  .owned = source.owned,
+					  .facts = source.facts,
+					  .operations = source.operations,
+					  .stage_instance_index = source.stage_instance_index,
+					  .accepted_storage_domains = domains,
+					  .transition_by_storage_domain =
+						  copy(source.transition_by_storage_domain, placement.transitions),
+				  });
+	}
+	for (std::size_t index = 0u; index < tx_batches_.size(); ++index) {
+		const auto &source = tx_batches_[index];
+		auto &batch = *std::construct_at(&views.tx_batches[index]);
+		if (source.count != 0u || source.owned != (source.stream != nullptr)) {
+			std::terminate();
+		}
+		batch.owned = source.owned;
+		if (source.stream != nullptr) {
+			const uint32_t stream = source.stream->facts->io_stream_index;
+			if (stream >= tx_streams_.size() || source.stream != &tx_streams_[stream]) {
+				std::terminate();
+			}
+			batch.stream = &views.tx_streams[stream];
+		}
+	}
+	for (std::size_t index = 0u; index < release_flush_schedule_.size(); ++index) {
+		const auto *source = release_flush_schedule_[index];
+		const uint32_t domain = source->operations->domain_index;
+		if (domain >= release_batches_.size() || source != &release_batches_[domain]) {
+			std::terminate();
+		}
+		std::construct_at(&views.release_flush_schedule[index], &views.release_batches[domain]);
+	}
+	for (std::size_t index = 0u; index < transition_flush_schedule_.size(); ++index) {
+		const auto *source = transition_flush_schedule_[index];
+		const uint32_t transition = source->facts->transition_index;
+		if (transition >= transition_batches_.size() || source != &transition_batches_[transition]) {
+			std::terminate();
+		}
+		std::construct_at(&views.transition_flush_schedule[index], &views.transition_batches[transition]);
+	}
+	for (std::size_t index = 0u; index < rx_inputs_.size(); ++index) {
+		const auto *source = rx_inputs_[index];
+		const uint32_t stream = source->facts->io_stream_index;
+		if (stream >= rx_streams_.size() || source != &rx_streams_[stream]) {
+			std::terminate();
+		}
+		std::construct_at(&views.rx_inputs[index], &views.rx_streams[stream]);
+	}
+	for (std::size_t index = 0u; index < tx_flush_schedule_.size(); ++index) {
+		const auto *source = tx_flush_schedule_[index];
+		const uint32_t stream = source->facts->io_stream_index;
+		if (stream >= tx_streams_.size() || source != &tx_streams_[stream]) {
+			std::terminate();
+		}
+		std::construct_at(&views.tx_flush_schedule[index], &views.tx_streams[stream]);
+	}
+	auto *placed = new (numa_layout::storage<implementation>(region, root_offset).data())
+		implementation(*this, views);
+	auto *facade = new (numa_layout::storage<packet_worker_kernel>(region, facade_offset).data())
+		packet_worker_kernel(placed);
+	auto owner = adopt_numa_owner(facade, std::move(region));
+	auto result = placed->initialize_active_scheduler_();
+	if (!result.is_ok()) {
+		return result;
+	}
+	result = placed->initialize_module_health_();
+	if (!result.is_ok()) {
+		return result;
+	}
+	result = placed->initialize_epoch_activation_();
+	if (!result.is_ok()) {
+		return result;
+	}
+	return owner;
+}
+
 common::status
-packet_worker_kernel::implementation::initialize(const std::vector<boundary_epoch_channel *> &boundaries,
-						 std::unique_ptr<worker_boundary_sender> boundary_sender,
-						 std::unique_ptr<worker_boundary_receiver> boundary_receiver)
+packet_worker_kernel::implementation::construction::initialize(const std::vector<boundary_epoch_channel *> &boundaries,
+							       numa_owner<worker_boundary_sender> boundary_sender,
+							       numa_owner<worker_boundary_receiver> boundary_receiver)
 {
 	if (providers_.runtime_generation() == 0 ||
 	    providers_.runtime_generation() > std::numeric_limits<uint32_t>::max() || commands_ == nullptr ||
@@ -882,18 +1383,10 @@ packet_worker_kernel::implementation::initialize(const std::vector<boundary_epoc
 			"packet worker compact identity or exact CPU ownership is malformed");
 	}
 	module_telemetry_by_context_.assign(topology_.module_contexts.size(), nullptr);
-	auto scratch_or = numa_memory_region::allocate({
-		.usable_bytes = sizeof(execution_scratch),
-		.alignment_bytes = alignof(execution_scratch),
-		.host_numa_node = worker_->numa_node,
-	});
-	if (!scratch_or.is_ok()) {
-		return scratch_or.error();
-	}
-	scratch_storage_ = std::move(scratch_or).value();
-	scratch_ = std::construct_at(static_cast<execution_scratch *>(scratch_storage_.data()));
+
 	for (auto *owner : module_telemetry_) {
 		if (owner == nullptr || owner->identity().worker_index != worker_index_ ||
+		    owner->identity().numa_node != worker_->numa_node ||
 		    owner->identity().context_index >= module_telemetry_by_context_.size() ||
 		    module_telemetry_by_context_[owner->identity().context_index] != nullptr) {
 			return common::status::failed_precondition(
@@ -902,7 +1395,7 @@ packet_worker_kernel::implementation::initialize(const std::vector<boundary_epoc
 		module_telemetry_by_context_[owner->identity().context_index] = owner;
 	}
 
-	auto result = initialize_storage_queues_();
+	auto result = initialize_storage_();
 	if (!result.is_ok()) {
 		return result;
 	}
@@ -948,20 +1441,16 @@ packet_worker_kernel::implementation::initialize(const std::vector<boundary_epoc
 	if (!result.is_ok()) {
 		return result;
 	}
-	result = initialize_active_scheduler_();
+	result = initialize_work_staging_();
 	if (!result.is_ok()) {
 		return result;
 	}
-	result = initialize_module_health_();
-	if (!result.is_ok()) {
-		return result;
-	}
-	return initialize_epoch_activation_();
+	return common::status::ok();
 }
 
-common::status packet_worker_kernel::implementation::initialize_storage_queues_()
+common::status packet_worker_kernel::implementation::construction::initialize_storage_()
 {
-	local_staging_owners_.resize(topology_.storage_domains.size());
+	local_staging_by_domain_.resize(topology_.storage_domains.size(), nullptr);
 	release_batches_.resize(topology_.storage_domains.size());
 	local_queue_schedule_.reserve(schedule_->storage_domain_indices.size());
 	release_flush_schedule_.reserve(schedule_->storage_domain_indices.size());
@@ -1004,22 +1493,7 @@ common::status packet_worker_kernel::implementation::initialize_storage_queues_(
 			return common::status::failed_precondition(
 				"worker storage-domain operation does not match compiled generation truth");
 		}
-		const bool source_domain = std::binary_search(schedule_->source_storage_domain_indices.begin(),
-							      schedule_->source_storage_domain_indices.end(),
-							      storage_domain_index);
-		const bool transition_source = source_domain && worker_->source_epoch_staging_capacity != 0u;
-		const std::size_t active_capacity = transition_source ? worker_->source_epoch_staging_capacity :
-									LOCAL_STAGING_CAPACITY;
-		const std::optional<std::size_t> future_capacity =
-			transition_source ? std::optional<std::size_t>(active_capacity) : std::nullopt;
-		auto staging_or = local_work_staging::create(active_capacity, future_capacity, worker_->numa_node);
-		if (!staging_or.is_ok()) {
-			return staging_or.error();
-		}
-		local_staging_owners_[storage_domain_index] = std::move(staging_or).value();
 		release_batches_[storage_domain_index].operations = operations;
-		local_queue_schedule_.push_back(
-			{storage_domain_index, local_staging_owners_[storage_domain_index].get()});
 		release_flush_schedule_.push_back(&release_batches_[storage_domain_index]);
 		previous = storage_domain_index;
 		have_previous = true;
@@ -1027,7 +1501,182 @@ common::status packet_worker_kernel::implementation::initialize_storage_queues_(
 	return common::status::ok();
 }
 
-common::status packet_worker_kernel::implementation::initialize_epoch_ledger_()
+common::status packet_worker_kernel::implementation::construction::initialize_work_staging_()
+{
+	std::vector<std::vector<packet_work_key>> keys(topology_.storage_domains.size());
+	/** @brief Retain each producer's exact continuation before sorting and assigning ordinals. */
+	const auto add = [&](uint32_t domain, uint32_t stage, packet_work_phase phase) {
+		if (!owns_storage_domain_(domain) || stage >= stages_.size() || !stages_[stage].owned ||
+		    stage >= INVALID_STAGE_ID) {
+			return false;
+		}
+		keys[domain].push_back({stage, phase, {}});
+		return true;
+	};
+	/** @brief Reject a producer that cannot bind to its declared worker/storage/stage identity. */
+	const auto invalid = [] {
+		return common::status::failed_precondition("packet work producer lacks exact local staging identity");
+	};
+	for (const auto *stream : rx_inputs_) {
+		if (!add(stream->storage_domain_index, stream->stage_instance_index, packet_work_phase::RX_DELIVER)) {
+			return invalid();
+		}
+	}
+	for (const uint32_t stage_index : schedule_->stage_instance_indices) {
+		const auto &stage = stages_[stage_index];
+		for (const uint32_t domain : stage.facts->reachable_storage_domain_indices) {
+			for (const auto &target : stage.targets) {
+				const uint32_t transition = target.transition_by_storage_domain[domain];
+				const uint32_t destination_domain =
+					transition == provider::INVALID_COMPILED_PROVIDER_INDEX ?
+						domain :
+						transition_batches_[transition].facts->to_storage_domain_index;
+				if (target.sender_ordinal != INVALID_RUNTIME_ORDINAL) {
+					if (!add(destination_domain, stage_index, packet_work_phase::BOUNDARY_SEND)) {
+						return invalid();
+					}
+				} else if (!add(destination_domain, target.stage_instance_index,
+						packet_work_phase::EXECUTE)) {
+					return invalid();
+				}
+			}
+		}
+	}
+	for (const auto *boundary : inbound_boundaries_) {
+		const auto &stage = stages_[boundary->to_stage_instance_index()];
+		for (const uint32_t domain : stage.facts->reachable_storage_domain_indices) {
+			if (!add(domain, stage.facts->stage_instance_index, packet_work_phase::EXECUTE)) {
+				return invalid();
+			}
+		}
+	}
+	for (const auto *batch : transition_flush_schedule_) {
+		const auto &facts = *batch->facts;
+		const uint32_t source_stage =
+			facts.from_endpoint.kind == provider::compiled_packet_path_endpoint_kind::IO_STREAM ?
+				rx_streams_[facts.from_endpoint.endpoint_index].stage_instance_index :
+				facts.from_endpoint.endpoint_index;
+		if (!add(facts.from_storage_domain_index, source_stage, batch->retry_phase)) {
+			return invalid();
+		}
+		switch (batch->post_action) {
+		case transition_post_action::RX_EXECUTE:
+		case transition_post_action::LOCAL_EXECUTE:
+			if (!add(facts.to_storage_domain_index, facts.to_endpoint.endpoint_index,
+				 packet_work_phase::EXECUTE)) {
+				return invalid();
+			}
+			break;
+		case transition_post_action::BOUNDARY_SEND:
+			if (!add(facts.to_storage_domain_index, source_stage, packet_work_phase::BOUNDARY_SEND)) {
+				return invalid();
+			}
+			break;
+		case transition_post_action::TX_SUBMIT:
+			break;
+		}
+	}
+
+	std::vector<worker_packet_staging_domain> domains;
+	domains.reserve(schedule_->storage_domain_indices.size());
+	for (const uint32_t domain : schedule_->storage_domain_indices) {
+		auto &rows = keys[domain];
+		std::sort(rows.begin(), rows.end());
+		rows.erase(std::unique(rows.begin(), rows.end()), rows.end());
+		const bool source_domain = std::binary_search(schedule_->source_storage_domain_indices.begin(),
+							      schedule_->source_storage_domain_indices.end(), domain);
+		const bool future = source_domain && worker_->source_epoch_staging_capacity != 0u;
+		const std::size_t capacity = future ? worker_->source_epoch_staging_capacity : LOCAL_STAGING_CAPACITY;
+		domains.push_back(
+			{domain, capacity, future ? std::optional<std::size_t>(capacity) : std::nullopt, rows});
+	}
+	auto staging_or = worker_packet_staging::create(domains, worker_->numa_node);
+	if (!staging_or.is_ok()) {
+		return staging_or.error();
+	}
+	staging_owner_ = std::move(staging_or).value();
+	for (auto &domain : staging_owner_->domains()) {
+		const uint32_t index = domain.storage_domain_index();
+		local_staging_by_domain_[index] = &domain;
+		local_queue_schedule_.push_back({index, &domain});
+		for (std::size_t key = 0u; key < domain.keys().size(); ++key) {
+			const auto &identity = domain.keys()[key];
+			auto &stage = stages_[identity.stage_instance_index];
+			switch (identity.phase) {
+			case packet_work_phase::EXECUTE:
+				if (stage.execution_keys.empty()) {
+					stage.execution_keys.assign(topology_.storage_domains.size(),
+								    INVALID_RUNTIME_ORDINAL);
+				}
+				stage.execution_keys[index] = static_cast<uint32_t>(key);
+				break;
+			case packet_work_phase::BOUNDARY_SEND:
+				if (stage.boundary_send_keys.empty()) {
+					stage.boundary_send_keys.assign(topology_.storage_domains.size(),
+									INVALID_RUNTIME_ORDINAL);
+				}
+				stage.boundary_send_keys[index] = static_cast<uint32_t>(key);
+				break;
+			case packet_work_phase::RX_DELIVER:
+			case packet_work_phase::STAGE_DELIVER:
+			case packet_work_phase::TX_DELIVER:
+				break;
+			}
+		}
+	}
+	/** @brief Resolve a cold producer once; the packet path consumes only the returned ordinal. */
+	const auto key_index = [&](uint32_t domain, uint32_t stage, packet_work_phase phase) {
+		const auto *staging = local_staging_(domain);
+		if (staging == nullptr) {
+			return INVALID_RUNTIME_ORDINAL;
+		}
+		const auto rows = staging->keys();
+		const packet_work_key expected{stage, phase, {}};
+		const auto found = std::lower_bound(rows.begin(), rows.end(), expected);
+		return found != rows.end() && *found == expected ? static_cast<uint32_t>(found - rows.begin()) :
+								   INVALID_RUNTIME_ORDINAL;
+	};
+	for (auto *stream : rx_inputs_) {
+		stream->delivery_key = key_index(stream->storage_domain_index, stream->stage_instance_index,
+						 packet_work_phase::RX_DELIVER);
+		if (stream->delivery_key == INVALID_RUNTIME_ORDINAL) {
+			return invalid();
+		}
+	}
+	for (auto *batch : transition_flush_schedule_) {
+		const auto &facts = *batch->facts;
+		const uint32_t source_stage =
+			facts.from_endpoint.kind == provider::compiled_packet_path_endpoint_kind::IO_STREAM ?
+				rx_streams_[facts.from_endpoint.endpoint_index].stage_instance_index :
+				facts.from_endpoint.endpoint_index;
+		batch->retry_key = key_index(facts.from_storage_domain_index, source_stage, batch->retry_phase);
+		if (batch->retry_key == INVALID_RUNTIME_ORDINAL) {
+			return invalid();
+		}
+		switch (batch->post_action) {
+		case transition_post_action::RX_EXECUTE:
+		case transition_post_action::LOCAL_EXECUTE:
+			batch->completed_key = key_index(facts.to_storage_domain_index,
+							 facts.to_endpoint.endpoint_index, packet_work_phase::EXECUTE);
+			break;
+		case transition_post_action::BOUNDARY_SEND:
+			batch->completed_key = key_index(facts.to_storage_domain_index, source_stage,
+							 packet_work_phase::BOUNDARY_SEND);
+			break;
+		case transition_post_action::TX_SUBMIT:
+			continue;
+		}
+		if (batch->completed_key == INVALID_RUNTIME_ORDINAL) {
+			return invalid();
+		}
+	}
+	// Recirculation can return only an already-ingested retained record. It
+	// reuses that stage/domain's EXECUTE key; origin-only stages acquire no
+	// unused execution queue merely because their run callback can emit.
+	return common::status::ok();
+}
+
+common::status packet_worker_kernel::implementation::construction::initialize_epoch_ledger_()
 {
 	if (schedule_ == nullptr || epoch_ledger_ != nullptr) {
 		return common::status::internal_error("worker epoch ledger construction has invalid owner state");
@@ -1101,7 +1750,8 @@ common::status packet_worker_kernel::implementation::initialize_epoch_ledger_()
 		return budget_or.error();
 	}
 
-	auto ledger_or = worker_epoch_ledger::create(worker_index_, providers_.runtime_generation(), budget_or->total);
+	auto ledger_or = worker_epoch_ledger::create(worker_index_, providers_.runtime_generation(), budget_or->total,
+						     worker_->numa_node);
 	if (!ledger_or.is_ok()) {
 		return ledger_or.error();
 	}
@@ -1109,7 +1759,7 @@ common::status packet_worker_kernel::implementation::initialize_epoch_ledger_()
 	return common::status::ok();
 }
 
-common::status packet_worker_kernel::implementation::select_source_kernel_() noexcept
+common::status packet_worker_kernel::implementation::construction::select_source_kernel_() noexcept
 {
 	if (rx_inputs_.empty()) {
 		source_kernel_ = source_kernel_kind::NO_SOURCES;
@@ -1141,7 +1791,7 @@ common::status packet_worker_kernel::implementation::select_source_kernel_() noe
 	return common::status::ok();
 }
 
-common::status packet_worker_kernel::implementation::initialize_input_scheduler_()
+common::status packet_worker_kernel::implementation::construction::initialize_input_scheduler_()
 {
 	constexpr auto MAXIMUM = static_cast<std::size_t>(std::numeric_limits<uint32_t>::max());
 	if (rx_inputs_.size() >= MAXIMUM || inbound_boundaries_.size() >= MAXIMUM - rx_inputs_.size()) {
@@ -1166,10 +1816,9 @@ common::status packet_worker_kernel::implementation::initialize_input_scheduler_
 	return common::status::ok();
 }
 
-common::status packet_worker_kernel::implementation::initialize_boundaries_(
-	const std::vector<boundary_epoch_channel *> &boundaries,
-	std::unique_ptr<worker_boundary_sender> boundary_sender,
-	std::unique_ptr<worker_boundary_receiver> boundary_receiver)
+common::status packet_worker_kernel::implementation::construction::initialize_boundaries_(
+	const std::vector<boundary_epoch_channel *> &boundaries, numa_owner<worker_boundary_sender> boundary_sender,
+	numa_owner<worker_boundary_receiver> boundary_receiver)
 {
 	const auto &compiled = topology_.transition_topology.boundaries;
 	if (boundaries.size() != compiled.size() || boundary_sender == nullptr || boundary_receiver == nullptr ||
@@ -1500,7 +2149,7 @@ common::status packet_worker_kernel::implementation::initialize_active_scheduler
 	return common::status::ok();
 }
 
-common::status packet_worker_kernel::implementation::initialize_transition_batches_()
+common::status packet_worker_kernel::implementation::construction::initialize_transition_batches_()
 {
 	transition_batches_.resize(topology_.storage_transitions.size());
 	transition_flush_schedule_.reserve(schedule_->storage_transition_indices.size());
@@ -1520,8 +2169,8 @@ common::status packet_worker_kernel::implementation::initialize_transition_batch
 		    operations->generation != providers_.runtime_generation() ||
 		    operations->from_storage_domain_index != facts.from_storage_domain_index ||
 		    operations->to_storage_domain_index != facts.to_storage_domain_index ||
-		    local_staging_(facts.from_storage_domain_index) == nullptr ||
-		    local_staging_(facts.to_storage_domain_index) == nullptr) {
+		    !owns_storage_domain_(facts.from_storage_domain_index) ||
+		    !owns_storage_domain_(facts.to_storage_domain_index)) {
 			return common::status::failed_precondition(
 				"worker storage-transition operation does not match compiled ownership");
 		}
@@ -1556,7 +2205,7 @@ common::status packet_worker_kernel::implementation::initialize_transition_batch
 	return common::status::ok();
 }
 
-common::status packet_worker_kernel::implementation::initialize_streams_()
+common::status packet_worker_kernel::implementation::construction::initialize_streams_()
 {
 	rx_streams_.resize(topology_.io_streams.size());
 	tx_streams_.resize(topology_.io_streams.size());
@@ -1575,10 +2224,9 @@ common::status packet_worker_kernel::implementation::initialize_streams_()
 		    facts.direction != provider::compiled_io_stream_direction::RX ||
 		    facts.worker_index != worker_index_ ||
 		    facts.stage_instance_index >= topology_.stage_instances.size() ||
-		    local_staging_(facts.rx_storage_domain_index) == nullptr ||
-		    !facts.tx_storage_domain_indices.empty() || !kinetum_provider_rx_operations_are_valid(operations) ||
-		    operations->maximum_burst == 0 || operations->maximum_burst > MAX_BURST ||
-		    facts.port_index >= topology_.ports.size() ||
+		    !owns_storage_domain_(facts.rx_storage_domain_index) || !facts.tx_storage_domain_indices.empty() ||
+		    !kinetum_provider_rx_operations_are_valid(operations) || operations->maximum_burst == 0 ||
+		    operations->maximum_burst > MAX_BURST || facts.port_index >= topology_.ports.size() ||
 		    operations->logical_port != topology_.ports[facts.port_index].logical_port_id) {
 			return common::status::failed_precondition(
 				"worker RX stream operation does not equal compiled stream truth");
@@ -1626,9 +2274,9 @@ common::status packet_worker_kernel::implementation::initialize_streams_()
 		}
 		stream.accepted_storage_domains = kinetum::algo::compact_index_set(topology_.storage_domains.size());
 		for (const uint32_t domain : facts.tx_storage_domain_indices) {
-			if (local_staging_(domain) == nullptr || !stream.accepted_storage_domains.insert(domain)) {
+			if (!owns_storage_domain_(domain) || !stream.accepted_storage_domains.insert(domain)) {
 				return common::status::failed_precondition(
-					"TX storage admission lacks exact local staging");
+					"TX storage admission lacks exact worker-domain ownership");
 			}
 		}
 		stream.transition_by_storage_domain.assign(topology_.storage_domains.size(),
@@ -1641,7 +2289,7 @@ common::status packet_worker_kernel::implementation::initialize_streams_()
 	return common::status::ok();
 }
 
-common::status packet_worker_kernel::implementation::initialize_stages_()
+common::status packet_worker_kernel::implementation::construction::initialize_stages_()
 {
 	stages_.resize(topology_.stage_instances.size());
 	std::vector<bool> active_schedule(stages_.size(), false);
@@ -1846,7 +2494,7 @@ void packet_worker_kernel::implementation::bind_bootstrap_epoch(uint64_t bootstr
 	publish_boundary_transport_();
 }
 
-common::status packet_worker_kernel::implementation::initialize_stage_routes_(stage_runtime &stage)
+common::status packet_worker_kernel::implementation::construction::initialize_stage_routes_(stage_runtime &stage)
 {
 	if (!stage.owned || stage.facts == nullptr || stage.logical == nullptr) {
 		return common::status::failed_precondition("worker route compilation requires one owned stage");
@@ -2058,7 +2706,7 @@ common::status packet_worker_kernel::implementation::initialize_stage_routes_(st
 	return common::status::ok();
 }
 
-common::status packet_worker_kernel::implementation::initialize_stream_transitions_()
+common::status packet_worker_kernel::implementation::construction::initialize_stream_transitions_()
 {
 	for (auto *stream : rx_inputs_) {
 		auto &stage = stages_[stream->stage_instance_index];
@@ -2129,7 +2777,7 @@ common::status packet_worker_kernel::implementation::initialize_stream_transitio
 	return common::status::ok();
 }
 
-common::status packet_worker_kernel::implementation::validate_transition_coverage_() const
+common::status packet_worker_kernel::implementation::construction::validate_transition_coverage_() const
 {
 	for (const auto &batch : transition_batches_) {
 		if (batch.owned != batch.configured) {
@@ -2159,11 +2807,10 @@ common::status packet_worker_kernel::implementation::validate_transition_coverag
 	return common::status::ok();
 }
 
-uint32_t packet_worker_kernel::implementation::find_transition_(provider::compiled_packet_path_endpoint_kind from_kind,
-								uint32_t from_index,
-								provider::compiled_packet_path_endpoint_kind to_kind,
-								uint32_t to_index,
-								uint32_t from_storage_domain) const noexcept
+uint32_t packet_worker_kernel::implementation::construction::find_transition_(
+	provider::compiled_packet_path_endpoint_kind from_kind, uint32_t from_index,
+	provider::compiled_packet_path_endpoint_kind to_kind, uint32_t to_index,
+	uint32_t from_storage_domain) const noexcept
 {
 	const auto requested = std::tuple{static_cast<uint8_t>(from_kind), from_index, static_cast<uint8_t>(to_kind),
 					  to_index, from_storage_domain};
@@ -2183,8 +2830,9 @@ uint32_t packet_worker_kernel::implementation::find_transition_(provider::compil
 	return found == requested ? iterator->transition_index : provider::INVALID_COMPILED_PROVIDER_INDEX;
 }
 
-boundary_epoch_channel *packet_worker_kernel::implementation::find_boundary_(uint32_t from_stage_instance,
-									     uint32_t to_stage_instance) const noexcept
+boundary_epoch_channel *
+packet_worker_kernel::implementation::construction::find_boundary_(uint32_t from_stage_instance,
+								   uint32_t to_stage_instance) const noexcept
 {
 	const auto &by_source = topology_.transition_topology.boundaries_by_source_stage_instance;
 	if (from_stage_instance >= by_source.size()) {
@@ -2202,9 +2850,8 @@ boundary_epoch_channel *packet_worker_kernel::implementation::find_boundary_(uin
 	return boundaries_by_index_[iterator->boundary_index];
 }
 
-common::status packet_worker_kernel::implementation::configure_transition_(uint32_t transition_index,
-									   packet_work_phase retry_phase,
-									   transition_post_action post_action)
+common::status packet_worker_kernel::implementation::construction::configure_transition_(
+	uint32_t transition_index, packet_work_phase retry_phase, transition_post_action post_action)
 {
 	if (transition_index >= transition_batches_.size()) {
 		return common::status(common::status_code::OUT_OF_RANGE,
@@ -2227,8 +2874,15 @@ common::status packet_worker_kernel::implementation::configure_transition_(uint3
 
 local_work_staging *packet_worker_kernel::implementation::local_staging_(uint32_t storage_domain_index) noexcept
 {
-	return storage_domain_index < local_staging_owners_.size() ? local_staging_owners_[storage_domain_index].get() :
-								     nullptr;
+	return storage_domain_index < local_staging_by_domain_.size() ? local_staging_by_domain_[storage_domain_index] :
+									nullptr;
+}
+
+bool packet_worker_kernel::implementation::construction::owns_storage_domain_(
+	uint32_t storage_domain_index) const noexcept
+{
+	return storage_domain_index < release_batches_.size() &&
+	       release_batches_[storage_domain_index].operations != nullptr;
 }
 
 bool packet_worker_kernel::implementation::validate_record_(const packet_record *record,
@@ -2239,16 +2893,7 @@ bool packet_worker_kernel::implementation::validate_record_(const packet_record 
 		return false;
 	}
 	const auto *operations = release_batches_[expected_domain].operations;
-	if (operations == nullptr) {
-		return false;
-	}
-	const auto &storage = record->storage;
-	return storage.operations == operations && storage.generation == providers_.runtime_generation() &&
-	       storage.generation == operations->generation && storage.domain_index == expected_domain &&
-	       storage.domain_index == operations->domain_index && storage.length != 0 &&
-	       storage.length <= operations->maximum_packet_length && storage.segment_count != 0 &&
-	       storage.capabilities == operations->capabilities &&
-	       (storage.capabilities & ~packet_storage_capabilities::KNOWN_MASK) == 0;
+	return packet_record_matches_storage(record, operations, expected_domain, providers_.runtime_generation());
 }
 
 uint32_t packet_worker_kernel::implementation::record_storage_domain_(const packet_record *record) const noexcept
@@ -2266,23 +2911,24 @@ bool packet_worker_kernel::implementation::reserve_local_slot_(uint32_t storage_
 	return staging != nullptr && staging->reserve_active();
 }
 
-void packet_worker_kernel::implementation::commit_local_reservation_(uint32_t storage_domain_index,
-								     packet_work_item item) noexcept
+void packet_worker_kernel::implementation::commit_local_reservation_(uint32_t storage_domain_index, uint32_t key,
+								     packet_record *record) noexcept
 {
 	auto *staging = local_staging_(storage_domain_index);
-	if (staging == nullptr || item.record == nullptr) {
+	if (staging == nullptr || record == nullptr) {
 		std::terminate();
 	}
-	staging->commit_active(std::move(item));
+	staging->commit_active(key, record);
 }
 
-void packet_worker_kernel::implementation::release_local_reservation_(uint32_t storage_domain_index) noexcept
+void packet_worker_kernel::implementation::release_local_reservation_(uint32_t storage_domain_index,
+								      std::size_t count) noexcept
 {
 	auto *staging = local_staging_(storage_domain_index);
 	if (staging == nullptr) {
 		std::terminate();
 	}
-	staging->release_active_reservation();
+	staging->release_active_reservation(count);
 }
 
 algo::service_result packet_worker_kernel::implementation::poll_one_rx_(rx_stream_runtime &stream,
@@ -2310,17 +2956,14 @@ algo::service_result packet_worker_kernel::implementation::poll_one_rx_(rx_strea
 		if (requested == 0u) {
 			return algo::service_result{0u, algo::service_disposition::RETAINED};
 		}
-		for (std::size_t index = 0; index < requested; ++index) {
-			bool reserved = false;
-			if constexpr (future) {
-				reserved = staging->reserve_future();
-			} else {
-				reserved = staging->reserve_active();
-			}
-			if (!reserved) {
-				std::terminate();
-			}
-			scratch_->rx_records[index] = nullptr;
+		bool reserved = false;
+		if constexpr (future) {
+			reserved = staging->reserve_future(requested);
+		} else {
+			reserved = staging->reserve_active(requested);
+		}
+		if (!reserved) {
+			std::terminate();
 		}
 		const auto result = receive_burst(stream.operations->state, scratch_->rx_records.data(),
 						  static_cast<uint16_t>(requested));
@@ -2328,13 +2971,23 @@ algo::service_result packet_worker_kernel::implementation::poll_one_rx_(rx_strea
 		if (kinetum_packet_rx_burst_result_is_valid(result, static_cast<uint16_t>(requested)) == 0u) {
 			std::terminate();
 		}
+		if (!std::all_of(scratch_->rx_records.data() + received, scratch_->rx_records.data() + requested,
+				 [](const auto *record) noexcept { return record == nullptr; })) {
+			// Only the returned prefix can carry ownership across this call.
+			std::terminate();
+		}
 		const auto &stage = stages_[stream.stage_instance_index];
+		if (received != 0u) {
+			if (!stage.owned || stage.facts == nullptr || stage.logical == nullptr ||
+			    stage.facts->stage_instance_index > std::numeric_limits<uint16_t>::max()) {
+				std::terminate();
+			}
+			epoch_ledger_->acquire(source_epoch, received);
+		}
 		uint64_t received_bytes = 0u;
 		for (uint16_t index = 0; index < received; ++index) {
 			auto *record = scratch_->rx_records[index];
-			if (!validate_record_(record, stream.storage_domain_index) || !stage.owned ||
-			    stage.facts == nullptr || stage.logical == nullptr ||
-			    stage.facts->stage_instance_index > std::numeric_limits<uint16_t>::max()) {
+			if (!validate_record_(record, stream.storage_domain_index)) {
 				std::terminate();
 			}
 			initialize_packet_record(*record);
@@ -2344,25 +2997,18 @@ algo::service_result packet_worker_kernel::implementation::poll_one_rx_(rx_strea
 			record->metadata.current_stage = stage.logical->logical_stage_index;
 			record->metadata.current_stage_instance =
 				static_cast<uint16_t>(stage.facts->stage_instance_index);
-			epoch_ledger_->acquire(record->metadata.epoch);
 			received_bytes += record->storage.length;
 			if constexpr (future) {
-				staging->commit_future({record, packet_work_phase::RX_DELIVER, {}});
+				staging->commit_future(stream.delivery_key, record);
 			} else {
-				staging->commit_active({record, packet_work_phase::RX_DELIVER, {}});
+				staging->commit_active(stream.delivery_key, record);
 			}
+			scratch_->rx_records[index] = nullptr;
 		}
-		for (std::size_t index = received; index < requested; ++index) {
-			if (scratch_->rx_records[index] != nullptr) {
-				// The foreign RX callback may transfer ownership only through its
-				// returned prefix. A published suffix pointer has no lawful owner.
-				std::terminate();
-			}
-			if constexpr (future) {
-				staging->release_future_reservation();
-			} else {
-				staging->release_active_reservation();
-			}
+		if constexpr (future) {
+			staging->release_future_reservation(requested - received);
+		} else {
+			staging->release_active_reservation(requested - received);
 		}
 		if (received != 0u || result.rejected_count != 0u) {
 			telemetry_->record_stream(stream.telemetry_ordinal, received, received_bytes,
@@ -2385,160 +3031,163 @@ algo::service_result packet_worker_kernel::implementation::poll_one_rx_(rx_strea
 algo::service_result packet_worker_kernel::implementation::drain_one_boundary_(boundary_epoch_channel &boundary,
 									       uint16_t allowance) noexcept
 {
-	uint16_t received = 0u;
-	while (received < allowance) {
-		const auto *observed = boundary.peek_data();
-		if (observed == nullptr) {
-			return {received, algo::service_disposition::YIELDED};
+	bool capacity_refused = false;
+	const uint64_t generation = providers_.runtime_generation();
+	const uint64_t active_epoch = epoch_ledger_->active_epoch();
+	const uint32_t boundary_index = boundary.boundary_index();
+	const uint32_t source = boundary.from_stage_instance_index();
+	const uint32_t destination = boundary.to_stage_instance_index();
+	if (destination >= stages_.size() || !stages_[destination].owned) {
+		std::terminate();
+	}
+	const auto &stage = stages_[destination];
+	uint32_t expected_domain = provider::INVALID_COMPILED_PROVIDER_INDEX;
+	const packet_storage_domain_operations *operations = nullptr;
+	const auto result = boundary.receive_data(allowance, [&](packet_record *record) noexcept {
+		const uint32_t domain = record->storage.domain_index;
+		if (domain != expected_domain) {
+			operations = domain < topology_.storage_domains.size() && domain < release_batches_.size() ?
+					     release_batches_[domain].operations :
+					     nullptr;
+			expected_domain = domain;
 		}
-		const uint32_t domain = record_storage_domain_(observed);
-		if (observed->metadata.epoch != epoch_ledger_->active_epoch()) {
-			const uint64_t active_epoch = epoch_ledger_->active_epoch();
+		if (!packet_record_matches_storage(record, operations, domain, generation)) {
+			std::terminate();
+		}
+		if (record->metadata.epoch != active_epoch) {
 			epoch_protocol_fault_code code = epoch_protocol_fault_code::EPOCH_EXECUTION_MISMATCH;
 			if (boundary_receiver_ != nullptr && boundary_receiver_->transition_active()) {
-				if (observed->metadata.epoch == boundary_receiver_->transition_to_epoch() &&
+				if (record->metadata.epoch == boundary_receiver_->transition_to_epoch() &&
 				    active_epoch == boundary_receiver_->transition_from_epoch()) {
 					code = epoch_protocol_fault_code::FUTURE_DATA_BEFORE_ACK;
-				} else if (observed->metadata.epoch == boundary_receiver_->transition_from_epoch() &&
+				} else if (record->metadata.epoch == boundary_receiver_->transition_from_epoch() &&
 					   active_epoch == boundary_receiver_->transition_to_epoch()) {
 					code = epoch_protocol_fault_code::OLD_DATA_AFTER_SEAL;
 				}
 			}
-			record_protocol_fault_(code, epoch_protocol_fault_disposition::TERMINATE,
-					       boundary.boundary_index(), UINT32_MAX,
-					       boundary.to_stage_instance_index(), observed->metadata.epoch,
-					       active_epoch, observed->metadata.epoch);
+			record_protocol_fault_(code, epoch_protocol_fault_disposition::TERMINATE, boundary_index,
+					       UINT32_MAX, destination, record->metadata.epoch, active_epoch,
+					       record->metadata.epoch);
 			std::terminate();
 		}
 		if (domain == provider::INVALID_COMPILED_PROVIDER_INDEX ||
-		    observed->metadata.current_stage_instance != boundary.from_stage_instance_index() ||
-		    observed->metadata.next_stage_instance != boundary.to_stage_instance_index() ||
-		    boundary.to_stage_instance_index() >= stages_.size() ||
-		    !stages_[boundary.to_stage_instance_index()].owned ||
-		    !stages_[boundary.to_stage_instance_index()].reachable_storage_domains.contains(domain)) {
+		    record->metadata.current_stage_instance != source ||
+		    record->metadata.next_stage_instance != destination ||
+		    !stage.reachable_storage_domains.contains(domain)) {
 			std::terminate();
 		}
 		if (!reserve_local_slot_(domain)) {
-			return {received, algo::service_disposition::RETAINED};
+			capacity_refused = true;
+			return false;
 		}
-		packet_record *record = nullptr;
-		const auto receive_result = boundary.try_receive_data(record);
-		if (KINETUM_UNLIKELY(receive_result != boundary_data_receive_result::RECEIVED)) {
-			if (receive_result == boundary_data_receive_result::SEQUENCE_EXHAUSTED) {
-				record_protocol_fault_(epoch_protocol_fault_code::SEQUENCE_EXHAUSTED,
-						       epoch_protocol_fault_disposition::TERMINATE,
-						       boundary.boundary_index(), UINT32_MAX,
-						       boundary.to_stage_instance_index(), observed->metadata.epoch,
-						       MAX_BOUNDARY_DATA_SEQUENCE, boundary.data_dequeued_sequence());
-			} else if (receive_result != boundary_data_receive_result::EMPTY) {
-				std::terminate();
-			}
-			std::terminate();
-		}
-		if (KINETUM_UNLIKELY(record != observed)) {
-			std::terminate();
-		}
-		// Receiver ownership must exist before the channel records this
-		// dequeue as successful sequence progress.
+		// Establish the receiving owner before the core consumes the pointer
+		// and the channel records completed sequence progress.
 		epoch_ledger_->acquire(record->metadata.epoch);
-		boundary.complete_data_receive(record);
 		promote_next_stage_(*record);
-		commit_local_reservation_(domain, {record, packet_work_phase::EXECUTE, {}});
-		++received;
+		commit_local_reservation_(domain, stage.execution_keys[domain], record);
+		return true;
+	});
+	if (KINETUM_UNLIKELY(result.sequence_exhausted)) {
+		record_protocol_fault_(epoch_protocol_fault_code::SEQUENCE_EXHAUSTED,
+				       epoch_protocol_fault_disposition::TERMINATE, boundary_index, UINT32_MAX,
+				       destination, active_epoch, MAX_BOUNDARY_DATA_SEQUENCE,
+				       boundary.data_dequeued_sequence());
+		std::terminate();
 	}
-	return {received, algo::service_disposition::RETAINED};
+	if (result.transferred_count > allowance) {
+		std::terminate();
+	}
+	return {static_cast<uint16_t>(result.transferred_count),
+		capacity_refused || result.transferred_count == allowance ? algo::service_disposition::RETAINED :
+									    algo::service_disposition::YIELDED};
 }
 
 template <bool has_active_scheduler, bool has_async_scheduler>
 void packet_worker_kernel::implementation::process_local_queues_() noexcept
 {
 	static_assert(has_active_scheduler || !has_async_scheduler);
-	flush_context_selection_();
+	flush_stage_outputs_();
 	for (const auto &entry : local_queue_schedule_) {
 		const uint32_t domain = entry.storage_domain_index;
 		auto *staging = entry.staging;
-		if (staging == nullptr) {
+		if (staging == nullptr || domain >= topology_.storage_domains.size() ||
+		    domain >= release_batches_.size()) {
 			std::terminate();
 		}
-		const std::size_t count = staging->pop_active_batch(scratch_->local_work.data(), MAX_BURST);
-		for (std::size_t index = 0; index < count; ++index) {
-			if (!reserve_local_slot_(domain)) {
+		const auto *operations = release_batches_[domain].operations;
+		const uint64_t generation = providers_.runtime_generation();
+		const uint64_t active_epoch = epoch_ledger_->active_epoch();
+		if (operations == nullptr) {
+			std::terminate();
+		}
+		staging->service_active(scratch_->local_records, [&](const packet_work_key &key,
+								     std::span<packet_record *const> records) noexcept {
+			if (key.stage_instance_index >= stages_.size()) {
 				std::terminate();
 			}
-		}
-		for (std::size_t index = 0; index < count;) {
-			const auto item = scratch_->local_work[index];
-			auto &stage = work_stage_(item, domain);
-			if (item.phase != packet_work_phase::EXECUTE ||
-			    stage.logical->kind != provider::compiled_stage_kind::MODULE) {
-				process_work_item_(item, stage, domain);
-				scratch_->local_work[index++] = {};
-				continue;
+			auto &stage = stages_[key.stage_instance_index];
+			if (!stage.owned || stage.facts == nullptr || stage.logical == nullptr) {
+				std::terminate();
 			}
-			const uint64_t epoch = item.record->metadata.epoch;
-			std::size_t size = 0u;
-			do {
-				scratch_->module_records[size++] = scratch_->local_work[index].record;
-				scratch_->local_work[index++] = {};
-				if (index == count) {
-					break;
+			constexpr std::size_t RECORD_PREFETCH_DISTANCE = 4u;
+			for (std::size_t index = 0u; index < std::min(records.size(), RECORD_PREFETCH_DISTANCE);
+			     ++index) {
+				if (records[index] != nullptr) {
+					packet_prefetch_record(records[index]);
 				}
-				const auto next = scratch_->local_work[index];
-				if (next.record == nullptr) {
+			}
+			for (std::size_t index = 0u; index < records.size(); ++index) {
+				if (index + RECORD_PREFETCH_DISTANCE < records.size() &&
+				    records[index + RECORD_PREFETCH_DISTANCE] != nullptr) {
+					packet_prefetch_record(records[index + RECORD_PREFETCH_DISTANCE]);
+				}
+				const auto *record = records[index];
+				if (!packet_record_matches_storage(record, operations, domain, generation) ||
+				    record->metadata.current_stage_instance != key.stage_instance_index ||
+				    record->metadata.current_stage != stage.logical->logical_stage_index ||
+				    record->metadata.epoch != active_epoch) {
 					std::terminate();
 				}
-				if (next.phase != packet_work_phase::EXECUTE ||
-				    next.record->metadata.current_stage_instance != stage.facts->stage_instance_index ||
-				    next.record->metadata.epoch != epoch) {
-					break;
-				}
-				(void)work_stage_(next, domain);
-			} while (size < MAX_BURST);
-			execute_module_batch_<has_active_scheduler, has_async_scheduler>(
-				{scratch_->module_records.data(), size}, stage, domain);
-			flush_context_selection_();
-		}
-		flush_context_selection_();
+			}
+			if (key.phase == packet_work_phase::EXECUTE &&
+			    stage.logical->kind == provider::compiled_stage_kind::MODULE) {
+				execute_module_batch_<has_active_scheduler, has_async_scheduler>(records, stage,
+												 domain);
+			} else {
+				process_work_batch_(key.phase, records, stage, domain);
+			}
+			flush_stage_outputs_();
+		});
 	}
 }
 
-packet_worker_kernel::implementation::stage_runtime &
-packet_worker_kernel::implementation::work_stage_(packet_work_item item, uint32_t reserved_domain) noexcept
+void packet_worker_kernel::implementation::process_work_batch_(packet_work_phase phase,
+							       std::span<packet_record *const> records,
+							       stage_runtime &stage, uint32_t reserved_domain) noexcept
 {
-	if (!validate_record_(item.record, reserved_domain) ||
-	    item.record->metadata.current_stage_instance >= stages_.size()) {
-		std::terminate();
-	}
-	auto &stage = stages_[item.record->metadata.current_stage_instance];
-	if (!stage.owned || stage.facts == nullptr || stage.logical == nullptr ||
-	    item.record->metadata.current_stage != stage.logical->logical_stage_index) {
-		std::terminate();
-	}
-	packet_prefetch(item.record);
-	return stage;
-}
-
-void packet_worker_kernel::implementation::process_work_item_(packet_work_item item, stage_runtime &stage,
-							      uint32_t reserved_domain) noexcept
-{
-	switch (item.phase) {
+	switch (phase) {
 	case packet_work_phase::RX_DELIVER:
-		deliver_rx_(item.record, stage, reserved_domain);
+		for (auto *record : records) {
+			deliver_rx_(record, stage, reserved_domain);
+		}
 		return;
 	case packet_work_phase::EXECUTE:
-		execute_stage_(item.record, stage, reserved_domain);
+		for (auto *record : records) {
+			execute_stage_(record, stage, reserved_domain);
+		}
 		return;
 	case packet_work_phase::STAGE_DELIVER:
-		flush_context_selection_();
-		deliver_stage_(item.record, stage, reserved_domain);
+		for (auto *record : records) {
+			deliver_stage_(record, stage, reserved_domain);
+		}
 		return;
 	case packet_work_phase::BOUNDARY_SEND:
-		flush_context_selection_();
-		send_boundary_(item.record, stage, reserved_domain);
+		send_boundary_(records, stage, reserved_domain);
 		return;
 	case packet_work_phase::TX_DELIVER:
-		flush_context_selection_();
-		deliver_tx_(item.record, stage, reserved_domain);
+		for (auto *record : records) {
+			deliver_tx_(record, stage, reserved_domain);
+		}
 		return;
 	}
 	std::terminate();
@@ -2547,8 +3196,7 @@ void packet_worker_kernel::implementation::process_work_item_(packet_work_item i
 void packet_worker_kernel::implementation::execute_stage_(packet_record *record, stage_runtime &stage,
 							  uint32_t reserved_domain) noexcept
 {
-	if (record->metadata.epoch != epoch_ledger_->active_epoch() ||
-	    stage.logical->kind == provider::compiled_stage_kind::MODULE) {
+	if (stage.logical->kind == provider::compiled_stage_kind::MODULE) {
 		std::terminate();
 	}
 	telemetry_->record_stage_input(stage.telemetry_ordinal, 1u, record->storage.length);
@@ -2584,9 +3232,6 @@ void packet_worker_kernel::implementation::execute_module_batch_(std::span<packe
 	uint16_t count = 0u;
 	const bool reachable = stage.reachable_storage_domains.contains(reserved_domain);
 	for (auto *record : records) {
-		if (record->metadata.epoch != epoch_ledger_->active_epoch()) {
-			std::terminate();
-		}
 		bytes += record->storage.length;
 		if (!reachable || !packet_record_has_current_cpu_shape(record)) {
 			telemetry_->record_stage_drop(stage.telemetry_ordinal);
@@ -2638,7 +3283,6 @@ void packet_worker_kernel::implementation::execute_module_batch_(std::span<packe
 			telemetry_->record_stage_drop(stage.telemetry_ordinal);
 			release_record_(record, reserved_domain);
 		}
-		scratch_->module_records[lane] = nullptr;
 	}
 }
 
@@ -2646,7 +3290,7 @@ void packet_worker_kernel::implementation::dispatch_stage_result_(packet_record 
 								  uint32_t reserved_domain) noexcept
 {
 	if (stage.logical->kind == provider::compiled_stage_kind::TX) {
-		flush_context_selection_();
+		flush_stage_outputs_();
 		deliver_tx_(record, stage, reserved_domain);
 		return;
 	}
@@ -2674,8 +3318,9 @@ void packet_worker_kernel::implementation::dispatch_stage_result_(packet_record 
 		for (const auto &route : stage.priority_routes) {
 			if (evaluate_condition(route.condition, &record->metadata)) {
 				if (route.pull_target_ordinal != INVALID_RUNTIME_ORDINAL) {
-					flush_context_selection_();
-					dispatch_one_target_(record, stage, route.pull_target_ordinal, reserved_domain);
+					flush_stage_outputs_();
+					dispatch_target_prefix_(std::span(&record, 1u), stage,
+								route.pull_target_ordinal, reserved_domain);
 				} else {
 					dispatch_one_group_(record, stage, route.group_ordinal, reserved_domain);
 				}
@@ -2696,15 +3341,10 @@ void packet_worker_kernel::implementation::dispatch_one_group_(packet_record *re
 		std::terminate();
 	}
 	auto &group = stage.groups[group_ordinal];
-	if (group.select_contexts == nullptr) {
-		flush_context_selection_();
-		dispatch_one_target_(record, stage, group.direct_target_ordinal, reserved_domain);
-		return;
-	}
 	if (scratch_->pending_count != 0u && (scratch_->pending_stage != &stage || scratch_->pending_group != &group ||
 					      scratch_->pending_domain != reserved_domain ||
 					      scratch_->pending_records[0]->metadata.epoch != record->metadata.epoch)) {
-		flush_context_selection_();
+		flush_stage_outputs_();
 	}
 	if (scratch_->pending_count == 0u) {
 		scratch_->pending_stage = &stage;
@@ -2713,62 +3353,68 @@ void packet_worker_kernel::implementation::dispatch_one_group_(packet_record *re
 	}
 	scratch_->pending_records[scratch_->pending_count++] = record;
 	if (scratch_->pending_count == MAX_BURST) {
-		flush_context_selection_();
+		flush_stage_outputs_();
 	}
 }
 
-void packet_worker_kernel::implementation::flush_context_selection_() noexcept
+void packet_worker_kernel::implementation::flush_stage_outputs_() noexcept
 {
 	const uint16_t count = scratch_->pending_count;
 	if (count == 0u) {
 		return;
 	}
-	auto &stage = *scratch_->pending_stage;
-	const auto &group = *scratch_->pending_group;
-	auto &batch = scratch_->selection;
-	const uint32_t domain = scratch_->pending_domain;
-	batch.count = count;
-	for (uint16_t lane = 0u; lane < count; ++lane) {
-		const auto &metadata = scratch_->pending_records[lane]->metadata;
-		batch.src_ip[lane] = metadata.src_ipv4;
-		batch.dst_ip[lane] = metadata.dst_ipv4;
-		batch.src_port[lane] = metadata.src_port;
-		batch.dst_port[lane] = metadata.dst_port;
-		batch.proto[lane] = metadata.l4_proto;
-		batch.input_port[lane] = metadata.ingress_port;
-		batch.platform_flags[lane] = metadata.platform_flags;
-		batch.flow_hash[lane] = metadata.flow_hash;
-		scratch_->selected_contexts[lane] = INVALID_RUNTIME_ORDINAL;
-	}
-	kinetum_context_selection_targets targets{
-		.context_count = group.context_count,
-		.permitted_count = static_cast<uint32_t>(group.permitted_ordinals.size()),
-		.permitted_ordinals = group.permitted_ordinals.data(),
-		.permitted_bitmap = group.permitted_bitmap.data(),
-	};
-	const uint64_t selected = group.select_contexts(&batch, &targets, scratch_->selected_contexts.data());
-	const uint64_t occupied = count == KINETUM_MAX_BURST ? UINT64_MAX : (UINT64_C(1) << count) - 1u;
-	if ((selected & ~occupied) != 0u || batch.count != count ||
-	    std::any_of(std::begin(batch.padding), std::end(batch.padding),
-			[](uint8_t value) { return value != 0u; }) ||
-	    targets.context_count != group.context_count ||
-	    targets.permitted_count != group.permitted_ordinals.size() ||
-	    targets.permitted_ordinals != group.permitted_ordinals.data() ||
-	    targets.permitted_bitmap != group.permitted_bitmap.data()) {
+	if (count > MAX_BURST || scratch_->pending_stage == nullptr || scratch_->pending_group == nullptr) {
 		std::terminate();
 	}
-	for (uint16_t lane = 0u; lane < count; ++lane) {
-		const auto &metadata = scratch_->pending_records[lane]->metadata;
-		const uint32_t context = scratch_->selected_contexts[lane];
-		if (batch.src_ip[lane] != metadata.src_ipv4 || batch.dst_ip[lane] != metadata.dst_ipv4 ||
-		    batch.src_port[lane] != metadata.src_port || batch.dst_port[lane] != metadata.dst_port ||
-		    batch.proto[lane] != metadata.l4_proto || batch.input_port[lane] != metadata.ingress_port ||
-		    batch.platform_flags[lane] != metadata.platform_flags ||
-		    batch.flow_hash[lane] != metadata.flow_hash ||
-		    ((selected & (UINT64_C(1) << lane)) != 0u &&
-		     (context >= group.target_by_context_ordinal.size() ||
-		      group.target_by_context_ordinal[context] == INVALID_RUNTIME_ORDINAL))) {
+	auto &stage = *scratch_->pending_stage;
+	const auto &group = *scratch_->pending_group;
+	const uint32_t domain = scratch_->pending_domain;
+	const uint64_t occupied = count == KINETUM_MAX_BURST ? UINT64_MAX : (UINT64_C(1) << count) - 1u;
+	uint64_t selected = occupied;
+	if (group.select_contexts != nullptr) {
+		auto &batch = scratch_->selection;
+		batch.count = count;
+		for (uint16_t lane = 0u; lane < count; ++lane) {
+			const auto &metadata = scratch_->pending_records[lane]->metadata;
+			batch.src_ip[lane] = metadata.src_ipv4;
+			batch.dst_ip[lane] = metadata.dst_ipv4;
+			batch.src_port[lane] = metadata.src_port;
+			batch.dst_port[lane] = metadata.dst_port;
+			batch.proto[lane] = metadata.l4_proto;
+			batch.input_port[lane] = metadata.ingress_port;
+			batch.platform_flags[lane] = metadata.platform_flags;
+			batch.flow_hash[lane] = metadata.flow_hash;
+			scratch_->selected_contexts[lane] = INVALID_RUNTIME_ORDINAL;
+		}
+		kinetum_context_selection_targets targets{
+			.context_count = group.context_count,
+			.permitted_count = static_cast<uint32_t>(group.permitted_ordinals.size()),
+			.permitted_ordinals = group.permitted_ordinals.data(),
+			.permitted_bitmap = group.permitted_bitmap.data(),
+		};
+		selected = group.select_contexts(&batch, &targets, scratch_->selected_contexts.data());
+		if ((selected & ~occupied) != 0u || batch.count != count ||
+		    std::any_of(std::begin(batch.padding), std::end(batch.padding),
+				[](uint8_t value) { return value != 0u; }) ||
+		    targets.context_count != group.context_count ||
+		    targets.permitted_count != group.permitted_ordinals.size() ||
+		    targets.permitted_ordinals != group.permitted_ordinals.data() ||
+		    targets.permitted_bitmap != group.permitted_bitmap.data()) {
 			std::terminate();
+		}
+		for (uint16_t lane = 0u; lane < count; ++lane) {
+			const auto &metadata = scratch_->pending_records[lane]->metadata;
+			const uint32_t context = scratch_->selected_contexts[lane];
+			if (batch.src_ip[lane] != metadata.src_ipv4 || batch.dst_ip[lane] != metadata.dst_ipv4 ||
+			    batch.src_port[lane] != metadata.src_port || batch.dst_port[lane] != metadata.dst_port ||
+			    batch.proto[lane] != metadata.l4_proto || batch.input_port[lane] != metadata.ingress_port ||
+			    batch.platform_flags[lane] != metadata.platform_flags ||
+			    batch.flow_hash[lane] != metadata.flow_hash ||
+			    ((selected & (UINT64_C(1) << lane)) != 0u &&
+			     (context >= group.target_by_context_ordinal.size() ||
+			      group.target_by_context_ordinal[context] == INVALID_RUNTIME_ORDINAL))) {
+				std::terminate();
+			}
 		}
 	}
 	// All foreign output is admitted before any packet leaves this prefix.
@@ -2776,30 +3422,58 @@ void packet_worker_kernel::implementation::flush_context_selection_() noexcept
 	scratch_->pending_stage = nullptr;
 	scratch_->pending_group = nullptr;
 	scratch_->pending_domain = provider::INVALID_COMPILED_PROVIDER_INDEX;
-	for (uint16_t lane = 0u; lane < count; ++lane) {
-		auto *record = scratch_->pending_records[lane];
-		scratch_->pending_records[lane] = nullptr;
-		if ((selected & (UINT64_C(1) << lane)) != 0u) {
-			dispatch_one_target_(record, stage,
-					     group.target_by_context_ordinal[scratch_->selected_contexts[lane]],
-					     domain);
-		} else {
+	const std::span<packet_record *const> records{scratch_->pending_records.data(), count};
+	if (group.select_contexts == nullptr) {
+		dispatch_target_prefix_(records, stage, group.direct_target_ordinal, domain);
+		return;
+	}
+	std::size_t first = 0u;
+	while (first < count) {
+		if ((selected & (UINT64_C(1) << first)) == 0u) {
 			telemetry_->record_stage_drop(stage.telemetry_ordinal);
-			release_record_(record, domain);
+			release_record_(records[first], domain);
+			++first;
+			continue;
 		}
+		const uint32_t target = group.target_by_context_ordinal[scratch_->selected_contexts[first]];
+		std::size_t end = first + 1u;
+		while (end < count && (selected & (UINT64_C(1) << end)) != 0u &&
+		       group.target_by_context_ordinal[scratch_->selected_contexts[end]] == target) {
+			++end;
+		}
+		dispatch_target_prefix_(records.subspan(first, end - first), stage, target, domain);
+		first = end;
 	}
 }
 
-void packet_worker_kernel::implementation::dispatch_one_target_(packet_record *record, stage_runtime &stage,
-								uint32_t target_ordinal,
-								uint32_t reserved_domain) noexcept
+void packet_worker_kernel::implementation::dispatch_target_prefix_(std::span<packet_record *const> records,
+								   stage_runtime &stage, uint32_t target_ordinal,
+								   uint32_t reserved_domain) noexcept
 {
-	if (target_ordinal >= stage.targets.size()) {
+	if (records.empty() || records.size() > MAX_BURST || target_ordinal >= stage.targets.size()) {
 		std::terminate();
 	}
-	telemetry_->record_stage_output(stage.telemetry_ordinal, record->storage.length);
-	stamp_route_(*record, stage.targets[target_ordinal]);
-	deliver_stage_(record, stage, reserved_domain);
+	const auto &target = stage.targets[target_ordinal];
+	if (reserved_domain >= target.transition_by_storage_domain.size()) {
+		std::terminate();
+	}
+	uint64_t bytes = 0u;
+	for (auto *record : records) {
+		if (record == nullptr) {
+			std::terminate();
+		}
+		bytes += record->storage.length;
+		stamp_route_(*record, target);
+	}
+	telemetry_->record_stage_output(stage.telemetry_ordinal, bytes, static_cast<uint16_t>(records.size()));
+	if (target.transition_by_storage_domain[reserved_domain] == provider::INVALID_COMPILED_PROVIDER_INDEX &&
+	    target.sender_ordinal != INVALID_RUNTIME_ORDINAL) {
+		send_boundary_(records, stage, reserved_domain);
+		return;
+	}
+	for (auto *record : records) {
+		deliver_stage_(record, stage, reserved_domain);
+	}
 }
 
 void packet_worker_kernel::implementation::dispatch_fanout_(packet_record *record, stage_runtime &stage,
@@ -2897,7 +3571,7 @@ void packet_worker_kernel::implementation::deliver_stage_(packet_record *record,
 		return;
 	}
 	if (target.sender_ordinal != INVALID_RUNTIME_ORDINAL) {
-		send_boundary_(record, stage, reserved_domain);
+		send_boundary_(std::span(&record, 1u), stage, reserved_domain);
 		return;
 	}
 	if (target.stage_instance_index >= stages_.size() || !stages_[target.stage_instance_index].owned ||
@@ -2905,36 +3579,64 @@ void packet_worker_kernel::implementation::deliver_stage_(packet_record *record,
 		std::terminate();
 	}
 	promote_next_stage_(*record);
-	commit_local_reservation_(reserved_domain, {record, packet_work_phase::EXECUTE, {}});
+	commit_local_reservation_(reserved_domain, stages_[target.stage_instance_index].execution_keys[reserved_domain],
+				  record);
 }
 
-void packet_worker_kernel::implementation::send_boundary_(packet_record *record, stage_runtime &stage,
+void packet_worker_kernel::implementation::send_boundary_(std::span<packet_record *const> records, stage_runtime &stage,
 							  uint32_t reserved_domain) noexcept
 {
-	const uint16_t destination_index = record->metadata.next_stage_instance;
-	if (destination_index >= stage.target_by_stage_instance.size()) {
+	if (records.size() > MAX_BURST || boundary_sender_ == nullptr) {
 		std::terminate();
 	}
-	const uint32_t target_ordinal = stage.target_by_stage_instance[destination_index];
-	if (target_ordinal == INVALID_RUNTIME_ORDINAL || target_ordinal >= stage.targets.size()) {
+	auto *staging = local_staging_(reserved_domain);
+	if (staging == nullptr || reserved_domain >= stage.boundary_send_keys.size()) {
 		std::terminate();
 	}
-	const auto &target = stage.targets[target_ordinal];
-	if (KINETUM_UNLIKELY(boundary_sender_ == nullptr || target.sender_ordinal == INVALID_RUNTIME_ORDINAL)) {
-		std::terminate();
+	std::size_t first = 0u;
+	while (first < records.size()) {
+		const auto *record = records[first];
+		if (record == nullptr) {
+			std::terminate();
+		}
+		const uint16_t destination = record->metadata.next_stage_instance;
+		if (destination >= stage.target_by_stage_instance.size()) {
+			std::terminate();
+		}
+		const uint32_t target_ordinal = stage.target_by_stage_instance[destination];
+		if (target_ordinal == INVALID_RUNTIME_ORDINAL || target_ordinal >= stage.targets.size()) {
+			std::terminate();
+		}
+		const uint32_t sender_ordinal = stage.targets[target_ordinal].sender_ordinal;
+		if (sender_ordinal == INVALID_RUNTIME_ORDINAL) {
+			std::terminate();
+		}
+		const uint64_t epoch = record->metadata.epoch;
+		std::size_t end = first;
+		while (end < records.size()) {
+			const auto *candidate = records[end];
+			if (candidate == nullptr || candidate->storage.domain_index != reserved_domain) {
+				std::terminate();
+			}
+			if (candidate->metadata.next_stage_instance != destination ||
+			    candidate->metadata.epoch != epoch) {
+				break;
+			}
+			++end;
+		}
+		const auto prefix = records.subspan(first, end - first);
+		const std::size_t accepted = boundary_sender_->try_send(sender_ordinal, prefix);
+		if (accepted > prefix.size()) {
+			std::terminate();
+		}
+		// The accepted pointers may already be reclaimed. Only retained
+		// reservations and the still-owned suffix are touched after publication.
+		staging->release_active_reservation(accepted);
+		for (std::size_t index = accepted; index < prefix.size(); ++index) {
+			staging->commit_active(stage.boundary_send_keys[reserved_domain], prefix[index]);
+		}
+		first = end;
 	}
-	switch (boundary_sender_->try_send(target.sender_ordinal, record)) {
-	case boundary_epoch_send_result::TRANSFERRED:
-	case boundary_epoch_send_result::HELD:
-		// DATA/channel ownership retires the worker credit; held ownership keeps
-		// it until release. Both outcomes retire this unpublished local slot.
-		release_local_reservation_(reserved_domain);
-		return;
-	case boundary_epoch_send_result::BACKPRESSURED:
-		commit_local_reservation_(reserved_domain, {record, packet_work_phase::BOUNDARY_SEND, {}});
-		return;
-	}
-	std::terminate();
 }
 
 void packet_worker_kernel::implementation::deliver_tx_(packet_record *record, stage_runtime &stage,
@@ -3000,12 +3702,11 @@ bool packet_worker_kernel::implementation::queue_transition_(uint32_t transition
 	}
 	const uint32_t destination_domain = batch.facts->to_storage_domain_index;
 	if (destination_domain != reserved_domain && !reserve_local_slot_(destination_domain)) {
-		commit_local_reservation_(reserved_domain, {record, batch.retry_phase, {}});
+		commit_local_reservation_(reserved_domain, batch.retry_key, record);
 		return false;
 	}
 	const uint16_t index = batch.count;
 	batch.sources[index] = record;
-	batch.destinations[index] = nullptr;
 	batch.metadata[index] = record->metadata;
 	++batch.count;
 	if (batch.count == MAX_BURST) {
@@ -3051,22 +3752,22 @@ void packet_worker_kernel::implementation::flush_transition_(transition_batch &b
 		}
 	}
 
+	if (destination_domain != source_domain) {
+		release_local_reservation_(source_domain, accepted);
+		release_local_reservation_(destination_domain, attempted - accepted);
+	}
 	for (uint16_t index = 0; index < accepted; ++index) {
 		auto *destination = batch.destinations[index];
-		if (destination_domain != source_domain) {
-			release_local_reservation_(source_domain);
-		}
 		switch (batch.post_action) {
 		case transition_post_action::RX_EXECUTE:
-			commit_local_reservation_(destination_domain, {destination, packet_work_phase::EXECUTE, {}});
+			commit_local_reservation_(destination_domain, batch.completed_key, destination);
 			break;
 		case transition_post_action::LOCAL_EXECUTE:
 			promote_next_stage_(*destination);
-			commit_local_reservation_(destination_domain, {destination, packet_work_phase::EXECUTE, {}});
+			commit_local_reservation_(destination_domain, batch.completed_key, destination);
 			break;
 		case transition_post_action::BOUNDARY_SEND:
-			commit_local_reservation_(destination_domain,
-						  {destination, packet_work_phase::BOUNDARY_SEND, {}});
+			commit_local_reservation_(destination_domain, batch.completed_key, destination);
 			break;
 		case transition_post_action::TX_SUBMIT: {
 			if (batch.facts->to_endpoint.kind != provider::compiled_packet_path_endpoint_kind::IO_STREAM ||
@@ -3081,17 +3782,10 @@ void packet_worker_kernel::implementation::flush_transition_(transition_batch &b
 			break;
 		}
 		}
+		batch.destinations[index] = nullptr;
 	}
 	for (uint16_t index = accepted; index < attempted; ++index) {
-		if (destination_domain != source_domain) {
-			release_local_reservation_(destination_domain);
-		}
-		commit_local_reservation_(source_domain, {batch.sources[index], batch.retry_phase, {}});
-	}
-	for (uint16_t index = 0; index < attempted; ++index) {
-		batch.sources[index] = nullptr;
-		batch.destinations[index] = nullptr;
-		batch.metadata[index] = {};
+		commit_local_reservation_(source_domain, batch.retry_key, batch.sources[index]);
 	}
 	batch.count = 0;
 }
@@ -3161,12 +3855,22 @@ void packet_worker_kernel::implementation::flush_tx_(tx_batch &batch) noexcept
 		}
 	}
 	uint64_t accepted_bytes = 0u;
-	for (uint16_t index = 0; index < accepted; ++index) {
-		const uint32_t stage_ordinal = stages_[batch.metadata[index].current_stage_instance].telemetry_ordinal;
-		epoch_ledger_->retire(batch.metadata[index].epoch);
-		release_local_reservation_(batch.storage_domains[index]);
-		telemetry_->record_stage_output(stage_ordinal, batch.lengths[index]);
-		accepted_bytes += batch.lengths[index];
+	for (uint16_t first = 0; first < accepted;) {
+		const uint64_t epoch = batch.metadata[first].epoch;
+		const uint32_t domain = batch.storage_domains[first];
+		const uint16_t stage = batch.metadata[first].current_stage_instance;
+		uint16_t end = first;
+		uint64_t bytes = 0u;
+		do {
+			bytes += batch.lengths[end++];
+		} while (end < accepted && batch.metadata[end].epoch == epoch && batch.storage_domains[end] == domain &&
+			 batch.metadata[end].current_stage_instance == stage);
+		const uint16_t count = static_cast<uint16_t>(end - first);
+		epoch_ledger_->retire(epoch, count);
+		release_local_reservation_(domain, count);
+		telemetry_->record_stage_output(stages_[stage].telemetry_ordinal, bytes, count);
+		accepted_bytes += bytes;
+		first = end;
 	}
 	for (uint16_t index = accepted; index < attempted; ++index) {
 		const uint32_t stage_ordinal = stages_[batch.metadata[index].current_stage_instance].telemetry_ordinal;
@@ -3175,12 +3879,6 @@ void packet_worker_kernel::implementation::flush_tx_(tx_batch &batch) noexcept
 	}
 	telemetry_->record_stream(batch.stream->telemetry_ordinal, accepted, accepted_bytes,
 				  static_cast<uint16_t>(attempted - accepted));
-	for (uint16_t index = 0; index < attempted; ++index) {
-		batch.records[index] = nullptr;
-		batch.metadata[index] = {};
-		batch.lengths[index] = 0u;
-		batch.storage_domains[index] = 0u;
-	}
 	batch.count = 0;
 }
 
@@ -3262,10 +3960,11 @@ void packet_worker_kernel::implementation::flush_release_(release_batch &batch) 
 		}
 	}
 	batch.operations->release_burst(batch.operations->state, batch.records.data(), count);
-	for (uint16_t index = 0; index < count; ++index) {
-		release_local_reservation_(domain);
-		batch.records[index] = nullptr;
+	auto *staging = local_staging_(domain);
+	if (staging == nullptr) {
+		std::terminate();
 	}
+	staging->release_active_reservation(count);
 	batch.count = 0;
 }
 
@@ -3526,16 +4225,15 @@ uint32_t packet_worker_kernel::implementation::emit_active_origins_(void *state,
 	if (requested == 0u) {
 		return 0u;
 	}
+	if (!staging->reserve_active(requested)) {
+		std::terminate();
+	}
 	for (std::size_t index = 0u; index < requested; ++index) {
-		if (!staging->reserve_active()) {
-			std::terminate();
-		}
 		origin_scratch[index] = packet_origin_view{
 			.data = static_cast<const uint8_t *>(batch->data[index]),
 			.length = batch->len[index],
 			.padding = 0u,
 		};
-		record_scratch[index] = nullptr;
 	}
 	const uint16_t accepted = operations->copy_origins_burst(
 		operations->state, origin_scratch.data(), record_scratch.data(), static_cast<uint16_t>(requested));
@@ -3544,6 +4242,14 @@ uint32_t packet_worker_kernel::implementation::emit_active_origins_(void *state,
 	}
 	if (accepted > requested) {
 		std::terminate();
+	}
+	if (!std::all_of(record_scratch.data() + accepted, record_scratch.data() + requested,
+			 [](const auto *record) noexcept { return record == nullptr; })) {
+		std::terminate();
+	}
+	staging->release_active_reservation(requested - accepted);
+	if (accepted != 0u) {
+		owner->epoch_ledger_->acquire(epoch, accepted);
 	}
 	for (uint16_t index = 0u; index < accepted; ++index) {
 		auto *record = record_scratch[index];
@@ -3572,15 +4278,8 @@ uint32_t packet_worker_kernel::implementation::emit_active_origins_(void *state,
 		metadata.dscp = batch->dscp[index];
 		metadata.current_stage = stage.logical->logical_stage_index;
 		metadata.current_stage_instance = static_cast<uint16_t>(stage_instance_index);
-		owner->epoch_ledger_->acquire(epoch);
 		owner->dispatch_stage_result_(record, stage, domain);
 		record_scratch[index] = nullptr;
-	}
-	for (std::size_t index = accepted; index < requested; ++index) {
-		if (record_scratch[index] != nullptr) {
-			std::terminate();
-		}
-		staging->release_active_reservation();
 	}
 	return accepted;
 }
@@ -3634,7 +4333,8 @@ bool packet_worker_kernel::implementation::publish_active_recirculated_(void *st
 	    record->metadata.current_stage_instance != stage_instance_index ||
 	    record->metadata.current_stage != stage.logical->logical_stage_index ||
 	    record->metadata.epoch != owner->epoch_ledger_->active_epoch() ||
-	    domain == provider::INVALID_COMPILED_PROVIDER_INDEX || !stage.reachable_storage_domains.contains(domain)) {
+	    domain == provider::INVALID_COMPILED_PROVIDER_INDEX || !stage.reachable_storage_domains.contains(domain) ||
+	    domain >= stage.execution_keys.size() || stage.execution_keys[domain] == INVALID_RUNTIME_ORDINAL) {
 		std::terminate();
 	}
 	if (!owner->reserve_local_slot_(domain)) {
@@ -3644,7 +4344,7 @@ bool packet_worker_kernel::implementation::publish_active_recirculated_(void *st
 	record->metadata.next_stage_instance = INVALID_STAGE_ID;
 	record->metadata.module_next_stage = INVALID_STAGE_ID;
 	owner->telemetry_->record_stage_output(stage.telemetry_ordinal, record->storage.length);
-	owner->commit_local_reservation_(domain, {record, packet_work_phase::EXECUTE, {}});
+	owner->commit_local_reservation_(domain, stage.execution_keys[domain], record);
 	return true;
 }
 
@@ -3959,28 +4659,23 @@ void packet_worker_kernel::implementation::run() noexcept
 	std::terminate();
 }
 
-common::status_or<std::unique_ptr<packet_worker_kernel>>
-packet_worker_kernel::create(uint32_t worker_index, const provider::compiled_provider_topology &topology,
-			     const provider::materialized_provider_runtime &providers, module::module_manager &modules,
-			     worker_runtime_command_publication &commands,
-			     const std::vector<boundary_epoch_channel *> &boundaries,
-			     std::unique_ptr<worker_boundary_sender> boundary_sender,
-			     std::unique_ptr<worker_boundary_receiver> boundary_receiver,
-			     worker_runtime_telemetry &telemetry, epoch_protocol_fault_latch &protocol_faults,
-			     std::span<lifecycle::lifecycle_context_owner *const> module_telemetry)
+common::status_or<numa_owner<packet_worker_kernel>> packet_worker_kernel::create(
+	uint32_t worker_index, const provider::compiled_provider_topology &topology,
+	const provider::materialized_provider_runtime &providers, module::module_manager &modules,
+	worker_runtime_command_publication &commands, const std::vector<boundary_epoch_channel *> &boundaries,
+	numa_owner<worker_boundary_sender> boundary_sender, numa_owner<worker_boundary_receiver> boundary_receiver,
+	worker_runtime_telemetry &telemetry, epoch_protocol_fault_latch &protocol_faults,
+	std::span<lifecycle::lifecycle_context_owner *const> module_telemetry)
 {
-	auto implementation = std::unique_ptr<packet_worker_kernel::implementation>(new (
-		std::nothrow) packet_worker_kernel::implementation(worker_index, topology, providers, modules, commands,
-								   telemetry, protocol_faults, module_telemetry));
-	if (implementation == nullptr) {
-		return common::status::resource_exhausted("packet worker implementation allocation failed");
-	}
 	try {
-		const auto result = implementation->initialize(boundaries, std::move(boundary_sender),
-							       std::move(boundary_receiver));
+		implementation::construction construction(worker_index, topology, providers, modules, commands,
+							  telemetry, protocol_faults, module_telemetry);
+		const auto result =
+			construction.initialize(boundaries, std::move(boundary_sender), std::move(boundary_receiver));
 		if (!result.is_ok()) {
 			return result;
 		}
+		return construction.materialize();
 	} catch (const std::bad_alloc &) {
 		return common::status::resource_exhausted("packet worker cold-table allocation failed");
 	} catch (const std::length_error &) {
@@ -3989,22 +4684,20 @@ packet_worker_kernel::create(uint32_t worker_index, const provider::compiled_pro
 	} catch (...) {
 		return common::status::internal_error("packet worker cold construction failed unexpectedly");
 	}
-	auto *kernel = new (std::nothrow) packet_worker_kernel(std::move(implementation));
-	if (kernel == nullptr) {
-		return common::status::resource_exhausted("packet worker owner allocation failed");
-	}
-	return std::unique_ptr<packet_worker_kernel>(kernel);
 }
 
-packet_worker_kernel::packet_worker_kernel(std::unique_ptr<implementation> implementation) noexcept
-	: implementation_(std::move(implementation))
+packet_worker_kernel::packet_worker_kernel(implementation *implementation) noexcept
+	: implementation_(implementation)
 {
 	if (implementation_ == nullptr) {
 		std::terminate();
 	}
 }
 
-packet_worker_kernel::~packet_worker_kernel() = default;
+packet_worker_kernel::~packet_worker_kernel()
+{
+	std::destroy_at(implementation_);
+}
 
 void packet_worker_kernel::bind_bootstrap_epoch(uint64_t bootstrap_epoch, uint64_t now_ns) noexcept
 {
@@ -4029,6 +4722,11 @@ publication_read_result packet_worker_kernel::try_read_epoch_ownership(worker_ep
 kinetum::algo::quiescence_reader &packet_worker_kernel::quiescence_reader_registration() noexcept
 {
 	return implementation_->quiescence_reader_registration();
+}
+
+worker_lifecycle_context &packet_worker_kernel::lifecycle_record() noexcept
+{
+	return implementation_->lifecycle_record();
 }
 
 epoch_transition_certificate_worker_source packet_worker_kernel::transition_certificate_source() const noexcept

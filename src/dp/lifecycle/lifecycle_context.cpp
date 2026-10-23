@@ -762,7 +762,6 @@ lifecycle_context_owner::lifecycle_context_owner(lifecycle_context_identity &&id
 						 std::size_t epoch_arena_capacity_bytes,
 						 lifecycle_memory_provider &memory_provider,
 						 lifecycle_log_provider &log_provider,
-						 lifecycle_memory_block telemetry_storage_block,
 						 telemetry_storage *telemetry_storage_pointer)
 	: identity_(std::move(identity))
 	, context_memory_capacity_bytes_(context_memory_capacity_bytes)
@@ -770,14 +769,9 @@ lifecycle_context_owner::lifecycle_context_owner(lifecycle_context_identity &&id
 	, memory_provider_(memory_provider)
 	, log_provider_(log_provider)
 	, borrowed_state_(std::make_unique<lifecycle_borrow_state>())
-	, telemetry_storage_block_(telemetry_storage_block)
 	, telemetry_storage_(telemetry_storage_pointer)
 {
-	if (telemetry_storage_ == nullptr ||
-	    !validate_provider_block(telemetry_storage_block_, identity_.numa_node,
-				     sizeof(lifecycle_context_owner::telemetry_storage),
-				     alignof(lifecycle_context_owner::telemetry_storage))
-		     .is_ok()) {
+	if (telemetry_storage_ == nullptr) {
 		std::terminate();
 	}
 	borrowed_state_->owner = this;
@@ -785,10 +779,11 @@ lifecycle_context_owner::lifecycle_context_owner(lifecycle_context_identity &&id
 	borrowed_context_.platform_opaque = borrowed_state_.get();
 }
 
-status_or<std::unique_ptr<lifecycle_context_owner>>
-lifecycle_context_owner::create(lifecycle_context_identity &&identity, std::size_t context_memory_capacity_bytes,
-				std::size_t epoch_arena_capacity_bytes, lifecycle_memory_provider &memory_provider,
-				lifecycle_log_provider &log_provider)
+status_or<lifecycle_context_ownership> lifecycle_context_owner::create(lifecycle_context_identity &&identity,
+								       std::size_t context_memory_capacity_bytes,
+								       std::size_t epoch_arena_capacity_bytes,
+								       lifecycle_memory_provider &memory_provider,
+								       lifecycle_log_provider &log_provider)
 {
 	if (!kinetum::sdk::valid_module_abi_text(identity.module_id) ||
 	    !kinetum::sdk::valid_module_abi_text(identity.context_instance_id)) {
@@ -812,27 +807,36 @@ lifecycle_context_owner::create(lifecycle_context_identity &&identity, std::size
 				      "lifecycle context requires nonzero context and epoch memory capacities"));
 	}
 	static_assert(std::is_nothrow_move_constructible_v<lifecycle_context_identity>);
-	auto telemetry_block_or = memory_provider.allocate(identity.numa_node, sizeof(telemetry_storage),
-							   alignof(telemetry_storage), true);
-	if (!telemetry_block_or.is_ok()) {
-		return telemetry_block_or.error();
+	static_assert(std::is_nothrow_default_constructible_v<telemetry_storage>);
+	const auto layout = compute_storage_layout_();
+	auto block_or =
+		layout.allocation.allocate(identity.numa_node, [&](const numa_memory_options &options) noexcept {
+			return memory_provider.allocate(options.host_numa_node.value(), options.usable_bytes,
+							options.alignment_bytes, true);
+		});
+	if (!block_or.is_ok()) {
+		return block_or.error();
 	}
-	auto telemetry_block = std::move(telemetry_block_or).value();
-	if (const auto block_status = validate_provider_block(telemetry_block, identity.numa_node,
-							      sizeof(telemetry_storage), alignof(telemetry_storage));
+	const auto block = std::move(block_or).value();
+	if (const auto block_status = validate_provider_block(block, identity.numa_node, layout.allocation.size(),
+							      layout.allocation.alignment());
 	    !block_status.is_ok()) {
-		memory_provider.release(telemetry_block);
+		memory_provider.release(block);
 		return block_status;
 	}
-	auto *telemetry_storage =
-		std::construct_at(static_cast<lifecycle_context_owner::telemetry_storage *>(telemetry_block.data));
+	const std::span<std::byte> storage(static_cast<std::byte *>(block.data), block.size);
+	auto *telemetry_storage = std::construct_at(
+		numa_layout::storage<lifecycle_context_owner::telemetry_storage>(storage, layout.telemetry_offset)
+			.data());
 	try {
-		return std::unique_ptr<lifecycle_context_owner>(new lifecycle_context_owner(
-			std::move(identity), context_memory_capacity_bytes, epoch_arena_capacity_bytes, memory_provider,
-			log_provider, telemetry_block, telemetry_storage));
+		auto *root = new (numa_layout::storage<lifecycle_context_owner>(storage, layout.root_offset).data())
+			lifecycle_context_owner(std::move(identity), context_memory_capacity_bytes,
+						epoch_arena_capacity_bytes, memory_provider, log_provider,
+						telemetry_storage);
+		return lifecycle_context_ownership(root, lifecycle_context_deleter{&memory_provider, block});
 	} catch (const std::bad_alloc &) {
 		std::destroy_at(telemetry_storage);
-		memory_provider.release(telemetry_block);
+		memory_provider.release(block);
 		return status(status_code::RESOURCE_EXHAUSTED,
 			      kinetum::common::static_status_text("failed to allocate lifecycle context owner"));
 	}
@@ -872,8 +876,54 @@ lifecycle_context_owner::~lifecycle_context_owner()
 	}
 	std::destroy_at(telemetry_storage_);
 	telemetry_storage_ = nullptr;
-	memory_provider_.release(telemetry_storage_block_);
-	telemetry_storage_block_ = {};
+}
+
+lifecycle_context_deleter::lifecycle_context_deleter(lifecycle_memory_provider *provider,
+						     lifecycle_memory_block block) noexcept
+	: provider(provider)
+	, block(block)
+{
+	if (provider == nullptr || block.data == nullptr) {
+		std::terminate();
+	}
+}
+
+lifecycle_context_deleter::lifecycle_context_deleter(lifecycle_context_deleter &&other) noexcept
+	: provider(std::exchange(other.provider, nullptr))
+	, block(std::exchange(other.block, {}))
+{
+}
+
+lifecycle_context_deleter &lifecycle_context_deleter::operator=(lifecycle_context_deleter &&other) noexcept
+{
+	if (this != &other) {
+		if (provider != nullptr || block.data != nullptr) {
+			std::terminate();
+		}
+		provider = std::exchange(other.provider, nullptr);
+		block = std::exchange(other.block, {});
+	}
+	return *this;
+}
+
+lifecycle_context_deleter::~lifecycle_context_deleter()
+{
+	if (provider != nullptr || block.data != nullptr) {
+		std::terminate();
+	}
+}
+
+void lifecycle_context_deleter::operator()(lifecycle_context_owner *owner) noexcept
+{
+	if (provider == nullptr ||
+	    !numa_layout::contains(std::span<const std::byte>(static_cast<const std::byte *>(block.data), block.size),
+				   owner)) {
+		std::terminate();
+	}
+	std::destroy_at(owner);
+	provider->release(block);
+	block = {};
+	provider = nullptr;
 }
 
 status_or<lifecycle_context_operation> lifecycle_context_owner::begin_operation(lifecycle_phase phase, uint64_t epoch,
@@ -947,9 +997,19 @@ std::size_t lifecycle_context_owner::epoch_arena_capacity_bytes() const noexcept
 	return epoch_arena_capacity_bytes_;
 }
 
-std::size_t lifecycle_context_owner::telemetry_storage_bytes() noexcept
+std::size_t lifecycle_context_owner::platform_storage_bytes() noexcept
 {
-	return sizeof(telemetry_storage);
+	return compute_storage_layout_().allocation.size();
+}
+
+lifecycle_context_owner::context_storage_layout lifecycle_context_owner::compute_storage_layout_() noexcept
+{
+	context_storage_layout layout;
+	if (!layout.allocation.append<lifecycle_context_owner>(1u, layout.root_offset) ||
+	    !layout.allocation.append<telemetry_storage>(1u, layout.telemetry_offset)) {
+		std::terminate();
+	}
+	return layout;
 }
 
 std::size_t lifecycle_context_owner::telemetry_handle_count() const noexcept

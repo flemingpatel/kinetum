@@ -29,9 +29,7 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <memory>
 #include <span>
-#include <vector>
 
 #include "src/common/status_or.hpp"
 #include "src/dp/epoch/boundary_epoch_channel.hpp"
@@ -39,6 +37,7 @@
 #include "src/dp/epoch/epoch_protocol_fault.hpp"
 #include "src/dp/epoch/worker_epoch_ledger.hpp"
 #include "src/dp/publication_read_result.hpp"
+#include "src/dp/numa_layout.hpp"
 
 namespace kinetum::dp
 {
@@ -63,10 +62,12 @@ class worker_boundary_receiver final {
 	 * @param worker_index Exact compact receiver-worker identity.
 	 * @param runtime_generation Exact nonzero materialized generation.
 	 * @param channels Strictly boundary-index-sorted complete inbound set.
+	 * @param numa_node Exact compiled receiver-worker node, including an empty endpoint set.
 	 * @return Unique unbound receiver owner or a fail-closed identity/claim status.
 	 */
-	[[nodiscard]] static common::status_or<std::unique_ptr<worker_boundary_receiver>>
-	create(uint32_t worker_index, uint64_t runtime_generation, std::span<boundary_epoch_channel *const> channels);
+	[[nodiscard]] static common::status_or<numa_owner<worker_boundary_receiver>>
+	create(uint32_t worker_index, uint64_t runtime_generation, std::span<boundary_epoch_channel *const> channels,
+	       int32_t numa_node);
 
 	/** @brief Reject copying because receiver policy claims are linear. */
 	worker_boundary_receiver(const worker_boundary_receiver &) = delete;
@@ -295,9 +296,10 @@ class worker_boundary_receiver final {
 	 * @param worker_index Exact compact receiver-worker identity.
 	 * @param runtime_generation Exact materialized generation.
 	 * @param endpoints Strictly sorted complete inbound endpoint set.
+	 * @param numa_node Exact node proved for root and endpoint bindings.
 	 */
-	worker_boundary_receiver(uint32_t worker_index, uint64_t runtime_generation,
-				 std::vector<endpoint> endpoints) noexcept;
+	worker_boundary_receiver(uint32_t worker_index, uint64_t runtime_generation, std::span<endpoint> endpoints,
+				 int32_t numa_node) noexcept;
 	/**
 	 * @param receiver_ordinal Exact owner-local inbound ordinal.
 	 * @return Exact mutable endpoint or terminate for a malformed ordinal.
@@ -350,10 +352,11 @@ class worker_boundary_receiver final {
 			   epoch_protocol_fault_disposition disposition, uint64_t observed_epoch,
 			   uint64_t expected_value, uint64_t observed_value) noexcept;
 
-	uint32_t worker_index_{0};			///< Exact compact worker identity.
-	uint64_t runtime_generation_{0};		///< Exact materialized generation.
-	std::vector<endpoint> endpoints_;		///< Stable sorted inbound endpoint table.
-	worker_epoch_ledger *ledger_{nullptr};		///< Bound sole worker credit authority.
+	uint32_t worker_index_{0};		///< Exact compact worker identity.
+	uint64_t runtime_generation_{0};	///< Exact materialized generation.
+	std::span<endpoint> endpoints_;		///< Stable sorted inbound endpoint table in the root mapping.
+	int32_t numa_node_{-1};			///< Compiled node shared by root, bindings and endpoint policy storage.
+	worker_epoch_ledger *ledger_{nullptr};	///< Bound sole worker credit authority.
 	worker_runtime_telemetry *telemetry_{nullptr};	///< Sole owner-local protocol counters.
 	epoch_protocol_fault_latch *faults_{nullptr};	///< Process-generation first-fault authority.
 	uint64_t bootstrap_epoch_{0};			///< Exact fixed epoch after owner binding.

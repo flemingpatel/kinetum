@@ -206,14 +206,13 @@ KINETUM_ALWAYS_INLINE void publish_batch_to_record(const kinetum_batch_t &batch,
 	}
 	const auto *data = packet.storage.data;
 	const auto length = packet.storage.length;
-	__builtin_prefetch(data, 0, 3);
+	packet_prefetch_payload(packet);
 
 	auto &metadata = packet.metadata;
 	std::memset(&metadata.src_ipv4, 0, sizeof(packet_private) - offsetof(packet_private, src_ipv4));
 	metadata.platform_flags &= ~packet_platform_flags::PARSED_MASK;
 
 	const auto ethernet = net::parse_ethernet(data, length);
-	metadata.eth_type = ethernet.eth_type;
 	if (KINETUM_UNLIKELY(!ethernet.ok || ethernet.eth_type != 0x0800)) {
 		return packet_mechanism_outcome::REJECTED;
 	}
@@ -234,8 +233,6 @@ KINETUM_ALWAYS_INLINE void publish_batch_to_record(const kinetum_batch_t &batch,
 	}
 	metadata.ip_offset = ipv4.ip_offset;
 	metadata.l4_offset = ipv4.l4_offset;
-	metadata.ip_header_len = ipv4.ip_header_len;
-	metadata.ip_total_len = ipv4.ip_total_len;
 	metadata.src_ipv4 = ipv4.src_ipv4;
 	metadata.dst_ipv4 = ipv4.dst_ipv4;
 	metadata.src_port = ipv4.src_port;
@@ -334,25 +331,26 @@ template <bool active>
 		return 0u;
 	}
 	const auto &view = store.owner_executable_view();
+	auto &batch = scratch.batch;
+	const auto count = static_cast<uint16_t>(packets.size());
 	bool valid = true;
-	for (const auto *packet : packets) {
+	for (uint16_t index = 0u; index < count; ++index) {
+		const auto *packet = packets[index];
 		if (KINETUM_UNLIKELY(packet == nullptr || packet->metadata.epoch != view.epoch)) {
 			store.record_epoch_mismatch(packet != nullptr ? packet->metadata.epoch : 0,
 						    stage_instance_index, region_id);
 			valid = false;
 		} else if (KINETUM_UNLIKELY(!packet_record_has_current_cpu_shape(packet))) {
 			valid = false;
+		} else {
+			packet_prefetch_payload(*packet);
+			project_record_to_batch(*packet, index, batch);
 		}
 	}
 	if (KINETUM_UNLIKELY(!valid)) {
 		return 0u;
 	}
 
-	auto &batch = scratch.batch;
-	const auto count = static_cast<uint16_t>(packets.size());
-	for (uint16_t index = 0u; index < count; ++index) {
-		project_record_to_batch(*packets[index], index, batch);
-	}
 	batch.count = count;
 	batch.region_id = static_cast<uint16_t>(region_id);
 	batch.padding = 0u;

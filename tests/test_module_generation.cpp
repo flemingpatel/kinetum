@@ -34,13 +34,19 @@
 #include <vector>
 
 #include "src/common/status.hpp"
+#include "src/dp/epoch/worker_epoch_ledger.hpp"
 #include "src/dp/lifecycle/lifecycle_context.hpp"
+#include "src/dp/lifecycle/numa_lifecycle_memory_provider.hpp"
 #include "src/dp/lifecycle/prepared_config_ownership.hpp"
 #include "src/dp/module/module_epoch_store.hpp"
 #include "src/dp/module/module_lifecycle_adapter.hpp"
 #include "src/dp/module/module_manager.hpp"
+#include "src/dp/module/worker_module_health.hpp"
+#include "src/dp/thread_affinity.hpp"
 #include "src/modules/acl/acl.pb.h"
 #include "tests/module_abi_test_harness.hpp"
+#include "tests/numa_test_support.hpp"
+#include "tests/numa_placement_test_support.hpp"
 
 namespace kinetum::dp::module
 {
@@ -147,13 +153,14 @@ void expect_image_unloaded(const std::filesystem::path &path)
  * @param context_index Compiled executable-context index.
  * @param worker_index Sole owner-worker index.
  * @param cpu_core_id Exact owner logical CPU.
- * @param numa_node Exact owner NUMA node.
+ * @param numa_node Exact owner node; the default establishes a live process-allowed test placement.
  * @return Complete admitted context specification.
  */
 module_context_spec context_spec(std::string context_id, std::string module_id,
 				 kinetum::test::module_test_resource_contract resources, uint32_t ordinal,
 				 uint32_t count, uint32_t context_index = 0, uint32_t worker_index = 0,
-				 int32_t cpu_core_id = 0, int32_t numa_node = 0)
+				 int32_t cpu_core_id = 0,
+				 int32_t numa_node = kinetum::test::required_memory_numa_node())
 {
 	return {
 		.context_instance_id = std::move(context_id),
@@ -520,7 +527,7 @@ TEST(module_generation, host_authoring_schema_is_independent_of_runtime_image)
 
 	generation_environment environment;
 	const status result = environment.manager.admit_generation(
-		{acl_image()}, {context_spec("acl@lane_0", "kinetum.acl", TEST_MODULE_RESOURCES, 0u, 1u, 0, 0, 0, 0)},
+		{acl_image()}, {context_spec("acl@lane_0", "kinetum.acl", TEST_MODULE_RESOURCES, 0u, 1u, 0, 0, 0)},
 		environment.memory, environment.log, environment.control);
 	ASSERT_TRUE(result.is_ok()) << result.message();
 	ASSERT_NE(environment.manager.image("kinetum.acl"), nullptr);
@@ -541,10 +548,9 @@ TEST(module_generation, base_namespace_exact_images_are_reclaimable)
 			generation_environment environment;
 			const status result = environment.manager.admit_generation(
 				{acl_image(), nat44_image(), qos_image()},
-				{context_spec("acl@lane_0", "kinetum.acl", TEST_MODULE_RESOURCES, 0u, 1u, 0, 0, 0, 0),
-				 context_spec("nat44@lane_0", "kinetum.nat44", TEST_MODULE_RESOURCES, 0u, 1u, 1, 0, 0,
-					      0),
-				 context_spec("qos@lane_0", "kinetum.qos", TEST_MODULE_RESOURCES, 0u, 1u, 2, 0, 0, 0)},
+				{context_spec("acl@lane_0", "kinetum.acl", TEST_MODULE_RESOURCES, 0u, 1u, 0, 0, 0),
+				 context_spec("nat44@lane_0", "kinetum.nat44", TEST_MODULE_RESOURCES, 0u, 1u, 1, 0, 0),
+				 context_spec("qos@lane_0", "kinetum.qos", TEST_MODULE_RESOURCES, 0u, 1u, 2, 0, 0)},
 				environment.memory, environment.log, environment.control);
 			ASSERT_TRUE(result.is_ok()) << "admission=" << admission << " error=" << result.message();
 		}
@@ -560,7 +566,7 @@ TEST(module_generation, accepts_exact_generation_retry)
 	generation_environment environment;
 	const std::vector<module_image_spec> images{passive_image()};
 	const std::vector<module_context_spec> contexts{
-		context_spec("module@lane_0", "test_module", TEST_MODULE_RESOURCES, 0u, 1u, 3, 2, 5, 0)};
+		context_spec("module@lane_0", "test_module", TEST_MODULE_RESOURCES, 0u, 1u, 3, 2, 5)};
 	ASSERT_TRUE(
 		environment.manager
 			.admit_generation(images, contexts, environment.memory, environment.log, environment.control)
@@ -581,7 +587,7 @@ TEST(module_generation, rejects_generation_retry_with_different_memory_capacity)
 	generation_environment environment;
 	const std::vector<module_image_spec> images{passive_image()};
 	const std::vector<module_context_spec> contexts{
-		context_spec("module@lane_0", "test_module", TEST_MODULE_RESOURCES, 0u, 1u, 3, 2, 5, 0)};
+		context_spec("module@lane_0", "test_module", TEST_MODULE_RESOURCES, 0u, 1u, 3, 2, 5)};
 	ASSERT_TRUE(
 		environment.manager
 			.admit_generation(images, contexts, environment.memory, environment.log, environment.control)
@@ -1108,6 +1114,77 @@ TEST(module_generation, rejects_newer_module_abi)
 	EXPECT_EQ(result.code(), status_code::FAILED_PRECONDITION);
 	EXPECT_NE(result.message().find("module ABI version mismatch"), std::string::npos);
 	EXPECT_FALSE(environment.manager.has_generation());
+}
+
+/** @brief Admit one real module generation whose context owners occupy distinct native nodes. */
+class ModuleNumaPlacementTest : public kinetum::test::NumaPlacementTest {};
+
+/** @brief Context roots, epoch stores, registry banks and health bindings retain exact mixed-node placement. */
+TEST_F(ModuleNumaPlacementTest, mixed_node_contexts_use_the_production_allocator)
+{
+	std::jthread construction([&] {
+		ASSERT_EQ(bind_current_thread_to_cpu_raw(cpus_[0].core_id), 0);
+		// Explicit test-provider bounds cover one context, its epochs and
+		// platform metadata on each node; no allocation consumes this total
+		// merely because it is admitted.
+		constexpr std::size_t NODE_BYTES = 96u * 1024u * 1024u;
+		const std::array<lifecycle::numa_lifecycle_memory_budget, 2> budgets{{
+			{cpus_[0].numa_node, 1u, NODE_BYTES},
+			{cpus_[1].numa_node, 1u, NODE_BYTES},
+		}};
+		auto memory_or = lifecycle::numa_lifecycle_memory_provider::create(budgets);
+		ASSERT_TRUE(memory_or.is_ok()) << memory_or.error().message();
+		auto memory = std::move(memory_or).value();
+		kinetum::test::module_test_log_provider log;
+		lifecycle_operation_control control(std::chrono::steady_clock::now() + std::chrono::seconds(5));
+		module_manager manager;
+		const std::array<uint32_t, 2> CONTEXTS{3u, 97u};
+		const auto admitted = manager.admit_generation(
+			{passive_image()},
+			{context_spec("module@lane_0", "test_module", TEST_MODULE_RESOURCES, 0u, 2u, CONTEXTS[0], 0u,
+				      cpus_[0].core_id, cpus_[0].numa_node),
+			 context_spec("module@lane_1", "test_module", TEST_MODULE_RESOURCES, 1u, 2u, CONTEXTS[1], 1u,
+				      cpus_[1].core_id, cpus_[1].numa_node)},
+			*memory, log, control);
+		ASSERT_TRUE(admitted.is_ok()) << admitted.message();
+		for (std::size_t index = 0u; index < CONTEXTS.size(); ++index) {
+			auto *context = manager.context(CONTEXTS[index]);
+			ASSERT_NE(context, nullptr);
+			const auto node = cpus_[index].numa_node;
+			EXPECT_TRUE(kinetum::test::resident_on_node(
+				{reinterpret_cast<const std::byte *>(context), sizeof(*context)}, node));
+			EXPECT_TRUE(kinetum::test::resident_owner_on_node(context->epoch_store, node));
+			const auto &block = context->lifecycle_owner.get_deleter().block;
+			EXPECT_TRUE(kinetum::test::resident_on_node(
+				{static_cast<const std::byte *>(block.data), block.size}, node));
+			EXPECT_TRUE(numa_layout::contains(
+				std::span<const std::byte>(static_cast<const std::byte *>(block.data), block.size),
+				context->lifecycle_owner.get()));
+			const auto worker = context->packet_context.worker_index;
+			auto channel = worker_telemetry_channel::create(worker, 1u, node, cpus_[0].numa_node);
+			auto ledger = worker_epoch_ledger::create(worker, 17u, 1024u, node);
+			ASSERT_TRUE(channel.is_ok()) << channel.error().message();
+			ASSERT_TRUE(ledger.is_ok()) << ledger.error().message();
+			const auto bound = context->lifecycle_owner->bind_telemetry(
+				17u, static_cast<uint16_t>(CONTEXTS[index]), *channel.value(),
+				context->image->descriptor->health_check != nullptr);
+			ASSERT_TRUE(bound.is_ok()) << bound.message();
+			{
+				const std::array<worker_module_health_binding, 1> bindings{{
+					{CONTEXTS[index], CONTEXTS[index], &context->packet_context,
+					 context->epoch_store.get(), context->image->descriptor,
+					 context->lifecycle_owner.get()},
+				}};
+				auto health =
+					worker_module_health::create(worker, 17u, 10000u, bindings, *ledger.value());
+				EXPECT_TRUE(health.is_ok()) << health.error().message();
+				if (health.is_ok()) {
+					EXPECT_TRUE(kinetum::test::resident_owner_on_node(health.value(), node));
+				}
+			}
+			context->lifecycle_owner->unbind_telemetry();
+		}
+	});
 }
 
 }  // namespace
