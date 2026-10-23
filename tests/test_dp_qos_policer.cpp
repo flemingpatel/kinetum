@@ -30,7 +30,7 @@
  *
  * Wire-Format Testing:
  * --------------------
- * QoS module is read-only for packet buffer (only modifies DSCP for remarking).
+ * QoS leaves bytes unchanged except for DSCP remarking and its full IPv4 checksum update.
  * Tests verify packet buffer integrity after processing.
  *
  * @see src/modules/qos/qos_impl.hpp
@@ -84,6 +84,25 @@ namespace
 [[nodiscard]] kinetum::modules::qos::flow_key test_flow(uint32_t source) noexcept
 {
 	return {source, 0xcb007101u, 12345u, 9999u, 17u, kinetum::modules::qos::flow_kind::TRANSPORT};
+}
+
+/**
+ * @brief Prepare one semantic key through the production map before policing a test packet.
+ * @param policer Exact mutable table owner.
+ * @param now_ns Caller-supplied processing time.
+ * @param profile Active rate, burst and remarking policy.
+ * @param runtime Bounded reclamation policy.
+ * @param key Semantic packet identity; ignored by an unlimited profile.
+ * @param bytes Packet cost.
+ * @return The production policer's exact disposition.
+ */
+[[nodiscard]] policer_result police_packet(kinetum::modules::qos::qos_policer &policer, uint64_t now_ns,
+					   const kinetum::modules::qos::qos_profile_compiled &profile,
+					   const kinetum::modules::qos::qos_runtime_tuning &runtime,
+					   const kinetum::modules::qos::flow_key &key, std::size_t bytes) noexcept
+{
+	const auto query = policer.prepare(key);
+	return policer.police(now_ns, profile, runtime, profile.cir_bytes_per_s != 0u ? &query : nullptr, bytes);
 }
 
 /**
@@ -184,46 +203,46 @@ TEST(qos_policer, exact_token_bucket)
 	uint64_t t0 = 1000000000ull;  // 1 second in nanoseconds
 
 	// First 500 bytes: allowed
-	EXPECT_EQ(p.police(t0, prof, runtime, flow, 500), policer_result::ALLOWED)
+	EXPECT_EQ(police_packet(p, t0, prof, runtime, flow, 500), policer_result::ALLOWED)
 		<< "First 500 bytes should be allowed (bucket has 1000)";
 
 	// Second 500 bytes: allowed (now bucket empty)
-	EXPECT_EQ(p.police(t0, prof, runtime, flow, 500), policer_result::ALLOWED)
+	EXPECT_EQ(police_packet(p, t0, prof, runtime, flow, 500), policer_result::ALLOWED)
 		<< "Second 500 bytes should be allowed (bucket had 500 remaining)";
 
 	// One more byte: denied (bucket exhausted)
-	EXPECT_EQ(p.police(t0, prof, runtime, flow, 1), policer_result::RATE_LIMIT)
+	EXPECT_EQ(police_packet(p, t0, prof, runtime, flow, 1), policer_result::RATE_LIMIT)
 		<< "Bucket is empty, 1 byte should be denied";
 
 	// Regressed platform time is a contradiction, before any credit mutation.
-	EXPECT_DEATH((void)p.police(t0 - 1000000000ull, prof, runtime, flow, 1), "");
+	EXPECT_DEATH((void)police_packet(p, t0 - 1000000000ull, prof, runtime, flow, 1), "");
 	const uint64_t t_half = t0 + 500000000ull;
-	EXPECT_EQ(p.police(t_half, prof, runtime, flow, 750), policer_result::RATE_LIMIT)
+	EXPECT_EQ(police_packet(p, t_half, prof, runtime, flow, 750), policer_result::RATE_LIMIT)
 		<< "Only 500 bytes may refill after half a second";
 
 	// After 1 second, refill 1000 bytes (CIR = 1000 bytes/s)
 	uint64_t t1 = t0 + 1000000000ull;  // +1 second
 
 	// 1000 bytes: allowed (full refill)
-	EXPECT_EQ(p.police(t1, prof, runtime, flow, 1000), policer_result::ALLOWED)
+	EXPECT_EQ(police_packet(p, t1, prof, runtime, flow, 1000), policer_result::ALLOWED)
 		<< "After 1s, bucket should have 1000 bytes from refill";
 
 	// One more byte: denied (bucket empty again)
-	EXPECT_EQ(p.police(t1, prof, runtime, flow, 1), policer_result::RATE_LIMIT)
+	EXPECT_EQ(police_packet(p, t1, prof, runtime, flow, 1), policer_result::RATE_LIMIT)
 		<< "Bucket exhausted again after consuming refill";
 
 	// Existing flow state survives exact configuration activation, but credit
 	// above the replacement profile's smaller burst must not. Without the
 	// clamp, this flow would incorrectly retain 900 bytes of old-policy credit.
 	const auto reconfigured_flow = test_flow(456);
-	ASSERT_EQ(p.police(t1, prof, runtime, reconfigured_flow, 100), policer_result::ALLOWED);
+	ASSERT_EQ(police_packet(p, t1, prof, runtime, reconfigured_flow, 100), policer_result::ALLOWED);
 	kinetum::modules::qos::qos_profile_compiled smaller_burst(*std::pmr::get_default_resource());
 	smaller_burst.name = prof.name;
 	smaller_burst.cir_bytes_per_s = prof.cir_bytes_per_s;
 	smaller_burst.conform_dscp = prof.conform_dscp;
 	smaller_burst.burst_bytes = 100;
-	EXPECT_EQ(p.police(t1, smaller_burst, runtime, reconfigured_flow, 101), policer_result::RATE_LIMIT);
-	EXPECT_EQ(p.police(t1, smaller_burst, runtime, reconfigured_flow, 100), policer_result::ALLOWED);
+	EXPECT_EQ(police_packet(p, t1, smaller_burst, runtime, reconfigured_flow, 101), policer_result::RATE_LIMIT);
+	EXPECT_EQ(police_packet(p, t1, smaller_burst, runtime, reconfigured_flow, 100), policer_result::ALLOWED);
 
 	// Maximal representable rate and elapsed time must saturate at the burst
 	// ceiling without overflowing the wide refill intermediate.
@@ -235,9 +254,10 @@ TEST(qos_policer, exact_token_bucket)
 	extreme_rate.conform_dscp = prof.conform_dscp;
 	extreme_rate.cir_bytes_per_s = std::numeric_limits<uint64_t>::max();
 	const auto extreme_flow = test_flow(789);
-	ASSERT_EQ(extreme_gap_policer.police(0, extreme_rate, runtime, extreme_flow, 1000), policer_result::ALLOWED);
-	EXPECT_EQ(extreme_gap_policer.police(std::numeric_limits<uint64_t>::max(), extreme_rate, runtime, extreme_flow,
-					     1000),
+	ASSERT_EQ(police_packet(extreme_gap_policer, 0, extreme_rate, runtime, extreme_flow, 1000),
+		  policer_result::ALLOWED);
+	EXPECT_EQ(police_packet(extreme_gap_policer, std::numeric_limits<uint64_t>::max(), extreme_rate, runtime,
+				extreme_flow, 1000),
 		  policer_result::ALLOWED);
 }
 
@@ -268,14 +288,14 @@ TEST(qos_policer, capacity_exhaustion_drops_new_flows)
 
 	// Fill all 4 slots with distinct flows
 	for (uint32_t f = 1; f <= 4; ++f) {
-		EXPECT_EQ(p.police(t, prof, runtime, test_flow(f), 100), policer_result::ALLOWED)
+		EXPECT_EQ(police_packet(p, t, prof, runtime, test_flow(f), 100), policer_result::ALLOWED)
 			<< "Flow " << f << " must be allowed (capacity not yet full)";
 	}
 
 	EXPECT_EQ(p.active_flows(), 4u);
 
 	// 5th flow must be dropped (fail-closed)
-	EXPECT_EQ(p.police(t, prof, runtime, test_flow(5), 100), policer_result::FLOW_CAPACITY)
+	EXPECT_EQ(police_packet(p, t, prof, runtime, test_flow(5), 100), policer_result::FLOW_CAPACITY)
 		<< "5th flow must be dropped - table full, fail-closed";
 
 	EXPECT_EQ(p.active_flows(), 4u);
@@ -302,12 +322,12 @@ TEST(qos_policer, existing_flows_work_at_capacity)
 
 	// Fill all 4 slots
 	for (uint32_t f = 1; f <= 4; ++f) {
-		EXPECT_EQ(p.police(t, prof, runtime, test_flow(f), 100), policer_result::ALLOWED);
+		EXPECT_EQ(police_packet(p, t, prof, runtime, test_flow(f), 100), policer_result::ALLOWED);
 	}
 
 	// Existing flow 1 at t+1s: tokens refilled, should allow
 	const uint64_t t1 = t + 1000000000ull;
-	EXPECT_EQ(p.police(t1, prof, runtime, test_flow(1), 100), policer_result::ALLOWED)
+	EXPECT_EQ(police_packet(p, t1, prof, runtime, test_flow(1), 100), policer_result::ALLOWED)
 		<< "Existing flow must still be policed normally at capacity";
 }
 
@@ -337,12 +357,12 @@ TEST(qos_policer, flow_reuse_after_gc)
 
 	// Fill all 4 slots
 	for (uint32_t f = 1; f <= 4; ++f) {
-		EXPECT_EQ(p.police(t0, prof, runtime, test_flow(f), 100), policer_result::ALLOWED);
+		EXPECT_EQ(police_packet(p, t0, prof, runtime, test_flow(f), 100), policer_result::ALLOWED);
 	}
 	EXPECT_EQ(p.active_flows(), 4u);
 
 	// 5th flow rejected at capacity
-	EXPECT_EQ(p.police(t0, prof, runtime, test_flow(5), 100), policer_result::FLOW_CAPACITY);
+	EXPECT_EQ(police_packet(p, t0, prof, runtime, test_flow(5), 100), policer_result::FLOW_CAPACITY);
 
 	// Advance time past idle timeout (t0 + 6s > 5s timeout)
 	const uint64_t t1 = t0 + 6000000000ull;
@@ -353,11 +373,11 @@ TEST(qos_policer, flow_reuse_after_gc)
 	unlimited.name = "unlimited";
 	unlimited.cir_bytes_per_s = 0u;
 	unlimited.burst_bytes = 0u;
-	EXPECT_EQ(p.police(t1, unlimited, runtime, test_flow(99), 100), policer_result::ALLOWED);
+	EXPECT_EQ(police_packet(p, t1, unlimited, runtime, test_flow(99), 100), policer_result::ALLOWED);
 	EXPECT_EQ(p.active_flows(), 0u);
 
 	// Returning to a bounded profile can consume one reclaimed slot.
-	EXPECT_EQ(p.police(t1, prof, runtime, test_flow(99), 100), policer_result::ALLOWED);
+	EXPECT_EQ(police_packet(p, t1, prof, runtime, test_flow(99), 100), policer_result::ALLOWED);
 	EXPECT_EQ(p.active_flows(), 1u);
 }
 
@@ -380,17 +400,17 @@ TEST(qos_policer, repeated_capacity_rejection_preserves_admitted_flows)
 	const uint64_t t = 1000000000ull;
 
 	// Fill both slots
-	EXPECT_EQ(p.police(t, prof, runtime, test_flow(1), 100), policer_result::ALLOWED);
-	EXPECT_EQ(p.police(t, prof, runtime, test_flow(2), 100), policer_result::ALLOWED);
+	EXPECT_EQ(police_packet(p, t, prof, runtime, test_flow(1), 100), policer_result::ALLOWED);
+	EXPECT_EQ(police_packet(p, t, prof, runtime, test_flow(2), 100), policer_result::ALLOWED);
 
 	// 3 rejected attempts
-	EXPECT_EQ(p.police(t, prof, runtime, test_flow(10), 100), policer_result::FLOW_CAPACITY);
-	EXPECT_EQ(p.police(t, prof, runtime, test_flow(11), 100), policer_result::FLOW_CAPACITY);
-	EXPECT_EQ(p.police(t, prof, runtime, test_flow(12), 100), policer_result::FLOW_CAPACITY);
+	EXPECT_EQ(police_packet(p, t, prof, runtime, test_flow(10), 100), policer_result::FLOW_CAPACITY);
+	EXPECT_EQ(police_packet(p, t, prof, runtime, test_flow(11), 100), policer_result::FLOW_CAPACITY);
+	EXPECT_EQ(police_packet(p, t, prof, runtime, test_flow(12), 100), policer_result::FLOW_CAPACITY);
 
 	EXPECT_EQ(p.active_flows(), 2u);
-	EXPECT_EQ(p.police(t + 1'000'000'000ull, prof, runtime, test_flow(1), 100), policer_result::ALLOWED);
-	EXPECT_EQ(p.police(t + 1'000'000'000ull, prof, runtime, test_flow(2), 100), policer_result::ALLOWED);
+	EXPECT_EQ(police_packet(p, t + 1'000'000'000ull, prof, runtime, test_flow(1), 100), policer_result::ALLOWED);
+	EXPECT_EQ(police_packet(p, t + 1'000'000'000ull, prof, runtime, test_flow(2), 100), policer_result::ALLOWED);
 }
 
 /**
@@ -414,9 +434,9 @@ TEST(qos_policer, zero_capacity_is_safe)
 	const uint64_t t = 1000000000ull;
 
 	// All packets must be dropped (no slab capacity)
-	EXPECT_EQ(p.police(t, prof, runtime, test_flow(1), 100), policer_result::FLOW_CAPACITY)
+	EXPECT_EQ(police_packet(p, t, prof, runtime, test_flow(1), 100), policer_result::FLOW_CAPACITY)
 		<< "Zero-capacity policer must drop all packets (fail-closed)";
-	EXPECT_EQ(p.police(t, prof, runtime, test_flow(2), 100), policer_result::FLOW_CAPACITY)
+	EXPECT_EQ(police_packet(p, t, prof, runtime, test_flow(2), 100), policer_result::FLOW_CAPACITY)
 		<< "Zero-capacity policer must drop all packets (fail-closed)";
 
 	EXPECT_EQ(p.active_flows(), 0u);
@@ -434,19 +454,19 @@ TEST(qos_policer, cuckoo_collision_failure_releases_claimed_capacity)
 	// These semantic keys share one candidate in each four-bucket table.
 	constexpr std::array<uint32_t, 9> SOURCES{36u, 54u, 70u, 75u, 90u, 134u, 137u, 158u, 168u};
 	for (std::size_t index = 0u; index < 8u; ++index) {
-		ASSERT_EQ(policer.police(0u, profile, runtime, test_flow(SOURCES[index]), 64u),
+		ASSERT_EQ(police_packet(policer, 0u, profile, runtime, test_flow(SOURCES[index]), 64u),
 			  policer_result::ALLOWED);
 	}
 	for (uint32_t attempt = 0u; attempt < 3u; ++attempt) {
-		EXPECT_EQ(policer.police(0u, profile, runtime, test_flow(SOURCES.back()), 64u),
+		EXPECT_EQ(police_packet(policer, 0u, profile, runtime, test_flow(SOURCES.back()), 64u),
 			  policer_result::FLOW_CAPACITY);
 	}
 	EXPECT_EQ(policer.active_flows(), 8u);
 	for (std::size_t index = 0u; index < 8u; ++index) {
-		EXPECT_EQ(policer.police(0u, profile, runtime, test_flow(SOURCES[index]), 1u),
+		EXPECT_EQ(police_packet(policer, 0u, profile, runtime, test_flow(SOURCES[index]), 1u),
 			  policer_result::RATE_LIMIT);
 	}
-	EXPECT_EQ(policer.police(0u, profile, runtime, test_flow(1u), 64u), policer_result::ALLOWED);
+	EXPECT_EQ(police_packet(policer, 0u, profile, runtime, test_flow(1u), 64u), policer_result::ALLOWED);
 	EXPECT_EQ(policer.active_flows(), 9u);
 }
 
@@ -460,24 +480,24 @@ TEST(qos_policer, exact_fractions_and_context_clock_survive_policy_changes)
 	profile.burst_bytes = 64u;
 	qos_runtime_tuning runtime;
 	const auto key = test_flow(1u);
-	ASSERT_EQ(policer.police(0u, profile, runtime, key, 64u), policer_result::ALLOWED);
+	ASSERT_EQ(police_packet(policer, 0u, profile, runtime, key, 64u), policer_result::ALLOWED);
 	for (uint64_t step = 1u; step < 512000u; ++step) {
-		ASSERT_EQ(policer.police(step * 1000u, profile, runtime, key, 64u), policer_result::RATE_LIMIT);
+		ASSERT_EQ(police_packet(policer, step * 1000u, profile, runtime, key, 64u), policer_result::RATE_LIMIT);
 	}
-	EXPECT_EQ(policer.police(512000000u, profile, runtime, key, 64u), policer_result::ALLOWED);
-	EXPECT_EQ(policer.police(516000000u, profile, runtime, key, 1u), policer_result::RATE_LIMIT);
+	EXPECT_EQ(police_packet(policer, 512000000u, profile, runtime, key, 64u), policer_result::ALLOWED);
+	EXPECT_EQ(police_packet(policer, 516000000u, profile, runtime, key, 1u), policer_result::RATE_LIMIT);
 	// Retained half-byte plus 2 ms at the replacement 250-byte/s rate is one byte.
 	profile.cir_bytes_per_s = 250u;
-	EXPECT_EQ(policer.police(518000000u, profile, runtime, key, 1u), policer_result::ALLOWED);
+	EXPECT_EQ(police_packet(policer, 518000000u, profile, runtime, key, 1u), policer_result::ALLOWED);
 	profile.cir_bytes_per_s = 0u;
 	runtime.gc_trigger_mask = 0u;
 	runtime.idle_timeout_ns = 1u;
-	EXPECT_EQ(policer.police(600000000u, profile, runtime, {}, 100u), policer_result::ALLOWED);
+	EXPECT_EQ(police_packet(policer, 600000000u, profile, runtime, {}, 100u), policer_result::ALLOWED);
 	EXPECT_EQ(policer.active_flows(), 0u);
-	EXPECT_DEATH((void)policer.police(599999999u, profile, runtime, {}, 0u), "");
+	EXPECT_DEATH((void)police_packet(policer, 599999999u, profile, runtime, {}, 0u), "");
 	profile.cir_bytes_per_s = 125u;
-	EXPECT_DEATH((void)policer.police(599999999u, profile, runtime, test_flow(2u), 0u), "");
-	EXPECT_EQ(policer.police(600000000u, profile, runtime, key, 64u), policer_result::ALLOWED);
+	EXPECT_DEATH((void)police_packet(policer, 599999999u, profile, runtime, test_flow(2u), 0u), "");
+	EXPECT_EQ(police_packet(policer, 600000000u, profile, runtime, key, 64u), policer_result::ALLOWED);
 }
 
 /** @brief Malformed keys reject before GC or allocation; equality ignores implicit key padding. */
@@ -491,15 +511,87 @@ TEST(qos_policer, semantic_keys_reject_missing_identity_without_mutating_flow_st
 	qos_runtime_tuning runtime;
 	runtime.gc_trigger_mask = 0u;
 	runtime.idle_timeout_ns = 1u;
-	ASSERT_EQ(policer.police(0u, profile, runtime, test_flow(1u), 64u), policer_result::ALLOWED);
-	EXPECT_EQ(policer.police(100u, profile, runtime, {}, 64u), policer_result::INVALID_INPUT);
+	ASSERT_EQ(police_packet(policer, 0u, profile, runtime, test_flow(1u), 64u), policer_result::ALLOWED);
+	EXPECT_EQ(police_packet(policer, 100u, profile, runtime, {}, 64u), policer_result::INVALID_INPUT);
 	EXPECT_EQ(policer.active_flows(), 1u);
 	flow_key first = test_flow(1u);
 	flow_key second = first;
 	auto *padding = reinterpret_cast<unsigned char *>(&second);
-	padding[sizeof(second) - 1u] = 0xffu;
+	constexpr std::size_t PADDING = offsetof(flow_key, protocol) + sizeof(first.protocol);
+	static_assert(PADDING < offsetof(flow_key, kind));
+	padding[PADDING] = 0xffu;
 	EXPECT_EQ(first, second);
 	EXPECT_EQ(flow_identity_hash{}(first), flow_identity_hash{}(second));
+	second.kind = static_cast<flow_kind>(0x101u);
+	EXPECT_FALSE(second.valid());
+	EXPECT_NE(first, second);
+	EXPECT_NE(flow_identity_hash{}(first), flow_identity_hash{}(second));
+	EXPECT_EQ(police_packet(policer, 100u, profile, runtime, second, 64u), policer_result::INVALID_INPUT);
+	EXPECT_EQ(policer.active_flows(), 1u);
+}
+
+/** @brief Prepared facts survive intervening insertions and GC while lookup observes current credit rows. */
+TEST(qos_policer, prepared_queries_follow_recycled_index_lifetimes)
+{
+	using namespace kinetum::modules::qos;
+	qos_policer policer(2u, *std::pmr::new_delete_resource());
+	qos_profile_compiled profile(*std::pmr::new_delete_resource());
+	profile.cir_bytes_per_s = 125u;
+	profile.burst_bytes = 64u;
+	qos_runtime_tuning runtime;
+	runtime.gc_trigger_mask = 0u;
+	runtime.idle_timeout_ns = 1u;
+	const auto first = policer.prepare(test_flow(1u));
+	const auto second = policer.prepare(test_flow(2u));
+	EXPECT_EQ(policer.police(0u, profile, runtime, &first, 64u), policer_result::ALLOWED);
+	EXPECT_EQ(policer.police(0u, profile, runtime, &first, 1u), policer_result::RATE_LIMIT);
+	EXPECT_EQ(policer.police(10u, profile, runtime, &second, 64u), policer_result::ALLOWED);
+	EXPECT_EQ(policer.active_flows(), 1u);
+	EXPECT_EQ(policer.police(10u, profile, runtime, &first, 64u), policer_result::ALLOWED);
+	EXPECT_EQ(policer.police(10u, profile, runtime, &second, 1u), policer_result::RATE_LIMIT);
+	EXPECT_EQ(policer.active_flows(), 2u);
+	qos_policer other(2u, *std::pmr::new_delete_resource());
+	EXPECT_DEATH((void)other.police(10u, profile, runtime, &first, 1u), "");
+	EXPECT_DEATH((void)policer.police(10u, profile, runtime, nullptr, 1u), "");
+}
+
+/** @brief One batch observes preceding flow mutations across DSCP profiles and repairs full checksums. */
+TEST_F(QosModuleTest, prepared_batch_keeps_packet_order_and_profile_specific_remarking)
+{
+	ASSERT_TRUE(module_->prepare_and_activate(2u,
+						  R"({"default_profile":"default","profiles":[)"
+						  R"({"name":"default","cir_kbps":1,"cbs_kb":1},)"
+						  R"({"name":"dscp_10","cir_kbps":0,"cbs_kb":0,"conform_dscp":20},)"
+						  R"({"name":"dscp_20","cir_kbps":1,"cbs_kb":1,"conform_dscp":30}]})")
+			    .is_ok());
+	std::array<std::unique_ptr<kinetum::test::packet_record_test_owner>, 4> owners;
+	std::array<kinetum::dp::packet_record *, 4> records{};
+	constexpr std::array<uint8_t, 4> DSCP{0u, 10u, 20u, 0u};
+	for (std::size_t index = 0; index < owners.size(); ++index) {
+		auto bytes = qos_packet();
+		bytes[15] = static_cast<uint8_t>((static_cast<uint32_t>(DSCP[index]) << 2u) | 3u);
+		bytes[24] = 0x12u;
+		bytes[25] = 0x34u;
+		owners[index] = std::make_unique<kinetum::test::packet_record_test_owner>(std::move(bytes), 2u);
+		ASSERT_TRUE(owners[index]->valid()) << owners[index]->error();
+		records[index] = owners[index]->get();
+		ASSERT_TRUE(engine_.execute_stage(&parse_, records[index]));
+	}
+	EXPECT_EQ(module_->process_batch(records, 0u), 0x7u);
+	EXPECT_EQ(counter("qos.active_flows"), 1u);
+	EXPECT_EQ(counter("qos.packets_allowed"), 3u);
+	EXPECT_EQ(counter("qos.rate_limit_drops"), 1u);
+	for (std::size_t index = 1u; index <= 2u; ++index) {
+		const auto *header = records[index]->storage.data + 14u;
+		EXPECT_EQ(header[1] & 3u, 3u);
+		EXPECT_EQ(header[1] >> 2u, index == 1u ? 20u : 30u);
+		EXPECT_EQ(records[index]->metadata.dscp, index == 1u ? 20u : 30u);
+		EXPECT_EQ(kinetum::algo::net::read_be16(header + 10u), compute_ipv4_checksum(header, 20u));
+	}
+	// Reuse only the first scratch lane, then the larger prefix, under exhausted credit.
+	EXPECT_EQ(module_->process_batch(std::span(records).first(1u), 0u), 0u);
+	EXPECT_EQ(module_->process_batch(records, 0u), 0u);
+	expect_drop_accounting();
 }
 
 /** @brief Distinct tuples with the same parser hash have separate allowances; rehashing cannot renew credit. */

@@ -20,65 +20,6 @@
 namespace kinetum::dp
 {
 
-namespace
-{
-
-/**
- * @brief Round one extent to a nonzero power-of-two alignment.
- *
- * @param value Candidate byte extent.
- * @param alignment Required nonzero power-of-two alignment.
- * @param[out] out Exact aligned extent on success.
- * @return true when the alignment contract and result are representable.
- */
-[[nodiscard]] bool round_up_checked(std::size_t value, std::size_t alignment, std::size_t &out) noexcept
-{
-	if (alignment == 0u || (alignment & (alignment - 1u)) != 0u) {
-		return false;
-	}
-	const std::size_t mask = alignment - 1u;
-	if (value > std::numeric_limits<std::size_t>::max() - mask) {
-		return false;
-	}
-	out = (value + mask) & ~mask;
-	return true;
-}
-
-/**
- * @brief Append one aligned fixed-stride array to a checked slab layout.
- *
- * @param cursor Current complete byte extent.
- * @param count Number of array elements.
- * @param stride Exact nonzero element stride.
- * @param alignment Exact nonzero power-of-two element alignment.
- * @param[out] offset First array byte, or the unchanged cursor for zero count.
- * @return true when alignment and multiplication are representable.
- */
-[[nodiscard]] bool append_array_checked(std::size_t &cursor, std::size_t count, std::size_t stride,
-					std::size_t alignment, std::size_t &offset) noexcept
-{
-	if (count == 0u) {
-		offset = cursor;
-		return true;
-	}
-	if (stride == 0u || count > std::numeric_limits<std::size_t>::max() / stride) {
-		return false;
-	}
-	std::size_t aligned = 0u;
-	if (!round_up_checked(cursor, alignment, aligned)) {
-		return false;
-	}
-	const std::size_t bytes = count * stride;
-	if (bytes > std::numeric_limits<std::size_t>::max() - aligned) {
-		return false;
-	}
-	offset = aligned;
-	cursor = aligned + bytes;
-	return true;
-}
-
-}  // namespace
-
 bool boundary_epoch_worker_slab::sender_slot::empty() const noexcept
 {
 	return !owner.cut_pending && ack_ring.empty() && policy.transition_generation == 0u &&
@@ -97,11 +38,11 @@ bool boundary_epoch_worker_slab::sender_slot::pristine() const noexcept
 
 bool boundary_epoch_worker_slab::receiver_slot::empty() const noexcept
 {
-	return !owner.ack_pending && owner.unsequenced_record == nullptr && cut_ring.empty() &&
-	       policy.active_epoch == 0u && policy.accepted_cut == boundary_epoch_cut{} &&
-	       policy.duplicate_cut_count == 0u && policy.phase == boundary_epoch_receiver_phase::UNBOUND &&
-	       timing.cut_observed_monotonic_ns == 0u && timing.cut_drained_monotonic_ns == 0u &&
-	       timing.activation_monotonic_ns == 0u && timing.ack_published_monotonic_ns == 0u &&
+	return !owner.ack_pending && !owner.receive_in_progress && cut_ring.empty() && policy.active_epoch == 0u &&
+	       policy.accepted_cut == boundary_epoch_cut{} && policy.duplicate_cut_count == 0u &&
+	       policy.phase == boundary_epoch_receiver_phase::UNBOUND && timing.cut_observed_monotonic_ns == 0u &&
+	       timing.cut_drained_monotonic_ns == 0u && timing.activation_monotonic_ns == 0u &&
+	       timing.ack_published_monotonic_ns == 0u &&
 	       std::all_of(timing.padding.begin(), timing.padding.end(), [](uint8_t byte) { return byte == 0u; });
 }
 
@@ -115,19 +56,13 @@ common::status_or<boundary_epoch_worker_slab::storage_layout>
 boundary_epoch_worker_slab::compute_layout_(std::size_t sender_slot_count, std::size_t receiver_slot_count)
 {
 	storage_layout layout{};
-	std::size_t cursor = 0u;
-	if (!append_array_checked(cursor, sender_slot_count, sizeof(sender_slot), alignof(sender_slot),
-				  layout.sender_slots_offset) ||
-	    !append_array_checked(cursor, receiver_slot_count, sizeof(receiver_slot), alignof(receiver_slot),
-				  layout.receiver_slots_offset) ||
-	    !append_array_checked(cursor, sender_slot_count, sizeof(slot_claim), alignof(slot_claim),
-				  layout.sender_claims_offset) ||
-	    !append_array_checked(cursor, receiver_slot_count, sizeof(slot_claim), alignof(slot_claim),
-				  layout.receiver_claims_offset)) {
+	if (!layout.allocation.append<sender_slot>(sender_slot_count, layout.sender_slots_offset) ||
+	    !layout.allocation.append<receiver_slot>(receiver_slot_count, layout.receiver_slots_offset) ||
+	    !layout.allocation.append<slot_claim>(sender_slot_count, layout.sender_claims_offset) ||
+	    !layout.allocation.append<slot_claim>(receiver_slot_count, layout.receiver_claims_offset)) {
 		return common::status(common::status_code::OUT_OF_RANGE,
 				      "boundary endpoint slab layout exceeds the host size domain");
 	}
-	layout.storage_bytes = cursor;
 	return layout;
 }
 
@@ -138,7 +73,7 @@ common::status_or<std::size_t> boundary_epoch_worker_slab::checked_storage_bytes
 	if (!layout_or.is_ok()) {
 		return layout_or.error();
 	}
-	return layout_or->storage_bytes;
+	return layout_or->allocation.size();
 }
 
 common::status_or<std::unique_ptr<boundary_epoch_worker_slab>>
@@ -159,12 +94,8 @@ boundary_epoch_worker_slab::create(uint32_t worker_index, int32_t numa_node, std
 	const storage_layout layout = layout_or.value();
 
 	numa_memory_region region;
-	if (layout.storage_bytes != 0u) {
-		auto region_or = numa_memory_region::allocate({
-			.usable_bytes = layout.storage_bytes,
-			.alignment_bytes = kinetum::algo::CACHE_LINE_SIZE,
-			.host_numa_node = numa_node,
-		});
+	if (layout.allocation.size() != 0u) {
+		auto region_or = layout.allocation.allocate(numa_node);
 		if (!region_or.is_ok()) {
 			return region_or.error();
 		}
@@ -193,7 +124,7 @@ boundary_epoch_worker_slab::boundary_epoch_worker_slab(uint32_t worker_index, in
 	, numa_node_(numa_node)
 	, sender_slot_count_(sender_slot_count)
 	, receiver_slot_count_(receiver_slot_count)
-	, storage_bytes_(layout.storage_bytes)
+	, storage_bytes_(layout.allocation.size())
 	, region_(std::move(region))
 {
 	const bool has_storage = storage_bytes_ != 0u;
@@ -205,27 +136,14 @@ boundary_epoch_worker_slab::boundary_epoch_worker_slab(uint32_t worker_index, in
 		return;
 	}
 
-	auto *base = static_cast<std::byte *>(region_.data());
-	sender_slots_ = sender_slot_count_ != 0u ? reinterpret_cast<sender_slot *>(base + layout.sender_slots_offset) :
-						   nullptr;
-	receiver_slots_ = receiver_slot_count_ != 0u ?
-				  reinterpret_cast<receiver_slot *>(base + layout.receiver_slots_offset) :
-				  nullptr;
-	sender_claims_ = sender_slot_count_ != 0u ? reinterpret_cast<slot_claim *>(base + layout.sender_claims_offset) :
-						    nullptr;
-	receiver_claims_ = receiver_slot_count_ != 0u ?
-				   reinterpret_cast<slot_claim *>(base + layout.receiver_claims_offset) :
-				   nullptr;
-	if ((sender_slot_count_ != 0u &&
-	     reinterpret_cast<std::uintptr_t>(sender_slots_) % alignof(sender_slot) != 0u) ||
-	    (receiver_slot_count_ != 0u &&
-	     reinterpret_cast<std::uintptr_t>(receiver_slots_) % alignof(receiver_slot) != 0u) ||
-	    (sender_slot_count_ != 0u &&
-	     reinterpret_cast<std::uintptr_t>(sender_claims_) % alignof(slot_claim) != 0u) ||
-	    (receiver_slot_count_ != 0u &&
-	     reinterpret_cast<std::uintptr_t>(receiver_claims_) % alignof(slot_claim) != 0u)) {
-		std::terminate();
-	}
+	sender_slots_ =
+		numa_layout::storage<sender_slot>(region_, layout.sender_slots_offset, sender_slot_count_).data();
+	receiver_slots_ =
+		numa_layout::storage<receiver_slot>(region_, layout.receiver_slots_offset, receiver_slot_count_).data();
+	sender_claims_ =
+		numa_layout::storage<slot_claim>(region_, layout.sender_claims_offset, sender_slot_count_).data();
+	receiver_claims_ =
+		numa_layout::storage<slot_claim>(region_, layout.receiver_claims_offset, receiver_slot_count_).data();
 
 	std::size_t constructed_sender_slots = 0u;
 	std::size_t constructed_receiver_slots = 0u;

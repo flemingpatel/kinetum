@@ -20,6 +20,7 @@
 
 #include "src/dp/active/worker_async_work.hpp"
 #include "src/dp/epoch/worker_epoch_ledger.hpp"
+#include "tests/numa_test_support.hpp"
 
 namespace kinetum::dp
 {
@@ -39,7 +40,7 @@ constexpr std::size_t TEST_SLOT_COUNT = 4u;
 
 /** @brief Own one exact ledger, logical slot set, MPMC cells, and tracker. */
 struct async_work_fixture {
-	std::unique_ptr<worker_epoch_ledger> ledger;			       ///< Exact test credit authority.
+	numa_owner<worker_epoch_ledger> ledger;				       ///< Exact test credit authority.
 	std::array<worker_async_work::slot_storage, TEST_SLOT_COUNT> slots{};  ///< Logical token slots.
 	std::array<worker_async_work::completion_queue_storage, TEST_SLOT_COUNT> queue{};  ///< Physical cells.
 	std::unique_ptr<worker_async_work> tracker;					   ///< Sole foreign-work owner.
@@ -51,7 +52,8 @@ struct async_work_fixture {
 	static std::unique_ptr<async_work_fixture> create()
 	{
 		auto fixture = std::make_unique<async_work_fixture>();
-		auto ledger_or = worker_epoch_ledger::create(TEST_WORKER_INDEX, TEST_RUNTIME_GENERATION, 16u);
+		auto ledger_or = worker_epoch_ledger::create(TEST_WORKER_INDEX, TEST_RUNTIME_GENERATION, 16u,
+							     kinetum::test::required_memory_numa_node());
 		if (!ledger_or.is_ok()) {
 			return nullptr;
 		}
@@ -122,7 +124,8 @@ void unresolved_token_destruction_child()
 /** @brief Construct one tracker with a valid but non-derived physical queue capacity. */
 void inexact_completion_capacity_child()
 {
-	auto ledger_or = worker_epoch_ledger::create(TEST_WORKER_INDEX, TEST_RUNTIME_GENERATION, 16u);
+	auto ledger_or = worker_epoch_ledger::create(TEST_WORKER_INDEX, TEST_RUNTIME_GENERATION, 16u,
+						     kinetum::test::required_memory_numa_node());
 	if (!ledger_or.is_ok()) {
 		std::_Exit(0);
 	}
@@ -145,7 +148,8 @@ void inexact_completion_capacity_child()
 /** @brief Construct one tracker over semantically dirty token-slot storage. */
 void dirty_slot_construction_child()
 {
-	auto ledger_or = worker_epoch_ledger::create(TEST_WORKER_INDEX, TEST_RUNTIME_GENERATION, 16u);
+	auto ledger_or = worker_epoch_ledger::create(TEST_WORKER_INDEX, TEST_RUNTIME_GENERATION, 16u,
+						     kinetum::test::required_memory_numa_node());
 	if (!ledger_or.is_ok()) {
 		std::_Exit(0);
 	}

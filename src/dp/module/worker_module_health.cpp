@@ -11,8 +11,8 @@
 
 #include <algorithm>
 #include <exception>
+#include <memory>
 #include <new>
-#include <stdexcept>
 #include <utility>
 
 #include "src/common/epoch_transition_contract.hpp"
@@ -86,7 +86,7 @@ void module_health_invocation::resolve_() noexcept
 	state_ = state::CLAIMED;
 }
 
-common::status_or<std::unique_ptr<worker_module_health>>
+common::status_or<numa_owner<worker_module_health>>
 worker_module_health::create(uint32_t worker_index, uint64_t runtime_generation, uint64_t callback_budget_ns,
 			     std::span<const worker_module_health_binding> bindings, worker_epoch_ledger &ledger)
 {
@@ -110,9 +110,10 @@ worker_module_health::create(uint32_t worker_index, uint64_t runtime_generation,
 		    binding.context == nullptr || binding.store == nullptr || binding.descriptor == nullptr ||
 		    binding.descriptor->module_id == nullptr || identity == nullptr ||
 		    binding.store->context_index() != binding.context_index ||
-		    binding.context->worker_index != worker_index ||
+		    binding.store->numa_node() != ledger.numa_node() || binding.context->worker_index != worker_index ||
 		    binding.context->cpu_core_id != identity->cpu_core_id ||
 		    binding.context->numa_node != identity->numa_node ||
+		    binding.context->numa_node != ledger.numa_node() ||
 		    identity->context_index != binding.context_index || identity->worker_index != worker_index ||
 		    identity->module_id != binding.descriptor->module_id ||
 		    binding.publication->telemetry_runtime_generation() != runtime_generation ||
@@ -128,52 +129,48 @@ worker_module_health::create(uint32_t worker_index, uint64_t runtime_generation,
 		have_previous = true;
 		callback_count += binding.descriptor->health_check != nullptr ? 1u : 0u;
 	}
-	try {
-		std::vector<worker_module_health_binding> rows(bindings.begin(), bindings.end());
-		std::size_t claimed = 0u;
-		for (auto &row : rows) {
-			const auto claim = row.publication->claim_module_health_owner(
-				runtime_generation, static_cast<uint16_t>(row.stage_instance_index));
-			if (!claim.is_ok()) {
-				while (claimed != 0u) {
-					--claimed;
-					rows[claimed].publication->release_module_health_owner();
-				}
-				return claim;
-			}
-			++claimed;
-		}
-		auto owner = std::unique_ptr<worker_module_health>(new (std::nothrow) worker_module_health(
-			owner_identity{
-				.worker_index = worker_index,
-				.runtime_generation = runtime_generation,
-				.callback_budget_ns = callback_budget_ns,
-			},
-			std::move(rows), ledger));
-		if (owner == nullptr) {
-			for (auto it = bindings.rbegin(); it != bindings.rend(); ++it) {
-				it->publication->release_module_health_owner();
-			}
-			return common::status::resource_exhausted("module health owner allocation failed");
-		}
-		if (owner->callback_count() != callback_count) {
-			std::terminate();
-		}
-		return owner;
-	} catch (const std::bad_alloc &) {
-		return common::status::resource_exhausted("module health binding allocation failed");
-	} catch (const std::length_error &) {
-		return common::status(common::status_code::OUT_OF_RANGE,
-				      "module health binding extent exceeds the host size domain");
+	numa_layout layout;
+	std::size_t root_offset = 0u;
+	std::size_t bindings_offset = 0u;
+	if (!layout.append<worker_module_health>(1u, root_offset) ||
+	    !layout.append<worker_module_health_binding>(bindings.size(), bindings_offset)) {
+		return common::status(common::status_code::OUT_OF_RANGE, "module health layout overflows");
 	}
+	auto region_or = layout.allocate(ledger.numa_node());
+	if (!region_or.is_ok()) {
+		return region_or.error();
+	}
+	auto region = std::move(region_or).value();
+	auto rows = numa_layout::storage<worker_module_health_binding>(region, bindings_offset, bindings.size());
+	std::uninitialized_copy(bindings.begin(), bindings.end(), rows.begin());
+	std::size_t claimed = 0u;
+	for (const auto &row : rows) {
+		const auto claim = row.publication->claim_module_health_owner(
+			runtime_generation, static_cast<uint16_t>(row.stage_instance_index));
+		if (!claim.is_ok()) {
+			while (claimed != 0u) {
+				rows[--claimed].publication->release_module_health_owner();
+			}
+			return claim;
+		}
+		++claimed;
+	}
+	auto *root = new (numa_layout::storage<worker_module_health>(region, root_offset).data()) worker_module_health(
+		owner_identity{worker_index, runtime_generation, callback_budget_ns}, rows, ledger);
+	auto owner = adopt_numa_owner(root, std::move(region));
+	if (owner->callback_count() != callback_count) {
+		std::terminate();
+	}
+	return owner;
 }
 
-worker_module_health::worker_module_health(owner_identity identity, std::vector<worker_module_health_binding> bindings,
+worker_module_health::worker_module_health(owner_identity identity,
+					   std::span<const worker_module_health_binding> bindings,
 					   worker_epoch_ledger &ledger) noexcept
 	: worker_index_(identity.worker_index)
 	, runtime_generation_(identity.runtime_generation)
 	, callback_budget_ns_(identity.callback_budget_ns)
-	, bindings_(std::move(bindings))
+	, bindings_(bindings)
 	, ledger_(&ledger)
 {
 }

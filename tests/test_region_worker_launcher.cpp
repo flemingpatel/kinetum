@@ -23,6 +23,8 @@
 #include "src/common/status.hpp"
 #include "src/common/packet_thread_log_guard.hpp"
 #include "src/dp/region_worker_launcher.hpp"
+#include "src/dp/numa_layout.hpp"
+#include "tests/numa_test_support.hpp"
 
 namespace kinetum::dp
 {
@@ -35,8 +37,54 @@ constexpr int TEST_WORKER_COUNT = 3;
 /** Expected one-bit-per-worker completion mask. */
 constexpr uint32_t TEST_EXPECTED_WORKER_MASK = (1U << TEST_WORKER_COUNT) - 1U;
 
-/** Stable compact context storage retained throughout each launch. */
-using test_worker_contexts = std::array<worker_lifecycle_context, TEST_WORKER_COUNT>;
+/** @brief Own real native context storage and its independent stable launch-reference table. */
+struct test_worker_contexts {
+	using record_array = std::array<worker_lifecycle_context, TEST_WORKER_COUNT>;  ///< Exact fixture population.
+	numa_owner<record_array> storage;  ///< All fixture records on one explicitly selected allowed node.
+	std::array<worker_lifecycle_context *, TEST_WORKER_COUNT> references{};	 ///< Launcher-visible identities.
+
+	/** @brief Materialize the fixture before any worker thread can retain a record. */
+	test_worker_contexts()
+	{
+		auto owner_or = make_numa_owner<record_array>(kinetum::test::required_memory_numa_node(),
+							      [](void *address) noexcept {
+								      return new (address) record_array{};
+							      });
+		if (!owner_or.is_ok()) {
+			ADD_FAILURE() << owner_or.error().message();
+			return;
+		}
+		storage = std::move(owner_or).value();
+		for (std::size_t index = 0u; index < references.size(); ++index) {
+			references[index] = &(*storage)[index];
+		}
+	}
+	/** @return Whether native construction established every record. */
+	[[nodiscard]] bool valid() const noexcept
+	{
+		return storage != nullptr;
+	}
+	/** @return Complete immutable reference order, retained through worker join. */
+	[[nodiscard]] std::span<worker_lifecycle_context *const> view() const noexcept
+	{
+		return references;
+	}
+	/** @return Exact fixture cardinality. */
+	[[nodiscard]] std::size_t size() const noexcept
+	{
+		return references.size();
+	}
+	/** @return First constructed fixture record. */
+	[[nodiscard]] auto begin() noexcept
+	{
+		return storage->begin();
+	}
+	/** @return End of the constructed fixture records. */
+	[[nodiscard]] auto end() noexcept
+	{
+		return storage->end();
+	}
+};
 
 /**
  * @brief Build one valid standard-thread launch request.
@@ -50,7 +98,7 @@ region_worker_launch_spec make_launch_spec(test_worker_contexts &contexts, std::
 					   std::function<void(int)> run_worker)
 {
 	return region_worker_launch_spec{
-		.worker_contexts = std::span<worker_lifecycle_context>(contexts),
+		.worker_contexts = contexts.view(),
 		.threads = &threads,
 		.configure_worker = {},
 		.activate_worker = [](int) {},
@@ -69,6 +117,7 @@ TEST(region_worker_launcher, packet_diagnostics_remain_excluded_for_the_complete
 {
 	std_thread_worker_launcher launcher;
 	test_worker_contexts contexts;
+	ASSERT_TRUE(contexts.valid());
 	std::vector<std::thread> threads;
 	std::atomic<uint32_t> guarded{0};
 	const auto before = kinetum::common::packet_thread_log_rejections();
@@ -139,6 +188,7 @@ TEST(region_worker_launcher, std_thread_launcher_creates_requested_workers)
 {
 	std_thread_worker_launcher launcher;
 	test_worker_contexts contexts;
+	ASSERT_TRUE(contexts.valid());
 	std::vector<std::thread> threads;
 	std::atomic<uint32_t> observed_workers{0};
 	for (auto &context : contexts) {
@@ -149,9 +199,9 @@ TEST(region_worker_launcher, std_thread_launcher_creates_requested_workers)
 	});
 
 	auto launch_status = launcher.launch(spec);
+	auto join_status = launcher.join(region_worker_join_spec{.threads = &threads});
 	ASSERT_TRUE(launch_status.is_ok()) << launch_status.to_string();
 	ASSERT_EQ(threads.size(), contexts.size());
-	auto join_status = launcher.join(region_worker_join_spec{.threads = &threads});
 	ASSERT_TRUE(join_status.is_ok()) << join_status.to_string();
 
 	EXPECT_EQ(observed_workers.load(std::memory_order_relaxed), TEST_EXPECTED_WORKER_MASK);
@@ -165,6 +215,7 @@ TEST(region_worker_launcher, std_thread_launcher_rolls_back_failed_worker_setup)
 {
 	std_thread_worker_launcher launcher;
 	test_worker_contexts contexts;
+	ASSERT_TRUE(contexts.valid());
 	std::vector<std::thread> threads;
 	std::atomic<uint32_t> worker_body_calls{0};
 	std::atomic<uint32_t> registered_workers{0};
@@ -203,6 +254,7 @@ TEST(region_worker_launcher, std_thread_launcher_releases_complete_activated_set
 {
 	std_thread_worker_launcher launcher;
 	test_worker_contexts contexts;
+	ASSERT_TRUE(contexts.valid());
 	std::vector<std::thread> threads;
 	std::atomic<uint32_t> configured_count{0};
 	std::atomic<uint32_t> activated_count{0};
@@ -262,8 +314,8 @@ TEST(region_worker_launcher, std_thread_launcher_releases_complete_activated_set
 	};
 
 	auto launch_status = launcher.launch(spec);
-	ASSERT_TRUE(launch_status.is_ok()) << launch_status.to_string();
 	auto join_status = launcher.join(region_worker_join_spec{.threads = &threads});
+	ASSERT_TRUE(launch_status.is_ok()) << launch_status.to_string();
 	ASSERT_TRUE(join_status.is_ok()) << join_status.to_string();
 
 	EXPECT_EQ(fully_configured_observers.load(std::memory_order_relaxed), static_cast<uint32_t>(TEST_WORKER_COUNT));
@@ -280,6 +332,7 @@ TEST(region_worker_launcher, std_thread_launcher_rejects_preowned_thread_vector)
 {
 	std_thread_worker_launcher launcher;
 	test_worker_contexts contexts;
+	ASSERT_TRUE(contexts.valid());
 	std::vector<std::thread> threads;
 	std::atomic<bool> stop{false};
 	threads.emplace_back([&stop]() {
@@ -301,6 +354,7 @@ TEST(region_worker_launcher, std_thread_launcher_rejects_malformed_spec)
 {
 	std_thread_worker_launcher launcher;
 	test_worker_contexts contexts;
+	ASSERT_TRUE(contexts.valid());
 	std::vector<std::thread> threads;
 	auto spec = make_launch_spec(contexts, threads, [](int) {});
 	spec.run_worker = {};
@@ -318,6 +372,28 @@ TEST(region_worker_launcher, std_thread_launcher_rejects_malformed_spec)
 	const auto missing_io_status = launcher.launch(spec);
 	EXPECT_EQ(missing_io_status.code(), common::status_code::INVALID_ARGUMENT);
 	EXPECT_TRUE(threads.empty());
+}
+
+/** @brief Null and repeated record references reject before any lifecycle state or callback changes. */
+TEST(region_worker_launcher, exact_reference_membership_is_required_before_mutation)
+{
+	test_worker_contexts contexts;
+	ASSERT_TRUE(contexts.valid());
+	std_thread_worker_launcher launcher;
+	std::vector<std::thread> threads;
+	std::atomic<uint32_t> calls{0u};
+	auto spec = make_launch_spec(contexts, threads, [&calls](int) { ++calls; });
+	const auto saved = contexts.references[1];
+	contexts.references[1] = nullptr;
+	EXPECT_EQ(launcher.launch(spec).code(), common::status_code::INVALID_ARGUMENT);
+	contexts.references[1] = contexts.references[0];
+	EXPECT_EQ(launcher.launch(spec).code(), common::status_code::INVALID_ARGUMENT);
+	contexts.references[1] = saved;
+	EXPECT_EQ(calls.load(), 0u);
+	EXPECT_TRUE(threads.empty());
+	for (const auto &context : contexts) {
+		EXPECT_EQ(context.get_state(), worker_lifecycle_state::INIT);
+	}
 }
 
 /** @brief Verify malformed join requests fail before touching worker state. */

@@ -234,7 +234,7 @@ between Gluon and the runtime. Top-level fields:
 | 21 | `module_context_domains[]` | Complete module populations in canonical context-ordinal order. |
 
 After finalizing workers, services, providers, and boundaries, Gluon emits the
-baseline `epoch_transition_plan`, assigns per-queue epoch-staging capacity only
+baseline `epoch_transition_plan`, assigns per-role epoch-staging capacity only
 to source workers, and assigns every worker a policy-independent observation
 cadence and health-callback budget. It validates the candidate through the
 shared transition-topology compiler, then the provider-topology compiler, before
@@ -287,7 +287,7 @@ scheduling truth for runtime workers:
 | `lane_id`        | Execution lane owned by this worker inside the region.                     |
 | `worker_index`   | Compact launch, telemetry, and worker-ledger identity.                      |
 | `cpu_core_ids[]` | Dedicated CPU ownership. Gluon emits exactly one core per worker; empty ownership fails host admission. |
-| `source_epoch_staging_capacity` | Power-of-two capacity of at least two for each active/future queue in a source worker's swappable pair, applied independently to every exact source storage domain. It is distinct from every boundary's sender-owned future-output hold. |
+| `source_epoch_staging_capacity` | Power-of-two aggregate capacity of at least two for each active/future role, applied independently to every exact source storage domain. Each role shares this bound across its work keys and outstanding reservations. It is distinct from every boundary's sender-owned future-output hold. |
 | `module_health_poll_interval_ms` | Policy-independent owner-worker telemetry cadence and, when enabled, module-health cadence. |
 | `module_health_callback_budget_ns` | Policy-independent maximum admitted owner-worker health callback duration; telemetry does not consume it as a work budget. |
 
@@ -298,11 +298,12 @@ region-owned.
 The current planner assigns source epoch-staging capacity only to workers that
 own an RX stage instance or an explicit active-origin domain. The value is a
 power of two and at least two; non-source workers carry zero and own no future
-queue. The provider compiler preserves the exact sorted source storage-domain
+role. The provider compiler preserves the exact sorted source storage-domain
 projection in each
 worker schedule. Runtime materialization gives every projected source domain an
-equal-capacity active/future pair, while every other reachable domain owns one
-active queue only. Every worker also receives the plan-owned,
+equal-capacity active/future pair, while every other scheduled domain owns an
+active role only. Work-key pointer arrays do not multiply the admitted packet
+capacity. Every worker also receives the plan-owned,
 policy-independent observation cadence and exact owner-health callback budget.
 The shared compiler rejects an inverted source-capacity assignment, zero or
 unrepresentable cadence values, or a callback budget that is not strictly
@@ -373,7 +374,7 @@ The current generated profile is planner-owned rather than CLI-tunable:
 | `retirement_timeout_ms` | `5000` |
 | `result_history_capacity` | `16` |
 | coordinator `command_mailbox_capacity` | `64` |
-| source `source_epoch_staging_capacity` | `1024` per queue role and source domain |
+| source `source_epoch_staging_capacity` | `1024` per role and source domain |
 | worker `module_health_poll_interval_ms` | `1000` |
 | worker `module_health_callback_budget_ns` | `10000` |
 
@@ -803,7 +804,7 @@ runtime-service indices, lifecycle NUMA coverage, monotonic policy durations,
 reachable storage domains, transition schedules, and buffer floors. DP passes
 that same representation to Quark before checking exact host CPU/NUMA truth.
 
-DP allocates the endpoint slabs, rings, active/future queues, and reader records
+DP allocates the endpoint slabs, rings, active/future role sets, and reader records
 from these compiled sets before worker launch. It derives certificate membership
 from the same worker/boundary graph rather than introducing another plan
 capacity or cycle validator. Allocation does not authorize a transition: each
@@ -817,9 +818,9 @@ owns the queue placement, transition sequence, and reclamation mechanics.
 | --------------------------------------------- | -------------- |
 | Endpoint stage instances and worker owners    | Gluon `BoundaryPlacement` |
 | DATA and future-output capacities, DATA NUMA  | Gluon `BoundaryPlacement` |
-| Source active/future queue capacity            | Gluon `WorkerPlacement.source_epoch_staging_capacity` |
+| Source active/future role capacity             | Gluon `WorkerPlacement.source_epoch_staging_capacity` |
 | Fixed-epoch DATA-ring materialization          | Dataplane, exactly from admitted placement |
-| Source queue-pair and future-hold materialization | Dataplane, exactly from compiled worker/boundary ownership |
+| Source role-pair and future-hold materialization | Dataplane, exactly from compiled worker/boundary ownership |
 | DATA pointer ownership, successful sequences, and typed control transport | Dataplane boundary endpoint owners |
 | Sender sealing, future-output gating, and exact ACK interpretation | Dataplane ordered-transition protocol |
 | CUT drain, fan-in activation, and exact ACK publication | Dataplane ordered-transition protocol |

@@ -605,9 +605,10 @@ for live apply, confirmation, and rollback semantics.
 ## 8. Observe Exact Runtime Telemetry
 
 `stats` returns one all-or-none shared runtime observation. Runtime, engine,
-transition, and protocol-fault summaries are mandatory; flags below select
-complete optional row families. A missing, changing, malformed, or failed
-selected observation returns exit status 1 with no partial stdout payload.
+worker counters, transition, and protocol-fault summaries are mandatory; flags below select
+complete optional row families. Missing required publications, crossing
+identities, malformed selected observations, or a failed collection operation
+return exit status 1 with no partial stdout payload.
 
 ```bash
 # Mandatory runtime, worker counters, engine, transition, and fault summaries

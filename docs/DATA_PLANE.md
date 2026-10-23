@@ -1,7 +1,7 @@
 # Data Plane
 
 The Kinetum Data Plane (DP) is the fast-path packet processor. Its packet
-runtime consumes the canonical deployment plan selected by `kinetum_photon`,
+runtime consumes the canonical deployment plan from its verified bundle,
 compiles its exact provider graph once, passes that same immutable artifact to
 Quark for live host proof, admits the required signed provider components,
 materializes one runtime generation transactionally, and runs busy-poll
@@ -123,9 +123,9 @@ asynchronous work, including across live transitions.
 | **Transition preparation owner** | Transient coordinator-thread schedule for one candidate's module PREPARE/RETIRE work. It preallocates every control and epoch arena before the first callback, permits at most one callback per image and executor, treats result eventfd counts as wake-only, and reports ABORTED only after zero prepared module ownership remains. |
 | **Transition completion owner** | Preallocated coordinator-thread owner of one exact post-commit identity, reader grace, behavior deadlines, module claims/results, snapshot retirement, and runtime-status projection. It owns no second global phase or participant graph. Before the first retirement claim, a reader-grace deadline freezes RETIRING with E retained; after ownership withdrawal, callback failure, identity mismatch, result loss, or deadline expiry is fail-stop. |
 | **Boundary epoch channel** | Compiled cross-worker transport: plan-sized pointer-only DATA with successful endpoint sequences, capacity-2 typed CUT/ACK lanes, bounded pending control, and coherent endpoint publication. Worker-local slabs place hot state/publication with its owner and control rings with their pollers. |
-| **Worker boundary sender** | Sole worker-owned policy composer for its exact outbound set. It routes fixed OPEN DATA, seals every cut only after source admission moves to the exact target and old credit reaches zero, admits only exact ACK identity, owns future-hold ordering, and preserves the sequence/hold/ledger conservation matrix. Its sender-NUMA policy and transition-timing lines are private; a disjoint two-cache-line snapshot publishes Bootstrap baseline and each real DRAINING/CUT-owned/ACK-observed edge coherently. |
+| **Worker boundary sender** | Sole worker-owned policy composer for its exact outbound set. The kernel invokes sealing only after every inbound cut drains, source admission moves to the target, and old credit reaches zero. The sender owns exact ACK gating and future-hold ordering. Its sender-NUMA policy and transition-timing lines are private; a disjoint two-cache-line snapshot publishes Bootstrap baseline and each real DRAINING/CUT-owned/ACK-observed edge coherently. |
 | **Worker boundary receiver** | Sole worker-owned CUT/fan-in/ACK policy for its exact inbound set. It latches one exact CUT per edge, classifies only successful dequeue sequence, requires all inbound cuts plus zero old local credit, and submits ACK only after complete local activation. Its receiver-NUMA policy and transition-timing lines are private; a disjoint two-cache-line snapshot publishes Bootstrap baseline and each CUT-observed/drained/activation/ACK-owned edge coherently. |
-| **Worker epoch activation** | Immutable owner-worker projection of exact module stores and source queue-role pairs. One complete nonmutating preflight precedes module ACTIVATE, O(1) role rotation, and whole future-to-active ledger promotion; a separate one-shot publication records Bootstrap baseline or completed live activation without owning global progress. |
+| **Worker epoch activation** | Immutable owner-worker projection of exact module stores and source role pairs. One complete nonmutating preflight precedes module ACTIVATE, O(1) role rotation, and whole future-to-active ledger promotion; a separate one-shot publication records Bootstrap baseline or completed live activation without owning global progress. |
 | **Quiescence domain** | Backend-neutral immutable binding of one caller-owned cache-line reader record per frozen worker. One adjacent grace generation is active at a time; readers publish it exactly once after their final old read. It owns no epoch, timeout, phase, or reclamation policy. |
 | **Transition certificate** | Immutable cold O(V+E) aggregator over frozen membership and coherent activation, ledger, boundary-policy, boundary-transport, and reader publications. Missing or older input underestimates; exact contradictions are typed. It observes but never starts grace, changes phase, or retires ownership. |
 | **Region**              | Logical partition slice in the deployment plan. Defined by `plan.regions[i]`.                              |
@@ -133,7 +133,7 @@ asynchronous work, including across live transitions.
 | **Boundary**            | An exact cross-worker handoff defined by `plan.boundaries[i]`, including endpoint stage instances, owner workers, capacities, and NUMA placement. |
 | **Dispatch core**       | The pre-resolved `packet_worker_kernel` dispatch methods route one owned `packet_record *` to its next stage, TX operation, boundary, fan-out branch, or burst retirement without a provider or string lookup. |
 | **Snapshot epoch store** | Cold coordinator-owned two-slot owner of exact canonical `ConfigSnapshot` artifacts in EMPTY, PREPARED, PUBLISHED, or RETAINED state. It has no history map, nearby-epoch lookup, allocator, lock, shared ownership, or packet-path reader. |
-| **Module image**        | One canonical, link-closed `.so` loaded by exact path with local symbol scope and exporting one exact `kinetum_module` descriptor. |
+| **Module image**        | One canonical, link-closed `.so` loaded by exact path with local symbol scope; `kinetum_module_register` returns its exact descriptor. |
 | **Module context**      | One executable stage-instance state object with a sole owner worker and exact compiled placement.         |
 | **Context-lifetime capacity** | Exact nonzero plan-authored byte limit for one module context's INIT-backed lifetime resource. No runtime default or heap fallback supplies it. |
 | **Per-epoch arena capacity** | Exact nonzero plan-authored byte limit for each PREPARE arena owned by one module context. Complete epoch memory is checked using `EXACT_EPOCH_SLOT_COUNT`. |
@@ -141,10 +141,10 @@ asynchronous work, including across live transitions.
 | **Module executable view** | One cache-line owner-local callback/config authority pre-resolved before worker launch. Packet execution performs one exact packet/view epoch equality and no slot or manager lookup. |
 | **Worker ownership record** | Compiled runtime-worker record containing the RX sources, inbound/outbound boundaries, I/O streams, and stage instances that one worker owns. |
 | **Worker epoch ledger** | One owner-worker two-slot logical-work counter. `packet_private.epoch` selects the exact active/future slot; packet operations use plain arithmetic, while foreign readers consume only the coherent per-turn publication. Local queue-slot reservations and physical storage credits remain separate capacity/record authorities. |
-| **Worker epoch input staging** | One cache-line-isolated owner with an exact-NUMA active queue for every worker/storage-domain relation plus an equal-capacity future role for each transition-enabled source domain with nonzero authored capacity. Queue roles exchange by pointer in O(1); reservations remain capacity-only. |
+| **Worker epoch input staging** | One prefaulted worker-NUMA allocation containing all domain roles. Each role groups packet pointers by exact stage and continuation while sharing one capacity with outstanding reservations. Transition-enabled source domains also own equal-capacity future roles; complete roles exchange by pointer in O(1). |
 | **Boundary future-output hold** | One sender-NUMA, pointer-only queue per boundary. It is preallocated and empty until ordered commit allows local future execution while that boundary's exact ACK gate is closed. |
-| **`packet_private`**    | 128-byte, two-cache-line sole metadata authority embedded in every provider-neutral packet record. |
-| **`packet_record`**     | Exact 192-byte, three-cache-line core packet representation physically declared by the provider C ABI: `packet_private` plus one provider-backed storage descriptor. Every packet-path owner transfers only `packet_record *`. |
+| **`packet_private`**    | 80-byte sole metadata authority embedded in every provider-neutral packet record. |
+| **`packet_record`**     | Exact 128-byte, two-cache-line core packet representation physically declared by the provider C ABI: a 48-byte storage descriptor followed by `packet_private`. Every packet-path owner transfers only `packet_record *`. |
 | **Provider contract**   | One exact typed configuration schema plus canonicalization and capability semantics, identified by its complete canonical type URL. |
 | **Provider component**  | One exact-release, signed-inventory ELF image that realizes one or more provider contracts behind the C provider ABI. |
 | **Compiled provider topology** | Sole semantic result containing compact facilities, drivers, storage, execution, transitions, worker schedules, access proofs, and required component contracts. |
@@ -161,15 +161,15 @@ asynchronous work, including across live transitions.
 | Constant                 | Value | Where                                  | What it bounds                                                                 |
 | ------------------------ | ----- | -------------------------------------- | ------------------------------------------------------------------------------ |
 | `EXACT_EPOCH_SLOT_COUNT` | `2`   | `epoch/exact_slot_table.hpp`           | Exact lifecycle slots composed by both module and complete-snapshot epoch stores. See [Section 6](#6-exact-snapshot-epoch-store). |
-| `PACKET_PRIVATE_SIZE`    | `128` | `provider_component_abi.h` / `packet.hpp` | Exact sole packet-metadata bytes; the C ABI is physical authority and the C++ header provides aliases/helpers. |
-| `PACKET_RECORD_SIZE`     | `192` | `provider_component_abi.h` / `packet.hpp` | Exact provider-neutral record bytes, including the storage descriptor.          |
+| `PACKET_PRIVATE_SIZE`    | `80` | `provider_component_abi.h` / `packet.hpp` | Exact sole packet-metadata bytes; the C ABI is physical authority and the C++ header provides aliases/helpers. |
+| `PACKET_RECORD_SIZE`     | `128` | `provider_component_abi.h` / `packet.hpp` | Exact provider-neutral record bytes, including the storage descriptor.          |
 | `PACKET_MAX_BURST_SIZE`  | `64`  | `runtime_sizing.hpp`                  | Shared RX, TX, release, active-origin, and worker scratch burst ceiling.         |
 | `INTER_REGION_DATA_RING_CAPACITY` | `1024` | `runtime_sizing.hpp` / `boundary_epoch_channel.hpp` | Default boundary DATA and ordinary active-only staging capacity. It bounds retained work; per-turn service limits independently bound polling cadence. Source-domain pairs use their exact plan field. |
 | `BOUNDARY_FUTURE_OUTPUT_HOLD_CAPACITY` | `1024` | `runtime_sizing.hpp` | Sender-owned future-epoch output hold per executable boundary; independent from the DATA ring and worker input staging. |
 | `BOUNDARY_CUT_RING_CAPACITY` | `2` | `runtime_sizing.hpp` / `boundary_epoch_storage.hpp` | Compile-time typed CUT transport placed with the receiver poller. One global transition permits one outstanding record; two is the minimum lawful SPSC capacity. |
 | `BOUNDARY_ACK_RING_CAPACITY` | `2` | `runtime_sizing.hpp` / `boundary_epoch_storage.hpp` | Compile-time typed ACK transport placed with the sender poller under the same one-outstanding-record law. |
 
-Every plan-authored SPSC usable capacity (source queue roles, boundary DATA, and
+Every plan-authored work-role or SPSC usable capacity (source roles, boundary DATA, and
 future-output hold) is a power of two and at least two. The shared topology
 compiler enforces that physical queue contract before NUMA allocation.
 
@@ -177,12 +177,12 @@ Packet storage counts, data-room size, headroom, alignment, stream descriptor
 counts, and transition staging capacities are exact plan fields rather than
 global runtime constants. The checked `plan_buffer_budget` authority derives
 the minimum safe population from ten terms: RX descriptors, TX descriptor
-slack, exact aggregate active worker queues, handoff staging, source future-
-role queues, boundary future-output holds, active-instance retained records,
+slack, exact aggregate active worker roles, handoff staging, source future
+roles, boundary future-output holds, active-instance retained records,
 worker burst slack, per-worker caches, and one safety margin. The connected
 provider compiler supplies one
 exact domain composition to that authority: `worker_staging_capacity` is the
-sum of physically materialized active queues, `handoff_staging_capacity` is the
+sum of admitted active-role capacities, `handoff_staging_capacity` is the
 sum of boundary DATA and bounded-copy staging, and future-output capacity is
 charged to the post-transition carried domain. Multiple source domains that
 converge into one carried domain are deduplicated before one physical boundary
@@ -190,6 +190,8 @@ capacity is charged. The formula adds one shared `PACKET_MAX_BURST_SIZE` safety
 margin, emits the floor with the compiled domain, and rejects under-sized or
 overflowing plans. Zero bounded-copy staging preserves the established budget
 answers; no provider or materializer maintains a parallel sizing formula.
+Per-key pointer arrays are queue metadata: their byte extents are checked at
+worker construction and do not add packet-buffer credits to this formula.
 
 Each worker ledger's ceiling covers packet and non-packet work. Checked
 addition combines the reachable domains' `buffer_count` values, one transient
@@ -205,7 +207,10 @@ rejects missing, extra, zero, narrowing, and overflowing facts, derives checked
 per-NUMA context, one-epoch, and complete epoch totals, and multiplies the
 per-epoch term by `EXACT_EPOCH_SLOT_COUNT` rather than a copied literal. The
 lifecycle allocator enforces both the per-context limits and compiled NUMA
-totals. Its fixed ownership table is also the sole free-slot authority:
+totals. The runtime adds checked platform context-control and telemetry
+storage per context to each node's complete allocation budget; those bytes do
+not consume the module author's context or epoch allowance. Its fixed ownership
+table is also the sole free-slot authority:
 allocation pops one intrusive free slot in O(1), and release uses an opaque
 one-based slot identity plus a nonzero reuse nonce to validate and return that
 exact slot in O(1). Stale, foreign, modified, or duplicate release fails stop;
@@ -218,8 +223,8 @@ not enter the plan, module ABI, provider ABI, or telemetry.
 
 **Hot-path invariants** (Platform Engineering Guide):
 
-- No `malloc`, no `new`, no `shared_ptr`, and no provider-native type in any
-  packet-processing path.
+- No `malloc`, `new`, or `shared_ptr` on the packet path. Provider-native types
+  remain inside their owning component.
 - Flat arrays indexed by compact IDs for worker-owned stage runtimes
   (`stages_`), streams, boundaries, storage batches, and precompiled route
   targets. No packet-path table uses a string identity.
@@ -258,7 +263,7 @@ admits installed providers, and materializes a generation before publishing
 | 5 | Preallocate coordinator command authority | Independently validate the coordinator's plan-authored power-of-two capacity in `2..64`, require zero on every lifecycle executor, and allocate the complete MPMC queue plus nonblocking `eventfd` before provider components load. |
 | 6 | Admit exact provider installation | Derive `<root>/bin/kinetum_dp` from `/proc/self/exe`, authenticate the fixed signed inventory with the production anchor, load only the compiled required component set, run exact COMPONENT-phase proofs, and seal the catalog. A post-load failure emits a bounded diagnostic and fails stop. |
 | 7 | Build the complete generation input | Move the canonical plan, sole compiled topology, unbound command mailbox, admitted catalog, exact verified module-image set, and nonzero generation identity into one move-only input. |
-| 8 | Materialize transactionally | Freeze the exact coordinator participants, construct its empty state, and allocate the stable RUN/TRANSITION/STOP worker-command publication; admit module images/contexts and pre-create lifecycle executors; materialize facilities, storage, I/O, execution, and transitions; then construct exact-NUMA DATA rings, source queue pairs, boundary future holds, pre-resolved kernels, worker state, and lifecycle services. The launcher binds the calling thread to the planned coordinator CPU; the mailbox then binds that same thread as sole consumer. Recoverable failure unwinds in reverse order; an unprovable foreign-runtime rollback fails stop. |
+| 8 | Materialize transactionally | Freeze the exact coordinator participants, construct its empty state, and allocate the stable RUN/TRANSITION/STOP worker-command publication; admit module images/contexts and pre-create lifecycle executors; materialize facilities, storage, I/O, execution, and transitions; then construct exact-NUMA DATA rings, source role pairs, boundary future holds, pre-resolved kernels, worker state, and lifecycle services. The launcher binds the calling thread to the planned coordinator CPU; the mailbox then binds that same thread as sole consumer. Recoverable failure unwinds in reverse order; an unprovable foreign-runtime rollback fails stop. |
 | 9 | Publish `CONTROL_READY` | Publish one immutable runtime graph and status record while packet workers remain behind the closed bootstrap gate. |
 | 10 | Start the control service | Build the TLS or insecure gRPC server around the complete runtime. Control readiness is not packet permission. |
 | 11 | Restore exact bootstrap | A gRPC producer validates CP's durable canonical request, publishes one fixed mailbox record, and waits unconditionally. The main/coordinator thread orchestrates lifecycle-executor preparation for every context, launches workers behind the activation gate, owner-activates every view, commits the complete snapshot plus allocator watermarks, and waits for every worker to publish `RUNNING` while packet bodies remain closed. |
@@ -389,15 +394,14 @@ ledger and drain contract, with no provider-specific quiescence exception.
   exact epoch credit and publishes one validated latest-value signal. The cold
   telemetry source maps one typed row per context without calling module code;
   null, missing, suppressed, and stale observations remain unavailable states.
-- **Link state is not a core packet authority.** Live ethdev readiness is
-  validated during transactional materialization. Diagnostic publication is
-  generation-owned and provider-private until projected through an exact
-  generic telemetry contract. No packet path reintroduces an asynchronously
-  sampled link gate.
+- **Link state is not a core packet authority.** Construction checks native
+  device and queue capabilities; successful driver activation precedes packet
+  readiness. Core packet dispatch does not consult an asynchronous link-status
+  publication.
 - **Mempool occupancy is cold diagnostics only.** The generation-scoped DPDK
-  statistics source may project exact native counts into generic storage-domain
-  identity during a cold request. The RX path relies on the native burst result
-  and never scans per-lcore mempool caches.
+  statistics source projects concurrent occupancy as approximate under generic
+  storage-domain identity. The RX path relies on the native burst result and
+  never scans per-lcore mempool caches.
 
 **`worker_lifecycle_state` enum** (`worker_lifecycle.hpp`) is the
 provider-neutral state machine for one compact runtime worker:
@@ -428,6 +432,9 @@ from mutable lifecycle records or a launcher-owned thread vector. Bootstrap
 publishes the complete active count only after every owner reports RUNNING.
 
 The runtime owns the packet-thread vector passed to the bootstrap launcher.
+The launcher borrows an ordered table of unique, non-null references to
+lifecycle records in the workers' own NUMA allocations. It validates the
+complete membership before changing any record.
 Partial launch joins every created thread before returning failure; successful
 launch leaves the complete set with the runtime for ordered drain and join.
 The main/coordinator thread also owns retirement; no separate retirement thread
@@ -749,9 +756,9 @@ receives an inferred source or default storage domain.
 Before launch, runtime materialization copies every cold driver endpoint's
 immutable RX/TX table and every storage-domain table into stable arrays. The
 worker loop therefore has one provider-neutral packet path regardless of the
-provider instances present in the plan. Every provider-specific call target is
-already resolved; a worker invokes it once per scheduled burst, never once per
-packet.
+provider instances present in the plan. RX, TX, and release use pre-resolved
+burst operations. Writable cloning remains a singular operation for each
+additional fan-out branch, as described in Section 10.
 
 #### Stage modes and worker loops
 
@@ -779,7 +786,7 @@ applying a configuration snapshot does not change it.
 
 Each packet worker owns one `worker_input_scheduler` and calls it from its
 existing loop to choose among its assigned RX streams and inbound DATA
-boundaries. The nonempty order's endpoints, links, and allowances occupy one
+boundaries. The scheduler root, endpoints, links, and allowances occupy one
 prefaulted worker-NUMA mapping. Each input has a quantum of at most 64 records,
 further bounded by an RX provider's admitted maximum. Completed quanta move
 behind waiting inputs; capacity-limited inputs keep their unfinished allowance
@@ -795,12 +802,22 @@ does not promise equal bandwidth or create capacity when storage remains full.
 This schedule holds only input identities and service state. The existing
 queues, reservations, and ledger remain the packet-ownership authorities.
 
-The loop owns cold-sized exact-NUMA local work staging, fixed burst scratch,
-fan-out clone scratch, transition/TX batches, and release batches. Every
-reachable storage domain has one active queue. Each exact source domain in a
-transition-enabled worker also has one equal-capacity future queue sized by
-`source_epoch_staging_capacity`; a transition-disabled source and every non-
-source domain have no future role. No packet container grows after launch.
+The kernel root, private stage/stream and nested route tables, membership
+words, flush schedules, lifecycle/reader records, fixed burst scratch,
+fan-out scratch, transition/TX batches, and release batches occupy one checked
+worker-NUMA layout. Temporary construction vectors are discarded after their
+contents and internal pointers have been resolved into that storage. The
+ledger, endpoint policies, activation, health, and other independently owned
+subsystems each retain their own exact-node allocation and lifetime.
+Shared compiled topology, provider tables and command publications retain
+their generation owners.
+
+Every scheduled storage domain has one active role. All roles for the worker share
+one prefaulted NUMA allocation, with mutable controls separated from key-major
+pointer arrays by cache-line boundaries. Each exact source domain in a
+transition-enabled worker also has an equal-capacity future role sized by
+`source_epoch_staging_capacity`; a transition-disabled source and every
+non-source domain have no future role. No packet container grows after launch.
 Before the loop starts, the sole owner ACTIVATEs every exact module context and
 `bind_bootstrap_epoch()` proves that each pre-resolved view has the same nonzero
 epoch. Every worker then publishes
@@ -825,8 +842,8 @@ body gate. Each iteration then:
    callback return permits the one additional budget/publication sample;
 4. on a transition turn, services receiver then sender control; then services
    the selected synchronous or tracked-async scheduler when present;
-5. fairly admits RX and inbound DATA, processes bounded owner-local active
-   queue prefixes, and flushes compiled storage-transition, grouped TX,
+5. fairly admits RX and inbound DATA, services bounded active-role key prefixes
+   as described in Section 10, and flushes compiled storage-transition, grouped TX,
    grouped storage-release, and provider-local pending work. Transition turns
    then advance cuts, activation, ACKs, and held output. RX stamps the source
    epoch and uses future staging while source and active differ; future work
@@ -884,17 +901,24 @@ epochs and selects exactly one queue role. Records enter that role of the exact
 storage-domain staging owner. The worker reserves a slot before asking the
 provider for a record and never requests more than available capacity slots,
 the provider's maximum burst, or `PACKET_MAX_BURST_SIZE`. A returned-prefix
-record receives one logical worker credit after its exact epoch is stamped and
-before local work publication. Rejected and unconsumed input creates no credit;
+population receives its exact source-epoch credits in one counted operation
+before any local work publication. Rejected and unconsumed input creates no credit;
 every unused staging reservation is released, including a rejected-only burst.
 The role-local reservation remains a capacity rollback proof and is never read
 as epoch ownership or quiescence.
 
+RX, ACTIVE-origin result and transition-destination buffers start entirely null.
+After each call, the worker validates the untouched suffix and clears accepted
+pointers after their last use. This preserves the complete buffer across changing
+request sizes without clearing it before every call. Origin byte views are
+separately cleared after the copy callback returns.
+
 At IDLE, source and active epochs are equal, so the predicted active branch is
-selected and every future queue is empty. A committed TRANSITION command binds
+selected and every future role is empty. A committed TRANSITION command binds
 the exact target, advances source admission once, and selects the separate
-future role for new RX while old active work drains. Local activation exchanges
-queue owners in O(1) and promotes the complete future-credit slot without a
+future role for new RX while old active work drains. Only RX-delivery keys may
+become ready in a future role. Local activation exchanges complete role owners
+in O(1) and promotes the complete future-credit slot without a
 scan or copy. Every boundary receive and stage execution still requires exact
 equality with the ledger's active epoch. A zero, reserved-wrap, or otherwise
 unbound packet epoch is an ownership invariant violation and terminates; the
@@ -903,13 +927,40 @@ packet whose exact module view disagrees.
 
 ### 10. Stage Dispatch
 
-The worker consumes available queue prefixes at the exact active epoch:
+Each active storage-domain role has pointer queues keyed by exact stage instance
+and continuation phase. One ready-key FIFO schedules only nonempty queues.
+At the start of role service, the worker captures its ready-key count and
+services each key in that original prefix at most once, within a total budget
+of 64 record dispatches. Retries consume that same budget. New keys wait for a
+later turn; appends to an already waiting key retain FIFO order and may join
+its one service. Partial batches run immediately, without waiting or sorting.
+
+The role's single capacity authority covers queued records plus outstanding
+reservations. Dequeue transfers capacity into outstanding ownership before a
+callback; requeue consumes that reservation, while final transfer or release
+returns capacity. Ready membership stays claimed throughout service, including
+callbacks that enqueue more work. If the popped prefix leaves work behind, the
+key reserves its next tail position before the callback can ready another key.
+If the pop emptied it and the callback refills it, it rejoins once afterward.
+
+Cold construction binds every producer, including delivery retries and a
+converted boundary send whose storage domain differs from its source stage's
+executable domains. A transient-only domain may have no keys while retaining
+capacity for provider calls. Pointer arrays never create a second packet
+population, and the ready FIFO never owns epoch credits.
+
+The shared passive/ACTIVE bridge admits each input and projects its SoA lane in
+one traversal. It records every epoch mismatch and invokes no callback if any
+input fails. Complete post-callback validation still precedes all metadata
+copy-back.
+
+For each serviced key prefix at the exact active epoch:
 
 ```text
-while bounded local work is available:
-    stage = stages_[record.current_stage_instance]         # O(1) executable lookup
-    if work is MODULE execution:
-        records = contiguous same-stage, same-epoch prefix # At most 64; never wait or sort
+for each key and its bounded FIFO record prefix:
+    stage = stages_[key.stage_instance_index]             # Once per prefix
+    validate every record's storage, stage and active epoch
+    if key.phase is EXECUTE and stage is MODULE:
         if worker has tracked-async scheduler and stage is ACTIVE:
             masks = scheduler.ingest_async(..., records, ..., cached_time)
         else if worker has synchronous active scheduler and stage is ACTIVE:
@@ -921,10 +972,17 @@ while bounded local work is available:
     else:
         execute the platform mechanism or resume the already-selected delivery
     dispatch forwarded records through precompiled logical routes
-    finish any pending context-selection prefix before the next ownership gate
+    finish the pending output prefix before the next ownership gate
 ```
 
-`stages_` is a flat `vector` indexed by executable stage-instance identity.
+FIFO is preserved within each key and DATA channel. Different keys have
+independent service order; there is no global arrival-order promise across
+different inputs or graph paths. Input admission retains its separate carried
+allowances. Multiple storage domains also retain independent local work
+budgets, so comparing shared and per-queue storage changes service opportunity
+as well as memory placement.
+
+`stages_` is a flat worker-NUMA array indexed by executable stage-instance identity.
 Each owned entry carries direct immutable compiled stage and logical-stage
 facts, its exact module store when applicable, and its precompiled routing
 tables. There are no string-keyed lookups on the hot path. Generic engine
@@ -941,13 +999,13 @@ values. Counter readers consume immutable completed telemetry banks; epoch-
 credit observers consume their separate coherent per-turn publication. Neither
 reader touches the owner's mutable line.
 
-`packet_worker_kernel::{dispatch_stage_result_,dispatch_one_target_,dispatch_fanout_}`
+`packet_worker_kernel::{dispatch_stage_result_,dispatch_target_prefix_,dispatch_fanout_}`
 apply the same three routing tiers to every storage and I/O implementation:
 
 1. **Explicit SDK route.** A non-invalid `module_next_stage` resolves an
    authored logical destination and is cleared after instance selection. An invalid or unsafe target
    retires the packet; no nearby instance is inferred.
-2. **Conditional edge.** The precompiled edge vector is walked in priority
+2. **Conditional edge.** The precompiled edge array is walked in priority
    order and the first matching edge wins. Equal priorities preserve authored
    edge order through the compiler's explicit source-index tie break. A
    conditional set with no match drops. Invalid condition syntax is rejected
@@ -955,8 +1013,9 @@ apply the same three routing tiers to every storage and I/O implementation:
 3. **Unconditional fan-out.** The first compiled successor receives the
    original record. Each additional successor invokes that record's singular
    `clone_writable` operation. The operation must create an independent
-   writable payload and metadata snapshot; DPDK uses a deep mbuf copy and the
-   fixed host pool copies into a distinct record/payload slot. Independence is
+   writable payload and metadata snapshot; DPDK allocates another mbuf and
+   copies bytes and metadata, while the fixed host pool uses a distinct
+   record/payload slot. Independence is
    required because NAT44 or another byte-mutating downstream branch must not
    change bytes observed by a sibling branch. Each successfully validated clone
    acquires one additional logical work credit before branch dispatch; clone
@@ -982,7 +1041,7 @@ context. The worker never consults live module state, provider RSS, or a registr
 to resolve ownership. Selector input and callback contracts are in
 [Module SDK](MODULE_SDK.md#module-context-selection).
 
-The compiled fan-out vector statically bounds singular clone invocations. A
+The compiled fan-out array statically bounds singular clone invocations. A
 clone failure or full fan-out staging array increments the owner worker's
 active telemetry bank's `fanout_overflow`. Capacity is checked before a clone
 is requested, so the runtime never creates a clone it cannot stage; a storage-
@@ -1014,7 +1073,7 @@ Terminal TX dispatch is a grouped scatter pattern with no fallback:
 - `KINETUM_PORT_UNSET` selects the operation through the owner worker's dense
   TX-stage-instance table.
 - Any explicit logical egress resolves through the precompiled
-  worker-local 64-entry `logical_to_tx_index` dense table. Packet dispatch
+  worker's 64-entry `tx_stream_index_by_logical_port` table. Packet dispatch
   performs one bounds check and one indexed load; it never hashes a logical
   port or reaches another worker's TX queue. Both forms are owner-local indexed
   lookups; neither terminal path consults the global materialization tables.
@@ -1109,27 +1168,29 @@ The same kernel adopts one complete `worker_boundary_receiver`. It is the only
 production caller of CUT receive and ACK submit/retry, and its receiver-local
 policy line carries only active epoch, accepted CUT, duplicate count,
 and phase. The channel remains the sole successful dequeue-sequence authority.
-DATA receive itself remains kernel-owned in the established
-order: peek and reserve destination capacity, pop the exact pointer, acquire
-receiver ledger credit, complete the channel sequence, then publish local
-execution. Receiver policy neither wraps nor replaces that hot path.
+The kernel supplies DATA admission and local ownership work directly to the
+channel's bounded conditional-prefix consumption. Receiver policy neither
+wraps nor replaces that hot path.
 
 Cross-worker dispatch first applies any exact compiled storage transition, then
-passes the exact record to that sender owner. In fixed `OPEN(E)`, only E can
+offers a contiguous prefix with one boundary, reservation domain and epoch to
+that sender owner. Existing dispatch scratch supplies the prefix without an
+additional output queue or fill threshold. In fixed `OPEN(E)`, only E can
 attempt DATA. During a committed E-to-N sender generation, E remains
 eligible only while DRAINING, N transfers to the exact future hold before ACK,
 and the worker invokes sealing only after every inbound cut is drained, source
 admission is N, and all old credit reaches zero.
-After that exact cut, E becomes terminate-class. A full DATA ring or full hold
-returns BACKPRESSURED and leaves record, local reservation, and ledger credit
-with the caller. HELD transfers
-the pointer to the hold, releases only the local reservation, and keeps the
-worker credit live. A successful direct enqueue transfers the pointer, advances
-the sender sequence, and then retires that credit.
-Sender or receiver approach to the reserved sequence terminal returns one typed
-`SEQUENCE_EXHAUSTED` result to the owning worker before mutation. That worker
-captures the fixed first-fault identity and terminates; neither endpoint wraps
-or loses the queued record inside the transport.
+After that exact cut, E becomes terminate-class. The counted result identifies
+the accepted prefix; the caller retains every suffix record, reservation and
+credit under its existing retry continuation. Holding releases local staging
+capacity while keeping worker credit live. Direct DATA transfer advances the
+packet sequence once, then retires credits and local reservations by the exact
+accepted count. Transferred records may already be reclaimed, so subsequent
+accounting uses identity retained before publication. DATA pressure counts
+rejected packet attempts, including retries, rather than calls or drops.
+Sequence exhaustion is reported before accepting the affected ownership. The
+owning worker captures the fixed first fault and terminates, retaining any
+already accepted prefix and every backing dependency; neither endpoint wraps.
 
 An exact ACK must equal both the target epoch and captured cut sequence;
 monotonic or greater-than progress is never accepted. Exact duplicates are
@@ -1137,8 +1198,8 @@ idempotent and counted, while every different, stale, skipped, or early ACK is
 terminate-class. Once the gate opens, older held output remains FIFO authority:
 the sender borrows its front, publishes DATA and advances the channel sequence,
 removes that exact pointer, and only then retires its worker credit. While that
-finite held prefix is nonempty, newly produced target output returns
-BACKPRESSURED with record, reservation, and credit still at the caller; it is
+finite held prefix is nonempty, newly produced target output is refused with
+record, reservation, and credit still at the caller; it is
 never appended behind the prefix. Sustained traffic therefore cannot postpone
 hold drain and the next generation indefinitely. DATA or hold pressure never
 prevents the bounded owner turn from polling every active CUT/ACK endpoint.
@@ -1146,12 +1207,14 @@ Held service spends one exact attempt budget: each selected endpoint drains
 until DATA is full, its hold is empty, or the budget expires, and the cursor
 already names the following endpoint for the next turn.
 
-The receiver peeks and validates the record's active epoch, endpoint, and
-storage domain before reserving destination staging. It then consumes that
-exact pointer, acquires one receiver credit, and completes the dequeue sequence
-before publishing local execution. A second receive, receiver publication, or destruction while
-that completion is unresolved terminates. The DATA ring owns the physical
-record between the two endpoint transfers; no worker claims it. During shutdown, a worker stops source
+Within one bounded receive call, the kernel validates each record's active
+epoch, endpoint and storage domain, reserves destination staging, and establishes
+receiver credit and local ownership. The shared SPSC core consumes only that
+accepted prefix and publishes its cursor once; the channel then advances the
+completed packet sequence. A capacity refusal retains the FIFO head and its
+suffix. No completion claim escapes the call, and reentrant receive, receiver
+publication or teardown terminates. The DATA ring owns records between endpoint
+transfers. During shutdown, a worker stops source
 admission, drains all local and inbound work, waits until every inbound sender
 is closed and every DATA/control/completion owner is empty, then closes each
 outbound producer exactly once. Channel destruction with retained ownership
@@ -1176,10 +1239,10 @@ source admission names the exact target, and active-epoch credit is zero. A
 worker with no inbound edge receives the same zero-credit/source proof before
 vacuous fan-in; logical-region aggregate state is never consulted.
 
-After all outbound CUTs have entered channel ownership, one local activation
+After all outbound CUTs have been published to their control rings, one local activation
 owner performs a complete nonmutating preflight over every worker-owned module
-store, source-domain queue pair, and ledger identity. Only then, with no packet
-work interleaved, it activates module stores, exchanges active/future queue
+store, source-domain role pair, and ledger identity. Only then, with no packet
+work interleaved, it activates module stores, exchanges complete active/future role
 owners in O(1), and moves the complete future credit count into active while
 clearing the future slot. Every inbound receiver line is marked activated
 before the first exact ACK submission. A full ACK lane retains one pending
@@ -1231,7 +1294,8 @@ module context, epoch store, origin storage domain, schedule order, trigger
 mask, active limits, control/PULL edges, and owner worker. Replicated lanes
 never share scheduler state.
 
-All mutable rows, retained/free/pending lists, copied payloads, queue storage,
+The scheduler root and invocation state, all mutable rows,
+retained/free/pending lists, copied payloads, queue storage,
 timer entries, origin-copy scratch, and relation bits occupy one checked
 prefaulted mapping on the worker's exact NUMA node. A dense global-stage-to-row
 index plus checked active-row bit matrices gives O(1) control/PULL edge
@@ -1387,8 +1451,10 @@ Admission is a transaction:
    shape. Older and newer ABI versions both reject.
 7. Require `KINETUM_MOD_F_REPLICABLE_CONTEXTS` before one image may own
    multiple contexts.
-8. Construct every cold lifecycle owner and invoke INIT under the image's
-   logical serialization domain. No manager mutex is held across foreign code.
+8. Construct each module context and lifecycle control/telemetry block on the
+   compiled owner node. Invoke INIT under the image's logical serialization
+   domain, then construct its epoch store on that same node. No manager mutex
+   is held across foreign code.
 9. Publish all image/context lookup tables only after every INIT succeeds. A
    failure finalizes already initialized staged contexts and unloads all staged
    images before returning.
@@ -1411,10 +1477,10 @@ global foreign-callback mutex.
 
 #### Cold and live state are structurally separate
 
-| Object | Owner and purpose | Packet-path reachability |
+| Object | Owner and purpose | Module packet-callback reachability |
 |---|---|---|
 | `kinetum_lifecycle_ctx` | Borrowed shell for one cold operation; points to the tracked lifecycle service table and opaque platform operation state. | Unreachable |
-| `lifecycle_context_owner` | Platform owner of exact identity, allocation arenas, telemetry registrations, deadline, and cancellation state. | Unreachable |
+| `lifecycle_context_owner` | Platform owner of exact identity, allocation arenas, telemetry registrations, deadline, and cancellation state. The kernel services its worker-local telemetry controls; cold allocation records and operation state remain private to lifecycle calls. | Unreachable |
 | `kinetum_ctx` | One cache-line live object containing context-local mutable state plus NUMA, CPU, and worker identity. | Direct owner-worker pointer |
 | `kinetum_prepared_config` | Exact transferred ownership record: module `owner_handle` plus immutable borrowed `packet_config` view. | Only `packet_config` is read |
 | `kinetum_batch_t::epoch_config` | Immutable view selected from the exact epoch-tagged runtime slot. | Direct batch field |
@@ -1647,6 +1713,9 @@ the request; no service owns a field-by-field duplicate schema or mapper.
   record in its deferred queue and reclaim it unsent at shutdown. Sending,
   flushing, or reclaiming that record does not count another transfer.
   Hardware misses/errors remain native port observations.
+  The telemetry root, private stage/stream maps, active-bank view and all three
+  banks share one checked worker-NUMA allocation. Worker-written selectors and
+  cold preparation/retirement selectors occupy separate cache lines.
 - **Module banks:** INIT admits counters and histograms independently up to 64
   and 16, with names unique across both kinds. Counter/gauge values are absolute.
   Histograms are interval banks backed by one transactional three-bank bucket
@@ -1664,9 +1733,11 @@ the request; no service owns a field-by-field duplicate schema or mapper.
   ordinary-standby, and activation-reserve banks. Ordinary cadence publishes
   only with a clean standby and completed-ring capacity; otherwise it
   saturating-increments skipped publication and continues without waiting or
-  borrowing the reserve. Activation publishes final E truth, retains the clean
-  E companion, and switches to the pre-reserved N bank before the remaining
-  module/queue/ledger/scheduler activation order. Shutdown stops ordinary
+  borrowing the reserve. Each module store publishes its final E bank, retains
+  its clean E companion, and switches to its reserved N bank before invoking
+  that module's ACTIVATE. After all module views advance, the worker performs
+  the same bank exchange before queue-role, ledger, and scheduler promotion.
+  Shutdown stops ordinary
   cadence first and cannot exit while a same-epoch return is unresolved. One
   due worker cadence starts a bounded module-context sweep; at most one context
   publishes per following turn, one overlap coalesces, and further overlap is
@@ -1781,9 +1852,9 @@ context population; both declared `buffer_count` and the compiler's
 `required_min_buffers` floor for each storage domain; and exact
 `io_driver_instance_id` plus `driver_port_id` for each logical port. A DPDK
 source reads ethdev counters and approximate concurrent mempool occupancy, but
-only their generic projections may cross the telemetry boundary. PMD-specific
-storage samples still partition the compiled buffer count exactly; approximate
-means the complete sample may become stale immediately after callback return.
+only their generic projections may cross the telemetry boundary. The two
+occupancy values partition the compiled buffer count exactly, but the underlying
+pool and per-core cache counts are sampled without a common snapshot.
 PMD-specific xstats do not cross the generic observation contract. Provider
 state is one of `AVAILABLE_EXACT`,
 `AVAILABLE_APPROXIMATE`, `UNSUPPORTED`, or `READ_FAILED`. Only the two
@@ -1988,6 +2059,7 @@ uncertainty after an irreversible native effect is fail-stop.
 
 | Type / function | Use |
 |---|---|
+| `numa_layout` / `numa_owner<T>` | Cold checked typed layout and move-only root ownership over one exact-node prefaulted mapping. Subsystem destructors retire nested objects before the mapping owner unmaps it. |
 | `config_snapshot_epoch_store` | Coordinator-owned canonical snapshot slots: stage, publish, exact lookup, and claimed retirement. |
 | `frozen_transition_participants` | Immutable, bidirectionally validated membership projected once from compiled topology and retained by identity. |
 | `epoch_transition_command_mailbox` | Plan-sized MPMC queue of borrowed command contexts; one wake-only eventfd and unconditional producer completion. Destroying an unresolved context terminates. |

@@ -35,7 +35,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <exception>
-#include <memory>
 #include <type_traits>
 
 #include <kinetum/algo/platform.hpp>
@@ -43,6 +42,7 @@
 #include "src/common/status_or.hpp"
 #include "src/dp/epoch/epoch_protocol_fault.hpp"
 #include "src/dp/publication_read_result.hpp"
+#include "src/dp/numa_layout.hpp"
 
 namespace kinetum::dp
 {
@@ -120,10 +120,11 @@ class alignas(kinetum::algo::CACHE_LINE_SIZE) worker_epoch_ledger final {
 	 * @param runtime_generation Nonzero generation representable by the provider ABI.
 	 * @param maximum_unretired Checked physical-record, synchronous-active,
 	 *        tracked-async, and bounded completion-handoff credit ceiling.
+	 * @param numa_node Exact compiled worker node for counters and publication.
 	 * @return Unique ledger, or a cold validation/allocation status.
 	 */
-	[[nodiscard]] static common::status_or<std::unique_ptr<worker_epoch_ledger>>
-	create(uint32_t worker_index, uint64_t runtime_generation, uint64_t maximum_unretired);
+	[[nodiscard]] static common::status_or<numa_owner<worker_epoch_ledger>>
+	create(uint32_t worker_index, uint64_t runtime_generation, uint64_t maximum_unretired, int32_t numa_node);
 
 	/** @brief Disable copying because one worker is the sole counter writer. */
 	worker_epoch_ledger(const worker_epoch_ledger &) = delete;
@@ -263,6 +264,11 @@ class alignas(kinetum::algo::CACHE_LINE_SIZE) worker_epoch_ledger final {
 	{
 		return runtime_generation_;
 	}
+	/** @return Exact node proved before ledger publication. */
+	[[nodiscard]] int32_t numa_node() const noexcept
+	{
+		return numa_node_;
+	}
 
 	/**
 	 * @brief Bind the sole owner-local counter bank and process fault latch.
@@ -274,33 +280,38 @@ class alignas(kinetum::algo::CACHE_LINE_SIZE) worker_epoch_ledger final {
 							  epoch_protocol_fault_latch &faults) noexcept;
 
 	/**
-	 * @brief Create one worker-owned work credit in an exact bound epoch slot.
+	 * @brief Create an exact worker-owned credit population in one bound epoch slot.
 	 *
 	 * @param epoch Sole immutable epoch read from packet metadata.
+	 * @param count Number of credits; zero validates the epoch without changing its population.
 	 *
 	 * @par Hot-Path Constraints
 	 * Predicted active-slot comparison and plain integer increments only. An
 	 * unknown epoch or capacity overflow terminates without publishing a false
 	 * observation.
 	 */
-	KINETUM_ALWAYS_INLINE void acquire(uint64_t epoch) noexcept
+	KINETUM_ALWAYS_INLINE void acquire(uint64_t epoch, uint64_t count = 1u) noexcept
 	{
 		if (KINETUM_LIKELY(epoch != 0u && epoch == owner_.active_epoch)) {
 			if (KINETUM_UNLIKELY(owner_.future_unretired > maximum_unretired_ ||
-					     owner_.active_unretired >= maximum_unretired_ - owner_.future_unretired)) {
+					     owner_.active_unretired > maximum_unretired_ - owner_.future_unretired ||
+					     count > maximum_unretired_ - owner_.future_unretired -
+							     owner_.active_unretired)) {
 				record_fault_and_terminate_(epoch_protocol_fault_code::OWNERSHIP_OVERFLOW, epoch,
 							    maximum_unretired_, owner_.active_unretired);
 			}
-			++owner_.active_unretired;
+			owner_.active_unretired += count;
 			return;
 		}
 		if (epoch != 0u && epoch == owner_.future_epoch) {
 			if (KINETUM_UNLIKELY(owner_.active_unretired > maximum_unretired_ ||
-					     owner_.future_unretired >= maximum_unretired_ - owner_.active_unretired)) {
+					     owner_.future_unretired > maximum_unretired_ - owner_.active_unretired ||
+					     count > maximum_unretired_ - owner_.active_unretired -
+							     owner_.future_unretired)) {
 				record_fault_and_terminate_(epoch_protocol_fault_code::OWNERSHIP_OVERFLOW, epoch,
 							    maximum_unretired_, owner_.future_unretired);
 			}
-			++owner_.future_unretired;
+			owner_.future_unretired += count;
 			return;
 		}
 		record_fault_and_terminate_(epoch_protocol_fault_code::OWNERSHIP_WRONG_SLOT, epoch, owner_.active_epoch,
@@ -308,31 +319,36 @@ class alignas(kinetum::algo::CACHE_LINE_SIZE) worker_epoch_ledger final {
 	}
 
 	/**
-	 * @brief Retire one worker-owned work credit from an exact bound epoch slot.
+	 * @brief Retire an exact worker-owned credit population from one bound epoch slot.
 	 *
 	 * @param epoch Sole immutable epoch retained for the terminal disposition.
+	 * @param count Number of credits; zero validates the epoch without changing its population.
 	 *
 	 * @par Hot-Path Constraints
 	 * Predicted active-slot comparison and plain integer decrements only. An
 	 * unknown epoch, underflow, or double retirement that reaches zero
 	 * terminates without manufacturing quiescence.
 	 */
-	KINETUM_ALWAYS_INLINE void retire(uint64_t epoch) noexcept
+	KINETUM_ALWAYS_INLINE void retire(uint64_t epoch, uint64_t count = 1u) noexcept
 	{
 		if (KINETUM_LIKELY(epoch != 0u && epoch == owner_.active_epoch)) {
-			if (KINETUM_UNLIKELY(owner_.active_unretired == 0u)) {
-				record_fault_and_terminate_(epoch_protocol_fault_code::OWNERSHIP_DOUBLE_RETIRE, epoch,
-							    1u, 0u);
+			if (KINETUM_UNLIKELY(count > owner_.active_unretired)) {
+				record_fault_and_terminate_(owner_.active_unretired == 0u ?
+								    epoch_protocol_fault_code::OWNERSHIP_DOUBLE_RETIRE :
+								    epoch_protocol_fault_code::OWNERSHIP_UNDERFLOW,
+							    epoch, count, owner_.active_unretired);
 			}
-			--owner_.active_unretired;
+			owner_.active_unretired -= count;
 			return;
 		}
 		if (epoch != 0u && epoch == owner_.future_epoch) {
-			if (KINETUM_UNLIKELY(owner_.future_unretired == 0u)) {
-				record_fault_and_terminate_(epoch_protocol_fault_code::OWNERSHIP_DOUBLE_RETIRE, epoch,
-							    1u, 0u);
+			if (KINETUM_UNLIKELY(count > owner_.future_unretired)) {
+				record_fault_and_terminate_(owner_.future_unretired == 0u ?
+								    epoch_protocol_fault_code::OWNERSHIP_DOUBLE_RETIRE :
+								    epoch_protocol_fault_code::OWNERSHIP_UNDERFLOW,
+							    epoch, count, owner_.future_unretired);
 			}
-			--owner_.future_unretired;
+			owner_.future_unretired -= count;
 			return;
 		}
 		if (epoch == 0u) {
@@ -413,8 +429,10 @@ class alignas(kinetum::algo::CACHE_LINE_SIZE) worker_epoch_ledger final {
 	 * @param worker_index Exact non-sentinel compact worker identity.
 	 * @param runtime_generation Exact nonzero runtime generation.
 	 * @param maximum_unretired Exact checked worker credit ceiling.
+	 * @param numa_node Exact proved worker allocation node.
 	 */
-	worker_epoch_ledger(uint32_t worker_index, uint64_t runtime_generation, uint64_t maximum_unretired) noexcept;
+	worker_epoch_ledger(uint32_t worker_index, uint64_t runtime_generation, uint64_t maximum_unretired,
+			    int32_t numa_node) noexcept;
 
 	/**
 	 * @brief Capture one impossible credit mutation and terminate.
@@ -426,9 +444,10 @@ class alignas(kinetum::algo::CACHE_LINE_SIZE) worker_epoch_ledger final {
 	[[noreturn]] void record_fault_and_terminate_(epoch_protocol_fault_code code, uint64_t observed_epoch,
 						      uint64_t expected_value, uint64_t observed_value) noexcept;
 
-	uint32_t worker_index_{0};				///< Immutable compact worker identity.
-	uint64_t runtime_generation_{0};			///< Immutable materialized generation.
-	uint64_t maximum_unretired_{0};				///< Immutable compiled worker credit ceiling.
+	uint32_t worker_index_{0};	  ///< Immutable compact worker identity.
+	int32_t numa_node_{-1};		  ///< Immutable placement identity proved by the allocation owner.
+	uint64_t runtime_generation_{0};  ///< Immutable materialized generation.
+	uint64_t maximum_unretired_{0};	  ///< Immutable compiled worker credit ceiling.
 	worker_runtime_telemetry *telemetry_{nullptr};		///< Bound owner-local typed fault counters.
 	epoch_protocol_fault_latch *protocol_faults_{nullptr};	///< Process-generation first-fault authority.
 	owner_state owner_{};					///< Sole packet-worker mutable accounting.

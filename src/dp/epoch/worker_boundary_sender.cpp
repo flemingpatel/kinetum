@@ -14,9 +14,11 @@
 #include <exception>
 #include <iterator>
 #include <limits>
+#include <memory>
 #include <new>
 #include <stdexcept>
 #include <utility>
+#include <vector>
 
 #include <kinetum/algo/platform.hpp>
 
@@ -29,13 +31,13 @@
 namespace kinetum::dp
 {
 
-common::status_or<std::unique_ptr<worker_boundary_sender>>
+common::status_or<numa_owner<worker_boundary_sender>>
 worker_boundary_sender::create(uint32_t worker_index, uint64_t runtime_generation,
 			       std::span<boundary_epoch_channel *const> channels,
-			       std::span<boundary_future_output_hold *const> holds)
+			       std::span<boundary_future_output_hold *const> holds, int32_t numa_node)
 {
 	if (worker_index == std::numeric_limits<uint32_t>::max() || runtime_generation == 0u ||
-	    runtime_generation > std::numeric_limits<uint32_t>::max()) {
+	    runtime_generation > std::numeric_limits<uint32_t>::max() || numa_node < 0) {
 		return common::status::invalid_argument(
 			"boundary sender requires exact representable worker and runtime identities");
 	}
@@ -56,8 +58,9 @@ worker_boundary_sender::create(uint32_t worker_index, uint64_t runtime_generatio
 			    hold->sender_worker_index() != worker_index ||
 			    channel->runtime_generation() != runtime_generation ||
 			    channel->boundary_index() != hold->boundary_index() ||
-			    channel->sender_endpoint_numa_node() != hold->numa_node() || channel->sender_closed() ||
-			    !channel->empty() || !hold->empty() || channel->endpoint_storage_sealed()) {
+			    channel->sender_endpoint_numa_node() != numa_node || hold->numa_node() != numa_node ||
+			    channel->sender_closed() || !channel->empty() || !hold->empty() ||
+			    channel->endpoint_storage_sealed()) {
 				return common::status::failed_precondition(
 					"boundary sender endpoint does not equal one clean unsealed compiled ownership");
 			}
@@ -77,12 +80,23 @@ worker_boundary_sender::create(uint32_t worker_index, uint64_t runtime_generatio
 				      "boundary sender endpoint table exceeds a bounded host container");
 	}
 
-	auto *raw = new (std::nothrow)
-		worker_boundary_sender(sender_identity{worker_index, runtime_generation}, std::move(endpoints));
-	if (raw == nullptr) {
-		return common::status::resource_exhausted("boundary sender owner allocation failed");
+	numa_layout layout;
+	std::size_t root_offset = 0u;
+	std::size_t endpoints_offset = 0u;
+	if (!layout.append<worker_boundary_sender>(1u, root_offset) ||
+	    !layout.append<endpoint>(endpoints.size(), endpoints_offset)) {
+		return common::status(common::status_code::OUT_OF_RANGE, "boundary sender layout overflows");
 	}
-	std::unique_ptr<worker_boundary_sender> owner(raw);
+	auto region_or = layout.allocate(numa_node);
+	if (!region_or.is_ok()) {
+		return region_or.error();
+	}
+	auto region = std::move(region_or).value();
+	auto placed = numa_layout::storage<endpoint>(region, endpoints_offset, endpoints.size());
+	std::uninitialized_copy(endpoints.begin(), endpoints.end(), placed.begin());
+	auto *raw = new (numa_layout::storage<worker_boundary_sender>(region, root_offset).data())
+		worker_boundary_sender(sender_identity{worker_index, runtime_generation, numa_node}, placed);
+	auto owner = adopt_numa_owner(raw, std::move(region));
 	for (auto &entry : owner->endpoints_) {
 		auto policy_or = entry.channel->sender_slab_->claim_sender_policy_(entry.channel->sender_slot_index_,
 										   entry.boundary_index);
@@ -97,10 +111,11 @@ worker_boundary_sender::create(uint32_t worker_index, uint64_t runtime_generatio
 	return owner;
 }
 
-worker_boundary_sender::worker_boundary_sender(sender_identity identity, std::vector<endpoint> endpoints) noexcept
+worker_boundary_sender::worker_boundary_sender(sender_identity identity, std::span<endpoint> endpoints) noexcept
 	: worker_index_(identity.worker_index)
 	, runtime_generation_(identity.runtime_generation)
-	, endpoints_(std::move(endpoints))
+	, endpoints_(endpoints)
+	, numa_node_(identity.numa_node)
 {
 }
 
@@ -136,7 +151,8 @@ worker_boundary_sender::~worker_boundary_sender()
 common::status worker_boundary_sender::bind_ledger(worker_epoch_ledger &ledger)
 {
 	if (ledger_ != nullptr || ledger.worker_index() != worker_index_ ||
-	    ledger.runtime_generation() != runtime_generation_ || bootstrap_epoch_ != 0u || transition_active_) {
+	    ledger.runtime_generation() != runtime_generation_ || ledger.numa_node() != numa_node_ ||
+	    bootstrap_epoch_ != 0u || transition_active_) {
 		return common::status::failed_precondition(
 			"boundary sender ledger does not match one unbound worker generation");
 	}
@@ -249,34 +265,41 @@ bool worker_boundary_sender::begin_transition(uint64_t transition_generation, ui
 	return true;
 }
 
-boundary_epoch_send_result worker_boundary_sender::try_send(uint32_t sender_ordinal, packet_record *record) noexcept
+std::size_t worker_boundary_sender::try_send(uint32_t sender_ordinal, std::span<packet_record *const> records) noexcept
 {
 	auto &entry = endpoint_(sender_ordinal);
-	if (ledger_ == nullptr || record == nullptr || entry.policy == nullptr) {
+	if (ledger_ == nullptr || entry.policy == nullptr ||
+	    records.size() > common::runtime_sizing::PACKET_MAX_BURST_SIZE) {
 		std::terminate();
 	}
-	const uint64_t packet_epoch = record->metadata.epoch;
+	if (records.empty()) {
+		return 0u;
+	}
+	if (records.front() == nullptr) {
+		std::terminate();
+	}
+	const uint64_t packet_epoch = records.front()->metadata.epoch;
+	const uint32_t storage_domain = records.front()->storage.domain_index;
+	for (const auto *record : records) {
+		if (record == nullptr || record->metadata.epoch != packet_epoch ||
+		    record->storage.domain_index != storage_domain) {
+			std::terminate();
+		}
+	}
 	const auto transfer = [&]() noexcept {
-		const auto result = entry.channel->try_send_data(record);
-		if (KINETUM_UNLIKELY(result != boundary_data_publication_result::TRANSFERRED)) {
-			if (result == boundary_data_publication_result::BACKPRESSURED) {
-				return boundary_epoch_send_result::BACKPRESSURED;
-			}
-			if (result != boundary_data_publication_result::SEQUENCE_EXHAUSTED) {
-				std::terminate();
-			}
+		const auto result = entry.channel->try_send_data(records);
+		if (KINETUM_UNLIKELY(result.sequence_exhausted)) {
 			record_fault_(entry, epoch_protocol_fault_code::SEQUENCE_EXHAUSTED,
 				      epoch_protocol_fault_disposition::TERMINATE, packet_epoch,
 				      MAX_BOUNDARY_DATA_SEQUENCE, entry.channel->data_enqueued_sequence());
 			std::terminate();
 		}
-		ledger_->retire(packet_epoch);
-		return boundary_epoch_send_result::TRANSFERRED;
+		if (result.transferred_count != 0u) {
+			ledger_->retire(packet_epoch, result.transferred_count);
+		}
+		return result.transferred_count;
 	};
-	const auto hold = [&]() noexcept {
-		return entry.hold->try_hold(record) ? boundary_epoch_send_result::HELD :
-						      boundary_epoch_send_result::BACKPRESSURED;
-	};
+	const auto hold = [&]() noexcept { return entry.hold->try_hold(records); };
 	if (KINETUM_LIKELY(!transition_active_ && entry.policy->phase == boundary_epoch_sender_phase::OPEN &&
 			   packet_epoch == entry.policy->open_epoch)) {
 		return transfer();
@@ -299,7 +322,7 @@ boundary_epoch_send_result worker_boundary_sender::try_send(uint32_t sender_ordi
 		// Once an ACK opens the target gate, the existing hold is a finite
 		// prefix. New target work remains caller-owned until that prefix drains,
 		// preventing sustained ingress from postponing transition completion.
-		return !entry.hold->empty() ? boundary_epoch_send_result::BACKPRESSURED : transfer();
+		return !entry.hold->empty() ? 0u : transfer();
 	case boundary_epoch_sender_phase::DRAINING:
 		if (packet_epoch == entry.policy->from_epoch) {
 			return transfer();
@@ -521,17 +544,17 @@ std::size_t worker_boundary_sender::service_held_output(std::size_t maximum_atte
 			auto *record = const_cast<packet_record *>(front);
 			const uint64_t packet_epoch = record->metadata.epoch;
 			--remaining_attempts;
-			const auto result = entry.channel->try_send_data(record);
-			if (KINETUM_UNLIKELY(result != boundary_data_publication_result::TRANSFERRED)) {
-				if (result == boundary_data_publication_result::BACKPRESSURED) {
-					break;
-				}
-				if (result != boundary_data_publication_result::SEQUENCE_EXHAUSTED) {
-					std::terminate();
-				}
+			const auto result = entry.channel->try_send_data(std::span(&record, 1u));
+			if (KINETUM_UNLIKELY(result.sequence_exhausted)) {
 				record_fault_(entry, epoch_protocol_fault_code::SEQUENCE_EXHAUSTED,
 					      epoch_protocol_fault_disposition::TERMINATE, packet_epoch,
 					      MAX_BOUNDARY_DATA_SEQUENCE, entry.channel->data_enqueued_sequence());
+				std::terminate();
+			}
+			if (result.transferred_count == 0u) {
+				break;
+			}
+			if (result.transferred_count != 1u) {
 				std::terminate();
 			}
 			packet_record *released = nullptr;

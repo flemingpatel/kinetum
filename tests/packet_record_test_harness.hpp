@@ -20,12 +20,12 @@
 #include <exception>
 #include <limits>
 #include <memory>
-#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
 
 #include "src/dp/fixed_packet_pool.hpp"
+#include "tests/numa_test_support.hpp"
 
 namespace kinetum::test
 {
@@ -55,7 +55,7 @@ class packet_record_test_owner final {
 			.alignment_bytes = alignof(dp::packet_record),
 			.domain_index = 0,
 			.generation = 1,
-			.host_numa_node = std::nullopt,
+			.host_numa_node = kinetum::test::required_memory_numa_node(),
 		});
 		if (!pool_or.is_ok()) {
 			error_ = pool_or.error().to_string();

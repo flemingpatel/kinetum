@@ -92,7 +92,7 @@ boundary_epoch_channel::create(const common::compiled_transition_boundary &facts
 
 boundary_epoch_channel::boundary_epoch_channel(const common::compiled_transition_boundary &facts,
 					       uint64_t runtime_generation,
-					       std::unique_ptr<numa_spsc_ring<packet_record *>> data_ring,
+					       numa_owner<numa_spsc_ring<packet_record *>> data_ring,
 					       boundary_epoch_worker_slab &sender_slab, std::size_t sender_slot_index,
 					       boundary_epoch_worker_slab::sender_slot &sender_slot,
 					       boundary_epoch_worker_slab &receiver_slab,
@@ -133,63 +133,31 @@ boundary_epoch_channel::~boundary_epoch_channel()
 	receiver_slab_->release_receiver_slot_(receiver_slot_index_, boundary_index_);
 }
 
-boundary_data_publication_result boundary_epoch_channel::try_send_data(packet_record *record) noexcept
+boundary_data_transfer_result boundary_epoch_channel::try_send_data(std::span<packet_record *const> records) noexcept
 {
 	auto &sender = sender_slot_->owner;
-	if (KINETUM_UNLIKELY(record == nullptr || sender.closed)) {
+	if (KINETUM_UNLIKELY(sender.closed || records.size() > common::runtime_sizing::PACKET_MAX_BURST_SIZE)) {
 		std::terminate();
 	}
-	if (KINETUM_UNLIKELY(!successful_data_sequence::can_advance(sender.data_enqueued.value()))) {
-		return boundary_data_publication_result::SEQUENCE_EXHAUSTED;
-	}
-	if (!data_ring_->try_push(record)) {
-		if (sender.data_backpressure_events != std::numeric_limits<uint64_t>::max()) {
-			++sender.data_backpressure_events;
+	for (const auto *record : records) {
+		if (record == nullptr) {
+			std::terminate();
 		}
-		return boundary_data_publication_result::BACKPRESSURED;
 	}
-	if (KINETUM_UNLIKELY(!sender.data_enqueued.record_success())) {
+	if (KINETUM_UNLIKELY(!successful_data_sequence::can_advance(sender.data_enqueued.value(), records.size()))) {
+		return {0u, true};
+	}
+	const std::size_t transferred = data_ring_->push_batch(records.data(), records.size());
+	const std::size_t rejected = records.size() - transferred;
+	if (rejected != 0u) {
+		const uint64_t remaining_events =
+			std::numeric_limits<uint64_t>::max() - sender.data_backpressure_events;
+		sender.data_backpressure_events += rejected < remaining_events ? rejected : remaining_events;
+	}
+	if (KINETUM_UNLIKELY(transferred != 0u && !sender.data_enqueued.record_success(transferred))) {
 		std::terminate();
 	}
-	return boundary_data_publication_result::TRANSFERRED;
-}
-
-boundary_data_receive_result boundary_epoch_channel::try_receive_data(packet_record *&record) noexcept
-{
-	auto &receiver = receiver_slot_->owner;
-	if (KINETUM_UNLIKELY(receiver.unsequenced_record != nullptr)) {
-		std::terminate();
-	}
-	if (KINETUM_UNLIKELY(!successful_data_sequence::can_advance(receiver.data_dequeued.value()))) {
-		return data_ring_->empty() ? boundary_data_receive_result::EMPTY :
-					     boundary_data_receive_result::SEQUENCE_EXHAUSTED;
-	}
-	packet_record *candidate = nullptr;
-	if (!data_ring_->try_pop(candidate)) {
-		return boundary_data_receive_result::EMPTY;
-	}
-	if (KINETUM_UNLIKELY(candidate == nullptr)) {
-		std::terminate();
-	}
-	receiver.unsequenced_record = candidate;
-	record = candidate;
-	return boundary_data_receive_result::RECEIVED;
-}
-
-void boundary_epoch_channel::complete_data_receive(packet_record *record) noexcept
-{
-	auto &receiver = receiver_slot_->owner;
-	if (KINETUM_UNLIKELY(record == nullptr || receiver.unsequenced_record != record ||
-			     !receiver.data_dequeued.record_success())) {
-		std::terminate();
-	}
-	receiver.unsequenced_record = nullptr;
-}
-
-const packet_record *boundary_epoch_channel::peek_data() const noexcept
-{
-	const auto *slot = data_ring_->peek();
-	return slot != nullptr ? *slot : nullptr;
+	return {transferred, false};
 }
 
 boundary_control_publication_result boundary_epoch_channel::submit_cut(const boundary_epoch_cut &cut) noexcept
@@ -225,6 +193,9 @@ boundary_control_publication_result boundary_epoch_channel::service_pending_cut(
 
 bool boundary_epoch_channel::try_receive_cut(boundary_epoch_cut &cut) noexcept
 {
+	if (receiver_slot_->owner.receive_in_progress) {
+		std::terminate();
+	}
 	boundary_epoch_cut candidate{};
 	if (!receiver_slot_->cut_ring.try_pop(candidate)) {
 		return false;
@@ -239,7 +210,7 @@ bool boundary_epoch_channel::try_receive_cut(boundary_epoch_cut &cut) noexcept
 boundary_control_publication_result boundary_epoch_channel::submit_ack(const boundary_epoch_ack &ack) noexcept
 {
 	auto &receiver = receiver_slot_->owner;
-	if (KINETUM_UNLIKELY(!ack.valid() || receiver.ack_pending)) {
+	if (KINETUM_UNLIKELY(!ack.valid() || receiver.ack_pending || receiver.receive_in_progress)) {
 		std::terminate();
 	}
 	if (sender_slot_->ack_ring.try_push(ack)) {
@@ -253,6 +224,9 @@ boundary_control_publication_result boundary_epoch_channel::submit_ack(const bou
 boundary_control_publication_result boundary_epoch_channel::service_pending_ack() noexcept
 {
 	auto &receiver = receiver_slot_->owner;
+	if (receiver.receive_in_progress) {
+		std::terminate();
+	}
 	if (!receiver.ack_pending) {
 		return boundary_control_publication_result::ABSENT;
 	}
@@ -323,7 +297,7 @@ void boundary_epoch_channel::publish_receiver_transport() noexcept
 	const auto &receiver = receiver_slot_->owner;
 	const uint64_t pending_epoch = receiver.ack_pending ? receiver.pending_ack.ready_epoch : 0u;
 	const uint64_t pending_sequence = receiver.ack_pending ? receiver.pending_ack.consumed_cut_sequence : 0u;
-	if (receiver.unsequenced_record != nullptr || !valid_boundary_data_sequence(receiver.data_dequeued.value()) ||
+	if (receiver.receive_in_progress || !valid_boundary_data_sequence(receiver.data_dequeued.value()) ||
 	    (receiver.ack_pending && !receiver.pending_ack.valid())) {
 		std::terminate();
 	}
@@ -508,7 +482,7 @@ uint64_t boundary_epoch_channel::data_dequeued_sequence() const noexcept
 
 bool boundary_epoch_channel::data_empty() const noexcept
 {
-	if (receiver_slot_->owner.unsequenced_record != nullptr || !data_ring_->empty()) {
+	if (receiver_slot_->owner.receive_in_progress || !data_ring_->empty()) {
 		return false;
 	}
 	if (sender_slot_->owner.data_enqueued.value() != receiver_slot_->owner.data_dequeued.value()) {

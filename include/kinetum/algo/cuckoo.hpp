@@ -9,12 +9,11 @@
  * @author Fleming Patel
  *
  * Cuckoo hashing provides constant-time lookups in the worst case by using
- * two hash functions and allowing elements to be displaced during insertion.
+ * two derived bucket candidates and allowing elements to be displaced during insertion.
  *
  * Key Properties:
- * - O(1) worst-case lookup (check exactly 2 locations)
  * - O(1) expected insertion (amortized)
- * - Lookup checks exactly two candidate locations
+ * - Lookup checks at most two candidate buckets
  * - Cache-line-aligned bucket starts for predictable memory access
  *
  * Thread Safety:
@@ -29,6 +28,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <memory_resource>
 #include <stdexcept>
 #include <type_traits>
@@ -85,7 +85,7 @@ struct alignas(CACHE_LINE_SIZE) cuckoo_bucket {
 		Key key{};	       ///< Exact semantic lookup key.
 		Value value{};	       ///< Value owned while @p occupied is true.
 		bool occupied{false};  ///< Whether this entry currently owns a key/value pair.
-		uint8_t _pad[7]{};     ///< Explicit bytes preserving eight-byte entry alignment.
+		uint8_t _pad[7]{};     ///< Explicit occupancy padding; key/value types determine entry alignment.
 	};
 
 	std::array<entry, CUCKOO_BUCKET_SIZE> entries{};  ///< Fixed bucket entry extent.
@@ -167,7 +167,7 @@ struct alignas(CACHE_LINE_SIZE) cuckoo_bucket {
 /**
  * @brief Fixed-capacity cuckoo hash table.
  *
- * Provides O(1) worst-case lookup by checking exactly 2 bucket locations.
+ * Provides O(1) worst-case lookup by checking at most two candidate buckets.
  * Uses bucketing (4 entries per bucket) to improve cache efficiency and
  * reduce the frequency of displacements.
  *
@@ -219,6 +219,50 @@ class cuckoo_map {
 	using size_type = std::size_t;	///< Public size and bucket-count type.
 
 	/**
+	 * @brief Copied key and bucket coordinates issued by one stable map.
+	 *
+	 * The map must outlive this value. No entry, value or lookup result is
+	 * borrowed: intervening mutations are observed by find(). Only the map
+	 * can construct a query; copying preserves its issuing identity.
+	 */
+	class prepared_query {
+	    public:
+		/** @brief Copy one complete query without moving its key. */
+		prepared_query(const prepared_query &) noexcept = default;
+		/** @brief Replace this query with one complete copied query. @return This destination. */
+		prepared_query &operator=(const prepared_query &) noexcept = default;
+
+		/** @return The immutable semantic key owned by this query. */
+		[[nodiscard]] const Key &key() const noexcept
+		{
+			return key_;
+		}
+
+	    private:
+		friend class cuckoo_map;
+
+		/**
+		 * @brief Bind a copied key to its issuing map and exact bucket ordinals.
+		 * @param owner Stable map that issued these coordinates.
+		 * @param key Semantic identity copied without default construction or moving.
+		 * @param first First-table bucket ordinal.
+		 * @param second Second-table bucket ordinal.
+		 */
+		prepared_query(const cuckoo_map *owner, const Key &key, size_type first, size_type second) noexcept
+			: owner_(owner)
+			, key_(key)
+			, first_(first)
+			, second_(second)
+		{
+		}
+
+		const cuckoo_map *owner_;  ///< Stable issuing-map identity; never an entry borrow.
+		Key key_;		   ///< Semantic key, copied through the map's nothrow contract.
+		size_type first_;	   ///< First-table bucket ordinal.
+		size_type second_;	   ///< Second-table bucket ordinal.
+	};
+
+	/**
 	 * @brief Construct cuckoo map with specified capacity.
 	 *
 	 * @param num_buckets Positive bucket count, rounded to the next power of two.
@@ -226,7 +270,7 @@ class cuckoo_map {
 	 *        the failure-atomic displacement log; it must outlive the map.
 	 * @throws std::invalid_argument when the bucket count is zero or cannot be
 	 *         rounded without overflow, or when @p memory_resource is null.
-	 * @throws Any allocation exception emitted by the supplied resource.
+	 * @throws Exceptions from the supplied resource or cold key/value/hash construction.
 	 *
 	 * @note Actual capacity is num_buckets * CUCKOO_BUCKET_SIZE * 2 (two tables)
 	 * @note Recommended load factor: 50% for best performance
@@ -240,10 +284,56 @@ class cuckoo_map {
 	{
 	}
 
+	/** @brief Preserve the exact resource and issuing-map identity. */
+	cuckoo_map(const cuckoo_map &) = delete;
+	/** @brief Preserve the exact resource and issuing-map identity. */
+	cuckoo_map &operator=(const cuckoo_map &) = delete;
+	/** @brief Keep this map's address stable for every prepared query. */
+	cuckoo_map(cuckoo_map &&) = delete;
+	/** @brief Keep this map's address stable for every prepared query. */
+	cuckoo_map &operator=(cuckoo_map &&) = delete;
+
+	/**
+	 * @brief Compute and prefetch both candidate buckets without reading entries.
+	 * @param key Semantic key copied into the returned query.
+	 * @return Map-bound query valid until this map is destroyed.
+	 */
+	[[nodiscard]] KINETUM_ALWAYS_INLINE prepared_query prepare(const Key &key) const noexcept
+	{
+		const auto [h1, h2] = hash_pair(key);
+		const size_type first = h1 & mask_;
+		const size_type second = h2 & mask_;
+		prefetch_buckets_(first, second);
+		return prepared_query(this, key, first, second);
+	}
+
+	/**
+	 * @brief Search current contents using a query issued by this map.
+	 * @param query Copied lookup facts; intervening mutations do not invalidate them.
+	 * @return Current value or null. A foreign issuing-map identity terminates.
+	 */
+	[[nodiscard]] KINETUM_ALWAYS_INLINE Value *find(const prepared_query &query) noexcept
+	{
+		if (KINETUM_UNLIKELY(query.owner_ != this)) {
+			std::terminate();
+		}
+		return find_buckets_(query.key_, query.first_, query.second_);
+	}
+
+	/**
+	 * @brief Search current contents without granting mutable value access.
+	 * @param query Facts issued by this map; a foreign identity terminates.
+	 * @return Immutable current value, or null when absent.
+	 */
+	[[nodiscard]] KINETUM_ALWAYS_INLINE const Value *find(const prepared_query &query) const noexcept
+	{
+		return const_cast<cuckoo_map *>(this)->find(query);
+	}
+
 	/**
 	 * @brief Find value by key.
 	 *
-	 * O(1) worst-case: checks exactly 2 bucket locations.
+	 * O(1) worst-case: checks at most two candidate buckets.
 	 *
 	 * @param key Key to find
 	 * @return Pointer to value if found, nullptr otherwise
@@ -252,17 +342,10 @@ class cuckoo_map {
 	{
 		const auto [h1, h2] = hash_pair(key);
 
-		// Prefetch both buckets (parallel memory access)
-		KINETUM_PREFETCH_L1(&table1_[h1 & mask_]);
-		KINETUM_PREFETCH_L1(&table2_[h2 & mask_]);
-
-		// Check first table
-		if (Value *v = table1_[h1 & mask_].find(key)) {
-			return v;
-		}
-
-		// Check second table
-		return table2_[h2 & mask_].find(key);
+		const size_type first = h1 & mask_;
+		const size_type second = h2 & mask_;
+		prefetch_buckets_(first, second);
+		return find_buckets_(key, first, second);
 	}
 
 	/**
@@ -359,6 +442,33 @@ class cuckoo_map {
 	}
 
     private:
+	/**
+	 * @brief Prefetch stable bucket storage without inspecting mutable entries.
+	 * @param first First-table bucket ordinal.
+	 * @param second Second-table bucket ordinal.
+	 */
+	KINETUM_ALWAYS_INLINE void prefetch_buckets_(size_type first, size_type second) const noexcept
+	{
+		KINETUM_PREFETCH_L1(&table1_[first]);
+		KINETUM_PREFETCH_L1(&table2_[second]);
+	}
+
+	/**
+	 * @brief Search the two current candidate buckets in canonical order.
+	 * @param key Semantic key to compare.
+	 * @param first First-table bucket ordinal.
+	 * @param second Second-table bucket ordinal.
+	 * @return Current value, or null when absent from both candidates.
+	 */
+	[[nodiscard]] KINETUM_ALWAYS_INLINE Value *find_buckets_(const Key &key, size_type first,
+								 size_type second) noexcept
+	{
+		if (Value *value = table1_[first].find(key)) {
+			return value;
+		}
+		return table2_[second].find(key);
+	}
+
 	/** Cache-aligned bucket representation for this key/value pair. */
 	using bucket_type = cuckoo_bucket<Key, Value>;
 
@@ -381,7 +491,7 @@ class cuckoo_map {
 	/**
 	 * @brief Compute hash pair for cuckoo tables.
 	 *
-	 * Uses two independent hash functions derived from the primary hash.
+	 * Derive both candidates from the same semantic hash with distinct mixes.
 	 *
 	 * @param key Semantic key consumed by the explicit caller hasher.
 	 * @return First- and second-table candidate hashes.
@@ -389,13 +499,9 @@ class cuckoo_map {
 	KINETUM_ALWAYS_INLINE
 	std::pair<uint64_t, uint64_t> hash_pair(const Key &key) const noexcept
 	{
-		// Primary hash
-		uint64_t h = hasher_(key);
-
-		// Secondary hash: mix with different constant
-		// This ensures h1 and h2 are independent
-		uint64_t h1 = splitmix64(h);
-		uint64_t h2 = splitmix64(h ^ 0xc4ceb9fe1a85ec53ULL);
+		const uint64_t h = hasher_(key);
+		const uint64_t h1 = splitmix64(h);
+		const uint64_t h2 = splitmix64(h ^ 0xc4ceb9fe1a85ec53ULL);
 
 		return {h1, h2};
 	}
@@ -442,9 +548,7 @@ class cuckoo_map {
 				return true;
 			}
 
-			// Evict entry using round-robin selection (deterministic but distributed)
-			// Cycle through bucket entries based on kick count to avoid always evicting [0]
-			// This improves performance by distributing displacement chains evenly
+			// Rotate victims deterministically instead of always evicting entry zero.
 			const std::size_t victim_idx = kick % CUCKOO_BUCKET_SIZE;
 			auto &victim = bucket.entries[victim_idx];
 			undo_log_[undo_count++] = undo_record{use_table1, bucket_idx,	victim_idx,

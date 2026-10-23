@@ -16,11 +16,14 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <concepts>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <memory_resource>
+#include <map>
+#include <set>
 #include <stdexcept>
 #include <string_view>
 #include <thread>
@@ -128,6 +131,8 @@ struct throwing_batch_value {
 /** @brief Nothrow value with an exact live-object counter for batch proofs. */
 struct tracked_batch_value {
 	static inline std::size_t live_count = 0;  ///< Number of currently live objects.
+	static inline const tracked_batch_value *last_move_destination =
+		nullptr;  ///< Observed placement of the last move construction.
 
 	/** @brief Construct one tracked zero-valued output destination. */
 	tracked_batch_value() noexcept
@@ -166,6 +171,7 @@ struct tracked_batch_value {
 		: value(other.value)
 	{
 		++live_count;
+		last_move_destination = this;
 	}
 
 	/**
@@ -240,6 +246,47 @@ struct constant_hash {
 using test_cuckoo_map = cuckoo_map<uint32_t, uint32_t, constant_hash>;
 static_assert(!std::is_default_constructible_v<test_cuckoo_map>);
 static_assert(!std::is_constructible_v<test_cuckoo_map, std::size_t>);
+static_assert(!std::is_copy_constructible_v<test_cuckoo_map>);
+static_assert(!std::is_copy_assignable_v<test_cuckoo_map>);
+static_assert(!std::is_move_constructible_v<test_cuckoo_map>);
+static_assert(!std::is_move_assignable_v<test_cuckoo_map>);
+
+/** @brief Count cold defaults and forbid moves while retaining the map's existing key requirements. */
+struct copy_only_key {
+	static inline uint32_t defaults = 0;  ///< Default constructions, which query preparation must not perform.
+	uint32_t value{0};		      ///< Semantic identity.
+	/** @brief Record a permitted cold default construction. */
+	copy_only_key() noexcept(false)
+	{
+		++defaults;
+	}
+	/** @brief Copy the semantic key without throwing. */
+	copy_only_key(const copy_only_key &) noexcept = default;
+	/** @brief Replace the semantic key without throwing. @return This destination. */
+	copy_only_key &operator=(const copy_only_key &) noexcept = default;
+	copy_only_key(copy_only_key &&) = delete;
+	copy_only_key &operator=(copy_only_key &&) = delete;
+	/** @return Equality of the semantic value. */
+	bool operator==(const copy_only_key &) const noexcept = default;
+};
+
+/** @brief Hash only the copied semantic value. */
+struct copy_only_key_hash {
+	/** @param key Borrowed semantic key. @return Semantic hash with no key construction. */
+	std::size_t operator()(const copy_only_key &key) const noexcept
+	{
+		return key.value;
+	}
+};
+
+/** @brief Deterministic semantic hash for the independent mutation oracle. */
+struct integer_key_hash {
+	/** @param key Semantic integer identity. @return Its mixed value. */
+	std::size_t operator()(uint32_t key) const noexcept
+	{
+		return splitmix64(key);
+	}
+};
 
 /** @brief Caller-owned node used to prove exact intrusive-list membership. */
 struct test_lru_node final : lru_node {
@@ -780,6 +827,135 @@ TEST(algo_queue, borrowed_spsc_peek_does_not_consume_front)
 	EXPECT_TRUE(ring.empty());
 }
 
+/** @brief Every SPSC composition inherits the core's four cursor lines without changing element capacity. */
+TEST(algo_queue, spsc_cursor_layout_is_owned_by_the_shared_core)
+{
+	using static_core = detail::spsc_ring_core<uint64_t, 8u>;
+	using dynamic_core = detail::spsc_ring_core<uint64_t, 0u>;
+	static_assert(alignof(static_core) == CACHE_LINE_SIZE);
+	static_assert(alignof(dynamic_core) == CACHE_LINE_SIZE);
+	static_assert(sizeof(static_core) == 5u * CACHE_LINE_SIZE);
+	static_assert(sizeof(dynamic_core) == sizeof(static_core));
+	static_assert(sizeof(spsc_ring_view<uint64_t>) == sizeof(dynamic_core));
+	static_assert(sizeof(spsc_ring_static<uint64_t, 8u>) == sizeof(static_core) + CACHE_LINE_SIZE);
+	EXPECT_EQ(spsc_ring_storage_bytes<uint64_t>(8u), 8u * sizeof(uint64_t));
+}
+
+/** @brief Conditional consumption retains a refused head and suffix across wrap in every storage form. */
+TEST(algo_queue, conditional_prefix_preserves_refused_head_across_wrap)
+{
+	/** @brief Exercise one semantic FIFO sequence without inspecting ring indices. */
+	const auto exercise = [](auto &ring) {
+		const std::array input{7, 11, 13, 17, 19, 23};
+		ASSERT_EQ(ring.push_batch(input.data(), 4u), 4u);
+		std::array<int, 6> visited{};
+		std::size_t visits = 0u;
+		bool overflow = false;
+		bool refuse_thirteen = true;
+		/** @brief Record borrowed values, refusing one head without touching later values. */
+		const auto accept = [&](const int &value) noexcept {
+			if (visits == visited.size()) {
+				overflow = true;
+				return false;
+			}
+			visited[visits++] = value;
+			return !refuse_thirteen || value != 13;
+		};
+		EXPECT_EQ(ring.consume_prefix(0u, accept), 0u);
+		EXPECT_EQ(visits, 0u);
+		ASSERT_EQ(ring.consume_prefix(4u, accept), 2u);
+		EXPECT_EQ(visits, 3u);
+		EXPECT_EQ(ring.size_approx(), 2u);
+		ASSERT_EQ(ring.push_batch(input.data() + 4u, 2u), 2u);
+		refuse_thirteen = false;
+		ASSERT_EQ(ring.consume_prefix(3u, accept), 3u);
+		EXPECT_FALSE(overflow);
+		EXPECT_EQ(visited, (std::array{7, 11, 13, 13, 17, 19}));
+		std::array<int, 4> remaining{};
+		ASSERT_EQ(ring.pop_batch(remaining.data(), remaining.size()), 1u);
+		EXPECT_EQ(remaining[0], 23);
+		EXPECT_TRUE(ring.empty());
+		EXPECT_EQ(ring.consume_prefix(4u, accept), 0u);
+		EXPECT_EQ(visits, 6u);
+	};
+	spsc_ring_static<int, 4u> embedded;
+	exercise(embedded);
+	spsc_ring<int> allocated(4u);
+	exercise(allocated);
+	alignas(int) std::array<std::byte, 4u * sizeof(int)> storage{};
+	spsc_ring_view<int> borrowed(storage.data(), storage.size(), 4u);
+	exercise(borrowed);
+}
+
+/** @brief Refusal preserves a live value; acceptance destroys each value only after its callback returns. */
+TEST(algo_queue, conditional_prefix_preserves_nontrivial_lifetimes)
+{
+	ASSERT_EQ(tracked_batch_value::live_count, 0u);
+	spsc_ring_static<tracked_batch_value, 2u> ring;
+	ASSERT_TRUE(ring.try_emplace(7));
+	ASSERT_TRUE(ring.try_emplace(11));
+	const auto refused = ring.consume_prefix(2u, [](const tracked_batch_value &) noexcept { return false; });
+	EXPECT_EQ(refused, 0u);
+	EXPECT_EQ(tracked_batch_value::live_count, 2u);
+	std::array<std::size_t, 2> live_during{};
+	std::array<int, 2> values{};
+	std::size_t visits = 0u;
+	const auto consumed = ring.consume_prefix(2u, [&](const tracked_batch_value &value) noexcept {
+		if (visits == values.size()) {
+			return false;
+		}
+		live_during[visits] = tracked_batch_value::live_count;
+		values[visits++] = value.value;
+		return true;
+	});
+	EXPECT_EQ(consumed, 2u);
+	EXPECT_EQ(live_during, (std::array<std::size_t, 2>{2u, 1u}));
+	EXPECT_EQ(values, (std::array{7, 11}));
+	EXPECT_EQ(tracked_batch_value::live_count, 0u);
+	EXPECT_TRUE(ring.empty());
+}
+
+/** @brief Producer bursts and conditional consumer prefixes publish exact ordered values across repeated wrap. */
+TEST(algo_queue, conditional_prefix_preserves_cross_thread_publication)
+{
+	constexpr uint64_t TOTAL = 100000u;
+	spsc_ring_static<uint64_t, 8u> ring;
+	std::atomic<bool> failed{false};
+	const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+	std::thread producer([&] {
+		uint64_t next = 0u;
+		std::array<uint64_t, 7> values{};
+		while (next < TOTAL && !failed.load(std::memory_order_relaxed)) {
+			const std::size_t count =
+				static_cast<std::size_t>(std::min<uint64_t>(values.size(), TOTAL - next));
+			for (std::size_t index = 0u; index < count; ++index) {
+				values[index] = next + index;
+			}
+			next += ring.push_batch(values.data(), count);
+			if (std::chrono::steady_clock::now() >= deadline) {
+				failed.store(true, std::memory_order_relaxed);
+			}
+		}
+	});
+	uint64_t expected = 0u;
+	while (expected < TOTAL && !failed.load(std::memory_order_relaxed)) {
+		(void)ring.consume_prefix(5u, [&](const uint64_t &value) noexcept {
+			if (value != expected) {
+				failed.store(true, std::memory_order_relaxed);
+			}
+			++expected;
+			return true;
+		});
+		if (std::chrono::steady_clock::now() >= deadline) {
+			failed.store(true, std::memory_order_relaxed);
+		}
+	}
+	producer.join();
+	EXPECT_FALSE(failed.load(std::memory_order_relaxed));
+	EXPECT_EQ(expected, TOTAL);
+	EXPECT_TRUE(ring.empty());
+}
+
 /**
  * @brief Verify optional pop supports move only non default values.
  */
@@ -790,6 +966,84 @@ TEST(algo_queue, optional_pop_supports_move_only_non_default_values)
 	auto static_value = static_ring.try_pop();
 	ASSERT_TRUE(static_value.has_value());
 	EXPECT_EQ(static_value->value, 7);
+}
+
+/** @brief Owning and borrowed membership preserve the same exact universe against an independent set. */
+TEST(algo_compact_index_set, borrowed_and_owning_sets_match_the_reference_universe)
+{
+	for (const std::size_t limit : {0u, 1u, 63u, 64u, 65u, 130u, 1024u}) {
+		SCOPED_TRACE(limit);
+		std::vector<uint64_t> words(compact_index_set_view::storage_word_count(limit), UINT64_MAX);
+		compact_index_set_view borrowed(words, limit);
+		compact_index_set owned(limit);
+		std::set<std::size_t> reference;
+		EXPECT_EQ(borrowed.value_limit(), limit);
+		for (std::size_t value = 0u; value < limit + 3u; ++value) {
+			EXPECT_FALSE(borrowed.contains(value));
+			if (value % 3u == 0u) {
+				const bool admitted = value < limit && reference.insert(value).second;
+				EXPECT_EQ(borrowed.insert(value), admitted);
+				EXPECT_EQ(owned.insert(value), admitted);
+				EXPECT_FALSE(borrowed.insert(value));
+				EXPECT_FALSE(owned.insert(value));
+			}
+		}
+		for (std::size_t value = 0u; value < limit + 3u; ++value) {
+			EXPECT_EQ(borrowed.contains(value), reference.contains(value));
+			EXPECT_EQ(owned.contains(value), reference.contains(value));
+		}
+		EXPECT_FALSE(borrowed.contains(std::numeric_limits<std::size_t>::max()));
+	}
+}
+
+/** @brief Owning membership moves its bound with storage and leaves every source safely empty. */
+TEST(algo_compact_index_set, copy_and_move_preserve_complete_universe_ownership)
+{
+	compact_index_set source(130u);
+	ASSERT_TRUE(source.insert(0u));
+	ASSERT_TRUE(source.insert(129u));
+	compact_index_set copied(source);
+	ASSERT_TRUE(copied.insert(64u));
+	EXPECT_FALSE(source.contains(64u));
+	compact_index_set moved(std::move(source));
+	EXPECT_EQ(source.value_limit(), 0u);
+	EXPECT_FALSE(source.contains(0u));
+	EXPECT_FALSE(source.contains(129u));
+	EXPECT_FALSE(source.insert(0u));
+	EXPECT_EQ(moved.value_limit(), 130u);
+	EXPECT_TRUE(moved.contains(0u));
+	EXPECT_TRUE(moved.contains(129u));
+	compact_index_set target(1024u);
+	ASSERT_TRUE(target.insert(1000u));
+	target = std::move(moved);
+	EXPECT_EQ(target.value_limit(), 130u);
+	EXPECT_FALSE(target.contains(1000u));
+	EXPECT_TRUE(target.contains(129u));
+	EXPECT_EQ(moved.value_limit(), 0u);
+	EXPECT_FALSE(moved.contains(129u));
+	EXPECT_FALSE(moved.insert(0u));
+	auto *alias = &target;
+	target = std::move(*alias);
+	EXPECT_EQ(target.value_limit(), 130u);
+	EXPECT_TRUE(target.contains(129u));
+	source = copied;
+	EXPECT_EQ(source.value_limit(), 130u);
+	EXPECT_TRUE(source.contains(64u));
+}
+
+/** @brief A borrowed set rejects both short and excess backing extents without changing the caller's words. */
+TEST(algo_compact_index_set, borrowed_extent_must_equal_the_complete_universe)
+{
+	std::array<uint64_t, 2> words{UINT64_MAX, UINT64_MAX};
+	EXPECT_THROW((compact_index_set_view(words, 64u)), std::invalid_argument);
+	EXPECT_THROW((compact_index_set_view(std::span<uint64_t>(words).first(1u), 65u)), std::invalid_argument);
+	EXPECT_EQ(words, (std::array<uint64_t, 2>{UINT64_MAX, UINT64_MAX}));
+	compact_index_set_view view(words, 65u);
+	EXPECT_EQ(words, (std::array<uint64_t, 2>{0u, 0u}));
+	EXPECT_TRUE(view.insert(64u));
+	EXPECT_EQ(words[1], 1u);
+	EXPECT_FALSE(view.insert(65u));
+	EXPECT_FALSE(view.contains(127u));
 }
 
 /** @brief Verify caller-storage owner queues retain exact runtime FIFO capacity. */
@@ -816,6 +1070,96 @@ TEST(algo_queue, borrowed_work_queue_uses_exact_single_owner_arithmetic)
 		ASSERT_TRUE(queue.try_pop(value));
 		EXPECT_EQ(value, expected);
 	}
+	EXPECT_TRUE(queue.empty());
+}
+
+/** @brief Consume partial and wrapped work-queue batches in FIFO order without touching the output suffix. */
+TEST(algo_queue, work_queue_batches_preserve_wrapped_prefixes)
+{
+	std::array<work_queue_view<uint32_t>::storage_type, 4> storage{};
+	work_queue_view<uint32_t> queue(storage.data(), storage.size());
+	std::array<uint32_t, 6> output{};
+	output.fill(UINT32_MAX);
+	EXPECT_EQ(queue.pop_batch(nullptr, 0u), 0u);
+	EXPECT_EQ(queue.pop_batch(output.data(), output.size()), 0u);
+	for (uint32_t value = 1u; value <= 4u; ++value) {
+		ASSERT_TRUE(queue.try_push(value));
+	}
+	ASSERT_EQ(queue.pop_batch(output.data(), 3u), 3u);
+	EXPECT_EQ(output, (std::array<uint32_t, 6>{1u, 2u, 3u, UINT32_MAX, UINT32_MAX, UINT32_MAX}));
+	for (uint32_t value = 5u; value <= 7u; ++value) {
+		ASSERT_TRUE(queue.try_push(value));
+	}
+	EXPECT_TRUE(queue.full());
+	EXPECT_FALSE(queue.try_push(8u));
+	output.fill(UINT32_MAX);
+	ASSERT_EQ(queue.pop_batch(output.data(), output.size()), 4u);
+	EXPECT_EQ(output, (std::array<uint32_t, 6>{4u, 5u, 6u, 7u, UINT32_MAX, UINT32_MAX}));
+	EXPECT_TRUE(queue.empty());
+	EXPECT_EQ(queue.pop_batch(output.data(), output.size()), 0u);
+}
+
+/** @brief Batch movement uses caller slots and retires each lifetime exactly once through wrap and clear. */
+TEST(algo_queue, work_queue_batch_lifetimes_are_exact)
+{
+	ASSERT_EQ(tracked_batch_value::live_count, 0u);
+	{
+		std::array<work_queue_view<tracked_batch_value>::storage_type, 4> storage{};
+		work_queue_view<tracked_batch_value> queue(storage.data(), storage.size());
+		std::array<tracked_batch_value, 3> output{};
+		for (int value = 1; value <= 4; ++value) {
+			ASSERT_TRUE(queue.try_push(tracked_batch_value(value)));
+			const auto placed =
+				reinterpret_cast<std::uintptr_t>(tracked_batch_value::last_move_destination);
+			const auto first = reinterpret_cast<std::uintptr_t>(storage.data());
+			EXPECT_GE(placed, first);
+			EXPECT_LT(placed, first + sizeof(storage));
+		}
+		EXPECT_EQ(tracked_batch_value::live_count, 7u);
+		ASSERT_EQ(queue.pop_batch(output.data(), output.size()), 3u);
+		EXPECT_EQ(tracked_batch_value::live_count, 4u);
+		for (std::size_t index = 0u; index < output.size(); ++index) {
+			EXPECT_EQ(output[index].value, static_cast<int>(index + 1u));
+		}
+		for (int value = 5; value <= 7; ++value) {
+			ASSERT_TRUE(queue.try_push(tracked_batch_value(value)));
+			const auto placed =
+				reinterpret_cast<std::uintptr_t>(tracked_batch_value::last_move_destination);
+			const auto first = reinterpret_cast<std::uintptr_t>(storage.data());
+			EXPECT_GE(placed, first);
+			EXPECT_LT(placed, first + sizeof(storage));
+		}
+		ASSERT_EQ(queue.pop_batch(output.data(), output.size()), 3u);
+		EXPECT_EQ(tracked_batch_value::live_count, 4u);
+		for (std::size_t index = 0u; index < output.size(); ++index) {
+			EXPECT_EQ(output[index].value, static_cast<int>(index + 4u));
+		}
+		queue.clear();
+		EXPECT_EQ(tracked_batch_value::live_count, 3u);
+		ASSERT_TRUE(queue.try_push(tracked_batch_value(8)));
+	}
+	EXPECT_EQ(tracked_batch_value::live_count, 0u);
+}
+
+/** @brief Work batches preserve nothrow constraints and the existing modular capacity wall. */
+TEST(algo_queue, work_queue_batch_type_and_capacity_contracts_are_exact)
+{
+	static_assert(supports_batch_pop<work_queue_view<move_only_no_default>>);
+	static_assert(!supports_batch_pop<work_queue_view<throwing_batch_value>>);
+	using queue_type = work_queue_view<move_only_no_default>;
+	EXPECT_FALSE(queue_type::valid_capacity(0u));
+	EXPECT_FALSE(queue_type::valid_capacity(1u));
+	EXPECT_FALSE(queue_type::valid_capacity(3u));
+	EXPECT_FALSE(queue_type::valid_capacity(std::numeric_limits<std::size_t>::max() / 2u + 1u));
+	EXPECT_TRUE(queue_type::valid_capacity(2u));
+	std::array<queue_type::storage_type, 2> storage{};
+	queue_type queue(storage.data(), storage.size());
+	ASSERT_TRUE(queue.try_push(move_only_no_default(17)));
+	ASSERT_TRUE(queue.try_push(move_only_no_default(23)));
+	std::array<move_only_no_default, 2> output{move_only_no_default(0), move_only_no_default(0)};
+	ASSERT_EQ(queue.pop_batch(output.data(), output.size()), 2u);
+	EXPECT_EQ(output[0].value, 17);
+	EXPECT_EQ(output[1].value, 23);
 	EXPECT_TRUE(queue.empty());
 }
 
@@ -983,6 +1327,86 @@ TEST(algo_cuckoo, failed_insert_preserves_existing_entries)
 TEST(algo_cuckoo, map_object_does_not_embed_displacement_log)
 {
 	EXPECT_LT(sizeof(test_cuckoo_map), 1024u);
+}
+
+/** @brief Prepared queries observe updates, erasure, reinsertions and failed displacement without cached results. */
+TEST(algo_cuckoo, prepared_queries_observe_current_collision_bucket_contents)
+{
+	test_cuckoo_map map(1u, std::pmr::new_delete_resource());
+	std::vector<test_cuckoo_map::prepared_query> queries;
+	queries.reserve(9u);
+	for (uint32_t key = 0; key < 9u; ++key) {
+		queries.push_back(map.prepare(key));
+		EXPECT_EQ(map.find(queries.back()), nullptr);
+	}
+	for (uint32_t key = 0; key < 8u; ++key) {
+		ASSERT_TRUE(map.insert(key, key + 100u));
+	}
+	EXPECT_FALSE(map.insert(8u, 108u));
+	for (uint32_t key = 0; key < 8u; ++key) {
+		ASSERT_NE(map.find(queries[key]), nullptr);
+		EXPECT_EQ(*map.find(queries[key]), key + 100u);
+	}
+	ASSERT_TRUE(map.erase(3u));
+	EXPECT_EQ(map.find(queries[3]), nullptr);
+	ASSERT_TRUE(map.insert(8u, 108u));
+	ASSERT_TRUE(map.insert(2u, 999u));
+	EXPECT_EQ(*std::as_const(map).find(queries[8]), 108u);
+	EXPECT_EQ(*map.find(queries[2]), 999u);
+	test_cuckoo_map other(1u, std::pmr::new_delete_resource());
+	EXPECT_DEATH((void)other.find(queries[0]), "");
+	EXPECT_DEATH((void)std::as_const(other).find(queries[0]), "");
+}
+
+/** @brief Query creation and copying require neither a key default construction nor a move. */
+TEST(algo_cuckoo, prepared_query_preserves_the_nothrow_copy_key_contract)
+{
+	cuckoo_map<copy_only_key, uint32_t, copy_only_key_hash> map(2u, std::pmr::new_delete_resource());
+	copy_only_key key;
+	key.value = 37u;
+	const auto defaults = copy_only_key::defaults;
+	const auto query = map.prepare(key);
+	const auto copied = query;
+	EXPECT_EQ(copy_only_key::defaults, defaults);
+	EXPECT_EQ(map.find(query), nullptr);
+	ASSERT_TRUE(map.insert(key, 73u));
+	ASSERT_NE(map.find(copied), nullptr);
+	EXPECT_EQ(*map.find(copied), 73u);
+	EXPECT_EQ(copy_only_key::defaults, defaults);
+}
+
+/** @brief Long-lived queries and scalar lookup agree with an independent map after every mutation. */
+TEST(algo_cuckoo, prepared_queries_match_independent_mutation_oracle)
+{
+	using map_type = cuckoo_map<uint32_t, uint32_t, integer_key_hash>;
+	constexpr uint32_t KEY_COUNT = 96u;
+	map_type map(8u, std::pmr::new_delete_resource());
+	std::vector<map_type::prepared_query> queries;
+	queries.reserve(KEY_COUNT);
+	for (uint32_t key = 0; key < KEY_COUNT; ++key) {
+		queries.push_back(map.prepare(key));
+	}
+	std::map<uint32_t, uint32_t> reference;
+	uint32_t state = 0x4b1d5u;
+	for (uint32_t step = 0; step < 4096u; ++step) {
+		state = state * 1664525u + 1013904223u;
+		const uint32_t key = (state >> 8u) % KEY_COUNT;
+		if ((state & 3u) == 0u) {
+			EXPECT_EQ(map.erase(key), reference.erase(key) != 0u);
+		} else if (map.insert(key, step)) {
+			reference[key] = step;
+		}
+		ASSERT_EQ(map.size(), reference.size());
+		for (uint32_t candidate = 0; candidate < KEY_COUNT; ++candidate) {
+			const auto expected = reference.find(candidate);
+			const auto *prepared = map.find(queries[candidate]);
+			EXPECT_EQ(prepared, map.find(candidate));
+			ASSERT_EQ(prepared != nullptr, expected != reference.end());
+			if (prepared != nullptr) {
+				EXPECT_EQ(*prepared, expected->second);
+			}
+		}
+	}
 }
 
 /**

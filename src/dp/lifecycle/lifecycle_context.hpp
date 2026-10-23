@@ -57,6 +57,7 @@
 #include "src/common/status.hpp"
 #include "src/common/status_or.hpp"
 #include "src/dp/runtime_telemetry_bank.hpp"
+#include "src/dp/numa_layout.hpp"
 
 namespace kinetum::dp
 {
@@ -78,8 +79,8 @@ inline constexpr std::size_t LIFECYCLE_MAX_TELEMETRY_HANDLES =
 /** @brief Exact active/standby/activation-reserve telemetry-bank population. */
 inline constexpr std::size_t LIFECYCLE_TELEMETRY_BANK_COUNT = RUNTIME_TELEMETRY_BANK_COUNT;
 
-/** @brief Registry slab plus one exact three-bank bucket block per histogram. */
-inline constexpr std::size_t LIFECYCLE_MAX_INTERNAL_TELEMETRY_ALLOCATIONS = 1u + KINETUM_MAX_HISTOGRAMS;
+/** @brief Context/registry/bank allocation plus one exact three-bank bucket block per histogram. */
+inline constexpr std::size_t LIFECYCLE_MAX_INTERNAL_ALLOCATIONS = 1u + KINETUM_MAX_HISTOGRAMS;
 
 /** @brief Maximum histogram buckets merged and cleared in one cold service unit. */
 inline constexpr std::size_t LIFECYCLE_TELEMETRY_BUCKET_PREFIX = 64u;
@@ -523,6 +524,33 @@ struct lifecycle_module_telemetry_bank_view {
 };
 
 class lifecycle_context_owner;
+
+/** @brief Retain the issuing allocator's exact context block until the complete root is destroyed. */
+struct lifecycle_context_deleter {
+	lifecycle_memory_provider *provider{nullptr};  ///< Issuer that outlives the owned context.
+	lifecycle_memory_block block{};	 ///< Complete mapped root/telemetry allocation and unchanged release token.
+
+	/** @brief Construct empty context reclamation state. */
+	lifecycle_context_deleter() noexcept = default;
+	/** @param provider Issuing allocator. @param block Exact token for the constructed root's complete allocation. */
+	lifecycle_context_deleter(lifecycle_memory_provider *provider, lifecycle_memory_block block) noexcept;
+	/** @brief An allocator claim cannot be copied. */
+	lifecycle_context_deleter(const lifecycle_context_deleter &) = delete;
+	/** @brief An allocator claim cannot be copy-assigned. */
+	lifecycle_context_deleter &operator=(const lifecycle_context_deleter &) = delete;
+	/** @param other Sole issuer/block claim transferred into this deleter. */
+	lifecycle_context_deleter(lifecycle_context_deleter &&other) noexcept;
+	/** @param other Sole source. @return This empty-or-self destination after transfer. */
+	lifecycle_context_deleter &operator=(lifecycle_context_deleter &&other) noexcept;
+	/** @brief Require the owning context to have resolved its reclamation claim. */
+	~lifecycle_context_deleter();
+
+	/** @param owner Sole constructed context after all packet and lifecycle borrowers are quiescent. */
+	void operator()(lifecycle_context_owner *owner) noexcept;
+};
+
+/** @brief Linear context ownership retaining the existing lifecycle allocator's accounting claim. */
+using lifecycle_context_ownership = std::unique_ptr<lifecycle_context_owner, lifecycle_context_deleter>;
 struct lifecycle_borrow_state;
 
 /**
@@ -597,7 +625,7 @@ class lifecycle_context_owner {
 	 *        returned owner.
 	 * @return Unique owner, or an admission error for malformed identity.
 	 */
-	[[nodiscard]] static kinetum::common::status_or<std::unique_ptr<lifecycle_context_owner>>
+	[[nodiscard]] static kinetum::common::status_or<lifecycle_context_ownership>
 	create(lifecycle_context_identity &&identity, std::size_t context_memory_capacity_bytes,
 	       std::size_t epoch_arena_capacity_bytes, lifecycle_memory_provider &memory_provider,
 	       lifecycle_log_provider &log_provider);
@@ -646,8 +674,8 @@ class lifecycle_context_owner {
 	 * @return Immutable nonzero authored byte capacity.
 	 */
 	[[nodiscard]] std::size_t epoch_arena_capacity_bytes() const noexcept;
-	/** @return Exact platform-owned telemetry registry/bank overhead per context. */
-	[[nodiscard]] static std::size_t telemetry_storage_bytes() noexcept;
+	/** @return Exact platform-owned context-control and telemetry overhead per context. */
+	[[nodiscard]] static std::size_t platform_storage_bytes() noexcept;
 
 	/**
 	 * @brief Return the number of registered telemetry handles.
@@ -959,6 +987,15 @@ class lifecycle_context_owner {
 	static_assert(offsetof(telemetry_storage, health_owner) % kinetum::algo::CACHE_LINE_SIZE == 0u);
 	static_assert(offsetof(telemetry_storage, health_publication) % kinetum::algo::CACHE_LINE_SIZE == 0u);
 
+	/** @brief Complete context root and telemetry geometry through the shared layout mechanism. */
+	struct context_storage_layout {
+		numa_layout allocation;		   ///< Sole checked geometry and cold allocation composition.
+		std::size_t root_offset{0u};	   ///< Context control object.
+		std::size_t telemetry_offset{0u};  ///< Complete telemetry registry and bank storage.
+	};
+	/** @return Checked fixed context geometry; an unrepresentable compiled type layout terminates. */
+	[[nodiscard]] static context_storage_layout compute_storage_layout_() noexcept;
+
 	/**
 	 * @brief Construct one owner after identity admission succeeds.
 	 *
@@ -968,13 +1005,11 @@ class lifecycle_context_owner {
 	 * @param epoch_arena_capacity_bytes Exact per-epoch arena byte bound.
 	 * @param memory_provider Exact allocation and release authority.
 	 * @param log_provider Cold diagnostic authority.
-	 * @param telemetry_storage_block Exact provider-owned telemetry storage.
 	 * @param telemetry_storage_pointer Placement-constructed storage address.
 	 */
 	lifecycle_context_owner(lifecycle_context_identity &&identity, std::size_t context_memory_capacity_bytes,
 				std::size_t epoch_arena_capacity_bytes, lifecycle_memory_provider &memory_provider,
-				lifecycle_log_provider &log_provider, lifecycle_memory_block telemetry_storage_block,
-				telemetry_storage *telemetry_storage_pointer);
+				lifecycle_log_provider &log_provider, telemetry_storage *telemetry_storage_pointer);
 
 	/** @brief Clear borrowed operation state and release the exclusive claim. */
 	void end_operation_() noexcept;
@@ -1065,29 +1100,30 @@ class lifecycle_context_owner {
 	::kinetum_lifecycle_ctx borrowed_context_{};		  ///< Stable public two-pointer ABI shell.
 	std::array<long_lived_allocation_record, LIFECYCLE_MAX_LONG_LIVED_ALLOCATIONS> allocations_{};	///< Fixed ledger.
 	std::array<long_lived_allocation_record, KINETUM_MAX_HISTOGRAMS> telemetry_allocations_{};  ///< Internal buckets.
-	lifecycle_memory_block telemetry_storage_block_{};  ///< Exact worker-NUMA stable telemetry storage.
-	telemetry_storage *telemetry_storage_{nullptr};	    ///< Placement-constructed handles and banks.
-	std::size_t telemetry_count_{0};		    ///< Occupied descriptor-registry prefix.
-	std::size_t counter_count_{0};			    ///< Registered counters in the prefix.
-	std::size_t histogram_count_{0};		    ///< Registered histograms in the prefix.
+	alignas(64) telemetry_storage *telemetry_storage_{
+		nullptr};		  ///< Immutable hot views, separate from cold allocation claims.
+	std::size_t telemetry_count_{0};  ///< Occupied descriptor-registry prefix.
+	std::size_t counter_count_{0};	  ///< Registered counters in the prefix.
+	std::size_t histogram_count_{0};  ///< Registered histograms in the prefix.
 	std::array<std::array<uint64_t *, LIFECYCLE_TELEMETRY_BANK_COUNT>, KINETUM_MAX_HISTOGRAMS>
 		telemetry_histogram_banks_{};  ///< Cold pre-resolved bucket-bank starts.
 	std::array<uint32_t, KINETUM_MAX_HISTOGRAMS> telemetry_histogram_lengths_{};  ///< Exact bucket counts.
-	uint64_t telemetry_runtime_generation_{0};	       ///< Exact bound runtime generation.
-	uint16_t telemetry_stage_instance_index_{UINT16_MAX};  ///< Exact module stage identity.
-	uint64_t telemetry_active_epoch_{0};		       ///< Exact active telemetry epoch.
-	uint64_t telemetry_prepared_epoch_{0};		       ///< Exact reserved target epoch.
-	uint64_t telemetry_aggregated_epoch_{0};	       ///< Cold-confirmed fully aggregated epoch.
-	uint8_t telemetry_active_bank_{UINT8_MAX};	       ///< Current owner-writable bank.
-	uint8_t telemetry_standby_bank_{UINT8_MAX};	       ///< Same-epoch clean standby.
-	uint8_t telemetry_reserved_bank_{UINT8_MAX};	       ///< Target reserve.
-	uint8_t telemetry_free_bank_{UINT8_MAX};	       ///< Cold-owned unassigned slot identity.
-	bool telemetry_old_banks_retained_{false};	       ///< Missing standby is exact old-generation ownership.
-	bool telemetry_worker_quiesced_{false};		       ///< Whether no worker can consume a returned bank.
-	std::optional<runtime_telemetry_bank_token>
-		telemetry_reclaimed_transfer_;				     ///< Immutable issued-retirement record.
+	uint64_t telemetry_runtime_generation_{0};			     ///< Exact bound runtime generation.
+	uint16_t telemetry_stage_instance_index_{UINT16_MAX};		     ///< Exact module stage identity.
 	kinetum::dp::worker_telemetry_channel *telemetry_channel_{nullptr};  ///< Exact transfer authority.
-	std::atomic<bool> operation_active_{false};			     ///< Exclusive operation claim publication.
+	alignas(64) uint64_t telemetry_active_epoch_{0};    ///< Worker selectors, isolated from cold preparation.
+	uint8_t telemetry_active_bank_{UINT8_MAX};	    ///< Current owner-writable bank.
+	uint8_t telemetry_standby_bank_{UINT8_MAX};	    ///< Same-epoch clean standby.
+	bool telemetry_old_banks_retained_{false};	    ///< Missing standby is exact old-generation ownership.
+	alignas(64) uint64_t telemetry_prepared_epoch_{0};  ///< Cold-prepared identity, handed over at commit.
+	uint64_t telemetry_aggregated_epoch_{0};	    ///< Cold-confirmed fully aggregated epoch.
+	uint8_t telemetry_reserved_bank_{UINT8_MAX};	    ///< Target reserve.
+	uint8_t telemetry_free_bank_{UINT8_MAX};	    ///< Cold-owned unassigned slot identity.
+	bool telemetry_worker_quiesced_{false};		    ///< Whether no worker can consume a returned bank.
+	std::optional<runtime_telemetry_bank_token>
+		telemetry_reclaimed_transfer_;	///< Immutable issued-retirement record.
+	alignas(64) std::atomic<bool> operation_active_{
+		false};	 ///< Lifecycle-executor claim, separate from telemetry writers.
 };
 
 /**

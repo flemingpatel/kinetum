@@ -388,7 +388,7 @@ class aggregate_fixture final {
 	std::unique_ptr<module::module_runtime_generation> modules_;		  ///< Empty exact module generation.
 	runtime_status_publication runtime_status_;				  ///< Exact readiness/epoch truth.
 	std::unique_ptr<worker_telemetry_channel> channel_;			  ///< Exact SPSC bank transport.
-	std::unique_ptr<worker_runtime_telemetry> worker_;			  ///< Exact worker bank owner.
+	numa_owner<worker_runtime_telemetry> worker_;				  ///< Exact worker bank owner.
 	std::unique_ptr<runtime_telemetry_aggregator> aggregator_;		  ///< Sole cold bank consumer.
 	lifecycle::lifecycle_context_owner *module_owner_{nullptr};		  ///< Optional exact module bank owner.
 	bool module_health_claimed_{false};  ///< Whether the component fixture owns the linear health row.

@@ -9,6 +9,7 @@
 
 #include "src/dp/region_worker_launcher.hpp"
 
+#include <algorithm>
 #include <condition_variable>
 #include <exception>
 #include <limits>
@@ -91,10 +92,29 @@ status validate_region_worker_launch_spec(const region_worker_launch_spec &spec)
 	if (spec.worker_contexts.empty()) {
 		return status(status_code::INVALID_ARGUMENT, "runtime worker set cannot be empty");
 	}
+	if (spec.worker_contexts.size() - 1u > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+		return status(status_code::OUT_OF_RANGE, "compact worker index exceeds launcher callback range");
+	}
 	for (const auto &thread : *spec.threads) {
 		if (thread.joinable()) {
 			return status(status_code::FAILED_PRECONDITION, "worker thread vector already owns a thread");
 		}
+	}
+	try {
+		std::vector<worker_lifecycle_context *> identities(spec.worker_contexts.begin(),
+								   spec.worker_contexts.end());
+		if (std::any_of(identities.begin(), identities.end(),
+				[](const auto *context) { return context == nullptr; })) {
+			return status::invalid_argument("worker lifecycle membership contains a null record");
+		}
+		std::sort(identities.begin(), identities.end(), std::less<worker_lifecycle_context *>{});
+		if (std::adjacent_find(identities.begin(), identities.end()) != identities.end()) {
+			return status::invalid_argument("worker lifecycle membership contains a repeated record");
+		}
+	} catch (const std::bad_alloc &) {
+		return status::resource_exhausted("worker lifecycle membership validation exhausted memory");
+	} catch (const std::length_error &) {
+		return status(status_code::OUT_OF_RANGE, "worker lifecycle membership exceeds the host size domain");
 	}
 	return status::ok();
 }
@@ -107,17 +127,23 @@ status validate_region_worker_join_spec(const region_worker_join_spec &spec)
 	return status::ok();
 }
 
-void request_region_worker_exit(std::span<worker_lifecycle_context> contexts) noexcept
+void request_region_worker_exit(std::span<worker_lifecycle_context *const> contexts) noexcept
 {
-	for (auto &context : contexts) {
-		context.request_exit();
+	for (auto *context : contexts) {
+		if (context == nullptr) {
+			std::terminate();
+		}
+		context->request_exit();
 	}
 }
 
-void reset_region_worker_launch_reservation(std::span<worker_lifecycle_context> contexts) noexcept
+void reset_region_worker_launch_reservation(std::span<worker_lifecycle_context *const> contexts) noexcept
 {
-	for (auto &context : contexts) {
-		context.reset();
+	for (auto *context : contexts) {
+		if (context == nullptr) {
+			std::terminate();
+		}
+		context->reset();
 	}
 }
 
@@ -144,9 +170,9 @@ status std_thread_worker_launcher::launch(const region_worker_launch_spec &spec)
 	}
 
 	spec.threads->clear();
-	for (auto &context : spec.worker_contexts) {
-		context.reset();
-		context.set_state(worker_lifecycle_state::STARTING);
+	for (auto *context : spec.worker_contexts) {
+		context->reset();
+		context->set_state(worker_lifecycle_state::STARTING);
 	}
 
 	std::shared_ptr<std_thread_start_gate> gate;
@@ -154,9 +180,6 @@ status std_thread_worker_launcher::launch(const region_worker_launch_spec &spec)
 		gate = std::make_shared<std_thread_start_gate>();
 		spec.threads->reserve(spec.worker_contexts.size());
 		for (std::size_t worker_index = 0; worker_index < spec.worker_contexts.size(); ++worker_index) {
-			if (worker_index > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
-				throw std::length_error("compact worker index exceeds launcher callback range");
-			}
 			const auto worker_id = static_cast<int>(worker_index);
 			spec.threads->emplace_back([gate, configure_worker = spec.configure_worker,
 						    activate_worker = spec.activate_worker,
@@ -210,7 +233,7 @@ status std_thread_worker_launcher::launch(const region_worker_launch_spec &spec)
 				gate->cv.wait(lock, [&gate]() { return gate->release_workers; });
 				lock.unlock();
 
-				auto &worker_context = worker_contexts[static_cast<std::size_t>(worker_id)];
+				auto &worker_context = *worker_contexts[static_cast<std::size_t>(worker_id)];
 				if (try_enter_worker_running(worker_context) != worker_enter_running_result::RUNNING) {
 					// Every module ACTIVATE and the generation commit have completed.
 					// A competing or malformed lifecycle state can no longer be

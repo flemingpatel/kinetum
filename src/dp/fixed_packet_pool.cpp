@@ -13,10 +13,15 @@
 #include <cstring>
 #include <exception>
 #include <limits>
+#include <memory>
 #include <new>
+#include <type_traits>
 #include <utility>
 
+#include <kinetum/algo/bits.hpp>
+
 #include "src/common/status.hpp"
+#include "src/dp/numa_layout.hpp"
 
 namespace kinetum::dp
 {
@@ -27,57 +32,20 @@ namespace
 using kinetum::common::status;
 using kinetum::common::status_code;
 
-/**
- * @brief Round a logical record population up to the free queue's power-of-two capacity.
- *
- * @param value Nonzero logical population.
- * @return Rounded capacity, or a value below input when size_t cannot represent the result.
- */
-[[nodiscard]] std::size_t next_power_of_two(std::size_t value) noexcept
-{
-	std::size_t result = 2;
-	while (result < value && result <= std::numeric_limits<std::size_t>::max() / 2) {
-		result <<= 1;
-	}
-	return result;
-}
-
-/**
- * @brief Round a nonnegative value up to one nonzero power-of-two alignment.
- *
- * @param value Value to round.
- * @param alignment Nonzero power-of-two alignment.
- * @param[out] rounded Exact rounded value on success.
- * @return true when the rounded value is representable.
- */
-[[nodiscard]] bool round_up_checked(std::size_t value, std::size_t alignment, std::size_t &rounded) noexcept
-{
-	const std::size_t mask = alignment - 1u;
-	if (value > std::numeric_limits<std::size_t>::max() - mask) {
-		return false;
-	}
-	rounded = (value + mask) & ~mask;
-	return true;
-}
-
-/**
- * @brief Multiply two allocation dimensions without wrapping size_t.
- *
- * @param count Logical slot count.
- * @param stride Physical bytes per slot.
- * @param[out] bytes Exact allocation bytes on success.
- * @return true when the product is representable.
- */
-[[nodiscard]] bool allocation_size_checked(uint32_t count, std::size_t stride, std::size_t &bytes) noexcept
-{
-	if (stride == 0 || static_cast<std::size_t>(count) > std::numeric_limits<std::size_t>::max() / stride) {
-		return false;
-	}
-	bytes = static_cast<std::size_t>(count) * stride;
-	return true;
-}
-
 }  // namespace
+
+/** @brief Checked cold extents for the one storage-domain mapping. */
+struct fixed_packet_pool::storage_layout {
+	numa_layout memory;		     ///< Sole allocation geometry authority.
+	std::size_t queue_capacity{0};	     ///< Rounded physical cells, not additional packet credits.
+	std::size_t queue_offset{0};	     ///< Mutable queue control.
+	std::size_t cells_offset{0};	     ///< Exact free-queue cells.
+	std::size_t record_offset{0};	     ///< First record row.
+	std::size_t record_stride{0};	     ///< Cache-line-isolated record extent.
+	std::size_t payload_offset{0};	     ///< First payload row.
+	std::size_t payload_stride{0};	     ///< Cache-line-isolated payload extent.
+	std::size_t payload_data_offset{0};  ///< Aligned data after the authored headroom.
+};
 
 kinetum::common::status_or<std::unique_ptr<fixed_packet_pool>>
 fixed_packet_pool::create(const fixed_packet_pool_options &options)
@@ -102,92 +70,68 @@ fixed_packet_pool::create(const fixed_packet_pool_options &options)
 	if (options.generation == 0) {
 		return status(status_code::INVALID_ARGUMENT, "fixed packet pool has zero generation");
 	}
-	if (options.host_numa_node.has_value() && options.host_numa_node.value() < 0) {
+	if (options.host_numa_node < 0) {
 		return status(status_code::INVALID_ARGUMENT, "fixed packet pool host NUMA node must be nonnegative");
 	}
 
-	const auto queue_capacity = next_power_of_two(options.record_count);
-	if (queue_capacity < options.record_count) {
-		return status(status_code::OUT_OF_RANGE, "fixed packet pool free queue capacity overflows size_t");
-	}
 	const uint32_t maximum_packet_length = options.data_room_bytes - options.headroom_bytes;
 	if (maximum_packet_length > std::numeric_limits<uint16_t>::max()) {
 		return status(status_code::OUT_OF_RANGE,
 			      "fixed packet pool maximum packet length exceeds the packet-record ABI");
 	}
 
-	const std::size_t requested_alignment = options.alignment_bytes;
-	const std::size_t allocation_alignment = std::max<std::size_t>(alignof(packet_record), requested_alignment);
-	std::size_t record_stride = 0;
-	std::size_t aligned_headroom = 0;
-	if (!round_up_checked(sizeof(packet_record), allocation_alignment, record_stride) ||
-	    !round_up_checked(options.headroom_bytes, requested_alignment, aligned_headroom)) {
-		return status(status_code::OUT_OF_RANGE, "fixed packet pool alignment rounding overflows size_t");
+	storage_layout layout;
+	layout.queue_capacity =
+		static_cast<std::size_t>(algo::next_power_of_2_64(std::max<uint64_t>(2u, options.record_count)));
+	if (!free_queue::valid_capacity(layout.queue_capacity)) {
+		return status(status_code::OUT_OF_RANGE, "fixed packet pool free queue capacity overflows");
 	}
-	const std::size_t payload_prefix = aligned_headroom - options.headroom_bytes;
-	if (payload_prefix > std::numeric_limits<std::size_t>::max() - options.data_room_bytes) {
-		return status(status_code::OUT_OF_RANGE, "fixed packet pool payload span overflows size_t");
+	const std::size_t alignment = std::max<std::size_t>(alignof(packet_record), options.alignment_bytes);
+	numa_layout payload_row;
+	std::size_t headroom_offset = 0;
+	if (!payload_row.append<uint8_t>(options.headroom_bytes, headroom_offset) ||
+	    !payload_row.append<uint8_t>(maximum_packet_length, layout.payload_data_offset, options.alignment_bytes) ||
+	    !layout.memory.append<free_queue>(1u, layout.queue_offset, algo::CACHE_LINE_SIZE) ||
+	    !layout.memory.append<free_queue::storage_type>(layout.queue_capacity, layout.cells_offset) ||
+	    !layout.memory.append_rows<packet_record>(options.record_count, 1u, layout.record_offset,
+						      layout.record_stride, alignment) ||
+	    !layout.memory.append_rows<uint8_t>(options.record_count, payload_row.size(), layout.payload_offset,
+						layout.payload_stride, alignment)) {
+		return status(status_code::OUT_OF_RANGE, "fixed packet pool layout overflows");
 	}
-	const std::size_t payload_span = payload_prefix + options.data_room_bytes;
-	std::size_t payload_stride = 0;
-	if (!round_up_checked(payload_span, allocation_alignment, payload_stride)) {
-		return status(status_code::OUT_OF_RANGE, "fixed packet pool payload stride overflows size_t");
-	}
-	std::size_t record_bytes = 0;
-	std::size_t payload_bytes = 0;
-	if (!allocation_size_checked(options.record_count, record_stride, record_bytes) ||
-	    !allocation_size_checked(options.record_count, payload_stride, payload_bytes)) {
-		return status(status_code::OUT_OF_RANGE, "fixed packet pool backing allocation overflows size_t");
-	}
-	std::size_t payload_storage_offset = 0;
-	if (!round_up_checked(record_bytes, allocation_alignment, payload_storage_offset) ||
-	    payload_storage_offset > std::numeric_limits<std::size_t>::max() - payload_bytes) {
-		return status(status_code::OUT_OF_RANGE, "fixed packet pool combined backing overflows size_t");
-	}
-	const std::size_t backing_bytes = payload_storage_offset + payload_bytes;
-
-	std::unique_ptr<kinetum::algo::mpmc_queue_dynamic<packet_record *>> free_records;
-	try {
-		free_records = std::make_unique<kinetum::algo::mpmc_queue_dynamic<packet_record *>>(queue_capacity);
-	} catch (const std::bad_alloc &) {
-		return status(status_code::RESOURCE_EXHAUSTED, "fixed packet pool free-credit allocation failed");
-	}
-
-	auto backing_or = numa_memory_region::allocate({
-		.usable_bytes = backing_bytes,
-		.alignment_bytes = allocation_alignment,
-		.host_numa_node = options.host_numa_node,
-	});
+	auto backing_or = layout.memory.allocate(options.host_numa_node);
 	if (!backing_or.is_ok()) {
 		return backing_or.error();
 	}
-	auto *pool = new (std::nothrow)
-		fixed_packet_pool(options, queue_capacity, std::move(*backing_or), record_stride,
-				  payload_storage_offset, payload_stride, aligned_headroom, std::move(free_records));
+	auto *pool = new (std::nothrow) fixed_packet_pool(options, layout, std::move(*backing_or));
 	if (pool == nullptr) {
 		return status(status_code::RESOURCE_EXHAUSTED, "fixed packet pool owner allocation failed");
 	}
 	return std::unique_ptr<fixed_packet_pool>(pool);
 }
 
-fixed_packet_pool::fixed_packet_pool(
-	fixed_packet_pool_options options, std::size_t free_queue_capacity, numa_memory_region backing,
-	std::size_t record_stride, std::size_t payload_storage_offset, std::size_t payload_stride,
-	std::size_t payload_data_offset,
-	std::unique_ptr<kinetum::algo::mpmc_queue_dynamic<packet_record *>> free_records) noexcept
+fixed_packet_pool::fixed_packet_pool(fixed_packet_pool_options options, const storage_layout &layout,
+				     numa_memory_region backing) noexcept
 	: options_(options)
 	, backing_(std::move(backing))
-	, record_stride_(record_stride)
-	, payload_stride_(payload_stride)
-	, payload_data_offset_(payload_data_offset)
-	, record_storage_(static_cast<uint8_t *>(backing_.data()))
-	, payload_storage_(static_cast<uint8_t *>(backing_.data()) + payload_storage_offset)
-	, free_records_(std::move(free_records))
+	, record_stride_(layout.record_stride)
+	, payload_stride_(layout.payload_stride)
+	, payload_data_offset_(layout.payload_data_offset)
+	, record_storage_(reinterpret_cast<uint8_t *>(numa_layout::row<packet_record>(backing_, layout.record_offset,
+										      layout.record_stride, 0u,
+										      options.record_count, 1u)
+							      .data()))
+	, payload_storage_(numa_layout::row<uint8_t>(backing_, layout.payload_offset, layout.payload_stride, 0u,
+						     options.record_count, layout.payload_stride)
+				   .data())
+	, free_cells_(
+		  numa_layout::storage<free_queue::storage_type>(backing_, layout.cells_offset, layout.queue_capacity))
 {
-	if (!backing_ || backing_.size() == 0 || record_storage_ == nullptr || payload_storage_ == nullptr ||
-	    free_records_ == nullptr || free_records_->capacity() != free_queue_capacity) {
-		std::terminate();
-	}
+	static_assert(std::is_nothrow_default_constructible_v<free_queue::storage_type>);
+	static_assert(std::is_nothrow_default_constructible_v<packet_record>);
+	std::uninitialized_value_construct_n(free_cells_.data(), free_cells_.size());
+	free_records_ = std::construct_at(numa_layout::storage<free_queue>(backing_, layout.queue_offset).data(),
+					  free_cells_.data(), free_cells_.size());
 
 	operations_.state = this;
 	operations_.acquire_burst = &fixed_packet_pool::acquire_burst_;
@@ -232,6 +176,8 @@ fixed_packet_pool::~fixed_packet_pool()
 	for (uint32_t i = 0; i < options_.record_count; ++i) {
 		record_for_index_(i)->~packet_record();
 	}
+	std::destroy_at(free_records_);
+	std::destroy_n(free_cells_.data(), free_cells_.size());
 }
 
 uint16_t fixed_packet_pool::acquire_burst(packet_record **records, uint16_t capacity) noexcept

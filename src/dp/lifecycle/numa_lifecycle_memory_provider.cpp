@@ -15,6 +15,7 @@
 #include <utility>
 
 #include "src/common/status.hpp"
+#include "src/dp/numa_layout.hpp"
 
 namespace kinetum::dp::lifecycle
 {
@@ -83,7 +84,7 @@ numa_lifecycle_memory_provider::create(std::span<const numa_lifecycle_memory_bud
 	}
 
 	constexpr std::size_t LIVE_BLOCKS_PER_CONTEXT = LIFECYCLE_MAX_LONG_LIVED_ALLOCATIONS +
-							LIFECYCLE_MAX_INTERNAL_TELEMETRY_ALLOCATIONS +
+							LIFECYCLE_MAX_INTERNAL_ALLOCATIONS +
 							kinetum::common::EXACT_EPOCH_SLOT_COUNT;
 	std::size_t maximum_live_blocks = 0;
 	int32_t previous_numa_node = -1;
@@ -208,9 +209,15 @@ status_or<lifecycle_memory_block> numa_lifecycle_memory_provider::allocate(int32
 			kinetum::common::static_status_text(
 				"lifecycle NUMA allocation requires an exact node, positive size, and power-of-two alignment"));
 	}
+	numa_layout layout;
+	std::size_t offset = 0u;
+	if (!layout.append<std::byte>(size, offset, alignment)) {
+		return status(status_code::OUT_OF_RANGE,
+			      kinetum::common::static_status_text("lifecycle NUMA allocation layout overflows"));
+	}
 
-	std::size_t budget_index = budget_count_;
-	std::size_t slot_index = maximum_live_blocks_;
+	std::size_t budget_index;
+	std::size_t slot_index;
 	{
 		std::lock_guard<std::mutex> lock(mutex_);
 		std::size_t first = 0;
@@ -279,11 +286,7 @@ status_or<lifecycle_memory_block> numa_lifecycle_memory_provider::allocate(int32
 		budget.bytes_in_use += size;
 	}
 
-	auto region_or = numa_memory_region::allocate({
-		.usable_bytes = size,
-		.alignment_bytes = alignment,
-		.host_numa_node = numa_node,
-	});
+	auto region_or = layout.allocate(numa_node);
 	if (!region_or.is_ok()) {
 		std::lock_guard<std::mutex> lock(mutex_);
 		auto &slot = blocks_[slot_index];
@@ -338,7 +341,7 @@ void numa_lifecycle_memory_provider::release(lifecycle_memory_block block) noexc
 	}
 
 	numa_memory_region released;
-	std::size_t released_budget_index = budget_count_;
+	std::size_t released_budget_index;
 	{
 		std::lock_guard<std::mutex> lock(mutex_);
 		auto &slot = blocks_[released_slot_index];

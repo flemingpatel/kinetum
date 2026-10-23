@@ -12,8 +12,8 @@
 #include <algorithm>
 #include <cstddef>
 #include <limits>
+#include <memory>
 #include <new>
-#include <optional>
 #include <tuple>
 #include <utility>
 
@@ -24,36 +24,8 @@
 
 namespace kinetum::dp
 {
-namespace
-{
 
-/**
- * @brief Append one aligned cell per input without overflowing the storage size.
- * @tparam value_type Exact cell type determining size and alignment.
- * @param bindings Sole input population shared by all schedule tables.
- * @param[in,out] extent Current total, changed only on success.
- * @return Aligned array offset, or no value when the complete extent overflows.
- */
-template <typename value_type>
-[[nodiscard]] std::optional<std::size_t> append_extent(std::span<const worker_input_binding> bindings,
-						       std::size_t &extent) noexcept
-{
-	constexpr auto MAXIMUM = std::numeric_limits<std::size_t>::max();
-	constexpr auto ALIGNMENT = alignof(value_type);
-	if (extent > MAXIMUM - (ALIGNMENT - 1u)) {
-		return std::nullopt;
-	}
-	const std::size_t aligned = (extent + ALIGNMENT - 1u) & ~(ALIGNMENT - 1u);
-	if (bindings.size() > (MAXIMUM - aligned) / sizeof(value_type)) {
-		return std::nullopt;
-	}
-	extent = aligned + bindings.size() * sizeof(value_type);
-	return aligned;
-}
-
-}  // namespace
-
-common::status_or<std::unique_ptr<worker_input_scheduler>>
+common::status_or<numa_owner<worker_input_scheduler>>
 worker_input_scheduler::create(std::span<const worker_input_binding> bindings, int32_t numa_node)
 {
 	using order_type = algo::bounded_service_order;
@@ -83,54 +55,40 @@ worker_input_scheduler::create(std::span<const worker_input_binding> bindings, i
 		}
 	}
 
-	numa_memory_region storage;
+	numa_layout layout;
+	std::size_t root_offset = 0u;
+	std::size_t order_offset = 0u;
+	std::size_t endpoints_offset = 0u;
+	std::size_t entries_offset = 0u;
+	if (!layout.append<worker_input_scheduler>(1u, root_offset) ||
+	    !layout.append<order_type>(bindings.empty() ? 0u : 1u, order_offset) ||
+	    !layout.append<worker_input_endpoint>(bindings.size(), endpoints_offset) ||
+	    !layout.append<entry_type>(bindings.size(), entries_offset)) {
+		return common::status(common::status_code::OUT_OF_RANGE, "input schedule storage extent overflows");
+	}
+	auto storage_or = layout.allocate(numa_node);
+	if (!storage_or.is_ok()) {
+		return storage_or.error();
+	}
+	auto storage = std::move(storage_or).value();
+	auto endpoints = numa_layout::storage<worker_input_endpoint>(storage, endpoints_offset, bindings.size());
+	auto entries = numa_layout::storage<entry_type>(storage, entries_offset, bindings.size());
+	for (std::size_t index = 0u; index < bindings.size(); ++index) {
+		std::construct_at(&endpoints[index], bindings[index].endpoint);
+		std::construct_at(&entries[index], bindings[index].quantum);
+	}
 	order_type *order = nullptr;
-	std::span<const worker_input_endpoint> endpoints;
 	if (!bindings.empty()) {
-		std::size_t extent = sizeof(order_type);
-		const auto endpoint_offset = append_extent<worker_input_endpoint>(bindings, extent);
-		const auto entry_offset = append_extent<entry_type>(bindings, extent);
-		if (!endpoint_offset.has_value() || !entry_offset.has_value()) {
-			return common::status(common::status_code::OUT_OF_RANGE,
-					      "input schedule storage extent overflows");
-		}
-		auto storage_or = numa_memory_region::allocate({
-			.usable_bytes = extent,
-			.alignment_bytes =
-				std::max({static_cast<std::size_t>(algo::CACHE_LINE_SIZE), alignof(order_type),
-					  alignof(worker_input_endpoint), alignof(entry_type)}),
-			.host_numa_node = numa_node,
-		});
-		if (!storage_or.is_ok()) {
-			return storage_or.error();
-		}
-		storage = std::move(storage_or).value();
-		auto *base = static_cast<std::byte *>(storage.data());
-		auto *endpoint_data = reinterpret_cast<worker_input_endpoint *>(base + endpoint_offset.value());
-		auto *entry_data = reinterpret_cast<entry_type *>(base + entry_offset.value());
-		for (std::size_t index = 0u; index < bindings.size(); ++index) {
-			std::construct_at(endpoint_data + index, bindings[index].endpoint);
-			std::construct_at(entry_data + index, bindings[index].quantum);
-		}
-		// The complete population and every quantum were proved before mapping.
-		order = std::construct_at(static_cast<order_type *>(storage.data()),
-					  std::span<entry_type>(entry_data, bindings.size()));
-		endpoints = {endpoint_data, bindings.size()};
+		order = std::construct_at(numa_layout::storage<order_type>(storage, order_offset).data(), entries);
 	}
-	auto *owner = new (std::nothrow) worker_input_scheduler(std::move(storage), order, endpoints);
-	if (owner == nullptr) {
-		if (order != nullptr) {
-			std::destroy_at(order);
-		}
-		return common::status::resource_exhausted("input schedule owner allocation failed");
-	}
-	return std::unique_ptr<worker_input_scheduler>(owner);
+	auto *owner = new (numa_layout::storage<worker_input_scheduler>(storage, root_offset).data())
+		worker_input_scheduler(order, endpoints);
+	return adopt_numa_owner(owner, std::move(storage));
 }
 
-worker_input_scheduler::worker_input_scheduler(numa_memory_region storage, algo::bounded_service_order *order,
+worker_input_scheduler::worker_input_scheduler(algo::bounded_service_order *order,
 					       std::span<const worker_input_endpoint> endpoints) noexcept
-	: storage_(std::move(storage))
-	, order_(order)
+	: order_(order)
 	, endpoints_(endpoints)
 {
 }

@@ -31,7 +31,7 @@
 namespace kinetum::gluon
 {
 
-/** @brief Per-queue source-worker epoch-staging capacity in the generated profile. */
+/** @brief Aggregate capacity of each source-domain epoch role in the generated profile. */
 inline constexpr uint32_t SOURCE_EPOCH_STAGING_CAPACITY = 1024;
 static_assert(SOURCE_EPOCH_STAGING_CAPACITY >= 2u, "source epoch-staging capacity must contain at least two slots");
 static_assert((SOURCE_EPOCH_STAGING_CAPACITY & (SOURCE_EPOCH_STAGING_CAPACITY - 1u)) == 0u,

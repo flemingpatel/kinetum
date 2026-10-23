@@ -23,19 +23,16 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
-#include <memory>
 #include <span>
 #include <type_traits>
-#include <vector>
 
 #include <kinetum/algo/platform.hpp>
 #include <kinetum/algo/single_writer_snapshot.hpp>
 
 #include "src/common/status_or.hpp"
-#include "src/dp/epoch/epoch_transition_staging.hpp"
 #include "src/dp/epoch/worker_epoch_ledger.hpp"
-#include "src/dp/packet_work_item.hpp"
 #include "src/dp/publication_read_result.hpp"
+#include "src/dp/worker_packet_staging.hpp"
 
 namespace kinetum::dp::module
 {
@@ -48,9 +45,6 @@ namespace kinetum::dp
 
 class worker_active_stage_scheduler;
 class worker_runtime_telemetry;
-
-/** @brief Exact packet-kernel staging specialization consumed by activation. */
-using packet_epoch_input_staging = worker_epoch_input_staging<packet_work_item>;
 
 /**
  * @brief Coherent proof of one complete worker-local activation edge.
@@ -106,7 +100,7 @@ class worker_epoch_activation final {
 	 * @param telemetry Exact worker telemetry-bank owner.
 	 * @return Unique unbound activation owner or a fail-closed shape status.
 	 */
-	[[nodiscard]] static common::status_or<std::unique_ptr<worker_epoch_activation>>
+	[[nodiscard]] static common::status_or<numa_owner<worker_epoch_activation>>
 	create(uint32_t worker_index, uint64_t runtime_generation,
 	       std::span<module::module_epoch_store *const> module_stores,
 	       std::span<packet_epoch_input_staging *const> source_staging, worker_epoch_ledger &ledger,
@@ -230,9 +224,9 @@ class worker_epoch_activation final {
 	 * @param module_health Exact health claim owner, or null without module contexts.
 	 * @param telemetry Exact worker telemetry-bank owner.
 	 */
-	worker_epoch_activation(owner_identity identity, std::vector<module::module_epoch_store *> module_stores,
-				std::vector<packet_epoch_input_staging *> source_staging, worker_epoch_ledger &ledger,
-				worker_active_stage_scheduler *active_scheduler,
+	worker_epoch_activation(owner_identity identity, std::span<module::module_epoch_store *const> module_stores,
+				std::span<packet_epoch_input_staging *const> source_staging,
+				worker_epoch_ledger &ledger, worker_active_stage_scheduler *active_scheduler,
 				module::worker_module_health *module_health,
 				worker_runtime_telemetry &telemetry) noexcept;
 	/**
@@ -242,11 +236,12 @@ class worker_epoch_activation final {
 	 */
 	void publish_(bool activation_complete) noexcept;
 
-	uint32_t worker_index_{0};				    ///< Exact compact worker identity.
-	uint64_t runtime_generation_{0};			    ///< Exact materialized generation.
-	std::vector<module::module_epoch_store *> module_stores_;   ///< Immutable context projection.
-	std::vector<packet_epoch_input_staging *> source_staging_;  ///< Immutable source-domain projection.
-	worker_epoch_ledger *ledger_{nullptr};			    ///< Sole epoch/credit authority.
+	uint32_t worker_index_{0};				      ///< Exact compact worker identity.
+	uint64_t runtime_generation_{0};			      ///< Exact materialized generation.
+	std::span<module::module_epoch_store *const> module_stores_;  ///< Immutable context projection in owner storage.
+	std::span<packet_epoch_input_staging *const>
+		source_staging_;		///< Immutable source-domain projection in owner storage.
+	worker_epoch_ledger *ledger_{nullptr};	///< Sole epoch/credit authority.
 	worker_active_stage_scheduler *active_scheduler_{nullptr};  ///< Exact synchronous active owner when present.
 	module::worker_module_health *module_health_{nullptr};	    ///< Exact health callback claim owner.
 	worker_runtime_telemetry *telemetry_{nullptr};		    ///< Exact worker telemetry-bank owner.

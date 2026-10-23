@@ -46,7 +46,8 @@ separate concern documented in the root `THIRD_PARTY_NOTICES.md`.
 
 | Work | Author or owner | Relevance to Kinetum |
 |------|-----------------|----------------------|
-| [RFC 1624, Computation of the Internet Checksum via Incremental Update](https://www.rfc-editor.org/rfc/rfc1624) | IETF | Supplies the changed-word arithmetic used by NAT44 and the header-owned checksum helper, including the positive-zero boundary. |
+| [RFC 1624, Computation of the Internet Checksum via Incremental Update](https://www.rfc-editor.org/rfc/rfc1624) | IETF | Supplies the changed-word arithmetic used by NAT44 and the header-owned incremental helper, including the positive-zero boundary. |
+| [RFC 1071, Computing the Internet Checksum](https://www.rfc-editor.org/rfc/rfc1071) | IETF | Defines the full one's-complement sum, byte-order independence and odd-byte handling used by the header-owned full checksum helper. |
 | ["Distributed Snapshots: Determining Global States of Distributed Systems"](https://doi.org/10.1145/214451.214456) | K. Mani Chandy and Leslie Lamport, 1985 | Provides the consistent-cut vocabulary used to reason about DATA and control-channel ordering. Kinetum's Ordered-CUT Boundary Protocol operates at worker handoffs; it does not implement the paper's distributed snapshot algorithm. |
 | ["Abstractions for Network Update"](https://doi.org/10.1145/2342356.2342427) | Mark Reitblatt, Nate Foster, Jennifer Rexford, Cole Schlesinger, and David Walker, 2012 | Defines per-packet consistent network updates through versioned rules. The protocol guide compares that valid dual-version model with Kinetum's epoch-exclusive owner handoff. |
 | ["Lightweight Asynchronous Snapshots for Distributed Dataflows"](https://arxiv.org/abs/1506.08603) | Paris Carbone, Gyula Fora, Stephan Ewen, Seif Haridi, and Kostas Tzoumas, 2015 | Explains aligned barriers across streaming inputs; Kinetum's fan-in proof similarly requires every exact input cut before local activation. |

@@ -233,9 +233,9 @@ lifecycle_context_identity make_identity(uint32_t context_index = 7, int32_t num
  * @param context_capacity Exact byte budget for this owner's long-lived context state.
  * @return Unique valid owner, or nullptr after recording a test failure.
  */
-std::unique_ptr<lifecycle_context_owner> make_owner(test_memory_provider &memory, test_log_provider &log,
-						    uint32_t context_index = 7, int32_t numa_node = 0,
-						    std::size_t context_capacity = TEST_CONTEXT_MEMORY_CAPACITY_BYTES)
+lifecycle_context_ownership make_owner(test_memory_provider &memory, test_log_provider &log, uint32_t context_index = 7,
+				       int32_t numa_node = 0,
+				       std::size_t context_capacity = TEST_CONTEXT_MEMORY_CAPACITY_BYTES)
 {
 	auto owner_or = lifecycle_context_owner::create(make_identity(context_index, numa_node), context_capacity,
 							TEST_EPOCH_ARENA_CAPACITY_BYTES, memory, log);

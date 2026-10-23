@@ -17,15 +17,14 @@
 #include "src/common/status_or.hpp"
 #include "src/dp/worker_runtime_telemetry.hpp"
 #include "src/dp/worker_telemetry_channel.hpp"
-#include "src/quark/host_probe.hpp"
 
 namespace kinetum::test
 {
 
 /** @brief Own one exact channel and worker telemetry bank set. */
 struct worker_telemetry_test_owner {
-	std::unique_ptr<dp::worker_telemetry_channel> channel;	  ///< Exact poller-local token transport.
-	std::unique_ptr<dp::worker_runtime_telemetry> telemetry;  ///< Exact owner-worker banks.
+	std::unique_ptr<dp::worker_telemetry_channel> channel;	 ///< Exact poller-local token transport.
+	dp::numa_owner<dp::worker_runtime_telemetry> telemetry;	 ///< Exact owner-worker banks and their mapping.
 
 	/** @brief Reclaim a simple active-only worker telemetry lifetime. */
 	~worker_telemetry_test_owner()
@@ -61,30 +60,25 @@ struct worker_telemetry_test_owner {
 	 * @brief Create one production-shaped owner over one synthetic stage.
 	 * @param worker_index Exact compact worker identity.
 	 * @param runtime_generation Exact runtime generation.
+	 * @param numa_node Exact node selected by the owning fixture.
 	 * @param io_stream_indices Exact owned stream identities; empty for an I/O-free fixture.
 	 * @param module_context_count Module owners sharing the channel.
 	 * @return Complete owner or exact host/allocation failure.
 	 */
 	[[nodiscard]] static common::status_or<std::unique_ptr<worker_telemetry_test_owner>>
-	create(uint32_t worker_index, uint64_t runtime_generation, std::span<const uint32_t> io_stream_indices,
-	       std::size_t module_context_count = 0u)
+	create(uint32_t worker_index, uint64_t runtime_generation, int32_t numa_node,
+	       std::span<const uint32_t> io_stream_indices, std::size_t module_context_count = 0u)
 	{
-		const auto host = quark::probe_host();
-		if (!host.valid || host.memory_numa_nodes.empty()) {
-			return common::status::unavailable("test host has no exact memory NUMA node");
-		}
 		auto owner = std::make_unique<worker_telemetry_test_owner>();
-		auto channel_or = dp::worker_telemetry_channel::create(worker_index, module_context_count,
-								       host.memory_numa_nodes.front(),
-								       host.memory_numa_nodes.front());
+		auto channel_or =
+			dp::worker_telemetry_channel::create(worker_index, module_context_count, numa_node, numa_node);
 		if (!channel_or.is_ok()) {
 			return channel_or.error();
 		}
 		owner->channel = std::move(channel_or).value();
 		const std::array<uint32_t, 1> stages{0u};
-		auto telemetry_or = dp::worker_runtime_telemetry::create(runtime_generation, worker_index,
-									 host.memory_numa_nodes.front(), stages,
-									 io_stream_indices, 1000u, *owner->channel);
+		auto telemetry_or = dp::worker_runtime_telemetry::create(
+			runtime_generation, worker_index, numa_node, stages, io_stream_indices, 1000u, *owner->channel);
 		if (!telemetry_or.is_ok()) {
 			return telemetry_or.error();
 		}

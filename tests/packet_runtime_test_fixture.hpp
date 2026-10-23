@@ -10,7 +10,7 @@
  *
  * The fixture authors one explicit UDP/host/CPU provider graph against live
  * process-available CPU and NUMA facts, compiles it through Gluon and the sole
- * provider compiler, admits the real host and UDP components through a
+ * provider compiler, admits the selected host-contract and real UDP components through a
  * test-signed fixed installation, and constructs one complete CONTROL_READY
  * generation. It also owns the canonical six-field bootstrap request for the
  * exact emitted plan. No production default, provider inference, or test-only
@@ -590,17 +590,19 @@ compile_runtime_fixture(const kinetum::axiom::v1::Pipeline &pipeline, const host
 }
 
 /**
- * @brief Stage and sign the two real components required by the fixture plan.
+ * @brief Stage and sign the exact host-contract and UDP component images selected by the fixture.
  *
  * @param fixture Fixed installed-provider test root.
+ * @param host_source Exact host-contract image; may be the admitted short-prefix conformance image.
  * @return OK after canonical inventory publication.
  */
-[[nodiscard]] inline common::status stage_provider_inventory(provider_component_test_fixture &fixture)
+[[nodiscard]] inline common::status
+stage_provider_inventory(provider_component_test_fixture &fixture,
+			 const std::filesystem::path &host_source = KINETUM_PROVIDER_HOST_COMPONENT_PATH)
 {
 	try {
 		std::vector<provider::v1::ProviderComponentArtifact> components;
 		components.reserve(2);
-		const std::filesystem::path host_source(KINETUM_PROVIDER_HOST_COMPONENT_PATH);
 		const auto host_staged = fixture.stage_artifact(host_source, host_source.filename().string());
 		components.push_back(fixture.component_record(host_staged, "kinetum.provider.host",
 							      {std::string(provider::CPU_EXECUTION_TYPE_URL),
@@ -822,14 +824,16 @@ class packet_runtime_test_owner final {
 	 *        additional same-NUMA runtime-service cores.
 	 * @param zero_copy_transitions Exact caller-authored same-domain owner
 	 *        handoffs; borrowed strings must remain live until return.
+	 * @param bindings Complete optional provider intent, consumed only during construction.
 	 * @return Complete production-shaped owner or exact host/planner/runtime failure.
 	 */
 	[[nodiscard]] static common::status_or<std::unique_ptr<packet_runtime_test_owner>>
 	create_with_pipeline(kinetum::axiom::v1::Pipeline pipeline, std::size_t region_count,
-			     std::span<const packet_runtime_test_zero_copy_transition> zero_copy_transitions = {})
+			     std::span<const packet_runtime_test_zero_copy_transition> zero_copy_transitions = {},
+			     const kinetum::gluon::v1::DeploymentBindings *bindings = nullptr)
 	{
 		return create_impl_(std::nullopt, std::move(pipeline), std::nullopt, region_count,
-				    zero_copy_transitions);
+				    zero_copy_transitions, bindings);
 	}
 
 	/**
@@ -850,13 +854,17 @@ class packet_runtime_test_owner final {
 	 * @param module Exact image, configuration, and lifecycle-memory authority.
 	 * @param pipeline Logical graph whose module stages share that exact image/configuration identity.
 	 * @param bindings Provider bindings before fixture-owned host and UDP endpoint placement.
+	 * @param region_count Exact worker-region population, with two additional runtime-service cores.
+	 * @param host_component Exact host-contract implementation admitted through the signed inventory.
 	 * @return Complete owner after the ordinary planner and runtime admission path.
 	 */
 	[[nodiscard]] static common::status_or<std::unique_ptr<packet_runtime_test_owner>>
 	create(packet_runtime_test_module_intent module, kinetum::axiom::v1::Pipeline pipeline,
-	       const kinetum::gluon::v1::DeploymentBindings &bindings)
+	       const kinetum::gluon::v1::DeploymentBindings &bindings, std::size_t region_count = 1u,
+	       const std::filesystem::path &host_component = KINETUM_PROVIDER_HOST_COMPONENT_PATH)
 	{
-		return create_impl_(std::move(module), std::move(pipeline), std::nullopt, 1u, {}, &bindings);
+		return create_impl_(std::move(module), std::move(pipeline), std::nullopt, region_count, {}, &bindings,
+				    host_component);
 	}
 
 	/**
@@ -978,6 +986,7 @@ class packet_runtime_test_owner final {
 	 * @param region_count Exact positive Gluon region count.
 	 * @param zero_copy_transitions Exact explicit same-domain owner handoffs.
 	 * @param authored_bindings Optional complete provider intent before planning.
+	 * @param host_component Exact host-contract image selected by the test, without an alternate runtime path.
 	 * @return Complete owner; UNAVAILABLE only for insufficient live CPU/NUMA
 	 *         capacity, otherwise the exact failed admission status.
 	 *
@@ -991,7 +1000,8 @@ class packet_runtime_test_owner final {
 		     std::optional<kinetum::axiom::v1::Pipeline> authored_pipeline,
 		     std::optional<packet_runtime_test_transition_timing> timing, std::size_t region_count,
 		     std::span<const packet_runtime_test_zero_copy_transition> zero_copy_transitions = {},
-		     const kinetum::gluon::v1::DeploymentBindings *authored_bindings = nullptr)
+		     const kinetum::gluon::v1::DeploymentBindings *authored_bindings = nullptr,
+		     const std::filesystem::path &host_component = KINETUM_PROVIDER_HOST_COMPONENT_PATH)
 	{
 		try {
 			if (module.has_value() && authored_pipeline.has_value() && authored_bindings == nullptr) {
@@ -1048,8 +1058,8 @@ class packet_runtime_test_owner final {
 				limits->set_async_work_capacity(module->async_work_capacity);
 				limits->set_async_cancel_grace_ms(module->async_cancel_grace_ms);
 			}
-			const auto inventory_status =
-				packet_runtime_fixture_detail::stage_provider_inventory(owner->provider_fixture_);
+			const auto inventory_status = packet_runtime_fixture_detail::stage_provider_inventory(
+				owner->provider_fixture_, host_component);
 			if (!inventory_status.is_ok()) {
 				return inventory_status;
 			}

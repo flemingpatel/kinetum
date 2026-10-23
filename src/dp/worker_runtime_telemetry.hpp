@@ -19,18 +19,16 @@
 #include <cstddef>
 #include <cstdint>
 #include <exception>
-#include <memory>
 #include <optional>
 #include <span>
 #include <type_traits>
-#include <vector>
 
 #include <kinetum/algo/platform.hpp>
 
 #include "src/common/status.hpp"
 #include "src/common/status_or.hpp"
 #include "src/dp/epoch/epoch_protocol_fault.hpp"
-#include "src/dp/numa_memory.hpp"
+#include "src/dp/numa_layout.hpp"
 #include "src/dp/runtime_telemetry_bank.hpp"
 #include "src/dp/worker_telemetry_channel.hpp"
 
@@ -126,7 +124,7 @@ class worker_runtime_telemetry final {
 	 * @param channel Exact bank transfer authority that outlives this owner.
 	 * @return Complete unbound owner or a fail-closed allocation status.
 	 */
-	[[nodiscard]] static common::status_or<std::unique_ptr<worker_runtime_telemetry>>
+	[[nodiscard]] static common::status_or<numa_owner<worker_runtime_telemetry>>
 	create(uint64_t runtime_generation, uint32_t worker_index, int32_t worker_numa_node,
 	       std::span<const uint32_t> stage_instance_indices, std::span<const uint32_t> io_stream_indices,
 	       uint64_t cadence_ns, worker_telemetry_channel &channel);
@@ -304,18 +302,20 @@ class worker_runtime_telemetry final {
 		counter.in_bytes += bytes;
 	}
 	/**
-	 * @brief Record one exact stage output ownership transfer.
+	 * @brief Record an exact nonempty stage output prefix.
 	 * @param stage_ordinal Pre-resolved owner-local stage row.
-	 * @param bytes Exact positive transferred record length.
+	 * @param bytes Sum of the prefix's positive record lengths.
+	 * @param packets Exact positive number of output records.
 	 */
-	KINETUM_ALWAYS_INLINE void record_stage_output(uint32_t stage_ordinal, uint64_t bytes) noexcept
+	KINETUM_ALWAYS_INLINE void record_stage_output(uint32_t stage_ordinal, uint64_t bytes,
+						       uint16_t packets = 1u) noexcept
 	{
 		auto *stages = hot_->stages;
-		if (stages == nullptr || stage_ordinal >= hot_->stage_count || bytes == 0u) {
+		if (stages == nullptr || stage_ordinal >= hot_->stage_count || packets == 0u || bytes < packets) {
 			std::terminate();
 		}
 		auto &counter = stages[stage_ordinal];
-		++counter.out_packets;
+		counter.out_packets += packets;
 		counter.out_bytes += bytes;
 	}
 	/**
@@ -458,15 +458,18 @@ class worker_runtime_telemetry final {
 	static_assert(std::is_standard_layout_v<bank_header>);
 	static_assert(std::is_trivially_copyable_v<bank_header>);
 
-	/** @brief Describe checked offsets within one worker's exact-NUMA mapping. */
-	struct storage_layout {
-		std::size_t hot_offset{0};	    ///< One owner-local pre-resolved bank view.
-		std::size_t headers_offset{0};	    ///< Three bank headers.
-		std::size_t stages_offset{0};	    ///< Three dense stage-counter arrays.
-		std::size_t stage_bank_stride{0};   ///< Cache-line-complete bytes per stage bank.
-		std::size_t streams_offset{0};	    ///< Three dense stream-counter arrays.
-		std::size_t stream_bank_stride{0};  ///< Cache-line-complete bytes per stream bank.
-		std::size_t total_bytes{0};	    ///< Complete mapping extent.
+	/** @brief Complete constructed views into the allocation that also contains this root. */
+	struct storage_views {
+		std::span<const uint32_t> stage_indices;     ///< Local-to-global stage identity.
+		std::span<const uint32_t> stage_to_ordinal;  ///< Exact global-to-local stage map.
+		std::span<const uint32_t> stream_indices;    ///< Sorted stream identity.
+		hot_bank_view *hot{nullptr};		     ///< Constructed owner-local bank view.
+		bank_header *headers{nullptr};		     ///< Complete three-bank header array.
+		std::array<worker_stage_telemetry_counters *, RUNTIME_TELEMETRY_BANK_COUNT>
+			stages{};  ///< Pre-resolved stage banks.
+		std::array<worker_stream_telemetry_counters *, RUNTIME_TELEMETRY_BANK_COUNT>
+			streams{};	///< Pre-resolved stream banks.
+		std::size_t bytes{0u};	///< Exact usable bytes retained by the external mapping owner.
 	};
 
 	/**
@@ -476,33 +479,11 @@ class worker_runtime_telemetry final {
 	 * @param numa_node Exact worker NUMA node.
 	 * @param cadence_ns Exact plan cadence.
 	 * @param channel Exact token transport.
-	 * @param stage_indices Local-to-global stage projection.
-	 * @param stage_to_ordinal Global-to-local stage projection.
-	 * @param stream_indices Sorted local-to-global stream projection.
-	 * @param region Sole mapping owner.
-	 * @param hot Placement-constructed hot selector.
-	 * @param headers Placement-constructed bank headers.
-	 * @param stages Placement-constructed stage-counter extent.
-	 * @param stage_bank_stride Cache-line-complete bytes between stage banks.
-	 * @param streams Placement-constructed stream-counter extent, or null when empty.
-	 * @param stream_bank_stride Cache-line-complete bytes between stream banks.
+	 * @param storage Complete constructed bank and identity views in the same mapping.
 	 */
 	worker_runtime_telemetry(uint64_t runtime_generation, uint32_t worker_index, int32_t numa_node,
 				 uint64_t cadence_ns, worker_telemetry_channel &channel,
-				 std::vector<uint32_t> stage_indices, std::vector<uint32_t> stage_to_ordinal,
-				 std::vector<uint32_t> stream_indices, numa_memory_region region, hot_bank_view *hot,
-				 bank_header *headers, worker_stage_telemetry_counters *stages,
-				 std::size_t stage_bank_stride, worker_stream_telemetry_counters *streams,
-				 std::size_t stream_bank_stride) noexcept;
-
-	/**
-	 * @brief Derive one checked exact-NUMA mapping layout.
-	 * @param stage_count Exact positive worker-owned stage population.
-	 * @param stream_count Exact worker-owned stream population; zero is valid.
-	 * @return Complete offsets/extent or an overflow status.
-	 */
-	[[nodiscard]] static common::status_or<storage_layout> compute_layout(std::size_t stage_count,
-									      std::size_t stream_count) noexcept;
+				 storage_views storage) noexcept;
 	/**
 	 * @brief Perform one due cadence swap outside the recurring packet-loop path.
 	 * @param now_ns Sole cached worker timestamp at or after the deadline.
@@ -567,27 +548,28 @@ class worker_runtime_telemetry final {
 	uint32_t worker_index_{0};			 ///< Exact compact worker identity.
 	int32_t numa_node_{-1};				 ///< Exact owner NUMA node.
 	uint64_t cadence_ns_{0};			 ///< Exact plan-derived cadence.
-	uint64_t next_publication_ns_{0};		 ///< Owner-local next cadence deadline.
+	alignas(64) uint64_t next_publication_ns_{0};	 ///< Worker-written cadence; isolated from cold preparation.
 	uint64_t active_epoch_{0};			 ///< Exact active bank epoch.
-	uint64_t prepared_epoch_{0};			 ///< Exact reserved target epoch.
-	uint64_t aggregated_epoch_{0};			 ///< Cold-confirmed fully aggregated epoch.
 	uint8_t active_bank_{UINT8_MAX};		 ///< Current owner-writable bank.
 	uint8_t standby_bank_{UINT8_MAX};		 ///< Clean same-epoch ordinary standby.
-	uint8_t reserved_bank_{UINT8_MAX};		 ///< Cold-prepared target reserve.
-	uint8_t free_bank_{UINT8_MAX};			 ///< Cold-owned unassigned slot identity.
 	bool old_banks_retained_for_transition_{false};	 ///< Missing standby is exact old-generation ownership.
-	bool owner_quiesced_{false};			 ///< Whether no worker can consume a returned bank.
-	worker_telemetry_channel &channel_;		 ///< Exact cross-thread token transport.
-	std::vector<uint32_t> stage_indices_;		 ///< Local ordinal to global stage identity.
-	std::vector<uint32_t> stage_to_ordinal_;	 ///< Global stage to local ordinal or UINT32_MAX.
-	std::vector<uint32_t> stream_indices_;		 ///< Sorted local ordinal to global stream identity.
-	numa_memory_region region_;			 ///< Sole exact-NUMA three-bank mapping.
+	alignas(64) uint64_t prepared_epoch_{
+		0};			    ///< Cold-prepared identity, handed to the worker by the commit publication.
+	uint64_t aggregated_epoch_{0};	    ///< Cold-confirmed fully aggregated epoch.
+	uint8_t reserved_bank_{UINT8_MAX};  ///< Cold-prepared target reserve.
+	uint8_t free_bank_{UINT8_MAX};	    ///< Cold-owned unassigned slot identity.
+	bool owner_quiesced_{false};	    ///< Whether no worker can consume a returned bank.
+	alignas(64) worker_telemetry_channel &channel_;	 ///< Immutable views do not share either writer's line.
+	std::span<const uint32_t> stage_indices_;	 ///< Local ordinal to global stage identity.
+	std::span<const uint32_t> stage_to_ordinal_;	 ///< Global stage to local ordinal or UINT32_MAX.
+	std::span<const uint32_t> stream_indices_;	 ///< Sorted local ordinal to global stream identity.
+	std::size_t storage_bytes_{0u};			 ///< Exact extent proved by the external mapping owner.
 	hot_bank_view *hot_{nullptr};			 ///< Exact-NUMA pre-resolved packet-path view.
 	bank_header *banks_{nullptr};			 ///< Three placement-constructed headers.
-	worker_stage_telemetry_counters *stage_counters_{nullptr};    ///< Three dense stage arrays.
-	worker_stream_telemetry_counters *stream_counters_{nullptr};  ///< Three dense stream arrays, or null.
-	std::size_t stream_bank_stride_{0};  ///< Cache-line-complete byte stride between stream banks.
-	std::size_t stage_bank_stride_{0};   ///< Cache-line-complete byte stride between stage banks.
+	std::array<worker_stage_telemetry_counters *, RUNTIME_TELEMETRY_BANK_COUNT>
+		stage_banks_{};	 ///< Direct stage bank views.
+	std::array<worker_stream_telemetry_counters *, RUNTIME_TELEMETRY_BANK_COUNT>
+		stream_banks_{};  ///< Direct stream bank views, null for no streams.
 };
 
 }  // namespace kinetum::dp

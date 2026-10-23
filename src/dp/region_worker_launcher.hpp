@@ -25,10 +25,16 @@
 namespace kinetum::dp
 {
 
-/** @brief Complete launch request for one exact compact-worker set. */
+/**
+ * @brief Complete launch request for one exact compact-worker set.
+ *
+ * The caller retains the immutable reference table and its placed records
+ * through join. The launcher owns state transitions, not backing allocation.
+ */
 struct region_worker_launch_spec {
-	std::span<worker_lifecycle_context> worker_contexts;  ///< Contexts indexed by compact worker ID.
-	std::vector<std::thread> *threads{nullptr};	      ///< Runtime-owned worker thread handles.
+	std::span<worker_lifecycle_context *const>
+		worker_contexts;		     ///< Stable nonnull unique records indexed by compact worker ID.
+	std::vector<std::thread> *threads{nullptr};  ///< Runtime-owned worker thread handles.
 	/** Optional fallible owner-thread setup completed before any activation. */
 	std::function<kinetum::common::status(int worker_id)> configure_worker;
 	/** Required non-failing owner-thread activation after complete setup. */
@@ -70,7 +76,7 @@ struct region_worker_join_spec {
  *
  * @param contexts Exact compact worker contexts reserved by the transaction.
  */
-void request_region_worker_exit(std::span<worker_lifecycle_context> contexts) noexcept;
+void request_region_worker_exit(std::span<worker_lifecycle_context *const> contexts) noexcept;
 
 /**
  * @brief Restore a failed, fully joined launch reservation to canonical INIT.
@@ -80,7 +86,7 @@ void request_region_worker_exit(std::span<worker_lifecycle_context> contexts) no
  *
  * @param contexts Exact compact worker contexts owned by the failed launch.
  */
-void reset_region_worker_launch_reservation(std::span<worker_lifecycle_context> contexts) noexcept;
+void reset_region_worker_launch_reservation(std::span<worker_lifecycle_context *const> contexts) noexcept;
 
 /**
  * @brief Join every joinable worker or fail-stop on an ownership violation.

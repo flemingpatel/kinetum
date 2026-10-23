@@ -21,8 +21,11 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <memory>
 #include <optional>
+#include <span>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -420,6 +423,81 @@ TEST(module_execution_views, exact_active_view_drops_mismatch_then_runs_on_owner
 	EXPECT_EQ(packet.metadata().module_next_stage, 9u);
 	EXPECT_EQ(engine.stats().dropped_packets, 1u);
 	EXPECT_EQ(module->context().epoch_store->diagnostics_after_quiescence().mismatch_count, 1u);
+}
+
+/** @brief Fused admission records all mismatches and invokes no callback when any lane is invalid. */
+TEST(module_execution_views, rejected_batch_records_all_mismatches_without_foreign_effects)
+{
+	auto module_or = test::exact_module_test_context::create("test_module", KINETUM_TEST_MODULE_PATH,
+								 direct_module_resources());
+	ASSERT_TRUE(module_or.is_ok()) << module_or.error().message();
+	auto module = std::move(module_or).value();
+	ASSERT_TRUE(module->prepare_and_activate(TEST_ACTIVE_EPOCH, R"({"route_to_stage":9})").is_ok());
+	std::array<std::unique_ptr<test::packet_record_test_owner>, 5> owners;
+	std::array<packet_record *, 6> records{};
+	for (std::size_t index = 0; index < owners.size(); ++index) {
+		owners[index] = std::make_unique<test::packet_record_test_owner>(std::vector<uint8_t>(64u, 0u),
+										 TEST_ACTIVE_EPOCH);
+		ASSERT_TRUE(owners[index]->valid()) << owners[index]->error();
+		records[index] = owners[index]->get();
+		initialize_module_packet(*records[index], TEST_ACTIVE_EPOCH);
+	}
+	records[1]->metadata.epoch = TEST_ACTIVE_EPOCH - 1u;
+	records[2]->storage.contiguous_length = 0u;
+	records[3]->metadata.epoch = TEST_ACTIVE_EPOCH + 1u;
+	EXPECT_EQ(module->process_batch(records, 123u), 0u);
+	records[2]->storage.contiguous_length = records[2]->storage.length;
+	EXPECT_EQ(module->context().epoch_store->diagnostics_after_quiescence().mismatch_count, 3u);
+	for (const auto &owner : owners) {
+		EXPECT_EQ(owner->metadata().module_next_stage, INVALID_STAGE_ID);
+	}
+	bool found_batches = false;
+	const auto &lifecycle_owner = *module->context().lifecycle_owner;
+	for (std::size_t index = 1u; index <= lifecycle_owner.telemetry_handle_count(); ++index) {
+		const auto *row =
+			lifecycle_owner.telemetry_descriptor(static_cast<lifecycle::lifecycle_telemetry_handle>(index));
+		if (row != nullptr && row->kind == lifecycle::lifecycle_telemetry_kind::COUNTER &&
+		    std::string_view(row->counter.name) == "test_module.batches") {
+			found_batches = true;
+			EXPECT_EQ(row->counter.value, 0u);
+		}
+	}
+	EXPECT_TRUE(found_batches);
+}
+
+/** @brief A reused SoA and poisoned unused pointer lanes cannot affect the exact occupied prefix. */
+TEST(module_execution_views, poisoned_unused_scratch_is_inert_across_prefix_sizes)
+{
+	auto module_or = test::exact_module_test_context::create("test_module", KINETUM_TEST_MODULE_PATH,
+								 direct_module_resources());
+	ASSERT_TRUE(module_or.is_ok()) << module_or.error().message();
+	auto module = std::move(module_or).value();
+	ASSERT_TRUE(module->prepare_and_activate(TEST_ACTIVE_EPOCH, R"({"route_to_stage":9})").is_ok());
+	std::array<std::unique_ptr<test::packet_record_test_owner>, KINETUM_MAX_BURST> owners;
+	std::array<packet_record *, KINETUM_MAX_BURST> records{};
+	for (std::size_t index = 0u; index < owners.size(); ++index) {
+		owners[index] = std::make_unique<test::packet_record_test_owner>(std::vector<uint8_t>(64u, 0u),
+										 TEST_ACTIVE_EPOCH);
+		ASSERT_TRUE(owners[index]->valid()) << owners[index]->error();
+		initialize_module_packet(*owners[index]->get(), TEST_ACTIVE_EPOCH);
+	}
+	module_batch_scratch scratch{};
+	for (const std::size_t count : {64u, 3u, 1u, 0u, 17u, 2u}) {
+		SCOPED_TRACE(count);
+		auto scratch_bytes = std::as_writable_bytes(std::span(&scratch, 1u));
+		std::fill(scratch_bytes.begin(), scratch_bytes.end(), std::byte{0xa5});
+		for (std::size_t index = 0u; index < records.size(); ++index) {
+			records[index] = index < count ? owners[index]->get() :
+							 reinterpret_cast<packet_record *>(std::uintptr_t{0xa5a5a5a5u});
+		}
+		const auto forwarded = execute_module_batch_mechanism(*module->context().epoch_store, 0u, 0, 123u,
+								      std::span(records).first(count), scratch);
+		EXPECT_EQ(forwarded, KINETUM_FORWARD_MASK(count));
+		for (std::size_t index = 0u; index < count; ++index) {
+			EXPECT_EQ(owners[index]->metadata().module_next_stage, 9u);
+			EXPECT_EQ(owners[index]->metadata().epoch, TEST_ACTIVE_EPOCH);
+		}
+	}
 }
 
 /** @brief Begin one exact active context with no fabricated callback observation. */

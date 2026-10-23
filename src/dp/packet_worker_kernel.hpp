@@ -11,17 +11,18 @@
  * One kernel owns one compiled packet worker. Cold construction resolves every
  * RX source, TX sink, storage operation, storage transition, route, boundary,
  * module context, and provider-facility registration dependency into compact
- * array indices and immutable function targets. The running loop consequently
- * performs provider dispatch once per burst, never once per packet.
+ * array indices and immutable function targets.
  *
  * Packet metadata remains the sole writable epoch and stage authority. The
- * bounded owner-local work item carries only a packet pointer and an execution
- * phase; it never duplicates epoch, stage, port, storage, or provider identity.
- * One formula-sized canonical SPSC ring per reachable storage domain owns local
- * staging. One cache-line-separated worker epoch ledger counts logical packet
+ * owner-local queues carry packet pointers grouped by immutable stage and
+ * continuation keys. Each scheduled domain's role shares one capacity across
+ * queued and outstanding work. All roles occupy one prefaulted worker-NUMA
+ * region, composing single-owner work_queue_view rings and ready-key FIFOs.
+ * One cache-line-separated worker epoch ledger counts logical packet
  * work by the record's exact epoch; local slot reservations remain capacity
  * proofs and never become quiescence evidence. Transition, TX, and release
- * calls are grouped into bounded bursts.
+ * calls are grouped into bounded bursts. Fan-out requests writable clones
+ * individually after reserving capacity.
  *
  * Every cross-worker route resolves one direct ordinal in the worker's sole
  * `worker_boundary_sender`. A mirrored `worker_boundary_receiver` owns CUT
@@ -56,16 +57,19 @@
  * publication is the same sole acquire load that owns shutdown observation.
  * RX streams and inbound DATA share bounded fair admission. A capacity-limited
  * input retains its unfinished allowance while independent inputs may proceed;
- * service never scans queued packet depth or adds a packet-holding owner.
+ * input service never scans queued packet depth or adds a packet-holding owner.
+ * Local dispatch services each initially ready key at most once within a
+ * 64-record budget per domain role. It resolves stage and phase once per batch
+ * and validates every record before execution.
  */
 
 #include <cstdint>
-#include <memory>
 #include <span>
 #include <vector>
 
 #include "src/common/status_or.hpp"
 #include "src/dp/epoch/worker_epoch_ledger.hpp"
+#include "src/dp/numa_layout.hpp"
 #include "src/dp/publication_read_result.hpp"
 
 namespace kinetum::algo
@@ -88,6 +92,7 @@ class worker_boundary_receiver;
 class worker_boundary_sender;
 class worker_runtime_command_publication;
 class worker_runtime_telemetry;
+struct worker_lifecycle_context;
 
 namespace lifecycle
 {
@@ -119,12 +124,12 @@ class packet_worker_kernel final {
 	 * @param module_telemetry Exact module-context telemetry owners for this worker.
 	 * @return Unique complete kernel, or a fail-closed cold validation status.
 	 */
-	[[nodiscard]] static common::status_or<std::unique_ptr<packet_worker_kernel>>
+	[[nodiscard]] static common::status_or<numa_owner<packet_worker_kernel>>
 	create(uint32_t worker_index, const provider::compiled_provider_topology &topology,
 	       const provider::materialized_provider_runtime &providers, module::module_manager &modules,
 	       worker_runtime_command_publication &commands, const std::vector<boundary_epoch_channel *> &boundaries,
-	       std::unique_ptr<worker_boundary_sender> boundary_sender,
-	       std::unique_ptr<worker_boundary_receiver> boundary_receiver, worker_runtime_telemetry &telemetry,
+	       numa_owner<worker_boundary_sender> boundary_sender,
+	       numa_owner<worker_boundary_receiver> boundary_receiver, worker_runtime_telemetry &telemetry,
 	       epoch_protocol_fault_latch &protocol_faults,
 	       std::span<lifecycle::lifecycle_context_owner *const> module_telemetry);
 
@@ -192,6 +197,8 @@ class packet_worker_kernel final {
 	 * @return Stable caller-owned reader storage for this worker.
 	 */
 	[[nodiscard]] kinetum::algo::quiescence_reader &quiescence_reader_registration() noexcept;
+	/** @return The sole worker-local lifecycle record, borrowed by the launcher until join. */
+	[[nodiscard]] worker_lifecycle_context &lifecycle_record() noexcept;
 
 	/**
 	 * @brief Return the complete immutable certificate publication source set.
@@ -208,9 +215,9 @@ class packet_worker_kernel final {
 	 *
 	 * @param implementation Sole pre-resolved worker implementation owner.
 	 */
-	explicit packet_worker_kernel(std::unique_ptr<implementation> implementation) noexcept;
+	explicit packet_worker_kernel(implementation *implementation) noexcept;
 
-	std::unique_ptr<implementation> implementation_;  ///< Stable pre-resolved owner-local state.
+	implementation *implementation_{nullptr};  ///< Constructed state in the same mapped allocation as this view.
 };
 
 }  // namespace kinetum::dp

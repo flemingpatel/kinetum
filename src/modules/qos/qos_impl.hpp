@@ -5,26 +5,16 @@
 
 /**
  * @file qos_impl.hpp
- * @brief QoS Module Implementation (Module-Owned, Self-Contained)
+ * @brief Context-owned QoS policy, semantic flow identity, and exact byte policing.
  * @author Fleming Patel
  *
- * This file contains the token bucket QoS policing logic for the QoS module.
- * Its strict JSON contract corresponds to the module-owned
- * kinetum.module.qos.v1 schema and remains self-contained in the image.
- *
- * Design Philosophy:
- * - Module is the SOURCE OF TRUTH for QoS configuration schema
- * - Platform routes opaque config_blob without interpretation
- * - Module deserializes and applies its own config format
- *
- * Hot-Path Optimization (Context-Owner Design):
- * - Each admitted module context owns one preallocated policer
- * - NO LOCKS in hot path - one packet worker is the sole writer
- * - The admitted pipeline keeps each metered flow with its context owner
- * - One bounded index pool recycles preallocated slab entries without growth
- * - Follows Platform Engineering Guide: "No locks on hot path"
+ * The image owns its strict kinetum.module.qos.v1 JSON policy. Each context's
+ * sole packet worker meters flows in a preallocated slab indexed by semantic
+ * tuple. A bounded index pool recycles slab entries without allocation or locks.
+ * The admitted pipeline keeps each metered flow with that context owner.
  */
 
+#include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <memory_resource>
@@ -68,7 +58,7 @@ inline constexpr int64_t QOS_MAX_CBS_KB = static_cast<int64_t>(std::numeric_limi
 inline constexpr int64_t QOS_MAX_CIR_KBPS = static_cast<int64_t>(std::numeric_limits<uint64_t>::max() / 125u);
 
 /** @brief Exact identity class; missing transport bytes never select an aggregate. */
-enum class flow_kind : uint8_t {
+enum class flow_kind : uint16_t {
 	UNSPECIFIED = 0,   ///< No admitted identity.
 	TRANSPORT = 1,	   ///< Unfragmented IPv4 TCP/UDP with both port fields present.
 	IP_AGGREGATE = 2,  ///< IPv4 fragments or a protocol without TCP/UDP ports.
@@ -104,11 +94,16 @@ struct flow_identity_hash {
 		hash = (hash ^ key.src_port) * algo::FNV1A_PRIME;
 		hash = (hash ^ key.dst_port) * algo::FNV1A_PRIME;
 		hash = (hash ^ key.protocol) * algo::FNV1A_PRIME;
-		return static_cast<std::size_t>((hash ^ static_cast<uint8_t>(key.kind)) * algo::FNV1A_PRIME);
+		return static_cast<std::size_t>((hash ^ static_cast<uint16_t>(key.kind)) * algo::FNV1A_PRIME);
 	}
 };
 
-static_assert(sizeof(flow_key) == 16 && std::is_trivially_copyable_v<flow_key>);
+static_assert(sizeof(flow_kind) == sizeof(uint16_t));
+static_assert(sizeof(flow_key) == 16 && alignof(flow_key) == alignof(uint32_t));
+static_assert(std::is_standard_layout_v<flow_key> && std::is_trivially_copyable_v<flow_key>);
+static_assert(offsetof(flow_key, src_ip) == 0u && offsetof(flow_key, dst_ip) == 4u &&
+	      offsetof(flow_key, src_port) == 8u && offsetof(flow_key, dst_port) == 10u &&
+	      offsetof(flow_key, protocol) == 12u && offsetof(flow_key, kind) == 14u);
 static_assert(std::is_default_constructible_v<flow_key> && std::is_nothrow_copy_assignable_v<flow_key>);
 static_assert(sizeof(algo::cuckoo_bucket<flow_key, uint32_t>) == 128);
 
@@ -195,32 +190,35 @@ static_assert(std::is_nothrow_move_constructible_v<qos_profiles_compiled>,
 	      "QoS compiled policy transfer must remain nonthrowing");
 
 /**
- * @brief Per-flow token bucket policer (Single-Owner, Pre-Allocated)
+ * @brief Sole-worker policer over a fixed credit slab and separate reclamation keys.
  *
- * Implements rate limiting using token bucket algorithm with:
- * - Pre-allocated cuckoo_map + contiguous bucket slab (zero hot-path malloc)
- * - Shared exact fractional-byte arithmetic
- * - Lock-free design for hot-path (no mutex, no shared_mutex)
- * - Incremental cursor-based garbage collection
+ * A semantic-key cuckoo map resolves one slab index; bounded_index_pool recycles
+ * that index without allocation. Prepared queries contain no flow-state borrow.
+ * Each police() call runs bounded GC before looking up current state, preserving
+ * packet-order mutation. All storage uses the supplied context-lifetime resource.
  *
- * Storage Architecture (same pattern as NAT44):
- * - cuckoo_map: flow_key to slab index, O(1) worst-case, pre-allocated buckets
- * - Contiguous slab: cache-friendly bucket storage
- * - Bounded index pool: O(1) slot allocation/release without growth
- *
- * Thread Safety:
- * - Designed for one admitted context's sole packet worker
- * - The admitted pipeline keeps the same flow with its context owner
- * - NO LOCKS - caller must ensure single-writer access
- *
- * Hot-path properties:
- * - Cache-line aligned buckets
- * - No lock contention in the sole-owner access model
- * - Zero heap allocation on hot path
- * - Follows Platform Engineering Guide hot-path rules
+ * @par Thread Safety
+ * One admitted context's packet worker owns all lookup and mutation.
  */
 class qos_policer {
+    private:
+	/** @brief Sole semantic-key to flow-index authority. */
+	using flow_map = algo::cuckoo_map<flow_key, uint32_t, flow_identity_hash>;
+
     public:
+	/** @brief Map-bound copied lookup facts with no borrowed flow state. */
+	using prepared_query = flow_map::prepared_query;
+
+	/**
+	 * @brief Copy a key and prefetch its candidate buckets without reading flow state.
+	 * @param key Semantic identity to copy.
+	 * @return Query bound to this policer's map until the policer is destroyed.
+	 */
+	[[nodiscard]] prepared_query prepare(const flow_key &key) const noexcept
+	{
+		return map_.prepare(key);
+	}
+
 	/**
 	 * @brief Construct a lock-free policer with pre-allocated capacity.
 	 *
@@ -257,35 +255,38 @@ class qos_policer {
 	 * @param now_ns Exact cached owner-worker processing time in nanoseconds.
 	 * @param profile Exact active profile containing rate and burst limits.
 	 * @param runtime Bounded owner-local GC tuning.
-	 * @param key Semantic identity; ignored only by an explicitly unlimited profile.
+	 * @param query Prepared identity from this policer; may be null only for an unlimited profile.
 	 * @param bytes Packet length in bytes.
 	 * @return Exact allowance or rejection cause.
 	 *
 	 * @note Thread Safety: not thread-safe; call only on the context owner.
 	 */
 	[[nodiscard]] policer_result police(uint64_t now_ns, const qos_profile_compiled &profile,
-					    const qos_runtime_tuning &runtime, const flow_key &key,
+					    const qos_runtime_tuning &runtime, const prepared_query *query,
 					    std::size_t bytes) noexcept;
 
     private:
-	/** @brief Cache-line-isolated mutable state for one owner-local flow. */
-	struct alignas(64) bucket {
+	/** @brief Compact mutable state; all rows have the same sole worker owner. */
+	struct alignas(32) bucket {
 		algo::byte_credit credit;  ///< Exact byte credit, including its fractional part.
-		flow_key key;		   ///< Semantic identity used for lookup and reclamation.
 		uint64_t last_ns{0};	   ///< Last processing-time observation for refill and idle expiry.
 		bool occupied{false};	   ///< Whether the slot contributes live flow state.
+		uint8_t padding[7]{};	   ///< Explicit row completion.
 	};
-	static_assert(sizeof(bucket) == 64 && alignof(bucket) == 64);
+	static_assert(sizeof(bucket) == 32 && alignof(bucket) == 32);
+	static_assert(offsetof(bucket, credit) == 0 && offsetof(bucket, last_ns) == 16 &&
+		      offsetof(bucket, occupied) == 24 && offsetof(bucket, padding) == 25);
 
 	// -------------------------------------------------------------------------
 	// Flow storage: contiguous slab + cuckoo index map + bounded index pool
 	// -------------------------------------------------------------------------
 
-	std::pmr::vector<bucket> slab_;	 ///< Fixed context-lifetime flow-bucket slab.
+	std::pmr::vector<bucket> slab_;	   ///< Fixed context-lifetime flow-bucket slab.
+	std::pmr::vector<flow_key> keys_;  ///< Reclamation keys sharing the slab's exact index lifetime.
 
 	kinetum::algo::bounded_index_pool free_indices_;  ///< Fixed owner-local slab-index recycler.
 
-	kinetum::algo::cuckoo_map<flow_key, uint32_t, flow_identity_hash> map_;	 ///< Flow-to-slab index.
+	flow_map map_;	///< Flow-to-slab index.
 
 	uint32_t max_flows_;		///< Fixed slab capacity.
 	uint64_t gc_counter_{0};	///< Packet-operation cadence for bounded GC.

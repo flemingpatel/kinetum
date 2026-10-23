@@ -5,10 +5,10 @@
 
 /**
  * @file queue.hpp
- * @brief Bounded lock-free queues for packet processing.
+ * @brief Bounded concurrent and single-owner queues for packet processing.
  * @author Fleming Patel
  *
- * This is the canonical implementation for all lock-free queues in the platform.
+ * This is the canonical queue implementation for the platform.
  * All components (DP, CP, Photon, Gluon, SDK) should include from here.
  *
  * Contains:
@@ -20,27 +20,24 @@
  * - mpmc_queue_view: MPMC over exact caller-owned runtime storage
  * - work_queue_view: caller-storage single-owner circular arithmetic
  *
- * Design properties:
- *  - Cache line alignment to prevent false sharing
- *  - Power-of-2 capacity for fast modulo via bitmask
- *  - Relaxed atomics on hot path, acquire/release for synchronization
- *  - Batch operations for amortized overhead reduction
- *  - Zero dynamic allocation after construction
- *
  * Hot-path characteristics:
  *  - No dynamic allocation after construction
  *  - Power-of-2 capacity enables mask-based indexing
+ *  - Private SPSC cursor caches are isolated from shared publications
+ *  - Acquire/release publication between the exact queue owners
  *  - Batch operations reduce synchronization work per element
  *  - Actual latency depends on element type, CPU, compiler, and cache state
  *
  * Supported targets: little-endian x86-64 and AArch64.
  */
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <new>
@@ -155,12 +152,13 @@ class spsc_capacity_owner<0> {
  *
  * @par Thread Safety
  * One producer owns head and cached tail. One consumer owns tail and cached
- * head. Cross-owner publication uses release stores and acquire reloads. The
- * caller owns the backing storage for the complete core lifetime.
+ * head. Each publication and each private cache occupies a separate cache
+ * line. Cross-owner publication uses release stores and acquire reloads. The
+ * caller owns disjoint backing storage for the complete core lifetime.
  *
  * @par Performance
  * Every single-element operation is O(1). A batch of length k is O(k) with
- * one acquire observation and at most one release publication. No operation
+ * at most one acquire refresh and one release publication. No operation
  * allocates after the backing storage has been bound.
  */
 template <typename T, std::size_t StaticCapacity>
@@ -274,12 +272,15 @@ class spsc_ring_core final : private spsc_capacity_owner<StaticCapacity> {
 	[[nodiscard]] std::size_t push_batch(const T *items, std::size_t count) noexcept
 		requires std::is_nothrow_copy_constructible_v<T>
 	{
+		if (count == 0u) {
+			return 0u;
+		}
 		const std::size_t head = head_.load(std::memory_order_relaxed);
-		cached_tail_ = tail_.load(std::memory_order_acquire);
-		const std::size_t available = capacity_() - (head - cached_tail_);
+		const std::size_t available = producer_available_(head, count);
 		const std::size_t to_push = count < available ? count : available;
+		const std::size_t mask = mask_();
 		for (std::size_t index = 0; index < to_push; ++index) {
-			new (&storage_[(head + index) & mask_()]) T(items[index]);
+			new (&storage_[(head + index) & mask]) T(items[index]);
 		}
 		if (to_push != 0) {
 			head_.store(head + to_push, std::memory_order_release);
@@ -300,7 +301,7 @@ class spsc_ring_core final : private spsc_capacity_owner<StaticCapacity> {
 		if (!consumer_has_value_(tail)) {
 			return false;
 		}
-		T *slot = slot_(tail);
+		T *slot = slot_(tail & mask_());
 		out = std::move(*slot);
 		slot->~T();
 		tail_.store(tail + 1u, std::memory_order_release);
@@ -319,7 +320,7 @@ class spsc_ring_core final : private spsc_capacity_owner<StaticCapacity> {
 		if (!consumer_has_value_(tail)) {
 			return std::nullopt;
 		}
-		T *slot = slot_(tail);
+		T *slot = slot_(tail & mask_());
 		std::optional<T> value(std::in_place, std::move(*slot));
 		slot->~T();
 		tail_.store(tail + 1u, std::memory_order_release);
@@ -342,19 +343,31 @@ class spsc_ring_core final : private spsc_capacity_owner<StaticCapacity> {
 	[[nodiscard]] std::size_t pop_batch(T *out, std::size_t max_count) noexcept
 		requires std::is_nothrow_move_assignable_v<T>
 	{
-		const std::size_t tail = tail_.load(std::memory_order_relaxed);
-		cached_head_ = head_.load(std::memory_order_acquire);
-		const std::size_t available = cached_head_ - tail;
-		const std::size_t to_pop = max_count < available ? max_count : available;
-		for (std::size_t index = 0; index < to_pop; ++index) {
-			T *slot = slot_(tail + index);
-			out[index] = std::move(*slot);
-			slot->~T();
-		}
-		if (to_pop != 0) {
-			tail_.store(tail + to_pop, std::memory_order_release);
-		}
-		return to_pop;
+		std::size_t index = 0u;
+		return consume_prefix_(max_count, [&](T &value) noexcept {
+			out[index++] = std::move(value);
+			return true;
+		});
+	}
+
+	/**
+	 * @brief Admit and consume one bounded FIFO prefix with one tail publication.
+	 * The sole consumer borrows each value before its lifetime ends. Returning
+	 * false leaves that value and every later value in the ring. Returning true
+	 * completes the caller's ownership work before destruction and publication.
+	 * @tparam accept_type Nonthrowing callback over a read-only element borrow.
+	 * @param max_count Maximum number of values considered; zero invokes nothing.
+	 * @param accept Returns true only after accepting that element. It must not
+	 *        retain the borrow, mutate this ring, or invoke foreign callbacks.
+	 * @return Number accepted and consumed before the first refusal or limit.
+	 */
+	template <typename accept_type>
+	[[nodiscard]] std::size_t consume_prefix(std::size_t max_count, accept_type &&accept) noexcept
+		requires(std::is_nothrow_invocable_r_v<bool, accept_type &, const T &> &&
+			 std::is_nothrow_destructible_v<T>)
+	{
+		return consume_prefix_(max_count,
+				       [&](T &value) noexcept { return std::invoke(accept, std::as_const(value)); });
 	}
 
 	/**
@@ -369,7 +382,7 @@ class spsc_ring_core final : private spsc_capacity_owner<StaticCapacity> {
 	[[nodiscard]] const T *peek() const noexcept
 	{
 		const std::size_t tail = tail_.load(std::memory_order_relaxed);
-		if (tail == head_.load(std::memory_order_acquire)) {
+		if (!consumer_has_value_(tail)) {
 			return nullptr;
 		}
 		return std::launder(reinterpret_cast<const T *>(&storage_[tail & mask_()]));
@@ -449,33 +462,82 @@ class spsc_ring_core final : private spsc_capacity_owner<StaticCapacity> {
 	}
 
 	/**
-	 * @brief Refresh producer-local tail state only when the ring may be full.
+	 * @brief Return conservative producer capacity, refreshing only an insufficient cache.
 	 *
 	 * @param head Producer-owned publication sequence.
-	 * @return true when at least one slot is available.
+	 * @param requested Desired prefix length.
+	 * @return Available slots established by the acquired peer cursor.
 	 */
-	[[nodiscard]] bool producer_has_capacity_(std::size_t head) noexcept
+	[[nodiscard]] std::size_t producer_available_(std::size_t head, std::size_t requested) noexcept
 	{
-		if (KINETUM_LIKELY(head - cached_tail_ < capacity_())) {
-			return true;
+		std::size_t available = capacity_() - (head - cached_tail_);
+		if (available < requested) {
+			cached_tail_ = tail_.load(std::memory_order_acquire);
+			available = capacity_() - (head - cached_tail_);
 		}
-		cached_tail_ = tail_.load(std::memory_order_acquire);
-		return head - cached_tail_ < capacity_();
+		return available;
 	}
 
 	/**
-	 * @brief Refresh consumer-local head state only when the ring may be empty.
+	 * @brief Return the acquired consumer prefix, refreshing only an insufficient cache.
 	 *
 	 * @param tail Consumer-owned publication sequence.
-	 * @return true when at least one published value is available.
+	 * @param requested Desired prefix length.
+	 * @return Published values established by the acquired peer cursor.
 	 */
-	[[nodiscard]] bool consumer_has_value_(std::size_t tail) noexcept
+	[[nodiscard]] std::size_t consumer_available_(std::size_t tail, std::size_t requested) const noexcept
 	{
-		if (KINETUM_LIKELY(tail != cached_head_)) {
-			return true;
+		std::size_t available = cached_head_ - tail;
+		if (available < requested) {
+			cached_head_ = head_.load(std::memory_order_acquire);
+			available = cached_head_ - tail;
 		}
-		cached_head_ = head_.load(std::memory_order_acquire);
-		return tail != cached_head_;
+		return available;
+	}
+
+	/** @param head Sole producer sequence. @return Whether one slot is available. */
+	[[nodiscard]] bool producer_has_capacity_(std::size_t head) noexcept
+	{
+		return producer_available_(head, 1u) != 0u;
+	}
+
+	/** @param tail Sole consumer sequence. @return Whether one value is available. */
+	[[nodiscard]] bool consumer_has_value_(std::size_t tail) const noexcept
+	{
+		return consumer_available_(tail, 1u) != 0u;
+	}
+
+	/**
+	 * @brief Share prefix lifetime and publication arithmetic across consumer APIs.
+	 * @tparam consume_type Nonthrowing callback that may move an accepted value.
+	 * @param max_count Maximum number of elements considered.
+	 * @param consume Accepts the next value or refuses it without changing it.
+	 * @return Exact consumed prefix; no later value bypasses a refusal.
+	 */
+	template <typename consume_type>
+	[[nodiscard]] std::size_t consume_prefix_(std::size_t max_count, consume_type &&consume) noexcept
+	{
+		static_assert(std::is_nothrow_invocable_r_v<bool, consume_type &, T &>);
+		if (max_count == 0u) {
+			return 0u;
+		}
+		const std::size_t tail = tail_.load(std::memory_order_relaxed);
+		const std::size_t available = consumer_available_(tail, max_count);
+		const std::size_t limit = std::min(max_count, available);
+		const std::size_t mask = mask_();
+		std::size_t consumed = 0u;
+		while (consumed < limit) {
+			T *slot = slot_((tail + consumed) & mask);
+			if (!std::invoke(consume, *slot)) {
+				break;
+			}
+			std::destroy_at(slot);
+			++consumed;
+		}
+		if (consumed != 0u) {
+			tail_.store(tail + consumed, std::memory_order_release);
+		}
+		return consumed;
 	}
 
 	/**
@@ -498,14 +560,14 @@ class spsc_ring_core final : private spsc_capacity_owner<StaticCapacity> {
 	}
 
 	/**
-	 * @brief Resolve one live element from its monotonic sequence identity.
+	 * @brief Resolve one live element at an already bounded physical slot.
 	 *
-	 * @param sequence Producer/consumer sequence naming one live slot.
+	 * @param ordinal Physical storage index naming one live slot.
 	 * @return Laundered pointer to that exact slot.
 	 */
-	[[nodiscard]] T *slot_(std::size_t sequence) noexcept
+	[[nodiscard]] T *slot_(std::size_t ordinal) noexcept
 	{
-		return std::launder(reinterpret_cast<T *>(&storage_[sequence & mask_()]));
+		return std::launder(reinterpret_cast<T *>(&storage_[ordinal]));
 	}
 
 	/** @brief Destroy every element retained when a quiescent core retires. */
@@ -513,8 +575,9 @@ class spsc_ring_core final : private spsc_capacity_owner<StaticCapacity> {
 	{
 		std::size_t tail = tail_.load(std::memory_order_relaxed);
 		const std::size_t head = head_.load(std::memory_order_relaxed);
+		const std::size_t mask = mask_();
 		while (tail != head) {
-			slot_(tail)->~T();
+			slot_(tail & mask)->~T();
 			++tail;
 		}
 		tail_.store(head, std::memory_order_relaxed);
@@ -522,11 +585,11 @@ class spsc_ring_core final : private spsc_capacity_owner<StaticCapacity> {
 		cached_tail_ = head;
 	}
 
-	storage_type *storage_;					     ///< Caller-owned uninitialized element storage.
-	alignas(CACHE_LINE_SIZE) std::atomic<std::size_t> head_{0};  ///< Producer publication sequence.
-	std::size_t cached_tail_{0};				     ///< Producer-owned cached consumer sequence.
-	alignas(CACHE_LINE_SIZE) std::atomic<std::size_t> tail_{0};  ///< Consumer publication sequence.
-	std::size_t cached_head_{0};				     ///< Consumer-owned cached producer sequence.
+	storage_type *storage_;					       ///< Caller-owned uninitialized element storage.
+	alignas(CACHE_LINE_SIZE) std::atomic<std::size_t> head_{0};    ///< Producer publication sequence.
+	alignas(CACHE_LINE_SIZE) std::size_t cached_tail_{0};	       ///< Producer-private acquired consumer sequence.
+	alignas(CACHE_LINE_SIZE) std::atomic<std::size_t> tail_{0};    ///< Consumer publication sequence.
+	alignas(CACHE_LINE_SIZE) mutable std::size_t cached_head_{0};  ///< Consumer-private acquired producer sequence.
 };
 
 /**
@@ -564,6 +627,8 @@ template <typename T>
 /**
  * @brief Return the exact uninitialized byte count for runtime-capacity SPSC storage.
  *
+ * Counts elements only; the composed owner accounts for its core object size.
+ *
  * @tparam T Element type stored in the resulting extent.
  * @param capacity Exact power-of-two usable capacity.
  * @return Byte count for @p capacity elements.
@@ -574,10 +639,11 @@ template <typename T>
 [[nodiscard]] std::size_t spsc_ring_storage_bytes(std::size_t capacity)
 {
 	const std::size_t admitted = detail::validate_spsc_capacity(capacity);
-	if (admitted > std::numeric_limits<std::size_t>::max() / sizeof(detail::spsc_storage<T>)) {
+	using storage_type = typename detail::spsc_ring_core<T, 0>::storage_type;
+	if (admitted > std::numeric_limits<std::size_t>::max() / sizeof(storage_type)) {
 		throw std::length_error("spsc_ring: storage byte count is not representable");
 	}
-	return admitted * sizeof(detail::spsc_storage<T>);
+	return admitted * sizeof(storage_type);
 }
 
 /**
@@ -707,6 +773,22 @@ class spsc_ring_static {
 		return core_.pop_batch(out, count);
 	}
 	/**
+	 * @brief Consume an admitted FIFO prefix and publish its completed tail once.
+	 * @tparam accept_type Nonthrowing callback over a read-only element borrow.
+	 * @param count Maximum number considered; zero invokes nothing.
+	 * @param accept Returns true after accepting the value, or false to retain
+	 *        it and the suffix. It cannot retain the borrow, reenter this ring,
+	 *        or invoke foreign callbacks.
+	 * @return Exact number consumed before the first refusal or limit.
+	 */
+	template <typename accept_type>
+	[[nodiscard]] std::size_t consume_prefix(std::size_t count, accept_type &&accept) noexcept
+		requires(std::is_nothrow_invocable_r_v<bool, accept_type &, const T &> &&
+			 std::is_nothrow_destructible_v<T>)
+	{
+		return core_.consume_prefix(count, std::forward<accept_type>(accept));
+	}
+	/**
 	 * @brief Borrow the current front value without consuming it.
 	 *
 	 * Only the sole consumer may call this method. The pointer follows the
@@ -780,8 +862,9 @@ class spsc_ring_static {
  * Destruction requires both owners to be quiescent.
  *
  * @par Performance
- * Construction allocates the complete element extent once. Every later queue
- * operation is O(1) and allocation-free.
+ * Construction allocates the complete element extent once. Scalar operations
+ * are O(1); a batch or destruction of n values is O(n). Queue operations do not
+ * allocate.
  */
 template <typename T>
 class spsc_ring {
@@ -867,6 +950,22 @@ class spsc_ring {
 		return core_.pop_batch(out, count);
 	}
 	/**
+	 * @brief Consume an admitted FIFO prefix and publish its completed tail once.
+	 * @tparam accept_type Nonthrowing callback over a read-only element borrow.
+	 * @param count Maximum number considered; zero invokes nothing.
+	 * @param accept Returns true after accepting the value, or false to retain
+	 *        it and the suffix. It cannot retain the borrow, reenter this ring,
+	 *        or invoke foreign callbacks.
+	 * @return Exact number consumed before the first refusal or limit.
+	 */
+	template <typename accept_type>
+	[[nodiscard]] std::size_t consume_prefix(std::size_t count, accept_type &&accept) noexcept
+		requires(std::is_nothrow_invocable_r_v<bool, accept_type &, const T &> &&
+			 std::is_nothrow_destructible_v<T>)
+	{
+		return core_.consume_prefix(count, std::forward<accept_type>(accept));
+	}
+	/**
 	 * @brief Return whether the observed ring is empty.
 	 *
 	 * @return One acquire-ordered empty-state observation.
@@ -931,8 +1030,8 @@ class spsc_ring {
  * @tparam T Element type stored in the borrowed extent.
  *
  * @par Performance
- * Construction validates and binds in O(1). Every queue operation is O(1) and
- * allocation-free.
+ * Construction validates and binds in O(1). Scalar operations are O(1); a batch
+ * or destruction of n values is O(n). Queue operations do not allocate.
  */
 template <typename T>
 class spsc_ring_view {
@@ -1024,6 +1123,22 @@ class spsc_ring_view {
 		requires std::is_nothrow_move_assignable_v<T>
 	{
 		return core_.pop_batch(out, count);
+	}
+	/**
+	 * @brief Consume an admitted FIFO prefix and publish its completed tail once.
+	 * @tparam accept_type Nonthrowing callback over a read-only element borrow.
+	 * @param count Maximum number considered; zero invokes nothing.
+	 * @param accept Returns true after accepting the value, or false to retain
+	 *        it and the suffix. It cannot retain the borrow, reenter this ring,
+	 *        or invoke foreign callbacks.
+	 * @return Exact number consumed before the first refusal or limit.
+	 */
+	template <typename accept_type>
+	[[nodiscard]] std::size_t consume_prefix(std::size_t count, accept_type &&accept) noexcept
+		requires(std::is_nothrow_invocable_r_v<bool, accept_type &, const T &> &&
+			 std::is_nothrow_destructible_v<T>)
+	{
+		return core_.consume_prefix(count, std::forward<accept_type>(accept));
 	}
 	/**
 	 * @brief Borrow the current front value without consuming it.
@@ -1154,13 +1269,20 @@ class mpmc_queue_core {
 	/** @brief Reject move assignment so queue identity cannot be replaced. */
 	mpmc_queue_core &operator=(mpmc_queue_core &&) = delete;
 
-	/** @return true only for one representable physical queue capacity. */
+	/**
+	 * @param capacity Candidate physical cell population.
+	 * @return true only for one representable physical queue capacity.
+	 */
 	[[nodiscard]] static constexpr bool valid_capacity(std::size_t capacity) noexcept
 	{
 		return capacity >= 2u && (capacity & (capacity - 1u)) == 0u && capacity <= COUNTER_HALF_RANGE;
 	}
 
-	/** @brief Publish one copied value if a physical cell is available. */
+	/**
+	 * @brief Publish one copied value if a physical cell is available.
+	 * @param value Value borrowed until its copy is published.
+	 * @return true after publication; false when no cell can be reserved.
+	 */
 	[[nodiscard]] bool try_enqueue(const T &value) noexcept(std::is_nothrow_copy_assignable_v<T>)
 	{
 		storage_type *target;
@@ -1185,7 +1307,11 @@ class mpmc_queue_core {
 		return true;
 	}
 
-	/** @brief Consume one value if a published physical cell is available. */
+	/**
+	 * @brief Consume one value if a published physical cell is available.
+	 * @param[out] out Initialized destination, unchanged when no value is available.
+	 * @return true after transfer; false when no published cell can be reserved.
+	 */
 	[[nodiscard]] bool try_dequeue(T &out) noexcept(std::is_nothrow_move_assignable_v<T>)
 	{
 		storage_type *target;
@@ -1559,6 +1685,15 @@ namespace detail
 class work_queue_indices final {
     public:
 	/**
+	 * @param capacity Candidate exact usable slot population.
+	 * @return Whether it fits the power-of-two modular sequence domain.
+	 */
+	[[nodiscard]] static constexpr bool valid_capacity(std::size_t capacity) noexcept
+	{
+		return capacity >= 2u && (capacity & (capacity - 1u)) == 0u && capacity <= COUNTER_HALF_RANGE;
+	}
+
+	/**
 	 * @brief Construct one empty exact-capacity sequence owner.
 	 * @param capacity Power-of-two usable capacity in the modular half range.
 	 */
@@ -1566,7 +1701,7 @@ class work_queue_indices final {
 		: capacity_(capacity)
 		, mask_(capacity - 1u)
 	{
-		if (capacity_ < 2u || (capacity_ & (capacity_ - 1u)) != 0u || capacity_ > COUNTER_HALF_RANGE) {
+		if (!valid_capacity(capacity_)) {
 			std::terminate();
 		}
 	}
@@ -1606,10 +1741,13 @@ class work_queue_indices final {
 	{
 		++head_;
 	}
-	/** @brief Commit one already-destroyed consumption. */
-	KINETUM_ALWAYS_INLINE void commit_pop() noexcept
+	/**
+	 * @brief Commit an already-consumed FIFO prefix.
+	 * @param count Number of live values whose ownership has been transferred.
+	 */
+	KINETUM_ALWAYS_INLINE void commit_pop(std::size_t count = 1u) noexcept
 	{
-		++tail_;
+		tail_ += count;
 	}
 	/** @brief Reset a proven-empty sequence owner to its canonical state. */
 	void reset_empty() noexcept
@@ -1644,8 +1782,10 @@ class work_queue_indices final {
  * No operation is a cross-thread publication mechanism.
  *
  * @par Performance
- * Construction adopts already allocated storage. Every queue operation is
- * O(1), allocation-free, lock-free, and uses the shared mask/index core.
+ * Construction adopts already allocated storage. Scalar operations are O(1);
+ * consuming or clearing n values is O(n). Batch consumption reads at most two
+ * contiguous slot ranges and advances the owner cursor once. Every operation
+ * is allocation-free and lock-free, using the shared mask/index core.
  *
  * @tparam T Move-constructible value type.
  */
@@ -1654,7 +1794,17 @@ class work_queue_view {
 	static_assert(std::is_move_constructible_v<T>);
 
     public:
+	using value_type = T;						     ///< Exact queue element type.
 	using storage_type = std::aligned_storage_t<sizeof(T), alignof(T)>;  ///< Uninitialized caller slot.
+
+	/**
+	 * @param capacity Candidate exact usable slot population.
+	 * @return Whether a cold owner may allocate this extent before binding the view.
+	 */
+	[[nodiscard]] static constexpr bool valid_capacity(std::size_t capacity) noexcept
+	{
+		return detail::work_queue_indices::valid_capacity(capacity);
+	}
 
 	/**
 	 * @brief Bind one exact empty queue to caller-owned storage.
@@ -1726,11 +1876,39 @@ class work_queue_view {
 		if (KINETUM_UNLIKELY(empty())) {
 			return false;
 		}
-		auto *slot = reinterpret_cast<T *>(&storage_[indices_.consumer_slot()]);
+		auto *slot = slot_(indices_.consumer_slot());
 		out = std::move(*slot);
 		slot->~T();
 		indices_.commit_pop();
 		return true;
+	}
+
+	/**
+	 * @brief Consume the available bounded FIFO prefix into initialized storage.
+	 *
+	 * Move assignment and destruction finish before the single cursor advance.
+	 * Output storage must not overlap this queue's backing slots.
+	 *
+	 * @param[out] out Initialized destinations; nonnull when @p max_count is nonzero.
+	 * @param max_count Maximum number of values to transfer.
+	 * @return Number of values consumed, no greater than @p max_count.
+	 */
+	[[nodiscard]] KINETUM_ALWAYS_INLINE std::size_t pop_batch(T *out, std::size_t max_count) noexcept
+		requires(std::is_nothrow_move_assignable_v<T> && std::is_nothrow_destructible_v<T>)
+	{
+		if (KINETUM_UNLIKELY(out == nullptr && max_count != 0u)) {
+			std::terminate();
+		}
+		const std::size_t count = std::min(max_count, indices_.size());
+		if (count == 0u) {
+			return 0u;
+		}
+		const std::size_t begin = indices_.consumer_slot();
+		const std::size_t first = std::min(count, indices_.capacity() - begin);
+		consume_range_(out, begin, first);
+		consume_range_(out + first, 0u, count - first);
+		indices_.commit_pop(count);
+		return count;
 	}
 
 	/** @return true when no value is retained. */
@@ -1758,7 +1936,7 @@ class work_queue_view {
 	void clear() noexcept
 	{
 		while (!empty()) {
-			auto *slot = reinterpret_cast<T *>(&storage_[indices_.consumer_slot()]);
+			auto *slot = slot_(indices_.consumer_slot());
 			slot->~T();
 			indices_.commit_pop();
 		}
@@ -1766,6 +1944,32 @@ class work_queue_view {
 	}
 
     private:
+	/**
+	 * @brief Access the live placement-constructed value rather than its backing slot.
+	 * @param ordinal Physical ordinal whose value has been constructed and not consumed.
+	 * @return Pointer to that live value.
+	 */
+	[[nodiscard]] KINETUM_ALWAYS_INLINE T *slot_(std::size_t ordinal) noexcept
+	{
+		return std::launder(reinterpret_cast<T *>(&storage_[ordinal]));
+	}
+
+	/**
+	 * @brief Move and destroy one contiguous slot range without changing queue indices.
+	 * @param[out] out Initialized nonoverlapping output range.
+	 * @param begin First physical storage ordinal.
+	 * @param count Number of live slots before the physical end.
+	 */
+	KINETUM_ALWAYS_INLINE void consume_range_(T *out, std::size_t begin, std::size_t count) noexcept
+		requires(std::is_nothrow_move_assignable_v<T> && std::is_nothrow_destructible_v<T>)
+	{
+		for (std::size_t index = 0u; index < count; ++index) {
+			auto *slot = slot_(begin + index);
+			out[index] = std::move(*slot);
+			std::destroy_at(slot);
+		}
+	}
+
 	storage_type *storage_{nullptr};      ///< Exact borrowed slot array.
 	detail::work_queue_indices indices_;  ///< Shared exact circular sequence arithmetic.
 };

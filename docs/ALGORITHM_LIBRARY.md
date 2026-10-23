@@ -67,7 +67,7 @@ C++ algorithm surface or in exact module-owned implementations.
 | `queue.hpp` | Static, owning-runtime, and caller-storage SPSC rings; static/runtime-capacity MPMC queues; caller-storage single-owner work queues. | All queue operations are allocation-free after construction under their exact ownership model. | NUMA-composed DATA boundaries, worker active/future staging, active control mailboxes, boundary future holds, lifecycle channels, fixed host packet-pool credits, and UDP/development queues. |
 | `bounded_service_order.hpp` | Caller-storage fair service with bounded carried allowances. | Single owner; O(1) order updates and input-count-bounded turns. | Worker RX and inbound DATA admission. |
 | `ratelimit.hpp` | Exact byte credit, token bucket, leaky bucket, and sliding window. | Hot-path safe after construction. | `byte_credit` supplies both generic token buckets and built-in QoS slab entries. |
-| `net.hpp` | Big-endian reads/writes, protocol constants, and RFC 1918 classification. | Hot-path safe. | DP IPv4 parsing and NAT44/QoS packet work. |
+| `net.hpp` | Big-endian reads/writes, Internet checksums, protocol constants, and RFC 1918 classification. | Hot-path safe. | DP IPv4 parsing and NAT44/QoS packet work. |
 | `cidr.hpp` | Header-owned IPv4/CIDR parsing, formatting, and matching. | `match_cidr` is hot-path safe; parsing/formatting are cold path. | ACL and NAT44 config parsing; ACL matching; installed C++ SDK. |
 | `condition_parse.hpp` | Shared parser for `field op decimal_uint32` edge-condition syntax. | Cold path. | Axiom authoring-time validation and DP route compilation. |
 | `graph.hpp` | Identity-only DAG and deterministic topological sort with exact blocked-node evidence. | Cold path. | Axiom cycle checks and canonical order consumed by Gluon. |
@@ -198,11 +198,18 @@ QoS check each recycled slab entry before reuse.
 
 `compact_index_set` owns fixed-universe dense membership for zero-based compact
 identities. Its constructor allocates the complete `ceil(value_limit / 64)`
-word array. One cold owner inserts each exact identity before publication;
+word array. Copies own independent membership; moves transfer the words and
+identity bound together, leaving an empty zero-universe source.
+`compact_index_set_view` instead binds and clears an exact
+caller-owned word span; a different extent rejects. Both forms use the same
+membership arithmetic and retain the exclusive identity limit, so padding bits
+never enlarge the universe. The backing words must outlive every view.
+One cold owner inserts each exact identity before publication;
 duplicate or out-of-range insertion rejects. Published `contains()` calls use
 one bounds check and one word-mask test without allocation or search.
 
-The DP compiles each stage's sorted reachable-storage set into this O(1) gate.
+The DP places each stage's membership words with its worker's execution tables
+and binds the caller-storage view to this O(1) gate.
 The sorted vector remains compiler and cold-validation authority; the compact
 set is an immutable runtime projection.
 
@@ -396,11 +403,11 @@ not falsely marked `noexcept`.
 |------|-------|-------------|
 | `spsc_ring_static<T, Capacity>` | Fixed-capacity SPSC ring with exactly `Capacity` usable slots. | Lifecycle channels and the boundary channel's capacity-2 typed CUT/ACK lanes. |
 | `spsc_ring<T>` | Runtime-capacity owning SPSC ring with exactly constructor `capacity` usable slots. | Available when ordinary heap-backed ownership is the admitted cold-path mechanism. |
-| `spsc_ring_view<T>` | Runtime-capacity SPSC arithmetic over one exact caller-owned storage extent. | The DP-local NUMA owner composes it once for DATA boundaries, worker queue roles, and boundary future-output holds. |
+| `spsc_ring_view<T>` | Runtime-capacity SPSC arithmetic over one exact caller-owned storage extent. | The DP-local NUMA owner composes it once for DATA boundaries and boundary future-output holds. |
 | `mpmc_queue<T, Capacity>` | Fixed-capacity MPMC queue. | Available for bounded cold/control paths; packet workers use the caller-storage form where MPMC is required. |
-| `mpmc_queue_dynamic<T>` | Construction-time power-of-two MPMC storage; no enqueue/dequeue allocation. | Exact free-credit authority for `fixed_packet_pool`, and plan-sized fixed-record admission for the DP coordinator command mailbox. |
-| `mpmc_queue_view<T>` | Runtime-capacity MPMC arithmetic over exact caller-owned cache-line cells. | Tracked-async completion delivery inside each eligible active worker's exact-NUMA slab. |
-| `work_queue_view<T>` | Runtime-capacity single-owner queue over exact caller storage. | Copied active-control mailboxes inside each active worker's exact-NUMA slab. |
+| `mpmc_queue_dynamic<T>` | Construction-time power-of-two MPMC storage; no enqueue/dequeue allocation. | Plan-sized fixed-record admission for the DP coordinator command mailbox. |
+| `mpmc_queue_view<T>` | Runtime-capacity MPMC arithmetic over exact caller-owned cache-line cells. | Fixed host-pool free credits and tracked-async completion delivery in their owners' exact-NUMA mappings. |
+| `work_queue_view<T>` | Runtime-capacity single-owner queue over exact caller storage. | Active-control mailboxes, worker packet rings grouped by execution key, and their ready-key FIFOs. |
 
 Every SPSC usable capacity is a power of two and at least two. Static forms
 enforce that relation at compile time; runtime and borrowed forms reject it at
@@ -408,8 +415,10 @@ construction before adopting storage.
 
 SPSC requires one producer and one consumer. DP's `numa_spsc_ring<T>` places
 `spsc_ring_view<T>` and its elements in one checked, prefaulted NUMA mapping.
-Active/future queue roles exchange stable owners without copying or resizing
-entries.
+The shared core puts each published cursor and each owner-private cached peer
+cursor on its own cache line. `peek()`, scalar consumption and batch consumption
+reuse the acquired head; producer operations reuse the acquired tail. An
+insufficient cached extent causes one acquire refresh.
 
 All MPMC forms use `mpmc_queue_core`, with isolated cells and separate
 producer/consumer cursors. Fixed queues embed storage, dynamic queues allocate
@@ -426,8 +435,20 @@ Since one live slot can publish at most one terminal cell, a winning foreign
 completion never needs a caller retry loop.
 
 The single-owner work-queue view composes one `work_queue_indices` arithmetic
-core over a power-of-two caller extent. It allocates no storage, takes no lock,
-and keeps circular head/tail semantics out of its subsystem consumer.
+core over a power-of-two caller extent of at least two slots. `valid_capacity()`
+lets a cold storage owner check that extent before allocation. Scalar operations
+are O(1); `pop_batch()` consumes an available FIFO prefix across at most two
+contiguous ranges and advances the cursor once. It requires nonthrowing move
+assignment and destruction into initialized, nonoverlapping output storage.
+Batch consumption and `clear()` are O(n). The view allocates no storage, takes
+no lock, and keeps circular arithmetic out of its subsystem consumer.
+
+DP composes these views into active/future role sets. Each role shares one
+packet-capacity bound across its keys and outstanding reservations; its
+physical pointer arrays do not multiply that bound. Complete role owners
+exchange in O(1), including ready state, without copying or resizing entries.
+Epoch and dispatch policy remain in DP, as described in
+[Stage Dispatch](DATA_PLANE.md#10-stage-dispatch).
 
 The coordinator mailbox composes `mpmc_queue_dynamic` with subsystem-owned
 linear completion contexts and an `eventfd` wake source. Queue cells store only
@@ -441,7 +462,13 @@ All SPSC forms share batch arithmetic and keep capacity below the modular
 counter half-range. A producer constructs an accepted prefix before one
 release store; a consumer move-assigns and destroys its prefix before one
 release store. Batch APIs require nothrow copy construction or move assignment,
-respectively. Single-element push may use a throwing constructor because it
+respectively. `consume_prefix(max_count, accept)` instead passes each FIFO
+element as a read-only borrow to a nonthrowing callback. Acceptance completes
+local ownership work before destruction; refusal retains that head and every
+later element. The callback may not retain the borrow, reenter the ring, or
+invoke foreign code. It requires nonthrowing destruction and performs O(n)
+work for at most `max_count` elements. No accepted elements means no cursor
+publication. Single-element push may use a throwing constructor because it
 publishes only after construction; pop still requires nonthrowing move.
 MPMC requires default construction and nonthrowing copy/move assignment because
 reserved cursors cannot roll back. Batch pointers may be null only at count zero.
@@ -482,15 +509,20 @@ next call. QoS activation retains exact credit and does not call `reconfigure()`
 
 ### `net.hpp`
 
-`net.hpp` owns byte-order and lightweight IP utilities:
+`net.hpp` owns byte-order, checksum and lightweight IP utilities:
 
 - `read_be16`, `read_be32`, `read_be64`
 - `write_be16`, `write_be32`, `write_be64`
 - `protocol::ICMP`, `protocol::TCP`, `protocol::UDP`
 - `is_private_ip`
+- `internet_checksum`: full one's-complement sum over a caller-proven byte extent
+- `update_internet_checksum`: exact changed-word update
 
-Checksum algorithms are not a shared SDK or DP service. Packet-mutating modules
-keep the required inline checksum arithmetic inside their link-closed images.
+Both checksum helpers return host-order representations of network words.
+The full sum accepts unaligned input and a `uint16_t` byte extent, including odd
+lengths. The incremental helper neither validates the original checksum nor
+applies protocol-specific zero rules. Callers own bounds and protocol policy;
+the header-owned arithmetic keeps module images link-closed.
 
 ### `cidr.hpp`
 
@@ -552,9 +584,10 @@ cycle validation. Gluon consumes Axiom's canonical order for planning.
 
 - construction requires a positive bucket count and an explicit non-null PMR
   resource that outlives the map
+- copying and moving are deleted; storage authority and the map's address stay fixed
 - every instantiation supplies a nonthrowing semantic hasher; no default or
   raw-object representation hash exists
-- two hash locations per lookup
+- at most two candidate buckets per lookup, derived from one semantic hash
 - four entries per bucket
 - cache-line-aligned buckets
 - bounded displacement chain on insert
@@ -563,6 +596,14 @@ cycle validation. Gluon consumes Axiom's canonical order for planning.
 - preallocated displacement undo log stored with the map, so insert does not
   allocate and does not place the full undo log on the caller's stack
 - prefetch of both candidate buckets
+
+`prepare(key)` copies the semantic key, computes both bucket ordinals and
+prefetches their stable storage. `find(query)` reads current entries, including
+mutations made since preparation. A query carries its issuing map's address;
+using it with another map terminates. The map must outlive its queries. Queries
+cache no entry pointer, value or lookup result, and impose no additional key
+default-construction or move requirement. Scalar `find(key)` uses the same
+bucket search.
 
 Each bucket starts on a cache-line boundary. Its extent depends on `K` and `V`
 and may span more than one line. Hash invocation, key equality, and mutation
@@ -680,9 +721,8 @@ Examples:
 | Packet-batch ACL-style matching | `algo::packet_batch_soa` and `classify_batch_acl` |
 | Single-owner active-stage timers | `algo::timer_wheel` |
 
-Checksum updates are module-owned policy. A module that needs them must carry a
-link-closed implementation or declare an explicit installed dependency; no DP
-checksum service completes an unloadable image.
+Modules select full recomputation or incremental update according to their
+packet-mutation contract; both mechanisms are in `algo::net`.
 
 ## Duplicate And Local-Code Rules
 
@@ -691,8 +731,7 @@ Some local code remains intentional:
 | Location | Why it stays local |
 |----------|--------------------|
 | `kinetum_sdk.h` branch and attribute macros | Pure C SDK cannot include C++ algorithm headers. |
-| NAT44 local checksum helpers | The link-closed module image owns every checksum symbol it calls. |
-| Module-specific hashers | ACL/NAT44 keys need exact field-wise hashing and padding avoidance. |
+| Module-specific hashers | ACL, NAT44, and QoS keys need exact semantic hashing and padding avoidance. |
 
 If new reusable C++ primitives are added, put them in
 `include/kinetum/algo/` first and have callers include them through the

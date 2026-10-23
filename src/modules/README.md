@@ -243,7 +243,7 @@ translated endpoints until expiration or context destruction.
 | Condition | Result |
 |-----------|--------|
 | No config published | Drop all packets. |
-| IPv6 packet | Forward unchanged. |
+| IPv4 metadata flag absent | Forward unchanged. |
 | Non-TCP/UDP packet | Forward unchanged. |
 | IPv4 TCP/UDP fragment | Drop. |
 | Outbound private-source TCP/UDP | Create or reuse SNAT session and rewrite source IP/port. |
@@ -251,6 +251,9 @@ translated endpoints until expiration or context destruction.
 | Inbound public-side TCP/UDP without session | Drop and increment `inbound_misses`. |
 | IPv4 TCP/UDP with a malformed buffer, truncated header, or inconsistent IPv4/UDP length fields | Drop before session lookup, creation, or byte mutation. |
 | Slab, map, or pool exhausted | Drop and increment allocation failure counters. |
+
+These are module-callback predicates. The canonical gateway's upstream IPv4
+parser rejects non-IPv4 frames before they reach NAT44.
 
 ### NAT44 Telemetry
 
@@ -316,11 +319,15 @@ worker mutates it.
 
 `qos_policer` contains:
 
-- A contiguous bucket slab.
+- A contiguous slab of 32-byte credit/time/occupancy rows and a separate 16-byte
+  reclamation-key array sharing each slab index's lifetime.
 - A `bounded_index_pool` that recycles bucket indexes without container growth.
 - A `cuckoo_map<flow_key, slab_index, flow_identity_hash>` with semantic field equality.
 - Shared `algo::byte_credit` state retaining exact fractional bytes.
 - Cursor-based incremental GC.
+
+Callback scratch holds copied keys and bucket ordinals, with no retained
+packet or policy pointers. Policing and GC preserve packet order.
 
 Token refill and idle timeout use `batch->now_ns`, the worker's once-per-turn
 processing time, with no module clock read. A decreasing value terminates before

@@ -264,12 +264,12 @@ TEST(provider_component_abi, packet_record_physical_authority_preserves_exact_la
 {
 	EXPECT_TRUE((std::is_same_v<dp::packet_private, ::kinetum_packet_private>));
 	EXPECT_TRUE((std::is_same_v<dp::packet_record, ::kinetum_packet_record>));
-	EXPECT_EQ(sizeof(kinetum_packet_private), 128u);
-	EXPECT_EQ(alignof(kinetum_packet_private), 64u);
-	EXPECT_EQ(sizeof(kinetum_packet_record), 192u);
+	EXPECT_EQ(sizeof(kinetum_packet_private), 80u);
+	EXPECT_EQ(alignof(kinetum_packet_private), 8u);
+	EXPECT_EQ(sizeof(kinetum_packet_record), 128u);
 	EXPECT_EQ(alignof(kinetum_packet_record), 64u);
-	EXPECT_EQ(offsetof(kinetum_packet_record, metadata), 0u);
-	EXPECT_EQ(offsetof(kinetum_packet_record, storage), 128u);
+	EXPECT_EQ(offsetof(kinetum_packet_record, metadata), 48u);
+	EXPECT_EQ(offsetof(kinetum_packet_record, storage), 0u);
 }
 
 /** @brief Prove packet and operation records remain plain exact ABI values. */

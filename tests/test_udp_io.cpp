@@ -26,12 +26,12 @@
 #include <cstring>
 #include <exception>
 #include <memory>
-#include <optional>
 #include <utility>
 
 #include "src/common/status_or.hpp"
 #include "src/dp/backends/udp/udp_io.hpp"
 #include "src/dp/fixed_packet_pool.hpp"
+#include "tests/numa_test_support.hpp"
 #include "tests/worker_telemetry_test_fixture.hpp"
 
 namespace kinetum::dp
@@ -149,9 +149,9 @@ class scoped_test_socket {
  *
  * @param record_count Logical packet-credit population.
  * @param data_room_bytes Bytes reserved for each packet payload.
- * @return Complete fixed-pool options with intentionally absent host NUMA.
+ * @return Complete fixed-pool options on a proved process-allowed memory node.
  */
-[[nodiscard]] fixed_packet_pool_options udp_test_pool_options(uint32_t record_count, uint32_t data_room_bytes) noexcept
+[[nodiscard]] fixed_packet_pool_options udp_test_pool_options(uint32_t record_count, uint32_t data_room_bytes)
 {
 	return fixed_packet_pool_options{
 		.record_count = record_count,
@@ -160,7 +160,7 @@ class scoped_test_socket {
 		.alignment_bytes = 64,
 		.domain_index = 4,
 		.generation = 9,
-		.host_numa_node = std::nullopt,
+		.host_numa_node = kinetum::test::required_memory_numa_node(),
 	};
 }
 
@@ -1065,7 +1065,8 @@ TEST(udp_io, deferred_shutdown_keeps_acceptance_without_delivery_evidence)
 	ASSERT_NE(address.sin_port, 0);
 	ASSERT_TRUE(port->connect(exact_endpoint(address)).is_ok());
 	constexpr std::array<uint32_t, 1> STREAMS{0u};
-	auto telemetry_or = test::worker_telemetry_test_owner::create(0u, 1u, STREAMS);
+	auto telemetry_or =
+		test::worker_telemetry_test_owner::create(0u, 1u, kinetum::test::required_memory_numa_node(), STREAMS);
 	ASSERT_TRUE(telemetry_or.is_ok()) << telemetry_or.error().message();
 	auto telemetry = std::move(telemetry_or).value();
 	telemetry->telemetry->bind_bootstrap_epoch(1u, 1u);

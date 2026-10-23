@@ -64,9 +64,8 @@ worker_telemetry_channel::create(uint32_t worker_index, std::size_t module_conte
 }
 
 worker_telemetry_channel::worker_telemetry_channel(
-	uint32_t worker_index, std::size_t capacity,
-	std::unique_ptr<numa_spsc_ring<runtime_telemetry_bank_token>> completed,
-	std::unique_ptr<numa_spsc_ring<runtime_telemetry_bank_token>> returned) noexcept
+	uint32_t worker_index, std::size_t capacity, numa_owner<numa_spsc_ring<runtime_telemetry_bank_token>> completed,
+	numa_owner<numa_spsc_ring<runtime_telemetry_bank_token>> returned) noexcept
 	: worker_index_(worker_index)
 	, capacity_(capacity)
 	, completed_(std::move(completed))

@@ -148,7 +148,7 @@ void module_retirement_claim::resolve_() noexcept
 	retirement_completed_ = false;
 }
 
-status_or<std::unique_ptr<module_epoch_store>>
+status_or<numa_owner<module_epoch_store>>
 module_epoch_store::create(uint32_t module_image_index, uint32_t context_index, const kinetum_module *descriptor,
 			   kinetum_ctx *context, lifecycle_context_owner *telemetry_owner)
 {
@@ -177,12 +177,10 @@ module_epoch_store::create(uint32_t module_image_index, uint32_t context_index, 
 		return status::invalid_argument("module epoch store received an unknown execution mode");
 	}
 
-	try {
-		return std::unique_ptr<module_epoch_store>(new module_epoch_store(
-			module_image_index, context_index, *descriptor, *context, *telemetry_owner));
-	} catch (const std::bad_alloc &) {
-		return status::resource_exhausted("failed to allocate exact module epoch store");
-	}
+	return make_numa_owner<module_epoch_store>(context->numa_node, [&](void *storage) noexcept {
+		return new (storage)
+			module_epoch_store(module_image_index, context_index, *descriptor, *context, *telemetry_owner);
+	});
 }
 
 module_epoch_store::module_epoch_store(uint32_t module_image_index, uint32_t context_index,
@@ -477,6 +475,11 @@ uint64_t module_epoch_store::prepared_epoch() const noexcept
 uint32_t module_epoch_store::context_index() const noexcept
 {
 	return context_index_;
+}
+
+int32_t module_epoch_store::numa_node() const noexcept
+{
+	return context_.numa_node;
 }
 
 status module_epoch_store::bind_protocol_fault_latch(epoch_protocol_fault_latch &faults) noexcept

@@ -484,10 +484,10 @@ enum class command_output_format : uint8_t {
 }
 
 /**
- * @brief Emit one already validated success through a single stdout write.
+ * @brief Emit one already validated response through checked stdout delivery.
  * @param response Exact generated response.
  * @param format Selected output encoding.
- * @return true after complete encoding and emission; false with stderr only.
+ * @return True after complete encoding and delivery; false on encoding or reported delivery failure.
  */
 bool emit_success_response(const google::protobuf::Message &response, command_output_format format)
 {

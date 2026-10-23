@@ -10,11 +10,14 @@
 #include <gtest/gtest.h>
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <memory>
+#include <span>
 #include <string>
+#include <thread>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -93,19 +96,24 @@ struct sender_test_owner {
 	std::unique_ptr<boundary_epoch_worker_slab> sender_slab;       ///< Exact sender storage.
 	std::unique_ptr<boundary_epoch_worker_slab> receiver_slab;     ///< Exact receiver storage.
 	std::unique_ptr<boundary_epoch_channel> channel;	       ///< Exact transport.
-	std::unique_ptr<boundary_future_output_hold> hold;	       ///< Exact held-output queue.
+	numa_owner<boundary_future_output_hold> hold;		       ///< Exact held-output queue.
 	std::unique_ptr<test::worker_telemetry_test_owner> telemetry;  ///< Production-shaped worker banks.
 	std::unique_ptr<epoch_protocol_fault_latch> faults;	       ///< Process-generation first-fault authority.
-	std::unique_ptr<worker_epoch_ledger> ledger;		       ///< Exact worker credit owner.
-	std::unique_ptr<worker_boundary_sender> sender;		       ///< Sole sender policy.
-	std::unique_ptr<worker_boundary_receiver> receiver;	       ///< Mirrored receiver claim owner.
+	numa_owner<worker_epoch_ledger> ledger;			       ///< Exact worker credit owner.
+	numa_owner<worker_boundary_sender> sender;		       ///< Sole sender policy.
+	numa_owner<worker_boundary_receiver> receiver;		       ///< Mirrored receiver claim owner.
 
+	/** @brief Construct an empty fixture ownership graph. */
 	sender_test_owner() noexcept = default;
+	/** @brief Reject copying linear fixture ownership. */
 	sender_test_owner(const sender_test_owner &) = delete;
+	/** @brief Reject copy assignment of linear fixture ownership. */
 	sender_test_owner &operator=(const sender_test_owner &) = delete;
 	/** Transfer complete fixture resource ownership. */
 	sender_test_owner(sender_test_owner &&) noexcept = default;
+	/** @brief Reject replacement that would destroy dependencies before borrowers. */
 	sender_test_owner &operator=(sender_test_owner &&) = delete;
+	/** @brief Retire borrowers before their backing storage. */
 	~sender_test_owner() = default;
 
 	/** @return true when every exact owner is present. */
@@ -153,13 +161,15 @@ struct sender_test_owner {
 	owner.hold = std::move(hold_or).value();
 	std::array<boundary_epoch_channel *, 1> channels{owner.channel.get()};
 	std::array<boundary_future_output_hold *, 1> holds{owner.hold.get()};
-	auto sender_or = worker_boundary_sender::create(TEST_SENDER_WORKER, TEST_RUNTIME_GENERATION, channels, holds);
+	auto sender_or =
+		worker_boundary_sender::create(TEST_SENDER_WORKER, TEST_RUNTIME_GENERATION, channels, holds, numa_node);
 	if (!sender_or.is_ok()) {
 		ADD_FAILURE() << sender_or.error().message();
 		return owner;
 	}
 	owner.sender = std::move(sender_or).value();
-	auto receiver_or = worker_boundary_receiver::create(TEST_RECEIVER_WORKER, TEST_RUNTIME_GENERATION, channels);
+	auto receiver_or =
+		worker_boundary_receiver::create(TEST_RECEIVER_WORKER, TEST_RUNTIME_GENERATION, channels, numa_node);
 	if (!receiver_or.is_ok()) {
 		ADD_FAILURE() << receiver_or.error().message();
 		return owner;
@@ -171,13 +181,14 @@ struct sender_test_owner {
 		ADD_FAILURE() << (sender_sealed.is_ok() ? receiver_sealed.message() : sender_sealed.message());
 		return owner;
 	}
-	auto ledger_or = worker_epoch_ledger::create(TEST_SENDER_WORKER, TEST_RUNTIME_GENERATION, 32u);
+	auto ledger_or = worker_epoch_ledger::create(TEST_SENDER_WORKER, TEST_RUNTIME_GENERATION, 32u, numa_node);
 	if (!ledger_or.is_ok()) {
 		ADD_FAILURE() << ledger_or.error().message();
 		return owner;
 	}
 	owner.ledger = std::move(ledger_or).value();
-	auto telemetry_or = test::worker_telemetry_test_owner::create(TEST_SENDER_WORKER, TEST_RUNTIME_GENERATION, {});
+	auto telemetry_or =
+		test::worker_telemetry_test_owner::create(TEST_SENDER_WORKER, TEST_RUNTIME_GENERATION, numa_node, {});
 	if (!telemetry_or.is_ok()) {
 		ADD_FAILURE() << telemetry_or.error().message();
 		return owner;
@@ -212,14 +223,16 @@ struct sender_test_owner {
  */
 void drain_data(boundary_epoch_channel &channel, std::size_t expected_count)
 {
-	for (std::size_t index = 0u; index < expected_count; ++index) {
-		packet_record *record = nullptr;
-		ASSERT_EQ(channel.try_receive_data(record), boundary_data_receive_result::RECEIVED);
-		ASSERT_NE(record, nullptr);
-		channel.complete_data_receive(record);
-	}
-	packet_record *extra = nullptr;
-	EXPECT_EQ(channel.try_receive_data(extra), boundary_data_receive_result::EMPTY);
+	std::size_t retired = 0u;
+	const auto result =
+		channel.receive_data(common::runtime_sizing::PACKET_MAX_BURST_SIZE, [&](packet_record *) noexcept {
+			++retired;
+			return true;
+		});
+	EXPECT_FALSE(result.sequence_exhausted);
+	EXPECT_EQ(result.transferred_count, expected_count);
+	EXPECT_EQ(retired, expected_count);
+	EXPECT_TRUE(channel.data_empty());
 }
 
 /**
@@ -288,7 +301,7 @@ void send_old_after_seal(int32_t numa_node)
 	packet_record record{};
 	record.metadata.epoch = TEST_ACTIVE_EPOCH;
 	owner.ledger->acquire(TEST_ACTIVE_EPOCH);
-	(void)owner.sender->try_send(0u, &record);
+	(void)owner.sender->try_send(0u, std::array{&record});
 	std::_Exit(EXIT_SUCCESS);
 }
 
@@ -306,7 +319,7 @@ void send_unrelated_epoch(int32_t numa_node)
 	begin_transition(owner);
 	packet_record record{};
 	record.metadata.epoch = TEST_FUTURE_EPOCH + 1u;
-	(void)owner.sender->try_send(0u, &record);
+	(void)owner.sender->try_send(0u, std::array{&record});
 	std::_Exit(EXIT_SUCCESS);
 }
 
@@ -381,6 +394,31 @@ void service_oversized_hold_budget(int32_t numa_node)
 	std::_Exit(EXIT_SUCCESS);
 }
 
+/**
+ * @brief Reject a prefix that mixes immutable handoff identities before publication.
+ * @param numa_node Exact fixture placement.
+ * @param wrong_epoch Select an epoch mismatch rather than a domain mismatch.
+ */
+void send_incompatible_prefix(int32_t numa_node, bool wrong_epoch)
+{
+	auto owner = make_sender(numa_node);
+	if (!owner) {
+		std::_Exit(EXIT_SUCCESS);
+	}
+	std::array<packet_record, 2> records{};
+	for (auto &record : records) {
+		record.metadata.epoch = TEST_ACTIVE_EPOCH;
+	}
+	if (wrong_epoch) {
+		records[1].metadata.epoch = TEST_FUTURE_EPOCH;
+	} else {
+		records[1].storage.domain_index = 1u;
+	}
+	owner.ledger->acquire(TEST_ACTIVE_EPOCH, records.size());
+	(void)owner.sender->try_send(0u, std::array{&records[0], &records[1]});
+	std::_Exit(EXIT_SUCCESS);
+}
+
 /** @brief Prove exact layout, binding, identity, and sender-NUMA placement. */
 TEST(worker_boundary_sender, policy_state_is_cacheline_exact_and_sender_numa_local)
 {
@@ -434,21 +472,104 @@ TEST(worker_boundary_sender, fixed_open_path_preserves_sequence_before_credit_re
 		record.metadata.epoch = TEST_ACTIVE_EPOCH;
 		owner.ledger->acquire(TEST_ACTIVE_EPOCH);
 	}
-	EXPECT_EQ(owner.sender->try_send(0u, &records[0]), boundary_epoch_send_result::TRANSFERRED);
-	EXPECT_EQ(owner.sender->try_send(0u, &records[1]), boundary_epoch_send_result::TRANSFERRED);
-	EXPECT_EQ(owner.sender->try_send(0u, &records[2]), boundary_epoch_send_result::BACKPRESSURED);
+	const std::array prefix{&records[0], &records[1], &records[2]};
+	EXPECT_EQ(owner.sender->try_send(0u, {}), 0u);
+	EXPECT_EQ(owner.ledger->active_unretired(), 3u);
+	EXPECT_EQ(owner.sender->try_send(0u, prefix), 2u);
+	EXPECT_EQ(owner.sender->try_send(0u, std::span(prefix).last(1u)), 0u);
 	EXPECT_EQ(owner.channel->data_enqueued_sequence(), 2u);
 	owner.ledger->publish();
 	worker_epoch_ledger_snapshot observation{};
 	ASSERT_EQ(owner.ledger->try_read(observation), publication_read_result::AVAILABLE);
 	EXPECT_EQ(observation.active_unretired, 1u);
 	drain_data(*owner.channel, 2u);
-	EXPECT_EQ(owner.sender->try_send(0u, &records[2]), boundary_epoch_send_result::TRANSFERRED);
+	EXPECT_EQ(owner.sender->try_send(0u, std::span(prefix).last(1u)), 1u);
 	EXPECT_EQ(owner.channel->data_enqueued_sequence(), 3u);
 	owner.ledger->publish();
 	ASSERT_EQ(owner.ledger->try_read(observation), publication_read_result::AVAILABLE);
 	EXPECT_EQ(observation.active_unretired, 0u);
 	drain_data(*owner.channel, 1u);
+}
+
+/** @brief Accepted records can be reclaimed by the receiver while sender accounting uses retained identity. */
+TEST(worker_boundary_sender, accepted_prefixes_allow_immediate_receiver_reclamation)
+{
+	const int32_t numa_node = test_numa_node();
+	ASSERT_GE(numa_node, 0);
+	auto owner = make_sender(numa_node, 4u);
+	ASSERT_TRUE(owner);
+	constexpr std::size_t TOTAL = 4096u;
+	constexpr std::size_t PREFIX = 32u;
+	auto receiver_ledger_or =
+		worker_epoch_ledger::create(TEST_RECEIVER_WORKER, TEST_RUNTIME_GENERATION, PREFIX, numa_node);
+	ASSERT_TRUE(receiver_ledger_or.is_ok()) << receiver_ledger_or.error().message();
+	auto receiver_ledger = std::move(receiver_ledger_or).value();
+	receiver_ledger->bind_bootstrap_epoch(TEST_ACTIVE_EPOCH);
+	std::vector<std::unique_ptr<packet_record>> records;
+	records.reserve(TOTAL);
+	for (std::size_t index = 0u; index < TOTAL; ++index) {
+		auto record = std::make_unique<packet_record>();
+		record->metadata.epoch = TEST_ACTIVE_EPOCH;
+		record->metadata.user_meta = index;
+		records.push_back(std::move(record));
+	}
+	std::atomic<bool> receiver_ready{false};
+	bool ordered = true;
+	std::size_t retired = 0u;
+	std::thread receiver([&] {
+		receiver_ready.store(true, std::memory_order_release);
+		std::array<packet_record *, PREFIX> local{};
+		while (retired < TOTAL) {
+			std::size_t count = 0u;
+			const auto received =
+				owner.channel->receive_data(local.size(), [&](packet_record *record) noexcept {
+					receiver_ledger->acquire(record->metadata.epoch);
+					local[count++] = record;
+					return true;
+				});
+			if (received.sequence_exhausted || received.transferred_count != count) {
+				std::terminate();
+			}
+			for (std::size_t index = 0u; index < count; ++index) {
+				ordered = ordered && local[index]->metadata.user_meta == retired;
+				++retired;
+				receiver_ledger->retire(local[index]->metadata.epoch);
+				delete local[index];
+			}
+			if (count == 0u) {
+				std::this_thread::yield();
+			}
+		}
+	});
+	while (!receiver_ready.load(std::memory_order_acquire)) {
+		std::this_thread::yield();
+	}
+	for (std::size_t first = 0u; first < TOTAL; first += PREFIX) {
+		std::array<packet_record *, PREFIX> offered{};
+		for (std::size_t index = 0u; index < PREFIX; ++index) {
+			offered[index] = records[first + index].get();
+		}
+		owner.ledger->acquire(TEST_ACTIVE_EPOCH, PREFIX);
+		std::size_t sent = 0u;
+		while (sent < PREFIX) {
+			const auto count = owner.sender->try_send(0u, std::span(offered).subspan(sent));
+			for (std::size_t index = 0u; index < count; ++index) {
+				(void)records[first + sent + index].release();
+			}
+			sent += count;
+			if (count == 0u) {
+				std::this_thread::yield();
+			}
+		}
+	}
+	receiver.join();
+	EXPECT_TRUE(ordered);
+	EXPECT_EQ(retired, TOTAL);
+	EXPECT_TRUE(owner.ledger->empty());
+	EXPECT_TRUE(receiver_ledger->empty());
+	EXPECT_EQ(owner.channel->data_enqueued_sequence(), TOTAL);
+	EXPECT_EQ(owner.channel->data_dequeued_sequence(), TOTAL);
+	EXPECT_TRUE(owner.channel->data_empty());
 }
 
 /** @brief Hold future output until one byte-exact ACK and retire only on release. */
@@ -462,7 +583,7 @@ TEST(worker_boundary_sender, future_output_is_held_until_exact_ack)
 	packet_record record{};
 	record.metadata.epoch = TEST_FUTURE_EPOCH;
 	owner.ledger->acquire(TEST_FUTURE_EPOCH);
-	EXPECT_EQ(owner.sender->try_send(0u, &record), boundary_epoch_send_result::HELD);
+	EXPECT_EQ(owner.sender->try_send(0u, std::array{&record}), 1u);
 	EXPECT_EQ(owner.sender->held_size(0u), 1u);
 	EXPECT_EQ(owner.channel->data_enqueued_sequence(), 0u);
 	ASSERT_TRUE(owner.sender->try_seal_after_old_work_drained());
@@ -505,9 +626,9 @@ TEST(worker_boundary_sender, full_hold_preserves_pointer_reservation_and_credit)
 		record.metadata.epoch = TEST_FUTURE_EPOCH;
 		owner.ledger->acquire(TEST_FUTURE_EPOCH);
 	}
-	EXPECT_EQ(owner.sender->try_send(0u, &records[0]), boundary_epoch_send_result::HELD);
-	EXPECT_EQ(owner.sender->try_send(0u, &records[1]), boundary_epoch_send_result::HELD);
-	EXPECT_EQ(owner.sender->try_send(0u, &records[2]), boundary_epoch_send_result::BACKPRESSURED);
+	const std::array prefix{&records[0], &records[1], &records[2]};
+	EXPECT_EQ(owner.sender->try_send(0u, prefix), 2u);
+	EXPECT_EQ(owner.sender->try_send(0u, std::span(prefix).last(1u)), 0u);
 	EXPECT_EQ(owner.sender->held_size(0u), 2u);
 	owner.ledger->publish();
 	worker_epoch_ledger_snapshot observation{};
@@ -517,9 +638,9 @@ TEST(worker_boundary_sender, full_hold_preserves_pointer_reservation_and_credit)
 	const auto cut = consume_cut(*owner.channel);
 	acknowledge(owner, cut);
 	EXPECT_EQ(owner.sender->service_held_output(1u), 1u);
-	EXPECT_EQ(owner.sender->try_send(0u, &records[2]), boundary_epoch_send_result::BACKPRESSURED);
+	EXPECT_EQ(owner.sender->try_send(0u, std::span(prefix).last(1u)), 0u);
 	EXPECT_EQ(owner.sender->service_held_output(2u), 1u);
-	EXPECT_EQ(owner.sender->try_send(0u, &records[2]), boundary_epoch_send_result::TRANSFERRED);
+	EXPECT_EQ(owner.sender->try_send(0u, std::span(prefix).last(1u)), 1u);
 	EXPECT_EQ(owner.sender->service_held_output(2u), 0u);
 	EXPECT_TRUE(owner.sender->packet_ownership_empty());
 	owner.sender->complete_sender_transition(TEST_TRANSITION_GENERATION);
@@ -544,7 +665,7 @@ TEST(worker_boundary_sender, old_credit_prevents_cut_and_zero_captures_every_exa
 	EXPECT_FALSE(owner.sender->try_seal_after_old_work_drained());
 	EXPECT_EQ(owner.sender->phase(0u), boundary_epoch_sender_phase::DRAINING);
 	EXPECT_EQ(owner.sender->cut_sequence(0u), 0u);
-	EXPECT_EQ(owner.sender->try_send(0u, &old_record), boundary_epoch_send_result::TRANSFERRED);
+	EXPECT_EQ(owner.sender->try_send(0u, std::array{&old_record}), 1u);
 	EXPECT_TRUE(owner.sender->try_seal_after_old_work_drained());
 	EXPECT_EQ(owner.sender->cut_sequence(0u), 1u);
 	EXPECT_EQ(owner.sender->phase(0u), boundary_epoch_sender_phase::WAITING_ACK);
@@ -632,7 +753,7 @@ TEST(worker_boundary_sender, data_pressure_preserves_held_ownership_and_control_
 	for (auto &record : records) {
 		record.metadata.epoch = TEST_FUTURE_EPOCH;
 		owner.ledger->acquire(TEST_FUTURE_EPOCH);
-		ASSERT_EQ(owner.sender->try_send(0u, &record), boundary_epoch_send_result::HELD);
+		ASSERT_EQ(owner.sender->try_send(0u, std::array{&record}), 1u);
 	}
 	ASSERT_TRUE(owner.sender->try_seal_after_old_work_drained());
 	const auto cut = consume_cut(*owner.channel);
@@ -666,7 +787,7 @@ TEST(worker_boundary_sender, multiboundary_seal_and_hold_service_are_all_or_none
 	auto receiver_slab = std::move(receiver_slab_or).value();
 
 	std::vector<std::unique_ptr<boundary_epoch_channel>> channel_owners;
-	std::vector<std::unique_ptr<boundary_future_output_hold>> hold_owners;
+	std::vector<numa_owner<boundary_future_output_hold>> hold_owners;
 	std::vector<boundary_epoch_channel *> channels;
 	std::vector<boundary_future_output_hold *> holds;
 	for (std::size_t index = 0u; index < 2u; ++index) {
@@ -681,13 +802,15 @@ TEST(worker_boundary_sender, multiboundary_seal_and_hold_service_are_all_or_none
 		channel_owners.push_back(std::move(channel_or).value());
 		hold_owners.push_back(std::move(hold_or).value());
 	}
-	auto ledger_or = worker_epoch_ledger::create(TEST_SENDER_WORKER, TEST_RUNTIME_GENERATION, 32u);
+	auto ledger_or = worker_epoch_ledger::create(TEST_SENDER_WORKER, TEST_RUNTIME_GENERATION, 32u, numa_node);
 	ASSERT_TRUE(ledger_or.is_ok()) << ledger_or.error().message();
 	auto ledger = std::move(ledger_or).value();
-	auto sender_or = worker_boundary_sender::create(TEST_SENDER_WORKER, TEST_RUNTIME_GENERATION, channels, holds);
+	auto sender_or =
+		worker_boundary_sender::create(TEST_SENDER_WORKER, TEST_RUNTIME_GENERATION, channels, holds, numa_node);
 	ASSERT_TRUE(sender_or.is_ok()) << sender_or.error().message();
 	auto sender = std::move(sender_or).value();
-	auto receiver_or = worker_boundary_receiver::create(TEST_RECEIVER_WORKER, TEST_RUNTIME_GENERATION, channels);
+	auto receiver_or =
+		worker_boundary_receiver::create(TEST_RECEIVER_WORKER, TEST_RUNTIME_GENERATION, channels, numa_node);
 	ASSERT_TRUE(receiver_or.is_ok()) << receiver_or.error().message();
 	auto receiver = std::move(receiver_or).value();
 	ASSERT_TRUE(sender_slab->seal().is_ok());
@@ -702,7 +825,7 @@ TEST(worker_boundary_sender, multiboundary_seal_and_hold_service_are_all_or_none
 	packet_record old_record{};
 	old_record.metadata.epoch = TEST_ACTIVE_EPOCH;
 	ledger->acquire(TEST_ACTIVE_EPOCH);
-	ASSERT_EQ(sender->try_send(0u, &old_record), boundary_epoch_send_result::TRANSFERRED);
+	ASSERT_EQ(sender->try_send(0u, std::array{&old_record}), 1u);
 	ledger->acquire(TEST_ACTIVE_EPOCH);
 	EXPECT_FALSE(sender->try_seal_after_old_work_drained());
 	EXPECT_EQ(sender->phase(0u), boundary_epoch_sender_phase::DRAINING);
@@ -715,8 +838,7 @@ TEST(worker_boundary_sender, multiboundary_seal_and_hold_service_are_all_or_none
 	for (std::size_t index = 0u; index < future_records.size(); ++index) {
 		future_records[index].metadata.epoch = TEST_FUTURE_EPOCH;
 		ledger->acquire(TEST_FUTURE_EPOCH);
-		ASSERT_EQ(sender->try_send(static_cast<uint32_t>(index), &future_records[index]),
-			  boundary_epoch_send_result::HELD);
+		ASSERT_EQ(sender->try_send(static_cast<uint32_t>(index), std::array{&future_records[index]}), 1u);
 	}
 	ASSERT_TRUE(sender->try_seal_after_old_work_drained());
 	EXPECT_EQ(sender->cut_sequence(0u), 1u);
@@ -752,6 +874,8 @@ TEST(worker_boundary_sender, exactness_and_live_lifetime_violations_fail_stop)
 	EXPECT_DEATH(begin_overlapping_transition(numa_node), "");
 	EXPECT_DEATH(destroy_active_sender(numa_node), "");
 	EXPECT_DEATH(service_oversized_hold_budget(numa_node), "");
+	EXPECT_DEATH(send_incompatible_prefix(numa_node, false), "");
+	EXPECT_DEATH(send_incompatible_prefix(numa_node, true), "");
 }
 
 }  // namespace

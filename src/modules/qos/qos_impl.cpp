@@ -3,19 +3,12 @@
 
 /**
  * @file qos_impl.cpp
- * @brief QoS Module Implementation (Single-Owner, Pre-Allocated)
+ * @brief Strict QoS policy compilation and sole-worker flow policing.
  * @author Fleming Patel
  *
- * Self-contained token bucket policer using strict module-owned JSON.
- *
- * Hot-Path Optimizations:
- * - Lock-free design (no mutex in police() function)
- * - Exact byte-credit arithmetic shared with the public token bucket
- * - Cache-line aligned buckets to prevent false sharing
- * - Context-local ownership gives zero-contention mutable state
- *
- * The implementation follows the Platform Engineering Guide's owner-local,
- * allocation-free packet-path contract.
+ * Flow state uses exact byte-credit arithmetic, a compact mutable slab and
+ * separate reclamation keys. GC and policing mutate each index only on its
+ * context's worker.
  */
 
 #include "qos_impl.hpp"
@@ -25,8 +18,7 @@
 #include <limits>
 #include <string_view>
 
-// Canonical algo/ headers for hot-path optimization macros
-#include <kinetum/algo/platform.hpp>  // KINETUM_LIKELY/UNLIKELY
+#include <kinetum/algo/platform.hpp>
 
 namespace kinetum::modules::qos
 {
@@ -237,6 +229,7 @@ config::compile_result compile_qos_from_json(const void *data, std::size_t len,
 
 qos_policer::qos_policer(uint32_t max_flows, std::pmr::memory_resource &memory_resource)
 	: slab_(max_flows, &memory_resource)
+	, keys_(max_flows, &memory_resource)
 	, free_indices_(max_flows, &memory_resource)
 	, map_(std::max<std::size_t>(1u, max_flows / kinetum::algo::CUCKOO_BUCKET_SIZE), &memory_resource)
 	, max_flows_(max_flows)
@@ -286,7 +279,7 @@ void qos_policer::maybe_gc_(uint64_t now_ns, const qos_runtime_tuning &runtime) 
 
 		const bucket &entry = slab_[cursor];
 		if (entry.occupied && now_ns > entry.last_ns && now_ns - entry.last_ns > runtime.idle_timeout_ns) {
-			if (!map_.erase(entry.key)) {
+			if (!map_.erase(keys_[cursor])) {
 				std::terminate();
 			}
 			slab_[cursor].occupied = false;
@@ -302,11 +295,17 @@ void qos_policer::maybe_gc_(uint64_t now_ns, const qos_runtime_tuning &runtime) 
 }
 
 policer_result qos_policer::police(uint64_t now_ns, const qos_profile_compiled &profile,
-				   const qos_runtime_tuning &runtime, const flow_key &key, std::size_t bytes) noexcept
+				   const qos_runtime_tuning &runtime, const prepared_query *query,
+				   std::size_t bytes) noexcept
 {
 	observe_time(now_ns);
-	if (profile.cir_bytes_per_s != 0u && !key.valid()) {
-		return policer_result::INVALID_INPUT;
+	if (profile.cir_bytes_per_s != 0u) {
+		if (query == nullptr) {
+			std::terminate();
+		}
+		if (!query->key().valid()) {
+			return policer_result::INVALID_INPUT;
+		}
 	}
 
 	// Even an unlimited replacement policy must retire stale state retained from
@@ -319,7 +318,7 @@ policer_result qos_policer::police(uint64_t now_ns, const qos_profile_compiled &
 	}
 
 	// O(1) cuckoo lookup -> slab dereference (zero heap allocation)
-	uint32_t *idx_ptr = map_.find(key);
+	uint32_t *idx_ptr = map_.find(*query);
 
 	bucket *b;
 
@@ -341,7 +340,7 @@ policer_result qos_policer::police(uint64_t now_ns, const qos_profile_compiled &
 			std::terminate();
 		}
 
-		if (KINETUM_UNLIKELY(!map_.insert(key, idx))) {
+		if (KINETUM_UNLIKELY(!map_.insert(query->key(), idx))) {
 			// Cuckoo table full after max displacement - rollback
 			free_indices_.release(idx);
 			return policer_result::FLOW_CAPACITY;
@@ -350,7 +349,7 @@ policer_result qos_policer::police(uint64_t now_ns, const qos_profile_compiled &
 		b = acquired;
 		b->credit.reset(profile.burst_bytes);
 		b->last_ns = now_ns;
-		b->key = key;
+		keys_[idx] = query->key();
 		b->occupied = true;
 	}
 

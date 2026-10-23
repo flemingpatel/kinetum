@@ -290,6 +290,10 @@ TEST(epoch_transition_primitives, data_sequence_advances_only_when_owner_records
 	EXPECT_EQ(sequence.value(), 1u);
 	EXPECT_TRUE(sequence.record_success());
 	EXPECT_EQ(sequence.value(), 2u);
+	EXPECT_TRUE(sequence.record_success(0u));
+	EXPECT_EQ(sequence.value(), 2u);
+	EXPECT_TRUE(sequence.record_success(64u));
+	EXPECT_EQ(sequence.value(), 66u);
 }
 
 /**
@@ -301,6 +305,17 @@ TEST(epoch_transition_primitives, data_sequence_reserves_wrap_value)
 	EXPECT_TRUE(successful_data_sequence::can_advance(successful_data_sequence::MAX_VALUE - 1u));
 	EXPECT_FALSE(successful_data_sequence::can_advance(successful_data_sequence::MAX_VALUE));
 	EXPECT_FALSE(successful_data_sequence::can_advance(std::numeric_limits<uint64_t>::max()));
+	EXPECT_TRUE(successful_data_sequence::can_advance(successful_data_sequence::MAX_VALUE, 0u));
+	EXPECT_FALSE(successful_data_sequence::can_advance(std::numeric_limits<uint64_t>::max(), 0u));
+	EXPECT_TRUE(successful_data_sequence::can_advance(successful_data_sequence::MAX_VALUE - 64u, 64u));
+	EXPECT_FALSE(successful_data_sequence::can_advance(successful_data_sequence::MAX_VALUE - 63u, 64u));
+	successful_data_sequence sequence;
+	ASSERT_TRUE(sequence.record_success(successful_data_sequence::MAX_VALUE - 2u));
+	EXPECT_FALSE(sequence.record_success(3u));
+	EXPECT_EQ(sequence.value(), successful_data_sequence::MAX_VALUE - 2u);
+	EXPECT_TRUE(sequence.record_success(2u));
+	EXPECT_FALSE(sequence.record_success());
+	EXPECT_EQ(sequence.value(), successful_data_sequence::MAX_VALUE);
 }
 
 /**

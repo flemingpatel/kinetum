@@ -422,7 +422,7 @@ Quark's deterministic behavior:
 | Runtime-bundle pre-spawn admission and process supervision | **Photon**; DP independently readmits the bundle |
 | Host-memory NUMA availability for host storage/copy       | **Quark**, from compiled QUARK-phase requirements |
 | DPDK runtime/hugepage and UDP socket evidence             | Exact COMPONENT-phase provider proof; not Quark |
-| NIC presence, driver state, queues, and steering          | Exact MATERIALIZATION-phase provider proof; not Quark |
+| PCI ownership, device capabilities, queues, and steering | Component host proof for PCI ownership; initialized materialization for device/queue/steering capabilities; not Quark |
 | NUMA-aware core selection                                 | **Gluon** (using `hardware_inventory.pbtxt`) |
 | Selected core-to-NUMA host proof                          | **Quark** (`probe_host` + `validate_runtime_compat`) |
 
@@ -442,7 +442,7 @@ second host's device rows can be merged with the selected CPU set.
 | Core NUMA ownership | `hardware_inventory.pbtxt` CPU topology       | Live probed by Quark through libnuma; unknown/mismatch fails selected placement | Gluon plans, shared compiler freezes, Quark validates |
 | Host-memory NUMA nodes | Storage/transition placement in the canonical plan | Live positive-memory nodes allowed by the process cpuset; missing exact node fails | Shared compiler emits QUARK-phase rows, Quark validates |
 | DPDK hugepages/runtime and UDP sockets | Provider configuration plus compiled facility/storage requirements | Not probed by Quark; exact component-phase proof owns live evidence | Shared provider compiler + provider component |
-| DPDK PCI ports/driver queues | Exact single-node PCI inventory plus typed driver configuration and plan ports/streams; TAP/UDP identity lives only in typed bindings | Not probed by Quark; initialized materialization validates live device truth | Gluon resolves authored facts; provider compiler/component proves use |
+| DPDK PCI ports/driver queues | Exact single-node PCI inventory plus typed driver configuration and plan ports/streams; TAP/UDP identity lives only in typed bindings | Component host proof checks adapter ownership before EAL; initialized materialization validates device and queue capabilities | Gluon resolves authored facts; provider compiler/component proves use |
 
 Provider-specific evidence follows compiled contract requirements through
 component host proof and materialization; it does not extend Quark's scope.

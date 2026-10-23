@@ -420,9 +420,11 @@ access with predictable prefetch addresses.
   timestamp, and persistent user metadata. Immutable authority lanes are
   validated after the callback; only documented mutable lanes publish back to
   the record.
-- The callback's `uint64_t` return mask is the sole disposition authority: bit
-  `i` set forwards lane `i`; bit `i` clear retires it. There is no parallel
-  disposition array or native-provider disposition field.
+- The callback's `uint64_t` return mask selects forwarded lanes. A clear bit
+  drops the packet unless ACTIVE ingest successfully retained that lane through
+  `retain_input`. Forwarding and retention are mutually exclusive; the runtime
+  commits each retained handle after callback validation. There is no mutable
+  disposition array or provider-native disposition field.
 - Packet bytes and parsed lanes are one coherence contract. A module that
   mutates bytes updates every parsed field it invalidates; the runtime does not
   reparse between stages.
@@ -444,13 +446,14 @@ the runtime owns), `MODULE_SDK.md` (the SoA batch is the module ABI),
 
 ### Pat-5: Cache-Line Alignment and False-Sharing Avoidance
 
-**Rule.** Hot-path data structures are aligned to the cache line. State
-that is written by different cores does not share a cache line. State that
-is read together is colocated on the same cache line when possible.
+**Rule.** Align ownership units to cache lines. Members with the same sole
+writer may share a line; independent writers do not. Frequently written private
+state also stays off lines read by another core. State read together is colocated
+when possible.
 
 **Rationale.** Writes invalidate other cores' copies of the same cache line.
-Placing unrelated writers on one line creates false sharing and unnecessary
-coherence traffic.
+Unrelated private writes can invalidate a foreign reader's line even when
+that reader never accesses the written field.
 
 **Use instead.**
 
@@ -460,8 +463,10 @@ coherence traffic.
 - `kinetum::algo::cuckoo_bucket` uses `alignas(CACHE_LINE_SIZE)` so each
   bucket begins on its own line. Generic key/value size determines whether its
   complete four-entry extent spans additional lines.
-- `spsc_ring_static<T, N>` puts producer head and consumer tail on
-  separate cache lines via `alignas(64)`.
+- The shared SPSC core isolates producer head, producer-private cached tail,
+  consumer tail, and consumer-private cached head on four separate lines.
+  Static, dynamic and caller-storage rings inherit that layout; composition
+  sites do not add their own cursor padding.
 
 **Where this appears.** `docs/ALGORITHM_LIBRARY.md` (per-primitive notes on
 alignment), `DATA_PLANE.md` (region state alignment), `MODULE_SDK.md`
@@ -473,6 +478,11 @@ alignment), `DATA_PLANE.md` (region state alignment), `MODULE_SDK.md`
 node selected for their owner. A provider whose admitted memory contract uses
 hugepages must use and prove that backing; an explicit host-storage provider
 does not acquire a hugepage requirement by implication.
+Placement covers root controls and nested worker-private execution storage,
+including immutable routing tables. Preallocation, alignment, a stored node
+number, or moving a container into local memory does not place its backing
+array. Cold builders publish only complete checked layouts whose exact-node
+binding and resident pages have been proved.
 For a cross-worker channel, each ring lives with the endpoint that polls it,
 while endpoint-mutable state and its coherent publication live with the worker
 that owns those writes; cache-line separation never substitutes for placement.
@@ -519,6 +529,16 @@ misses.
 - A development path that intentionally avoids hugepages selects an explicit
   host-storage contract in deployment bindings. It does not turn absence of
   hugepages into an inferred DPDK mode or add a parallel CLI memory override.
+- Worker owners compose `numa_layout` and `numa_owner` over
+  `numa_memory_region`. One checked layout groups objects with the same
+  lifetime; the mapping remains outside its root and outlives every nested
+  object. Construction-only containers may use the heap. Shared topology,
+  code images, provider tables, command publications, and process-managed
+  stacks retain their own ownership contracts; locality of a borrowed pointer
+  never establishes locality of its pointee.
+- A fixed host packet pool places its free-credit queue controls and cells,
+  records and payload rows in one checked mapping on the domain's exact node.
+  Rounding queue storage never grants additional logical packet credits.
 
 **Where this appears.** `GLUON.md` (NUMA-aware core selection and exact
 storage-domain placement from hardware inventory), `DATA_PLANE.md` (provider
@@ -572,11 +592,11 @@ separate.
 
 ### Pat-8: RCU and versioned_rcu_buffer
 
-**Rule.** State that the cold path mutates and the hot path reads is
-published through `versioned_rcu_buffer<T>` (or `rcu_buffer<T>` when
-epoch tracking is not needed). Readers borrow a guard, get a stable view,
-and release on scope exit. Writers wait for readers to drain on the
-inactive slot before writing.
+**Rule.** Use `versioned_rcu_buffer<T>` for cold-published state whose readers
+must pin a stable value for each borrow, or `rcu_buffer<T>` when epoch tracking
+is not needed. Readers release their guard on scope exit. Writers wait for
+readers to drain on the inactive slot before writing. Exact module execution
+views follow Pat-7 and Pat-10; they do not acquire an RCU pin per packet.
 
 **Rationale.** Readers need a stable object, not a torn read followed by a
 retry. A slot guard preserves that object while the writer waits to reuse the
@@ -640,9 +660,7 @@ consistency to close its publication-versus-pin race.
   acquire on the readers.
 - The SPSC ring's head/tail uses acquire/release for the producer/consumer
   publication pair; see `include/kinetum/algo/queue.hpp`.
-- RCU active-slot publication, reader pin acquisition/revalidation, and writer
-  drain checks share sequentially consistent ordering. Initial slot selection
-  uses acquire ordering; completed pins use release ordering.
+- RCU pinning and slot reuse follow the joint ordering in Pat-8.
 - A quiescence reader acquire-observes one active grace and release-publishes
   exactly that adjacent generation through its own cache-line atomic. The cold
   coordinator never accepts a skipped generation through monotonic maximum.
@@ -773,28 +791,38 @@ use, eventual OOM, or unpredictable tail latency.
 - `kinetum::algo::spsc_ring_view<T>` when an owning subsystem supplies the
   exact storage extent and placement. Every SPSC usable capacity is a power of
   two and at least two. The DP composes this one arithmetic core with its
-  checked prefaulted NUMA owner for DATA rings, worker queue roles, and boundary
-  future-output holds; it does not copy the state machine into a placement-
-  specific queue.
-- `kinetum::algo::mpmc_queue<T, Capacity>` for the multi-producer case
-  (cold path or low-rate paths).
+  checked prefaulted NUMA owner for DATA rings and boundary future-output
+  holds; it does not copy the state machine into a placement-specific queue.
+- `kinetum::algo::work_queue_view<T>` for sole-worker queues. The same
+  power-of-two index core serves active-control mailboxes, per-key packet
+  rings, and ready-key FIFOs without cross-thread atomics. Packet role capacity
+  is shared across queued records and outstanding reservations; extra physical
+  pointer arrays never grant extra packet credits. All of one worker's packet
+  roles occupy one checked, prefaulted NUMA region, with controls separated
+  from pointer arrays by cache-line boundaries.
+- `kinetum::algo::mpmc_queue<T, Capacity>` for multiple producers or consumers
+  with a compile-time physical capacity.
 - `kinetum::algo::mpmc_queue_dynamic<T>` when the MPMC physical capacity is
   plan-derived at construction. It allocates once, requires a power-of-two
   physical capacity, and exposes only observational `size_approx()`; successful
   enqueue/dequeue remains the ownership authority.
 - `kinetum::algo::mpmc_queue_view<T>` when one subsystem supplies exact
   cache-line cell storage and placement. Static, dynamic, and caller-storage
-  forms delegate to one sequence/publication core.
+  forms delegate to one sequence/publication core. Fixed host-pool credits and
+  tracked async completions use the caller-storage form.
 - MPMC cell copy and move assignment are non-throwing type requirements: a
   reserved producer or consumer cursor has no rollback operation.
 - `try_push`/`try_pop` (SPSC/work queues) and
   `try_enqueue`/`try_dequeue` (MPMC queues) are non-blocking; full or empty is
   a normal condition the caller handles, not an error.
-- Treat a notification descriptor as wake-only. A coalesced count, spurious
-  wake, or already-drained descriptor cannot be an ownership or completion
-  count; after a wake, the sole consumer drains the bounded owning queues until
-  they are empty. Queue publication and exact result identity remain the only
-  work authority.
+- SPSC batches publish one completed cursor per accepted prefix. Conditional
+  consumption validates and admits each FIFO element before consuming it;
+  refusal retains that head and its suffix. Its nonthrowing callback performs
+  bounded owner-local work without foreign calls or queue reentry. Scalar and
+  batch operations share acquired peer-cursor caches and refresh only when
+  the cached extent is insufficient. A zero-length transfer publishes nothing.
+- Notifications follow Pat-22's wake-only contract. Queue publication and exact
+  result identity remain the work authority.
 - A full CUT/ACK control lane retains exactly one endpoint-local typed record
   and returns to the worker loop. Retry performs one later bounded push; it does
   not spin, sleep, yield, read a clock, or reinterpret another record as
@@ -828,15 +856,18 @@ buckets.
 - Construction requires a positive bucket count and the exact non-null PMR
   resource that owns all table and displacement-log storage. The resource must
   outlive the map; no process-heap default exists.
-- Every instantiation supplies an explicit nonthrowing semantic hasher. No
-  default may inspect object representation or padding.
+- Copy and move are deleted. Prepared queries carry copied keys, bucket
+  ordinals and their stable issuing-map address, never mutable lookup results.
+  The map outlives its queries; a foreign-map query is a contradiction.
+- Every instantiation supplies an explicit nonthrowing semantic hasher and
+  nonthrowing key equality. Both use semantic fields, never padding or raw
+  object representation.
 - Buckets are `alignas(CACHE_LINE_SIZE)` with `CUCKOO_BUCKET_SIZE = 4`
   entries each.
 - Inserts may evict (kick) up to `CUCKOO_MAX_KICKS = 500` times before
   failing; failure restores the prior table and returns `false`.
-- Two hash functions index two candidate buckets; lookups read both.
-- Hash invocation and key equality are non-throwing, and compound keys hash
-  semantic fields rather than padding or raw object representation.
+- Two mixes of the semantic hash select candidate buckets. Lookup searches
+  at most both, observing current entries even after query preparation.
 
 **Where this appears.** `docs/ALGORITHM_LIBRARY.md` (full API and tuning),
 `src/modules/README.md` (NAT44 session maps and QoS flow tables use
@@ -998,6 +1029,13 @@ release defects; they do not justify weakening safety bounds.
 - `perf stat` with `cache-misses`, `cache-references`, `branch-misses`,
   `branches`, `cycles`, `instructions` for low-level CPU behavior.
 - `perf record` / `perf report` for hotspot identification.
+- Verify event support, sampling fields, multiplexing and processor errata
+  before attributing a hardware count. Invalid data addresses cannot locate
+  an object, and a latency-filtered sample cannot establish an unconditional
+  cache-hit rate. Keep instrumented profiles separate from native results.
+- Compare matched fresh starts, including partial batches and low load. Inspect
+  generated instructions on each supported architecture; a microbenchmark
+  establishes a mechanism's cost, not an application throughput gain.
 - The physical-I/O validation harness's transition telemetry
   (`transition_metrics.jsonl`) is the canonical regression source for
   Ordered-CUT Boundary Protocol behavior.
@@ -1406,9 +1444,10 @@ and publish the result.
 When a callback spans time, represent the transfer with a move-only claim or
 token. The claim identifies its issuing store, operation, generation, and
 resource. Only the issuing owner may resolve it; unresolved destruction is
-terminate-class. A borrowed foreign view is read-only. Successful callback
-completion is an explicit claim transition, never inferred from an empty nested
-value after the callee had permission to move it.
+terminate-class. Lifecycle claims expose their ownership tokens as read-only
+borrows. Packet callbacks may mutate only the bytes and fields allowed by their
+ABI. Successful callback completion is an explicit claim transition, never
+inferred from an empty nested value after the callee had permission to move it.
 
 Cooperative cancellation closes new admission but does not erase an accepted
 call. Publish cancellation through stable operation state, collect every

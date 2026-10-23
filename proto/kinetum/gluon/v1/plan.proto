@@ -186,10 +186,11 @@ message WorkerPlacement {
   // empty ownership fails runtime host admission.
   repeated int32 cpu_core_ids = 5;
 
-  // Power-of-two capacity, at least two, of each active/future queue in this
-  // source worker's swappable epoch-staging pair, applied independently to
-  // every exact source storage domain. Non-source workers carry zero and
-  // allocate no future queue. Without epoch_transition_plan, every worker
+  // Power-of-two aggregate capacity, at least two, of each active/future role
+  // in this source worker's swappable pair, independently per source domain.
+  // Each role shares the bound across queued and outstanding work; per-key
+  // pointer arrays grant no extra packet capacity. Non-source workers carry
+  // zero and allocate no future role. Without epoch_transition_plan, every worker
   // carries zero and source domains remain active-only.
   uint32 source_epoch_staging_capacity = 6;
 

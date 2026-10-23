@@ -45,7 +45,7 @@ constexpr std::array<uint32_t, 2> TEST_STAGES{2u, 5u};
 /** @brief Create one exact worker channel and bank owner on an available NUMA node. */
 struct worker_bank_fixture {
 	std::unique_ptr<worker_telemetry_channel> channel;  ///< Exact bidirectional SPSC transport.
-	std::unique_ptr<worker_runtime_telemetry> owner;    ///< Exact worker-local three-bank owner.
+	numa_owner<worker_runtime_telemetry> owner;	    ///< Exact worker-local three-bank owner.
 
 	/**
 	 * @param stages Exact owned stage identities for this fixture.
@@ -146,6 +146,7 @@ TEST(worker_runtime_telemetry, cadence_swap_is_nonblocking_and_skip_is_visible)
 	fixture->owner->record_protocol_fault(epoch_protocol_fault_code::OLD_DATA_AFTER_SEAL);
 	fixture->owner->record_stage_input(stage, 1u, 64u);
 	fixture->owner->record_stage_output(stage, 60u);
+	fixture->owner->record_stage_output(stage, 184u, 3u);
 	fixture->owner->record_stage_drop(stage);
 	const runtime_telemetry_bank_token pressure{};
 	ASSERT_TRUE(fixture->channel->publish_completed(pressure));
@@ -190,7 +191,8 @@ TEST(worker_runtime_telemetry, cadence_swap_is_nonblocking_and_skip_is_visible)
 	EXPECT_EQ(first_bank.skipped_publications, 1u);
 	ASSERT_EQ(first_bank.stages.size(), 2u);
 	EXPECT_EQ(first_bank.stages[stage].in_packets, 1u);
-	EXPECT_EQ(first_bank.stages[stage].out_packets, 1u);
+	EXPECT_EQ(first_bank.stages[stage].out_packets, 4u);
+	EXPECT_EQ(first_bank.stages[stage].out_bytes, 244u);
 	EXPECT_EQ(first_bank.stages[stage].dropped_packets, 1u);
 	const auto first_stage_address = reinterpret_cast<std::uintptr_t>(first_bank.stages.data());
 	EXPECT_EQ(first_stage_address % kinetum::algo::CACHE_LINE_SIZE, 0u);

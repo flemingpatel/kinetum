@@ -247,8 +247,7 @@ class executor_test_result_consumer final : public config_lifecycle_result_consu
  * @param log No-op lifecycle log provider.
  * @return Unique valid owner, or nullptr after recording a test failure.
  */
-std::unique_ptr<lifecycle_context_owner> make_executor_owner(executor_test_memory_provider &memory,
-							     executor_test_log_provider &log)
+lifecycle_context_ownership make_executor_owner(executor_test_memory_provider &memory, executor_test_log_provider &log)
 {
 	lifecycle_context_identity identity{"kinetum.test.module", "stage@lane_0", 3, 7, 2, 5, 0, 0u, 1u};
 	auto owner_or = lifecycle_context_owner::create(std::move(identity), TEST_CONTEXT_MEMORY_CAPACITY_BYTES,

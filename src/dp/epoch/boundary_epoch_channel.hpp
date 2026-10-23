@@ -9,8 +9,8 @@
  * @author Fleming Patel
  *
  * One compiled sender and receiver share three bounded SPSC lanes. DATA carries
- * only `packet_record *`; successful sender publication and receiver ownership
- * completion advance independent process-lifetime sequences. CUT and ACK lanes
+ * only `packet_record *`; successful sender prefixes and receiver ownership
+ * completion advance independent process-lifetime packet sequences. CUT and ACK lanes
  * carry their exact fixed-width record types and retain at most one pending
  * publication without spinning.
  *
@@ -33,15 +33,18 @@
  * absent or quiescent.
  *
  * @par Performance
- * Every packet operation is allocation-free, lock-free, clock-free O(1) work.
- * Successful DATA transfer adds one plain owner-local sequence increment.
+ * Every packet prefix is bounded, allocation-free, lock-free, and clock-free.
+ * DATA publishes one ring cursor and advances owner-local packet counts per prefix.
  * Control publication attempts one ring operation and never spins, sleeps, or
  * yields. Endpoint observations publish only at a bounded worker-turn boundary.
  */
 
 #include <cstddef>
 #include <cstdint>
+#include <exception>
+#include <functional>
 #include <memory>
+#include <span>
 #include <type_traits>
 
 #include <kinetum/algo/platform.hpp>
@@ -78,8 +81,8 @@ struct alignas(kinetum::algo::CACHE_LINE_SIZE) boundary_sender_transport_snapsho
 	uint64_t publication_generation{0};    ///< Completed coherent-publication generation.
 	uint64_t runtime_generation{0};	       ///< Exact materialized runtime generation.
 	uint64_t boundary_index{0};	       ///< Exact compact boundary identity.
-	uint64_t data_enqueued_sequence{0};    ///< Successful DATA publications.
-	uint64_t data_backpressure_events{0};  ///< Full DATA publication attempts.
+	uint64_t data_enqueued_sequence{0};    ///< Successful DATA packet transfers.
+	uint64_t data_backpressure_events{0};  ///< Rejected DATA packet attempts, including retries.
 	uint64_t pending_cut_epoch{0};	       ///< Pending CUT epoch, or zero when absent.
 	uint64_t pending_cut_sequence{0};      ///< Pending CUT DATA watermark, or zero when absent.
 };
@@ -142,25 +145,17 @@ validate_boundary_sender_transport(const boundary_sender_transport_snapshot &val
 validate_boundary_receiver_transport(const boundary_receiver_transport_snapshot &value, uint64_t runtime_generation,
 				     uint32_t boundary_index) noexcept;
 
-/** @brief Exact result of one sender-owned DATA publication attempt. */
-enum class boundary_data_publication_result : uint8_t {
-	TRANSFERRED = 0,     ///< DATA owns the pointer and sequence advanced.
-	BACKPRESSURED,	     ///< Caller retains ownership because DATA is full.
-	SEQUENCE_EXHAUSTED,  ///< No additional successful sequence is representable.
+/** @brief Exact transferred prefix and a representability failure before the next transfer. */
+struct boundary_data_transfer_result {
+	std::size_t transferred_count{0u};  ///< Completed packet transfers; the suffix retains its prior owner.
+	bool sequence_exhausted{false};	    ///< An affected transfer would exceed the process-lifetime sequence.
 };
 
-static_assert(sizeof(boundary_data_publication_result) == sizeof(uint8_t),
-	      "boundary DATA publication result must remain one byte");
-
-/** @brief Exact result of one receiver-owned DATA acquisition attempt. */
-enum class boundary_data_receive_result : uint8_t {
-	RECEIVED = 0,	     ///< Caller owns one unresolved pointer transfer.
-	EMPTY,		     ///< DATA contained no pointer and no state changed.
-	SEQUENCE_EXHAUSTED,  ///< Queued DATA cannot receive another successful sequence.
-};
-
-static_assert(sizeof(boundary_data_receive_result) == sizeof(uint8_t),
-	      "boundary DATA receive result must remain one byte");
+static_assert(std::is_standard_layout_v<boundary_data_transfer_result> &&
+	      std::is_trivially_copyable_v<boundary_data_transfer_result>);
+static_assert(sizeof(boundary_data_transfer_result) == 16u && alignof(boundary_data_transfer_result) == 8u);
+static_assert(offsetof(boundary_data_transfer_result, transferred_count) == 0u &&
+	      offsetof(boundary_data_transfer_result, sequence_exhausted) == 8u);
 
 /**
  * @brief Nonmovable owner of one exact three-lane boundary transport.
@@ -210,38 +205,61 @@ class boundary_epoch_channel final {
 	~boundary_epoch_channel();
 
 	/**
-	 * @brief Transfer one packet into DATA and then advance sender sequence truth.
+	 * @brief Publish the capacity-accepted DATA prefix and advance its packet sequence once.
 	 *
-	 * @param record Nonnull exact packet ownership offered by the sender.
-	 * @return TRANSFERRED after ring transfer and sequence advancement,
-	 *         BACKPRESSURED when full with caller ownership unchanged, or
-	 *         SEQUENCE_EXHAUSTED before mutation.
+	 * @param records At most one worker burst of nonnull packet ownership.
+	 * @return Exact transferred count; full DATA retains the suffix and counts
+	 *         rejected packet attempts. Sequence exhaustion rejects before publication.
 	 */
-	[[nodiscard]] boundary_data_publication_result try_send_data(packet_record *record) noexcept;
+	[[nodiscard]] boundary_data_transfer_result try_send_data(std::span<packet_record *const> records) noexcept;
 
 	/**
-	 * @brief Transfer one packet out of DATA without yet advancing dequeue truth.
+	 * @brief Consume one locally admitted DATA prefix through the shared SPSC core.
 	 *
-	 * One successful call creates one exact unresolved completion. The receiver
-	 * must acquire its worker credit and call complete_data_receive() before any
-	 * second receive or receiver publication.
+	 * The callback validates the record and reserves its destination before
+	 * accepting it, then establishes credit and local ownership before returning
+	 * true. False retains that record and the complete suffix in DATA. Completed
+	 * sequence truth advances only after accepted ownership and ring consumption.
 	 *
-	 * @param[out] record Destination changed only after one successful pop.
-	 * @return RECEIVED after pointer transfer, EMPTY when DATA has no pointer, or
-	 *         SEQUENCE_EXHAUSTED before mutation when queued DATA cannot receive
-	 *         another successful sequence.
+	 * @tparam accept_type Nonthrowing owner-local admission and ownership callback.
+	 * @param maximum Maximum packets considered, bounded by the worker burst.
+	 * @param accept Receives the FIFO head. It may not invoke foreign callbacks,
+	 *        reenter this channel, or retain an unaccepted record borrow.
+	 * @return Exact consumed prefix and any sequence exhaustion before the next
+	 *         affected transfer. No receive-completion claim escapes this call.
 	 */
-	[[nodiscard]] boundary_data_receive_result try_receive_data(packet_record *&record) noexcept;
-
-	/**
-	 * @brief Complete one exact dequeue after receiver-credit acquisition.
-	 *
-	 * @param record Exact pointer returned by the unresolved try_receive_data().
-	 */
-	void complete_data_receive(packet_record *record) noexcept;
-
-	/** @return Consumer-borrowed next DATA record, or null when empty. */
-	[[nodiscard]] const packet_record *peek_data() const noexcept;
+	template <typename accept_type>
+	[[nodiscard]] boundary_data_transfer_result receive_data(std::size_t maximum, accept_type &&accept) noexcept
+		requires std::is_nothrow_invocable_r_v<bool, accept_type &, packet_record *>
+	{
+		auto &receiver = receiver_slot_->owner;
+		if (receiver.receive_in_progress || maximum > common::runtime_sizing::PACKET_MAX_BURST_SIZE) {
+			std::terminate();
+		}
+		receiver.receive_in_progress = true;
+		boundary_data_transfer_result result;
+		const auto consumed = data_ring_->consume_prefix(maximum, [&](packet_record *const &record) noexcept {
+			if (record == nullptr) {
+				std::terminate();
+			}
+			if (!successful_data_sequence::can_advance(receiver.data_dequeued.value(),
+								   result.transferred_count + 1u)) {
+				result.sequence_exhausted = true;
+				return false;
+			}
+			if (!std::invoke(accept, record)) {
+				return false;
+			}
+			++result.transferred_count;
+			return true;
+		});
+		if (consumed != result.transferred_count ||
+		    (consumed != 0u && !receiver.data_dequeued.record_success(consumed))) {
+			std::terminate();
+		}
+		receiver.receive_in_progress = false;
+		return result;
+	}
 
 	/**
 	 * @brief Publish or retain one exact CUT without waiting.
@@ -392,7 +410,7 @@ class boundary_epoch_channel final {
 		SENDER_RUNTIME_GENERATION = 0,	///< Exact materialized generation.
 		SENDER_BOUNDARY_INDEX,		///< Exact compact boundary identity.
 		SENDER_DATA_SEQUENCE,		///< Successful DATA enqueue sequence.
-		SENDER_BACKPRESSURE_EVENTS,	///< Full DATA publication attempts.
+		SENDER_BACKPRESSURE_EVENTS,	///< Rejected DATA packet attempts.
 		SENDER_PENDING_CUT_EPOCH,	///< Pending CUT epoch, or zero.
 		SENDER_PENDING_CUT_SEQUENCE,	///< Pending CUT sequence, or zero.
 	};
@@ -430,7 +448,7 @@ class boundary_epoch_channel final {
 	 * @param receiver_slot Exact claimed receiver slot.
 	 */
 	boundary_epoch_channel(const common::compiled_transition_boundary &facts, uint64_t runtime_generation,
-			       std::unique_ptr<numa_spsc_ring<packet_record *>> data_ring,
+			       numa_owner<numa_spsc_ring<packet_record *>> data_ring,
 			       boundary_epoch_worker_slab &sender_slab, std::size_t sender_slot_index,
 			       boundary_epoch_worker_slab::sender_slot &sender_slot,
 			       boundary_epoch_worker_slab &receiver_slab, std::size_t receiver_slot_index,
@@ -443,7 +461,7 @@ class boundary_epoch_channel final {
 	uint32_t receiver_worker_index_{0};				 ///< Sole DATA/CUT consumer and ACK producer.
 	uint64_t runtime_generation_{0};				 ///< Exact materialized generation identity.
 	int32_t data_ring_numa_node_{-1};				 ///< Exact receiver-local DATA placement.
-	std::unique_ptr<numa_spsc_ring<packet_record *>> data_ring_;	 ///< Sole plan-sized DATA owner.
+	numa_owner<numa_spsc_ring<packet_record *>> data_ring_;		 ///< Sole plan-sized DATA owner.
 	boundary_epoch_worker_slab *sender_slab_{nullptr};		 ///< Stable sender-worker storage lifetime.
 	std::size_t sender_slot_index_{0};				 ///< Exact claimed outbound ordinal.
 	boundary_epoch_worker_slab::sender_slot *sender_slot_{nullptr};	 ///< Borrowed sender-local state.

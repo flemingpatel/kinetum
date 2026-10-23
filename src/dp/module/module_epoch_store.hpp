@@ -40,7 +40,6 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
-#include <memory>
 #include <optional>
 #include <type_traits>
 
@@ -49,6 +48,7 @@
 #include "src/dp/epoch/epoch_protocol_fault.hpp"
 #include "src/dp/epoch/exact_slot_table.hpp"
 #include "src/dp/lifecycle/prepared_config_ownership.hpp"
+#include "src/dp/numa_layout.hpp"
 
 #include <kinetum/kinetum_sdk.h>
 
@@ -257,7 +257,7 @@ class module_epoch_store {
 	 * @param telemetry_owner Exact context-local three-bank telemetry authority.
 	 * @return Empty store, or exact structural/allocation failure.
 	 */
-	[[nodiscard]] static kinetum::common::status_or<std::unique_ptr<module_epoch_store>>
+	[[nodiscard]] static kinetum::common::status_or<numa_owner<module_epoch_store>>
 	create(uint32_t module_image_index, uint32_t context_index, const kinetum_module *descriptor,
 	       kinetum_ctx *context, kinetum::dp::lifecycle::lifecycle_context_owner *telemetry_owner);
 
@@ -376,6 +376,8 @@ class module_epoch_store {
 	[[nodiscard]] uint64_t prepared_epoch() const noexcept;
 	/** @return Immutable compact module-context identity. */
 	[[nodiscard]] uint32_t context_index() const noexcept;
+	/** @return Immutable owner node from the admitted context; used by cold binding validation. */
+	[[nodiscard]] int32_t numa_node() const noexcept;
 
 	/**
 	 * @brief Bind the process-generation protocol safety-fault authority.

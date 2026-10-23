@@ -27,6 +27,13 @@ These instructions apply to coding agents working in this repository.
 
 # Design Checkpoint Discipline
 
+For every work item, audit all public documentation line by line, including
+diagrams. Trace behavioral claims to the current code and accepted contract;
+correct stale claims and remove redundant prose without losing technical meaning.
+Documentation accuracy is part of the work, not only the rendering gate.
+Do not remove valid definitions, ownership tables, or useful local context solely
+because another document also contains them.
+
 These rules apply to core redesign checkpoints.
 
 - Before editing a checkpoint, re-read this file, the approved design,

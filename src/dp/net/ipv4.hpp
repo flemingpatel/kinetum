@@ -21,7 +21,7 @@
  * - Bounded VLAN tag handling (802.1Q and 802.1ad QinQ)
  * - IPv4 version, IHL, total-length validation, and fragment detection
  * - Explicit non-validation of the IPv4 checksum and complete L4 headers
- * - L4 port extraction only for complete TCP/UDP headers
+ * - Port extraction only when four bytes fit the declared unfragmented TCP/UDP extent
  *
  * Hot-path Characteristics:
  * - Bounded Ethernet parsing with at most two VLAN tags
@@ -46,6 +46,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <type_traits>
 
 #include <kinetum/algo/net.hpp>
 
@@ -115,14 +116,12 @@ struct eth_parse_result {
  * - is_fragment: true if packet is fragmented (MF=1 or FragOffset>0)
  * - ip_offset: Byte offset of IPv4 header start in buffer
  * - l4_offset: Byte offset of L4 header (TCP/UDP/etc.) in buffer
- * - ip_header_len: Length of IPv4 header in bytes (IHL * 4, typically 20)
- * - ip_total_len: Total length from IPv4 header (header + payload)
  * - src_ipv4: Source IP address in host byte order (via read_be32)
  * - dst_ipv4: Destination IP address in host byte order (via read_be32)
  * - proto: IP protocol number (6=TCP, 17=UDP, 1=ICMP, etc.)
  * - dscp: Differentiated Services Code Point (6 bits, ECN stripped)
- * - src_port: Source port (TCP/UDP), 0 if not TCP/UDP or fragment
- * - dst_port: Destination port (TCP/UDP), 0 if not TCP/UDP or fragment
+ * - src_port: Source port (TCP/UDP), zero unless four transport bytes are present in an unfragmented TCP/UDP packet
+ * - dst_port: Destination port (TCP/UDP), zero unless four transport bytes are present in an unfragmented TCP/UDP packet
  *
  * Important Notes:
  * - Ports are only extracted for TCP/UDP non-fragments
@@ -134,7 +133,7 @@ struct eth_parse_result {
  * @code
  *   auto result = parse_ipv4(buffer, len, l3_offset);
  *   if (result.ok && !result.is_fragment && result.proto == 6) {
- *     // Valid TCP packet, ports available
+ *     // IPv4 identifies TCP; ports remain zero if the four-byte prefix is absent.
  *     uint16_t sport = result.src_port;
  *   }
  * @endcode
@@ -148,9 +147,6 @@ struct ipv4_parse_result {
 	uint16_t ip_offset{0};	///< Offset of IPv4 header in buffer
 	uint16_t l4_offset{0};	///< Offset of L4 header in buffer
 
-	uint16_t ip_header_len{0};  ///< IPv4 header length (IHL * 4, bytes)
-	uint16_t ip_total_len{0};   ///< Total length from IPv4 header (bytes)
-
 	uint32_t src_ipv4{0};  ///< Source IP (host byte order)
 	uint32_t dst_ipv4{0};  ///< Destination IP (host byte order)
 	uint8_t proto{0};      ///< IP protocol number (6=TCP, 17=UDP, 1=ICMP)
@@ -159,6 +155,14 @@ struct ipv4_parse_result {
 	uint16_t src_port{0};  ///< Source port (TCP/UDP only, 0 otherwise)
 	uint16_t dst_port{0};  ///< Destination port (TCP/UDP only, 0 otherwise)
 };
+
+static_assert(sizeof(ipv4_parse_result) == 24u && alignof(ipv4_parse_result) == 4u);
+static_assert(std::is_standard_layout_v<ipv4_parse_result> && std::is_trivially_copyable_v<ipv4_parse_result>);
+static_assert(offsetof(ipv4_parse_result, ok) == 0u && offsetof(ipv4_parse_result, is_fragment) == 1u &&
+	      offsetof(ipv4_parse_result, ip_offset) == 2u && offsetof(ipv4_parse_result, l4_offset) == 4u &&
+	      offsetof(ipv4_parse_result, src_ipv4) == 8u && offsetof(ipv4_parse_result, dst_ipv4) == 12u &&
+	      offsetof(ipv4_parse_result, proto) == 16u && offsetof(ipv4_parse_result, dscp) == 17u &&
+	      offsetof(ipv4_parse_result, src_port) == 18u && offsetof(ipv4_parse_result, dst_port) == 20u);
 
 /**
  * @brief Parse Ethernet frame header with VLAN tag unwinding.

@@ -11,118 +11,15 @@
 
 #include <algorithm>
 #include <limits>
+#include <memory>
 #include <new>
-#include <stdexcept>
 #include <utility>
 
 #include <kinetum/algo/cache.hpp>
 
 namespace kinetum::dp
 {
-namespace
-{
-
-/**
- * @brief Add one aligned extent to a checked telemetry mapping layout.
- * @tparam value_type Placement element type.
- * @param count Element population.
- * @param[in,out] cursor Current checked layout end.
- * @param[out] offset Aligned start of this extent.
- * @return true after exact representable arithmetic.
- */
-template <typename value_type>
-[[nodiscard]] bool append_extent(std::size_t count, std::size_t &cursor, std::size_t &offset) noexcept
-{
-	if (count == 0u) {
-		offset = cursor;
-		return true;
-	}
-	const std::size_t alignment = alignof(value_type);
-	const std::size_t mask = alignment - 1u;
-	if (cursor > std::numeric_limits<std::size_t>::max() - mask) {
-		return false;
-	}
-	offset = (cursor + mask) & ~mask;
-	if (count > std::numeric_limits<std::size_t>::max() / sizeof(value_type) ||
-	    count * sizeof(value_type) > std::numeric_limits<std::size_t>::max() - offset) {
-		return false;
-	}
-	cursor = offset + count * sizeof(value_type);
-	return true;
-}
-
-/**
- * @brief Round one extent without overflowing its size domain.
- * @param value Unaligned byte count or offset.
- * @param alignment Required nonzero power-of-two alignment.
- * @param[out] rounded Aligned result written only on success.
- * @return true when the rounded value is representable.
- */
-[[nodiscard]] bool round_up_checked(std::size_t value, std::size_t alignment, std::size_t &rounded) noexcept
-{
-	if (alignment == 0u || (alignment & (alignment - 1u)) != 0u ||
-	    value > std::numeric_limits<std::size_t>::max() - (alignment - 1u)) {
-		return false;
-	}
-	rounded = (value + alignment - 1u) & ~(alignment - 1u);
-	return true;
-}
-
-/**
- * @brief Append three separately cache-aligned counter banks with checked bounds.
- * @tparam value_type Plain counter row owned by one worker.
- * @param count Exact rows per bank; zero allocates no extent.
- * @param[in,out] cursor Current layout end, advanced only on success.
- * @param[out] offset First counter bank offset.
- * @param[out] stride Cache-line-complete bytes per bank, or zero when empty.
- * @return true only for representable layout arithmetic.
- */
-template <typename value_type>
-[[nodiscard]] bool append_counter_banks(std::size_t count, std::size_t &cursor, std::size_t &offset,
-					std::size_t &stride) noexcept
-{
-	if (count == 0u) {
-		offset = cursor;
-		stride = 0u;
-		return true;
-	}
-	if (count > std::numeric_limits<std::size_t>::max() / sizeof(value_type) ||
-	    !round_up_checked(cursor, kinetum::algo::CACHE_LINE_SIZE, offset) ||
-	    !round_up_checked(count * sizeof(value_type), kinetum::algo::CACHE_LINE_SIZE, stride) || stride == 0u ||
-	    RUNTIME_TELEMETRY_BANK_COUNT > (std::numeric_limits<std::size_t>::max() - offset) / stride) {
-		return false;
-	}
-	cursor = offset + RUNTIME_TELEMETRY_BANK_COUNT * stride;
-	return true;
-}
-
-}  // namespace
-
-common::status_or<worker_runtime_telemetry::storage_layout>
-worker_runtime_telemetry::compute_layout(std::size_t stage_count, std::size_t stream_count) noexcept
-{
-	if (stage_count == 0u || stage_count > UINT32_MAX || stream_count > UINT32_MAX) {
-		return common::status(common::status_code::OUT_OF_RANGE,
-				      kinetum::common::static_status_text(
-					      "worker telemetry requires compact stage and stream populations"));
-	}
-	storage_layout layout;
-	std::size_t cursor = 0u;
-	if (!append_extent<hot_bank_view>(1u, cursor, layout.hot_offset) ||
-	    !append_extent<bank_header>(RUNTIME_TELEMETRY_BANK_COUNT, cursor, layout.headers_offset) ||
-	    !append_counter_banks<worker_stage_telemetry_counters>(stage_count, cursor, layout.stages_offset,
-								   layout.stage_bank_stride) ||
-	    !append_counter_banks<worker_stream_telemetry_counters>(stream_count, cursor, layout.streams_offset,
-								    layout.stream_bank_stride)) {
-		return common::status(common::status_code::OUT_OF_RANGE,
-				      kinetum::common::static_status_text(
-					      "worker telemetry slab extent exceeds the host size domain"));
-	}
-	layout.total_bytes = cursor;
-	return layout;
-}
-
-common::status_or<std::unique_ptr<worker_runtime_telemetry>>
+common::status_or<numa_owner<worker_runtime_telemetry>>
 worker_runtime_telemetry::create(uint64_t runtime_generation, uint32_t worker_index, int32_t worker_numa_node,
 				 std::span<const uint32_t> stage_instance_indices,
 				 std::span<const uint32_t> io_stream_indices, uint64_t cadence_ns,
@@ -134,144 +31,121 @@ worker_runtime_telemetry::create(uint64_t runtime_generation, uint32_t worker_in
 		return common::status::invalid_argument(
 			"worker telemetry requires exact generation, worker, NUMA, cadence, and stage ownership");
 	}
-	auto layout_or = compute_layout(stage_instance_indices.size(), io_stream_indices.size());
-	if (!layout_or.is_ok()) {
-		return layout_or.error();
-	}
-	const auto layout = layout_or.value();
-	try {
-		std::vector<uint32_t> stage_indices(stage_instance_indices.begin(), stage_instance_indices.end());
-		if (!std::is_sorted(stage_indices.begin(), stage_indices.end()) ||
-		    std::adjacent_find(stage_indices.begin(), stage_indices.end()) != stage_indices.end()) {
-			return common::status::invalid_argument(
-				"worker telemetry stage membership must be sorted and unique");
-		}
-		std::vector<uint32_t> stream_indices(io_stream_indices.begin(), io_stream_indices.end());
-		if (!std::is_sorted(stream_indices.begin(), stream_indices.end()) ||
-		    std::adjacent_find(stream_indices.begin(), stream_indices.end()) != stream_indices.end() ||
-		    (!stream_indices.empty() && stream_indices.back() == UINT32_MAX)) {
-			return common::status::invalid_argument(
-				"worker telemetry stream membership must be sorted and unique");
-		}
-		const uint32_t maximum_stage = stage_indices.back();
-		if (maximum_stage == UINT32_MAX) {
-			return common::status(common::status_code::OUT_OF_RANGE,
-					      "worker telemetry stage identity reaches the reserved sentinel");
-		}
-		std::vector<uint32_t> stage_to_ordinal(static_cast<std::size_t>(maximum_stage) + 1u, UINT32_MAX);
-		for (std::size_t ordinal = 0u; ordinal < stage_indices.size(); ++ordinal) {
-			stage_to_ordinal[stage_indices[ordinal]] = static_cast<uint32_t>(ordinal);
-		}
-		auto region_or = numa_memory_region::allocate({
-			.usable_bytes = layout.total_bytes,
-			.alignment_bytes = kinetum::algo::CACHE_LINE_SIZE,
-			.host_numa_node = worker_numa_node,
-		});
-		if (!region_or.is_ok()) {
-			return region_or.error();
-		}
-		auto region = std::move(region_or).value();
-		auto *base = static_cast<std::byte *>(region.data());
-		auto *hot = reinterpret_cast<hot_bank_view *>(base + layout.hot_offset);
-		auto *headers = reinterpret_cast<bank_header *>(base + layout.headers_offset);
-		auto *stages = reinterpret_cast<worker_stage_telemetry_counters *>(base + layout.stages_offset);
-		auto *streams =
-			stream_indices.empty() ?
-				nullptr :
-				reinterpret_cast<worker_stream_telemetry_counters *>(base + layout.streams_offset);
-		std::construct_at(hot);
-		for (std::size_t index = 0u; index < RUNTIME_TELEMETRY_BANK_COUNT; ++index) {
-			std::construct_at(&headers[index]);
-		}
-		for (std::size_t bank_index = 0u; bank_index < RUNTIME_TELEMETRY_BANK_COUNT; ++bank_index) {
-			auto *bank = reinterpret_cast<worker_stage_telemetry_counters *>(
-				base + layout.stages_offset + bank_index * layout.stage_bank_stride);
-			for (std::size_t stage_index = 0u; stage_index < stage_indices.size(); ++stage_index) {
-				std::construct_at(&bank[stage_index]);
-			}
-		}
-		for (std::size_t bank_index = 0u; !stream_indices.empty() && bank_index < RUNTIME_TELEMETRY_BANK_COUNT;
-		     ++bank_index) {
-			auto *bank = reinterpret_cast<worker_stream_telemetry_counters *>(
-				base + layout.streams_offset + bank_index * layout.stream_bank_stride);
-			for (std::size_t stream_index = 0u; stream_index < stream_indices.size(); ++stream_index) {
-				std::construct_at(&bank[stream_index]);
-			}
-		}
-		auto owner = std::unique_ptr<worker_runtime_telemetry>(new (std::nothrow) worker_runtime_telemetry(
-			runtime_generation, worker_index, worker_numa_node, cadence_ns, channel,
-			std::move(stage_indices), std::move(stage_to_ordinal), std::move(stream_indices),
-			std::move(region), hot, headers, stages, layout.stage_bank_stride, streams,
-			layout.stream_bank_stride));
-		if (owner == nullptr) {
-			for (std::size_t bank_index = 0u;
-			     !io_stream_indices.empty() && bank_index < RUNTIME_TELEMETRY_BANK_COUNT; ++bank_index) {
-				auto *bank = reinterpret_cast<worker_stream_telemetry_counters *>(
-					base + layout.streams_offset + bank_index * layout.stream_bank_stride);
-				for (std::size_t stream_index = 0u; stream_index < io_stream_indices.size();
-				     ++stream_index) {
-					std::destroy_at(&bank[stream_index]);
-				}
-			}
-			for (std::size_t bank_index = 0u; bank_index < RUNTIME_TELEMETRY_BANK_COUNT; ++bank_index) {
-				auto *bank = reinterpret_cast<worker_stage_telemetry_counters *>(
-					base + layout.stages_offset + bank_index * layout.stage_bank_stride);
-				for (std::size_t stage_index = 0u; stage_index < stage_instance_indices.size();
-				     ++stage_index) {
-					std::destroy_at(&bank[stage_index]);
-				}
-			}
-			for (std::size_t index = 0u; index < RUNTIME_TELEMETRY_BANK_COUNT; ++index) {
-				std::destroy_at(&headers[index]);
-			}
-			std::destroy_at(hot);
-			return common::status::resource_exhausted("failed to allocate worker telemetry owner");
-		}
-		return owner;
-	} catch (const std::bad_alloc &) {
-		return common::status::resource_exhausted("failed to allocate worker telemetry construction state");
-	} catch (const std::length_error &) {
+	if (stage_instance_indices.size() > UINT32_MAX || io_stream_indices.size() > UINT32_MAX ||
+	    stage_instance_indices.back() == UINT32_MAX) {
 		return common::status(common::status_code::OUT_OF_RANGE,
-				      "worker telemetry construction extent exceeds the host size domain");
+				      "worker telemetry requires compact stage and stream identities");
 	}
+	if (!std::is_sorted(stage_instance_indices.begin(), stage_instance_indices.end()) ||
+	    std::adjacent_find(stage_instance_indices.begin(), stage_instance_indices.end()) !=
+		    stage_instance_indices.end() ||
+	    !std::is_sorted(io_stream_indices.begin(), io_stream_indices.end()) ||
+	    std::adjacent_find(io_stream_indices.begin(), io_stream_indices.end()) != io_stream_indices.end() ||
+	    (!io_stream_indices.empty() && io_stream_indices.back() == UINT32_MAX)) {
+		return common::status::invalid_argument("worker telemetry membership must be sorted and unique");
+	}
+
+	numa_layout layout;
+	std::size_t root_offset = 0u;
+	std::size_t hot_offset = 0u;
+	std::size_t headers_offset = 0u;
+	std::size_t stage_indices_offset = 0u;
+	std::size_t stage_map_offset = 0u;
+	std::size_t stream_indices_offset = 0u;
+	std::size_t stages_offset = 0u;
+	std::size_t stage_stride = 0u;
+	std::size_t streams_offset = 0u;
+	std::size_t stream_stride = 0u;
+	const std::size_t stage_map_count = static_cast<std::size_t>(stage_instance_indices.back()) + 1u;
+	if (!layout.append<worker_runtime_telemetry>(1u, root_offset) ||
+	    !layout.append<hot_bank_view>(1u, hot_offset) ||
+	    !layout.append<bank_header>(RUNTIME_TELEMETRY_BANK_COUNT, headers_offset) ||
+	    !layout.append<uint32_t>(stage_instance_indices.size(), stage_indices_offset) ||
+	    !layout.append<uint32_t>(stage_map_count, stage_map_offset) ||
+	    !layout.append<uint32_t>(io_stream_indices.size(), stream_indices_offset) ||
+	    !layout.append_rows<worker_stage_telemetry_counters>(RUNTIME_TELEMETRY_BANK_COUNT,
+								 stage_instance_indices.size(), stages_offset,
+								 stage_stride, algo::CACHE_LINE_SIZE) ||
+	    !layout.append_rows<worker_stream_telemetry_counters>(RUNTIME_TELEMETRY_BANK_COUNT,
+								  io_stream_indices.size(), streams_offset,
+								  stream_stride, algo::CACHE_LINE_SIZE)) {
+		return common::status(common::status_code::OUT_OF_RANGE, "worker telemetry layout overflows");
+	}
+	auto region_or = layout.allocate(worker_numa_node);
+	if (!region_or.is_ok()) {
+		return region_or.error();
+	}
+	auto region = std::move(region_or).value();
+	auto stage_indices =
+		numa_layout::storage<uint32_t>(region, stage_indices_offset, stage_instance_indices.size());
+	auto stage_map = numa_layout::storage<uint32_t>(region, stage_map_offset, stage_map_count);
+	auto stream_indices = numa_layout::storage<uint32_t>(region, stream_indices_offset, io_stream_indices.size());
+	std::uninitialized_copy(stage_instance_indices.begin(), stage_instance_indices.end(), stage_indices.begin());
+	std::uninitialized_fill(stage_map.begin(), stage_map.end(), UINT32_MAX);
+	std::uninitialized_copy(io_stream_indices.begin(), io_stream_indices.end(), stream_indices.begin());
+	for (std::size_t ordinal = 0u; ordinal < stage_indices.size(); ++ordinal) {
+		stage_map[stage_indices[ordinal]] = static_cast<uint32_t>(ordinal);
+	}
+	storage_views storage{
+		.stage_indices = stage_indices,
+		.stage_to_ordinal = stage_map,
+		.stream_indices = stream_indices,
+		.hot = std::construct_at(numa_layout::storage<hot_bank_view>(region, hot_offset).data()),
+		.headers =
+			numa_layout::storage<bank_header>(region, headers_offset, RUNTIME_TELEMETRY_BANK_COUNT).data(),
+		.bytes = region.size(),
+	};
+	for (std::size_t index = 0u; index < RUNTIME_TELEMETRY_BANK_COUNT; ++index) {
+		std::construct_at(&storage.headers[index]);
+		auto stages = numa_layout::row<worker_stage_telemetry_counters>(
+			region, stages_offset, stage_stride, index, RUNTIME_TELEMETRY_BANK_COUNT, stage_indices.size());
+		auto streams = numa_layout::row<worker_stream_telemetry_counters>(region, streams_offset, stream_stride,
+										  index, RUNTIME_TELEMETRY_BANK_COUNT,
+										  stream_indices.size());
+		for (auto &value : stages) {
+			std::construct_at(&value);
+		}
+		for (auto &value : streams) {
+			std::construct_at(&value);
+		}
+		storage.stages[index] = stages.data();
+		storage.streams[index] = streams.data();
+	}
+	auto *root = new (numa_layout::storage<worker_runtime_telemetry>(region, root_offset).data())
+		worker_runtime_telemetry(runtime_generation, worker_index, worker_numa_node, cadence_ns, channel,
+					 storage);
+	return adopt_numa_owner(root, std::move(region));
 }
 
-worker_runtime_telemetry::worker_runtime_telemetry(
-	uint64_t runtime_generation, uint32_t worker_index, int32_t numa_node, uint64_t cadence_ns,
-	worker_telemetry_channel &channel, std::vector<uint32_t> stage_indices, std::vector<uint32_t> stage_to_ordinal,
-	std::vector<uint32_t> stream_indices, numa_memory_region region, hot_bank_view *hot, bank_header *headers,
-	worker_stage_telemetry_counters *stages, std::size_t stage_bank_stride,
-	worker_stream_telemetry_counters *streams, std::size_t stream_bank_stride) noexcept
+worker_runtime_telemetry::worker_runtime_telemetry(uint64_t runtime_generation, uint32_t worker_index,
+						   int32_t numa_node, uint64_t cadence_ns,
+						   worker_telemetry_channel &channel, storage_views storage) noexcept
 	: runtime_generation_(runtime_generation)
 	, worker_index_(worker_index)
 	, numa_node_(numa_node)
 	, cadence_ns_(cadence_ns)
 	, channel_(channel)
-	, stage_indices_(std::move(stage_indices))
-	, stage_to_ordinal_(std::move(stage_to_ordinal))
-	, stream_indices_(std::move(stream_indices))
-	, region_(std::move(region))
-	, hot_(hot)
-	, banks_(headers)
-	, stage_counters_(stages)
-	, stream_counters_(streams)
-	, stream_bank_stride_(stream_bank_stride)
-	, stage_bank_stride_(stage_bank_stride)
+	, stage_indices_(storage.stage_indices)
+	, stage_to_ordinal_(storage.stage_to_ordinal)
+	, stream_indices_(storage.stream_indices)
+	, storage_bytes_(storage.bytes)
+	, hot_(storage.hot)
+	, banks_(storage.headers)
+	, stage_banks_(storage.stages)
+	, stream_banks_(storage.streams)
 {
 	if (runtime_generation_ == 0u || worker_index_ == UINT32_MAX || numa_node_ < 0 || cadence_ns_ == 0u ||
 	    channel_.worker_index() != worker_index_ || channel_.returned_numa_node() != numa_node_ ||
-	    stage_indices_.empty() || !region_ || hot_ == nullptr || banks_ == nullptr || stage_counters_ == nullptr ||
-	    stage_bank_stride_ == 0u || stage_bank_stride_ % kinetum::algo::CACHE_LINE_SIZE != 0u ||
-	    stage_indices_.size() > stage_bank_stride_ / sizeof(worker_stage_telemetry_counters) ||
-	    stream_indices_.empty() != (stream_counters_ == nullptr) ||
-	    stream_indices_.empty() != (stream_bank_stride_ == 0u) ||
-	    stream_bank_stride_ % kinetum::algo::CACHE_LINE_SIZE != 0u ||
-	    stream_indices_.size() > stream_bank_stride_ / sizeof(worker_stream_telemetry_counters) ||
-	    !region_.host_numa_node().has_value() || *region_.host_numa_node() != numa_node_ ||
+	    stage_indices_.empty() || storage_bytes_ == 0u || hot_ == nullptr || banks_ == nullptr ||
 	    hot_->engine != nullptr || hot_->stages != nullptr || hot_->streams != nullptr ||
 	    hot_->stream_count != 0u || hot_->protocol_faults != nullptr || hot_->stage_count != 0u ||
 	    hot_->bank_index != UINT8_MAX) {
 		std::terminate();
+	}
+	for (std::size_t index = 0u; index < RUNTIME_TELEMETRY_BANK_COUNT; ++index) {
+		if (stage_banks_[index] == nullptr || stream_indices_.empty() != (stream_banks_[index] == nullptr)) {
+			std::terminate();
+		}
 	}
 }
 
@@ -300,32 +174,22 @@ worker_runtime_telemetry::~worker_runtime_telemetry()
 
 worker_stage_telemetry_counters *worker_runtime_telemetry::stage_bank_(uint8_t bank_index) noexcept
 {
-	return reinterpret_cast<worker_stage_telemetry_counters *>(reinterpret_cast<std::byte *>(stage_counters_) +
-								   static_cast<std::size_t>(bank_index) *
-									   stage_bank_stride_);
+	return stage_banks_[bank_index];
 }
 
 const worker_stage_telemetry_counters *worker_runtime_telemetry::stage_bank_(uint8_t bank_index) const noexcept
 {
-	return reinterpret_cast<const worker_stage_telemetry_counters *>(
-		reinterpret_cast<const std::byte *>(stage_counters_) +
-		static_cast<std::size_t>(bank_index) * stage_bank_stride_);
+	return stage_banks_[bank_index];
 }
 
 worker_stream_telemetry_counters *worker_runtime_telemetry::stream_bank_(uint8_t bank_index) noexcept
 {
-	return stream_counters_ == nullptr ? nullptr :
-					     reinterpret_cast<worker_stream_telemetry_counters *>(
-						     reinterpret_cast<std::byte *>(stream_counters_) +
-						     static_cast<std::size_t>(bank_index) * stream_bank_stride_);
+	return stream_banks_[bank_index];
 }
 
 const worker_stream_telemetry_counters *worker_runtime_telemetry::stream_bank_(uint8_t bank_index) const noexcept
 {
-	return stream_counters_ == nullptr ? nullptr :
-					     reinterpret_cast<const worker_stream_telemetry_counters *>(
-						     reinterpret_cast<const std::byte *>(stream_counters_) +
-						     static_cast<std::size_t>(bank_index) * stream_bank_stride_);
+	return stream_banks_[bank_index];
 }
 
 void worker_runtime_telemetry::select_active_bank_(uint8_t bank_index) noexcept
@@ -722,7 +586,7 @@ int32_t worker_runtime_telemetry::numa_node() const noexcept
 
 std::size_t worker_runtime_telemetry::storage_bytes() const noexcept
 {
-	return region_.size();
+	return storage_bytes_;
 }
 
 std::span<const uint32_t> worker_runtime_telemetry::stage_instance_indices() const noexcept

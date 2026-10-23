@@ -39,21 +39,24 @@ namespace kinetum::gluon
 namespace
 {
 
-/** @brief Source files and expected worker handoffs for one shipped deployment. */
+/** @brief Source inputs and independent topology/storage expectations for one shipped deployment. */
 struct example_spec {
-	const char *directory;	///< Example directory and pipeline filename stem.
-	const char *bindings;	///< Exact deployment-binding filename.
-	const char *hardware;	///< Exact hardware-inventory filename.
-	int32_t regions;	///< Region count used by the deployment.
-	int expected_handoffs;	///< Exact number of cross-worker stage edges.
+	const char *directory;	    ///< Example directory and pipeline filename stem.
+	const char *bindings;	    ///< Exact deployment-binding filename.
+	const char *hardware;	    ///< Exact hardware-inventory filename.
+	int32_t regions;	    ///< Region count used by the deployment.
+	int expected_handoffs;	    ///< Exact number of cross-worker stage edges.
+	uint32_t rx_descriptors;    ///< Authored descriptor population for each RX stream.
+	uint64_t required_buffers;  ///< Independently derived complete per-domain ownership bound.
 };
 
 /** @brief Single-queue deployments selected by the validation profiles. */
 constexpr std::array<example_spec, 3> SINGLE_QUEUE_EXAMPLES{{
-	{"passthrough", "passthrough_tap_bindings.pbtxt", "hardware_inventory_tap.pbtxt", 1, 0},
-	{"fan_in_edge_gateway", "fan_in_edge_gateway_tap_bindings.pbtxt", "hardware_inventory_tap.pbtxt", 3, 2},
+	{"passthrough", "passthrough_tap_bindings.pbtxt", "hardware_inventory_tap.pbtxt", 1, 0, 1024u, 4480u},
+	{"fan_in_edge_gateway", "fan_in_edge_gateway_tap_bindings.pbtxt", "hardware_inventory_tap.pbtxt", 3, 2, 1024u,
+	 13312u},
 	{"fan_in_edge_gateway", "fan_in_edge_gateway_cloudlab_d430_bindings.pbtxt",
-	 "hardware_inventory_cloudlab_d430.pbtxt", 3, 2},
+	 "hardware_inventory_cloudlab_d430.pbtxt", 3, 2, 2048u, 15360u},
 }};
 
 /** @brief Parsed inputs retained while planning or removing an authored handoff. */
@@ -200,9 +203,30 @@ void expect_i40e_rss_profile(const kinetum::gluon::v1::DeploymentPlan &planned,
 	}
 }
 
+/**
+ * @brief Pin authored queue depths and independently derived storage floors for a shipped example.
+ * @param planned Complete plan emitted from the shipped inputs.
+ * @param compiled Topology admitted by the production compiler.
+ * @param spec Expected RX depth and per-domain floor; every shipped TX queue has 1024 descriptors.
+ */
+void expect_storage_budget(const kinetum::gluon::v1::DeploymentPlan &planned,
+			   const kinetum::provider::compiled_provider_topology &compiled, const example_spec &spec)
+{
+	ASSERT_EQ(compiled.storage_domains.size(), static_cast<std::size_t>(planned.packet_storage_domains_size()));
+	for (const auto &stream : planned.io_streams()) {
+		EXPECT_EQ(stream.descriptor_count(), stream.direction() == kinetum::gluon::v1::IO_STREAM_DIRECTION_RX ?
+							     spec.rx_descriptors :
+							     1024u);
+	}
+	for (const auto &domain : compiled.storage_domains) {
+		SCOPED_TRACE(domain.storage_domain_id);
+		EXPECT_EQ(domain.budget.required_min_buffers, spec.required_buffers);
+	}
+}
+
 }  // namespace
 
-/** @brief Shipped single-queue examples plan with complete explicit shared-pool handoffs. */
+/** @brief Shipped single-queue examples preserve authored storage and complete worker handoffs. */
 TEST(gluon_examples, single_queue_bindings_plan_exact_handoffs)
 {
 	for (const auto &spec : SINGLE_QUEUE_EXAMPLES) {
@@ -212,6 +236,9 @@ TEST(gluon_examples, single_queue_bindings_plan_exact_handoffs)
 		const auto &inputs = inputs_or.value();
 		const auto planned = plan(inputs.pipeline, inputs.hardware, inputs.options);
 		ASSERT_TRUE(planned.is_ok()) << planned.error().message();
+		const auto compiled = kinetum::provider::compile_provider_topology(planned.value());
+		ASSERT_TRUE(compiled.is_ok()) << compiled.error().message();
+		expect_storage_budget(planned.value(), compiled.value(), spec);
 		expect_shared_pool_handoffs(planned.value(), spec.expected_handoffs);
 		expect_snapshots_match(planned.value(), spec);
 	}
@@ -236,7 +263,11 @@ TEST(gluon_examples, rss_bindings_plan_complete_context_selection_handoffs)
 {
 	constexpr example_spec RSS_EXAMPLE{"fan_in_edge_gateway",
 					   "fan_in_edge_gateway_cloudlab_d430_rx_rss_2_bindings.pbtxt",
-					   "hardware_inventory_cloudlab_d430.pbtxt", 3, 8};
+					   "hardware_inventory_cloudlab_d430.pbtxt",
+					   3,
+					   8,
+					   2048u,
+					   38848u};
 	auto inputs_or = load_example(RSS_EXAMPLE);
 	ASSERT_TRUE(inputs_or.is_ok()) << inputs_or.error().message();
 	const auto &inputs = inputs_or.value();
@@ -255,7 +286,7 @@ TEST(gluon_examples, rss_bindings_plan_complete_context_selection_handoffs)
 	ASSERT_TRUE(compiled.is_ok()) << compiled.error().message();
 	expect_i40e_rss_profile(planned.value(), compiled.value());
 	ASSERT_EQ(compiled->storage_domains.size(), 1u);
-	EXPECT_EQ(compiled->storage_domains[0].budget.required_min_buffers, 34752u);
+	expect_storage_budget(planned.value(), compiled.value(), RSS_EXAMPLE);
 	expect_shared_pool_handoffs(planned.value(), RSS_EXAMPLE.expected_handoffs);
 	expect_snapshots_match(planned.value(), RSS_EXAMPLE);
 	expect_missing_handoffs_reject(inputs);
@@ -271,25 +302,22 @@ TEST(gluon_examples, per_queue_storage_bindings_plan_original_domains)
 {
 	/** @brief Independently expected pool and lane populations for one physical fixture. */
 	struct storage_example {
-		example_spec source;	    ///< Exact fixture paths and worker handoffs.
-		int pool_count;		    ///< Independent number of RX allocation domains.
-		int lane_count;		    ///< Independent execution-lane count.
-		uint32_t pool_buffers;	    ///< Exact per-domain physical buffer population.
-		uint64_t required_buffers;  ///< Independently derived complete per-domain ownership bound.
+		example_spec source;	///< Exact fixture paths and worker handoffs.
+		int pool_count;		///< Independent number of RX allocation domains.
+		int lane_count;		///< Independent execution-lane count.
+		uint32_t pool_buffers;	///< Exact per-domain physical buffer population.
 	};
 	constexpr std::array<storage_example, 2> EXAMPLES{{
 		{{"fan_in_edge_gateway", "fan_in_edge_gateway_cloudlab_d430_per_rx_queue_bindings.pbtxt",
-		  "hardware_inventory_cloudlab_d430.pbtxt", 3, 2},
+		  "hardware_inventory_cloudlab_d430.pbtxt", 3, 2, 2048u, 8896u},
 		 2,
 		 1,
-		 65535u,
-		 7872u},
+		 65535u},
 		{{"fan_in_edge_gateway", "fan_in_edge_gateway_cloudlab_d430_rx_rss_2_per_rx_queue_bindings.pbtxt",
-		  "hardware_inventory_cloudlab_d430.pbtxt", 3, 8},
+		  "hardware_inventory_cloudlab_d430.pbtxt", 3, 8, 2048u, 13312u},
 		 4,
 		 2,
-		 32767u,
-		 12288u},
+		 32767u},
 	}};
 	for (const auto &spec : EXAMPLES) {
 		SCOPED_TRACE(spec.source.bindings);
@@ -309,9 +337,7 @@ TEST(gluon_examples, per_queue_storage_bindings_plan_original_domains)
 		if (spec.lane_count == 2) {
 			expect_i40e_rss_profile(planned.value(), compiled.value());
 		}
-		for (const auto &domain : compiled->storage_domains) {
-			EXPECT_EQ(domain.budget.required_min_buffers, spec.required_buffers);
-		}
+		expect_storage_budget(planned.value(), compiled.value(), spec.source);
 		for (const auto &domain : planned->packet_storage_domains()) {
 			EXPECT_EQ(domain.buffer_count(), spec.pool_buffers);
 		}

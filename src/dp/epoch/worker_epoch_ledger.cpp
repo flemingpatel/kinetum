@@ -52,8 +52,10 @@ compile_worker_epoch_credit_budget(worker_epoch_credit_budget_input input) noexc
 	return budget;
 }
 
-common::status_or<std::unique_ptr<worker_epoch_ledger>>
-worker_epoch_ledger::create(uint32_t worker_index, uint64_t runtime_generation, uint64_t maximum_unretired)
+common::status_or<numa_owner<worker_epoch_ledger>> worker_epoch_ledger::create(uint32_t worker_index,
+									       uint64_t runtime_generation,
+									       uint64_t maximum_unretired,
+									       int32_t numa_node)
 {
 	if (worker_index == std::numeric_limits<uint32_t>::max()) {
 		return common::status::invalid_argument(
@@ -67,16 +69,16 @@ worker_epoch_ledger::create(uint32_t worker_index, uint64_t runtime_generation, 
 		return common::status::invalid_argument(
 			"worker epoch ledger requires a nonzero compiled credit ceiling");
 	}
-	auto *ledger = new (std::nothrow) worker_epoch_ledger(worker_index, runtime_generation, maximum_unretired);
-	if (ledger == nullptr) {
-		return common::status::resource_exhausted("worker epoch ledger allocation failed");
-	}
-	return std::unique_ptr<worker_epoch_ledger>(ledger);
+	return make_numa_owner<worker_epoch_ledger>(numa_node, [&](void *storage) noexcept {
+		return new (storage)
+			worker_epoch_ledger(worker_index, runtime_generation, maximum_unretired, numa_node);
+	});
 }
 
-worker_epoch_ledger::worker_epoch_ledger(uint32_t worker_index, uint64_t runtime_generation,
-					 uint64_t maximum_unretired) noexcept
+worker_epoch_ledger::worker_epoch_ledger(uint32_t worker_index, uint64_t runtime_generation, uint64_t maximum_unretired,
+					 int32_t numa_node) noexcept
 	: worker_index_(worker_index)
+	, numa_node_(numa_node)
 	, runtime_generation_(runtime_generation)
 	, maximum_unretired_(maximum_unretired)
 {
@@ -92,7 +94,8 @@ worker_epoch_ledger::~worker_epoch_ledger()
 common::status worker_epoch_ledger::bind_protocol_faults(worker_runtime_telemetry &telemetry,
 							 epoch_protocol_fault_latch &faults) noexcept
 {
-	if (telemetry.runtime_generation() != runtime_generation_ || telemetry.worker_index() != worker_index_) {
+	if (telemetry.runtime_generation() != runtime_generation_ || telemetry.worker_index() != worker_index_ ||
+	    telemetry.numa_node() != numa_node_) {
 		return common::status::failed_precondition(kinetum::common::static_status_text(
 			"worker epoch ledger protocol-fault authorities disagree with owner identity"));
 	}

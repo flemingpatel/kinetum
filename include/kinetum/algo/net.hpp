@@ -28,6 +28,7 @@
  */
 
 #include <cstdint>
+#include <cstring>
 
 #include <kinetum/algo/platform.hpp>
 
@@ -160,8 +161,37 @@ constexpr void write_be64(uint8_t *p, uint64_t v) noexcept
 }
 
 // =============================================================================
-// Incremental Internet Checksum
+// Internet Checksum
 // =============================================================================
+
+/**
+ * @brief Compute the one's-complement checksum of one bounded byte extent.
+ *
+ * Native unaligned-safe word loads retain byte-order independence until the
+ * final conversion. The uint16_t extent bounds the accumulator below 2^31;
+ * two carry folds suffice, including for an odd trailing byte.
+ *
+ * @param data Caller-proven readable bytes; may be null only for an empty extent.
+ * @param length Exact byte count, at most UINT16_MAX.
+ * @return Host-order representation of the network checksum (0xffff when empty).
+ */
+[[nodiscard]] KINETUM_ALWAYS_INLINE KINETUM_PURE uint16_t internet_checksum(const uint8_t *data,
+									    uint16_t length) noexcept
+{
+	uint32_t sum = 0;
+	uint32_t offset = 0;
+	for (; offset + 1u < length; offset += 2u) {
+		uint16_t word;
+		std::memcpy(&word, data + offset, sizeof(word));
+		sum += word;
+	}
+	if (offset < length) {
+		sum += data[offset];
+	}
+	sum = (sum & UINT16_MAX) + (sum >> 16u);
+	sum = (sum & UINT16_MAX) + (sum >> 16u);
+	return __builtin_bswap16(static_cast<uint16_t>(~sum));
+}
 
 /**
  * @brief Adjust an Internet checksum for one changed 16-bit word.
