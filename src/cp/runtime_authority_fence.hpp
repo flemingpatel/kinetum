@@ -86,7 +86,7 @@ static_assert(sizeof(runtime_authority_relation) == sizeof(uint8_t), "runtime au
  *
  * @param before Durable view obtained before a remote observation.
  * @param after Durable view obtained after that observation.
-	 * @return true only when every active identity field is equal.
+ * @return true only when every active identity field is equal.
  */
 [[nodiscard]] bool same_active_runtime_authority(const durable_runtime_authority_view &before,
 						 const durable_runtime_authority_view &after) noexcept;

@@ -9,6 +9,11 @@ QoS modules provide filtering, address translation, and rate control; the SDK
 supports custom modules. A separate control plane manages live configuration
 changes and rollback.
 
+Kinetum provides a common runtime and control plane for custom packet-processing
+applications composed from reusable pipeline stages. It separates application
+policy from execution, resource management, and live configuration coordination,
+reducing the infrastructure each application must implement.
+
 ## Start Here
 
 | Need | Read |

@@ -491,8 +491,9 @@ message StreamStats {
 }
 
 // Compiled packet-storage capacity and provider occupancy observation. Both
-// available states partition buffer_count exactly; approximate means that the
-// complete sampled partition may change immediately after callback return.
+// available states partition buffer_count exactly. An approximate observation
+// may combine readings taken while the pool changes. Neither state reserves
+// credits or guarantees a subsequent acquisition's accepted prefix.
 message StorageDomainStats {
   string storage_domain_id = 1;
   optional int32 host_numa_node = 2;

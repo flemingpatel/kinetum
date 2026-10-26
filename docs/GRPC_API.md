@@ -1073,11 +1073,12 @@ family must sum to the corresponding engine RX/TX packet and byte totals.
 | `observation_state`    | `ProviderObservationState` | Typed occupancy availability.        |
 | `observed_monotonic_ns` | `optional uint64` | Platform post-callback sample when values exist. |
 | `in_use`               | `optional uint64` | Exact or approximate externally owned records. |
-| `available`            | `optional uint64` | Exact or approximate immediately available records. |
+| `available`            | `optional uint64` | Exact or approximate free records; an observation does not reserve them. |
 
 For both available states, `in_use + available == buffer_count` in the one
 returned sample. An approximate observation may combine readings taken while
 the pool changes; it must still return a complete tuple satisfying that identity.
+These counts do not guarantee a later acquisition's accepted prefix.
 
 `TrafficSteeringStats`:
 

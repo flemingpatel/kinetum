@@ -10,6 +10,7 @@
 #include "src/dp/fixed_packet_pool.hpp"
 
 #include <algorithm>
+#include <bit>
 #include <cstring>
 #include <exception>
 #include <limits>
@@ -17,8 +18,6 @@
 #include <new>
 #include <type_traits>
 #include <utility>
-
-#include <kinetum/algo/bits.hpp>
 
 #include "src/common/status.hpp"
 #include "src/dp/numa_layout.hpp"
@@ -37,9 +36,9 @@ using kinetum::common::status_code;
 /** @brief Checked cold extents for the one storage-domain mapping. */
 struct fixed_packet_pool::storage_layout {
 	numa_layout memory;		     ///< Sole allocation geometry authority.
-	std::size_t queue_capacity{0};	     ///< Rounded physical cells, not additional packet credits.
-	std::size_t queue_offset{0};	     ///< Mutable queue control.
-	std::size_t cells_offset{0};	     ///< Exact free-queue cells.
+	std::size_t word_count{0};	     ///< Exact availability-word population.
+	std::size_t control_offset{0};	     ///< Shared prefix-search control.
+	std::size_t words_offset{0};	     ///< Cache-line-separated availability words.
 	std::size_t record_offset{0};	     ///< First record row.
 	std::size_t record_stride{0};	     ///< Cache-line-isolated record extent.
 	std::size_t payload_offset{0};	     ///< First payload row.
@@ -81,23 +80,22 @@ fixed_packet_pool::create(const fixed_packet_pool_options &options)
 	}
 
 	storage_layout layout;
-	layout.queue_capacity =
-		static_cast<std::size_t>(algo::next_power_of_2_64(std::max<uint64_t>(2u, options.record_count)));
-	if (!free_queue::valid_capacity(layout.queue_capacity)) {
-		return status(status_code::OUT_OF_RANGE, "fixed packet pool free queue capacity overflows");
-	}
+	layout.word_count = free_index_pool::word_count(options.record_count);
 	const std::size_t alignment = std::max<std::size_t>(alignof(packet_record), options.alignment_bytes);
 	numa_layout payload_row;
 	std::size_t headroom_offset = 0;
 	if (!payload_row.append<uint8_t>(options.headroom_bytes, headroom_offset) ||
 	    !payload_row.append<uint8_t>(maximum_packet_length, layout.payload_data_offset, options.alignment_bytes) ||
-	    !layout.memory.append<free_queue>(1u, layout.queue_offset, algo::CACHE_LINE_SIZE) ||
-	    !layout.memory.append<free_queue::storage_type>(layout.queue_capacity, layout.cells_offset) ||
+	    !layout.memory.append<free_index_pool>(1u, layout.control_offset, algo::CACHE_LINE_SIZE) ||
+	    !layout.memory.append<free_index_pool::storage_type>(layout.word_count, layout.words_offset) ||
 	    !layout.memory.append_rows<packet_record>(options.record_count, 1u, layout.record_offset,
 						      layout.record_stride, alignment) ||
 	    !layout.memory.append_rows<uint8_t>(options.record_count, payload_row.size(), layout.payload_offset,
 						layout.payload_stride, alignment)) {
 		return status(status_code::OUT_OF_RANGE, "fixed packet pool layout overflows");
+	}
+	if (!std::has_single_bit(layout.record_stride)) {
+		std::terminate();
 	}
 	auto backing_or = layout.memory.allocate(options.host_numa_node);
 	if (!backing_or.is_ok()) {
@@ -114,7 +112,7 @@ fixed_packet_pool::fixed_packet_pool(fixed_packet_pool_options options, const st
 				     numa_memory_region backing) noexcept
 	: options_(options)
 	, backing_(std::move(backing))
-	, record_stride_(layout.record_stride)
+	, record_shift_(static_cast<std::size_t>(std::countr_zero(layout.record_stride)))
 	, payload_stride_(layout.payload_stride)
 	, payload_data_offset_(layout.payload_data_offset)
 	, record_storage_(reinterpret_cast<uint8_t *>(numa_layout::row<packet_record>(backing_, layout.record_offset,
@@ -124,14 +122,14 @@ fixed_packet_pool::fixed_packet_pool(fixed_packet_pool_options options, const st
 	, payload_storage_(numa_layout::row<uint8_t>(backing_, layout.payload_offset, layout.payload_stride, 0u,
 						     options.record_count, layout.payload_stride)
 				   .data())
-	, free_cells_(
-		  numa_layout::storage<free_queue::storage_type>(backing_, layout.cells_offset, layout.queue_capacity))
+	, free_words_(
+		  numa_layout::storage<free_index_pool::storage_type>(backing_, layout.words_offset, layout.word_count))
 {
-	static_assert(std::is_nothrow_default_constructible_v<free_queue::storage_type>);
+	static_assert(std::is_nothrow_default_constructible_v<free_index_pool::storage_type>);
 	static_assert(std::is_nothrow_default_constructible_v<packet_record>);
-	std::uninitialized_value_construct_n(free_cells_.data(), free_cells_.size());
-	free_records_ = std::construct_at(numa_layout::storage<free_queue>(backing_, layout.queue_offset).data(),
-					  free_cells_.data(), free_cells_.size());
+	std::uninitialized_value_construct_n(free_words_.data(), free_words_.size());
+	free_records_ = std::construct_at(numa_layout::storage<free_index_pool>(backing_, layout.control_offset).data(),
+					  free_words_, options.record_count);
 
 	operations_.state = this;
 	operations_.acquire_burst = &fixed_packet_pool::acquire_burst_;
@@ -159,9 +157,6 @@ fixed_packet_pool::fixed_packet_pool(fixed_packet_pool_options options, const st
 		record->storage.segment_count = 1;
 		record->storage.capabilities = operations_.capabilities;
 		initialize_packet_record(*record);
-		if (!free_records_->try_enqueue(record)) {
-			std::terminate();
-		}
 	}
 }
 
@@ -177,7 +172,37 @@ fixed_packet_pool::~fixed_packet_pool()
 		record_for_index_(i)->~packet_record();
 	}
 	std::destroy_at(free_records_);
-	std::destroy_n(free_cells_.data(), free_cells_.size());
+	std::destroy_n(free_words_.data(), free_words_.size());
+}
+
+template <std::size_t extent>
+uint16_t fixed_packet_pool::acquire_records_(std::span<packet_record *, extent> records) noexcept
+{
+	const auto accepted = free_records_->acquire_prefix(
+		static_cast<uint16_t>(records.size()),
+		[this, output = records.data()](std::size_t ordinal, uint32_t index) noexcept {
+			if (index >= options_.record_count) {
+				std::terminate();
+			}
+			auto *record = record_for_index_(index);
+			if (record->storage.native_handle != nullptr ||
+			    record->storage.data != payload_storage_ +
+							    static_cast<std::size_t>(index) * payload_stride_ +
+							    payload_data_offset_ ||
+			    record->storage.operations != &operations_ ||
+			    record->storage.generation != options_.generation ||
+			    record->storage.domain_index != options_.domain_index ||
+			    record->storage.segment_count != 1 ||
+			    record->storage.capabilities != operations_.capabilities) {
+				std::terminate();
+			}
+			initialize_packet_record(*record);
+			record->storage.native_handle = record;
+			record->storage.length = 0;
+			record->storage.contiguous_length = 0;
+			output[ordinal] = record;
+		});
+	return accepted;
 }
 
 uint16_t fixed_packet_pool::acquire_burst(packet_record **records, uint16_t capacity) noexcept
@@ -185,27 +210,10 @@ uint16_t fixed_packet_pool::acquire_burst(packet_record **records, uint16_t capa
 	if (records == nullptr || capacity == 0) {
 		return 0;
 	}
-
-	uint16_t acquired = 0;
-	for (; acquired < capacity; ++acquired) {
-		packet_record *record = nullptr;
-		if (!free_records_->try_dequeue(record)) {
-			break;
-		}
-		if (!owns_(record) || record->storage.native_handle != nullptr ||
-		    record->storage.data != payload_for_(record) || record->storage.operations != &operations_ ||
-		    record->storage.generation != options_.generation ||
-		    record->storage.domain_index != options_.domain_index || record->storage.segment_count != 1 ||
-		    record->storage.capabilities != operations_.capabilities) {
-			std::terminate();
-		}
-		initialize_packet_record(*record);
-		record->storage.native_handle = record;
-		record->storage.length = 0;
-		record->storage.contiguous_length = 0;
-		records[acquired] = record;
+	if (capacity == 1) {
+		return acquire_records_(std::span<packet_record *, 1>(records, 1));
 	}
-	return acquired;
+	return acquire_records_(std::span<packet_record *>(records, capacity));
 }
 
 uint16_t fixed_packet_pool::acquire_burst_(void *state, packet_record **records, uint16_t capacity) noexcept
@@ -222,8 +230,7 @@ uint32_t fixed_packet_pool::outstanding() const noexcept
 
 uint32_t fixed_packet_pool::available_approx() const noexcept
 {
-	const auto available = free_records_->size_approx();
-	return available > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(available);
+	return free_records_->available_approx();
 }
 
 packet_record *fixed_packet_pool::clone_writable_(void *state, const packet_record *source) noexcept
@@ -261,9 +268,10 @@ uint16_t fixed_packet_pool::copy_origins_burst_(void *state, const packet_origin
 	// Malformed origin metadata is not a capacity result. Validate the entire
 	// authored batch before consuming one storage credit so every provider
 	// implements the same fail-before-side-effects contract.
-	for (uint16_t index = 0; index < count; ++index) {
-		if (origins[index].data == nullptr || origins[index].length == 0 || origins[index].padding != 0 ||
-		    origins[index].length > pool->operations_.maximum_packet_length) {
+	const auto maximum_length = pool->operations_.maximum_packet_length;
+	for (const auto &origin : std::span{origins, count}) {
+		if (origin.data == nullptr || origin.length == 0 || origin.padding != 0 ||
+		    origin.length > maximum_length) {
 			return 0;
 		}
 	}
@@ -278,50 +286,53 @@ uint16_t fixed_packet_pool::copy_origins_burst_(void *state, const packet_origin
 	return accepted;
 }
 
-void fixed_packet_pool::release_burst_(void *state, packet_record *const *records, uint16_t count) noexcept
+template <std::size_t extent>
+void fixed_packet_pool::release_records_(std::span<packet_record *const, extent> records) noexcept
 {
-	auto *pool = static_cast<fixed_packet_pool *>(state);
-	if (pool == nullptr || records == nullptr || count == 0) {
-		std::terminate();
-	}
-
+	const auto count = records.size();
 	// Validate the complete burst before publishing any free credit. The second
 	// pass then claims every record by clearing its native ownership marker. If
 	// one pointer appears twice, the second claim fails before another worker can
-	// reacquire the first occurrence from the free queue; this closes the
-	// otherwise possible release/reacquire ABA window without allocation or a
-	// lock on the hot path.
-	for (uint16_t i = 0; i < count; ++i) {
+	// reacquire the first occurrence. This checks within-burst duplicates before
+	// publication; it cannot identify a stale pointer after a later acquisition.
+	for (std::size_t i = 0; i < count; ++i) {
 		auto *record = records[i];
 		if (record == nullptr) {
 			std::terminate();
 		}
-		if (!pool->owns_(record) || record->storage.native_handle != record ||
-		    record->storage.data != pool->payload_for_(record) ||
-		    record->storage.operations != &pool->operations_ ||
-		    record->storage.generation != pool->options_.generation ||
-		    record->storage.domain_index != pool->options_.domain_index || record->storage.segment_count != 1 ||
-		    record->storage.capabilities != pool->operations_.capabilities) {
+		if (!owns_(record) || record->storage.native_handle != record ||
+		    record->storage.data != payload_for_(record) || record->storage.operations != &operations_ ||
+		    record->storage.generation != options_.generation ||
+		    record->storage.domain_index != options_.domain_index || record->storage.segment_count != 1 ||
+		    record->storage.capabilities != operations_.capabilities) {
 			std::terminate();
 		}
 	}
-	for (uint16_t i = 0; i < count; ++i) {
+	for (std::size_t i = 0; i < count; ++i) {
 		auto *record = records[i];
 		if (record->storage.native_handle != record) {
 			std::terminate();
 		}
 		record->storage.native_handle = nullptr;
 	}
-	for (uint16_t i = 0; i < count; ++i) {
-		auto *record = records[i];
-		initialize_packet_record(*record);
-		record->storage.length = 0;
-		record->storage.contiguous_length = 0;
-		if (!pool->free_records_->try_enqueue(record)) {
-			// A full free queue can only mean duplicate retirement or corrupted
-			// ownership accounting; continuing would publish the same record twice.
-			std::terminate();
-		}
+	free_records_->release_prefix(count, [&](std::size_t ordinal) noexcept -> uint32_t {
+		auto *record = records[ordinal];
+		return static_cast<uint32_t>((reinterpret_cast<std::uintptr_t>(record) -
+					      reinterpret_cast<std::uintptr_t>(record_storage_)) >>
+					     record_shift_);
+	});
+}
+
+void fixed_packet_pool::release_burst_(void *state, packet_record *const *records, uint16_t count) noexcept
+{
+	auto *pool = static_cast<fixed_packet_pool *>(state);
+	if (pool == nullptr || records == nullptr || count == 0) {
+		std::terminate();
+	}
+	if (count == 1) {
+		pool->release_records_(std::span<packet_record *const, 1>(records, 1));
+	} else {
+		pool->release_records_(std::span<packet_record *const>(records, count));
 	}
 }
 
@@ -358,8 +369,9 @@ bool fixed_packet_pool::owns_(const packet_record *record) const noexcept
 	}
 	const auto begin = reinterpret_cast<std::uintptr_t>(record_storage_);
 	const auto address = reinterpret_cast<std::uintptr_t>(record);
-	const auto bytes = static_cast<std::size_t>(options_.record_count) * record_stride_;
-	return address >= begin && address - begin < bytes && ((address - begin) % record_stride_) == 0;
+	const auto bytes = (static_cast<std::size_t>(options_.record_count) << record_shift_);
+	return address >= begin && address - begin < bytes &&
+	       ((address - begin) & ((std::size_t{1} << record_shift_) - 1u)) == 0;
 }
 
 uint8_t *fixed_packet_pool::payload_for_(const packet_record *record) const noexcept
@@ -369,13 +381,13 @@ uint8_t *fixed_packet_pool::payload_for_(const packet_record *record) const noex
 	}
 	const auto byte_offset =
 		reinterpret_cast<std::uintptr_t>(record) - reinterpret_cast<std::uintptr_t>(record_storage_);
-	const auto index = byte_offset / record_stride_;
+	const auto index = byte_offset >> record_shift_;
 	return payload_storage_ + index * payload_stride_ + payload_data_offset_;
 }
 
 packet_record *fixed_packet_pool::record_for_index_(std::size_t index) const noexcept
 {
-	return reinterpret_cast<packet_record *>(record_storage_ + index * record_stride_);
+	return reinterpret_cast<packet_record *>(record_storage_ + (index << record_shift_));
 }
 
 }  // namespace kinetum::dp

@@ -7,9 +7,7 @@
  * @author Fleming Patel
  *
  * Covers parser edge cases, cache and queue contracts, cuckoo-map failure
- * atomicity, and fail-closed rate-limit behavior. These tests are intentionally
- * small because each primitive has component-level coverage in its primary
- * caller as well.
+ * atomicity, and compact owner-local storage contracts.
  */
 
 #include <gtest/gtest.h>
@@ -32,7 +30,6 @@
 #include <vector>
 
 #include <kinetum/algo/aligned_atomic.hpp>
-#include <kinetum/algo/atomic_index_pool.hpp>
 #include <kinetum/algo/bits.hpp>
 #include <kinetum/algo/bounded_index_pool.hpp>
 #include <kinetum/algo/cache.hpp>
@@ -44,7 +41,6 @@
 #include <kinetum/algo/hash.hpp>
 #include <kinetum/algo/platform.hpp>
 #include <kinetum/algo/queue.hpp>
-#include <kinetum/algo/ratelimit.hpp>
 #include <kinetum/kinetum_sdk.hpp>
 
 namespace kinetum::algo
@@ -503,77 +499,6 @@ TEST(algo_graph, failed_topology_reports_cycle_and_downstream_nodes_as_blocked)
 	EXPECT_FALSE(result.success);
 	EXPECT_TRUE(result.order.empty());
 	EXPECT_EQ(result.blocked_nodes, (std::vector<int>{0, 1, 2, 3}));
-}
-
-/** @brief Acquire every partial-word index once and recycle without affecting held leases. */
-TEST(algo_atomic_index_pool, exact_population_and_independent_release)
-{
-	atomic_index_pool<65> pool;
-	std::array<bool, 65> seen{};
-	for (uint32_t count = 0; count < seen.size(); ++count) {
-		uint32_t index = UINT32_MAX;
-		ASSERT_TRUE(pool.try_acquire(index));
-		ASSERT_LT(index, seen.size());
-		EXPECT_FALSE(seen[index]);
-		seen[index] = true;
-	}
-	uint32_t index = UINT32_MAX;
-	EXPECT_FALSE(pool.try_acquire(index));
-	EXPECT_EQ(index, UINT32_MAX);
-	for (uint32_t turn = 0; turn < 1024; ++turn) {
-		pool.release(64);
-		ASSERT_TRUE(pool.try_acquire(index));
-		EXPECT_EQ(index, 64u);
-	}
-	for (uint32_t returned = 0; returned < seen.size(); ++returned) {
-		pool.release(returned);
-	}
-	EXPECT_DEATH(pool.release(64), "");
-	EXPECT_DEATH(pool.release(65), "");
-}
-
-/** @brief Concurrent leases never alias and all published objects return to the complete pool. */
-TEST(algo_atomic_index_pool, concurrent_exclusive_ownership_and_publication)
-{
-	atomic_index_pool<65> pool;
-	std::array<std::atomic<bool>, 65> occupied{};
-	std::array<uint64_t, 65> touches{};
-	std::atomic<bool> collision{false};
-	std::atomic<uint64_t> admissions{0};
-	std::array<std::thread, 8> callers;
-	for (auto &caller : callers) {
-		caller = std::thread([&] {
-			for (uint32_t turn = 0; turn < 4096; ++turn) {
-				uint32_t index = 0;
-				if (!pool.try_acquire(index)) {
-					continue;
-				}
-				if (occupied[index].exchange(true, std::memory_order_relaxed)) {
-					collision.store(true, std::memory_order_relaxed);
-					return;
-				}
-				++touches[index];
-				admissions.fetch_add(1, std::memory_order_relaxed);
-				occupied[index].store(false, std::memory_order_relaxed);
-				pool.release(index);
-			}
-		});
-	}
-	for (auto &caller : callers) {
-		caller.join();
-	}
-	ASSERT_FALSE(collision.load(std::memory_order_relaxed));
-	uint64_t total = 0;
-	for (uint32_t count = 0; count < touches.size(); ++count) {
-		uint32_t index = 0;
-		ASSERT_TRUE(pool.try_acquire(index));
-		total += touches[index];
-	}
-	EXPECT_GT(total, 0u);
-	EXPECT_EQ(total, admissions.load(std::memory_order_relaxed));
-	for (uint32_t index = 0; index < touches.size(); ++index) {
-		pool.release(index);
-	}
 }
 
 /** @brief Verify compact membership across word boundaries without growth or aliasing. */
@@ -1407,126 +1332,6 @@ TEST(algo_cuckoo, prepared_queries_match_independent_mutation_oracle)
 			}
 		}
 	}
-}
-
-/**
- * @brief Verify oversized packet cost is fail closed.
- */
-TEST(algo_ratelimit, oversized_packet_cost_is_fail_closed)
-{
-	token_bucket token(0, 64);
-	EXPECT_FALSE(token.allow(1, std::numeric_limits<std::size_t>::max()));
-
-	leaky_bucket leaky(0, 64);
-	EXPECT_FALSE(leaky.allow(1, std::numeric_limits<std::size_t>::max()));
-}
-
-/** @brief Timestamp zero is ordinary identity and never reinitializes consumed credit. */
-TEST(algo_ratelimit, zero_timestamp_binds_one_exact_initial_baseline)
-{
-	token_bucket token(1u, 1u);
-	EXPECT_TRUE(token.allow(0u, 1u));
-	EXPECT_FALSE(token.allow(1u, 1u));
-	EXPECT_TRUE(token.allow(1'000'000'000u, 1u));
-
-	leaky_bucket leaky(1u, 1u);
-	EXPECT_TRUE(leaky.allow(0u, 1u));
-	EXPECT_FALSE(leaky.allow(1u, 1u));
-	EXPECT_TRUE(leaky.allow(1'000'000'000u, 1u));
-}
-
-/** @brief Sub-byte accrual survives every observation until one exact byte exists. */
-TEST(algo_ratelimit, low_rates_accumulate_fractional_credit_without_truncation)
-{
-	token_bucket token(1u, 1u);
-	ASSERT_TRUE(token.allow(0u, 1u));
-	for (uint64_t now_ns : {250'000'000u, 500'000'000u, 750'000'000u}) {
-		EXPECT_FALSE(token.allow(now_ns, 1u));
-	}
-	EXPECT_TRUE(token.allow(1'000'000'000u, 1u));
-
-	leaky_bucket leaky(1u, 1u);
-	ASSERT_TRUE(leaky.allow(0u, 1u));
-	for (uint64_t now_ns : {250'000'000u, 500'000'000u, 750'000'000u}) {
-		EXPECT_FALSE(leaky.allow(now_ns, 1u));
-	}
-	EXPECT_TRUE(leaky.allow(1'000'000'000u, 1u));
-}
-
-/** @brief Full-width capacities and costs retain exact arithmetic without saturation aliases. */
-TEST(algo_ratelimit, complete_unsigned_byte_domain_is_exact)
-{
-	constexpr uint64_t MAX_BYTES = std::numeric_limits<uint64_t>::max();
-	token_bucket token(0u, MAX_BYTES);
-	if constexpr (sizeof(std::size_t) == sizeof(uint64_t)) {
-		EXPECT_TRUE(token.allow(0u, std::numeric_limits<std::size_t>::max()));
-		EXPECT_EQ(token.tokens(), 0u);
-	}
-
-	leaky_bucket leaky(0u, MAX_BYTES);
-	EXPECT_TRUE(leaky.allow(0u, std::numeric_limits<std::size_t>::max()));
-	EXPECT_EQ(leaky.level(), static_cast<uint64_t>(std::numeric_limits<std::size_t>::max()));
-}
-
-/** @brief Regressing time and reconfiguration cannot mint rate credit. */
-TEST(algo_ratelimit, regression_and_reconfiguration_preserve_exact_credit)
-{
-	token_bucket token(1u, 2u);
-	ASSERT_TRUE(token.allow(100u, 1u));
-	EXPECT_FALSE(token.allow(99u, 1u));
-	EXPECT_EQ(token.tokens(), 1u);
-	EXPECT_TRUE(token.allow(100u, 1u));
-
-	token_bucket reconfigured(1u, 10u);
-	ASSERT_TRUE(reconfigured.allow(0u, 10u));
-	EXPECT_FALSE(reconfigured.allow(500'000'000u, 1u));
-	reconfigured.reconfigure(2u, 10u);
-	EXPECT_FALSE(reconfigured.allow(1'000'000'000u, 1u));
-	EXPECT_TRUE(reconfigured.allow(1'500'000'000u, 1u));
-
-	leaky_bucket leaky(0u, 2u);
-	ASSERT_TRUE(leaky.allow(100u, 1u));
-	EXPECT_FALSE(leaky.allow(99u, 1u));
-	EXPECT_EQ(leaky.level(), 1u);
-}
-
-/** @brief Exact credit retains every subdivision and caps before a full-width refill. */
-TEST(algo_ratelimit, byte_credit_preserves_subdivisions_and_saturates_before_addition)
-{
-	byte_credit divided;
-	byte_credit combined;
-	// 512,000 microseconds at 125 bytes/s earn exactly 64 bytes.
-	for (uint32_t interval = 0; interval < 512000u; ++interval) {
-		ASSERT_TRUE(divided.consume(1000u, 125u, 1024u, 0u));
-	}
-	ASSERT_TRUE(combined.consume(512000000u, 125u, 1024u, 0u));
-	EXPECT_EQ(divided.tokens(), 64u);
-	EXPECT_EQ(combined.tokens(), 64u);
-	EXPECT_TRUE(divided.consume(0u, 125u, 1024u, 64u));
-	EXPECT_TRUE(combined.consume(0u, 125u, 1024u, 64u));
-	EXPECT_FALSE(divided.consume(0u, 125u, 1024u, 1u));
-
-	constexpr uint64_t MAX = std::numeric_limits<uint64_t>::max();
-	byte_credit full(MAX);
-	EXPECT_TRUE(full.consume(MAX, MAX, MAX, MAX));
-	EXPECT_EQ(full.tokens(), 0u);
-	full.reset(1024u);
-	EXPECT_FALSE(full.consume(0u, MAX, 100u, 101u));
-	EXPECT_EQ(full.tokens(), 100u);
-	EXPECT_TRUE(full.consume(0u, 0u, 100u, 100u));
-}
-
-/** @brief Sliding windows reject zero duration and never reset on regressing time. */
-TEST(algo_ratelimit, sliding_window_requires_positive_monotonic_time)
-{
-	EXPECT_THROW((sliding_window(1u, 0u)), std::invalid_argument);
-	sliding_window window(2u, 100u);
-	EXPECT_TRUE(window.allow(100u));
-	EXPECT_TRUE(window.allow(101u));
-	EXPECT_FALSE(window.allow(99u));
-	EXPECT_EQ(window.count(), 2u);
-	EXPECT_FALSE(window.allow(102u));
-	EXPECT_TRUE(window.allow(200u));
 }
 
 }  // namespace kinetum::algo

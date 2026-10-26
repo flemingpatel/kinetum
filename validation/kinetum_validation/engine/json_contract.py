@@ -1314,8 +1314,11 @@ def validate_run_metadata(value: Dict[str, Any]) -> None:
     traffic_port_ids = set()
     profile_fields = (
         "logical_name", "traffic_role", "tap_iface", "peer_iface", "peer_ip",
-        "traffic_port_id",
     )
+    # A run retains its configured generator IDs and any explicit overrides.
+    # Current authoring defaults cannot reinterpret that recorded mapping.
+    if traffic_driver != "trex":
+        profile_fields += ("traffic_port_id",)
     for index, (item, expected_port) in enumerate(zip(ports, profile.ports)):
         row = require_object(item, f"run metadata port {index}")
         require_exact_keys(row, port_keys, f"run metadata port {index}")

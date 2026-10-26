@@ -379,8 +379,8 @@ kinetumctl set-config <path-to-pbtxt> [--confirm-timeout <ms>] \
 status {
   error_code: ERROR_CODE_OK
 }
-snapshot_id: "edge_gw_baseline_v1"
-revision: 7
+snapshot_id: "fan_in_edge_gw_baseline_v2"
+revision: 2
 epoch: 12
 ```
 
@@ -453,7 +453,7 @@ status { error_code: ERROR_CODE_OK }
 snapshot_id: "fan_in_edge_gw_baseline_v2"
 time_remaining_ms: 29975
 epoch: 12
-revision: 7
+revision: 2
 ```
 
 `time_remaining_ms` belongs only to exact success. A first Confirm at or
@@ -551,7 +551,7 @@ kinetumctl rollback <snapshot_id> [--modules <m1,m2,...>] \
 ```text
 status { error_code: ERROR_CODE_OK }
 new_snapshot_id: "fan_in_edge_gw_baseline_v1"
-new_revision: 8
+new_revision: 1
 epoch: 13
 ```
 
@@ -560,7 +560,7 @@ epoch: 13
 ```text
 status { error_code: ERROR_CODE_OK }
 new_snapshot_id: "selective_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-new_revision: 8
+new_revision: 3
 epoch: 13
 ```
 
@@ -1404,8 +1404,8 @@ guardrails policy. Those are implemented wire contracts for custom clients;
 
 #### Why field-level gaps exist
 
-Every wire field is implemented, though not every field has a CLI flag. For an
-unexposed field:
+The ControlService fields described here are implemented, though not every
+field has a CLI flag. For an unexposed field:
 
 1. Use generated protobuf/gRPC bindings from your scripting language. Best for
    production tooling.

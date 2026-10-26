@@ -233,7 +233,8 @@ class TestOrchestrator:
                 if execution_failure is not None:
                     raise RuntimeError(
                         "validation execution and cleanup both failed: "
-                        f"execution={execution_failure}; cleanup={cleanup_error}"
+                        f"execution={type(execution_failure).__name__}: {execution_failure}; "
+                        f"cleanup={type(cleanup_error).__name__}: {cleanup_error}"
                     ) from cleanup_error
                 raise
 
@@ -398,9 +399,11 @@ class TestOrchestrator:
         )
         proc = await asyncio.create_subprocess_exec(
             *command,
+            stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=exact_subprocess_environment(),
+            start_new_session=True,
         )
         try:
             _stdout, stderr = await communicate_bounded_subprocess(
@@ -1188,7 +1191,9 @@ class TestOrchestrator:
                 self.reporter.print_warning(f"Process cleanup failed: {exc}")
                 failures.append(("process", exc))
         if failures:
-            first_error = failures[0][1]
+            first_error = next(
+                (error for _, error in failures if isinstance(error, Exception)), failures[0][1],
+            )
             message = (
                 "validation cleanup reported failures: "
                 + "; ".join(

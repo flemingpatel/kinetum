@@ -38,7 +38,7 @@
  * Thread Safety:
  * - All RPC handlers are thread-safe (gRPC may invoke handlers concurrently)
  * - All config mutations are serialized through the shared control_loop
- * - Guardrails policy is propagated via versioned_rcu_buffer (lock-free reads)
+ * - Guardrails policy is propagated via versioned_rcu_buffer (pinned reader views)
  * - config_store write operations are serialized through control_loop
  *
  */

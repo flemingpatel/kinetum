@@ -198,9 +198,11 @@ class NativeTapTrafficDriver(TrafficDriver):
         log_info("native_tap", f"starting capture: {' '.join(cmd)}")
         process = await asyncio.create_subprocess_exec(
             *cmd,
+            stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,
             env={**exact_subprocess_environment(), "LC_ALL": "C"},
+            start_new_session=True,
         )
         self._capture_proc = process
         self._pcap_file = pcap_file
@@ -243,7 +245,8 @@ class NativeTapTrafficDriver(TrafficDriver):
             except BaseException as cleanup_error:
                 raise RuntimeError(
                     "tcpdump startup and ownership retirement both failed: "
-                    f"startup={start_error}; cleanup={cleanup_error}"
+                    f"startup={type(start_error).__name__}: {start_error}; "
+                    f"cleanup={type(cleanup_error).__name__}: {cleanup_error}"
                 ) from cleanup_error
             raise
         finally:
@@ -373,7 +376,8 @@ class NativeTapTrafficDriver(TrafficDriver):
             except BaseException as cleanup_error:
                 raise RuntimeError(
                     "tcpdump stop and ownership retirement both failed: "
-                    f"stop={stop_error}; cleanup={cleanup_error}"
+                    f"stop={type(stop_error).__name__}: {stop_error}; "
+                    f"cleanup={type(cleanup_error).__name__}: {cleanup_error}"
                 ) from cleanup_error
             raise
         finally:

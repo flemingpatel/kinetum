@@ -132,7 +132,7 @@ class TestBackendProfiles(unittest.TestCase):
                          ["10.10.1.1", "10.10.2.1", "10.10.3.2"])
         self.assertEqual([port.traffic_role for port in profile.ports],
                          ["rx", "rx", "tx"])
-        self.assertEqual([port.traffic_port_id for port in profile.ports], [0, 1, 2])
+        self.assertEqual([port.traffic_port_id for port in profile.ports], [0, 2, 1])
         self.assertEqual([port.runtime_direction for port in profile.ports],
                          ["", "", ""])
         self.assertEqual([port.runtime_mac for port in profile.ports], ["", "", ""])
@@ -541,6 +541,23 @@ class TestRunMetadata(unittest.TestCase):
             live_payload["traffic_endpoint"]["host"] = "trex.example"
             live_payload["traffic_endpoint"]["trex_identity"] = complete_trex_identity()
             validate_run_metadata(live_payload)
+            for mapping in ((0, 1, 2), (0, 2, 1), (5, 7, 6)):
+                with self.subTest(recorded_mapping=mapping):
+                    recorded = copy.deepcopy(live_payload)
+                    for row, port_id in zip(recorded["ports"], mapping):
+                        row["traffic_port_id"] = port_id
+                    recorded["traffic_endpoint"]["trex_identity"] = complete_trex_identity(
+                        ports=tuple(sorted(mapping)),
+                    )
+                    validate_run_metadata(recorded)
+                    malformed = copy.deepcopy(recorded)
+                    malformed["ports"][1]["traffic_port_id"] = mapping[0]
+                    with self.assertRaisesRegex(JsonContractError, "port identity"):
+                        validate_run_metadata(malformed)
+                    malformed = copy.deepcopy(recorded)
+                    malformed["ports"][1]["traffic_port_id"] = 99
+                    with self.assertRaisesRegex(JsonContractError, "foreign port membership"):
+                        validate_run_metadata(malformed)
             for malformed_identity in (
                 None,
                 {**complete_trex_identity(), "version": ""},

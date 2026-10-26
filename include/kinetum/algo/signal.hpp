@@ -46,7 +46,7 @@ namespace kinetum::algo
 class ewma {
     public:
 	/**
-     * @brief Construct EWMA filter.
+	 * @brief Construct EWMA filter.
 	 * @param alpha Finite smoothing factor in (0, 1]. Default: 0.3.
 	 * @throws std::invalid_argument when @p alpha is outside its exact domain.
 	 */
@@ -61,7 +61,7 @@ class ewma {
 	}
 
 	/**
-     * @brief Update with new sample.
+	 * @brief Update with new sample.
 	 * @param sample Finite new measurement.
 	 * @return Smoothed value.
 	 * @throws std::invalid_argument when @p sample is not finite; prior state is
@@ -133,7 +133,7 @@ class ewma {
 class hysteresis {
     public:
 	/**
-     * @brief Construct hysteresis filter.
+	 * @brief Construct hysteresis filter.
 	 * @param threshold Finite center threshold.
 	 * @param band_width Finite nonnegative width of the complete dead band.
 	 * @throws std::invalid_argument when either input or a derived boundary is
@@ -151,7 +151,7 @@ class hysteresis {
 	}
 
 	/**
-     * @brief Update with new value.
+	 * @brief Update with new value.
 	 * @param value Finite current measurement.
 	 * @return true if in HIGH state, false if in LOW state.
 	 * @throws std::invalid_argument when @p value is not finite; prior state is
@@ -218,7 +218,7 @@ class hysteresis {
 class rate_calculator {
     public:
 	/**
-     * @brief Construct rate calculator.
+	 * @brief Construct rate calculator.
 	 * @param ewma_alpha Finite smoothing factor in (0, 1].
 	 * @throws std::invalid_argument when @p ewma_alpha is outside its domain.
 	 */
@@ -232,11 +232,11 @@ class rate_calculator {
 	}
 
 	/**
-     * @brief Update with new counter value.
-     * @param count Current counter value
-     * @param time_ns Current timestamp (nanoseconds)
-     * @return Smoothed rate (units per second)
-     */
+	 * @brief Update with new counter value.
+	 * @param count Current counter value
+	 * @param time_ns Current timestamp (nanoseconds)
+	 * @return Smoothed rate (units per second)
+	 */
 	[[nodiscard]] double update(uint64_t count, uint64_t time_ns)
 	{
 		if (!initialized_) {

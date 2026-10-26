@@ -47,33 +47,34 @@ C++ algorithm surface or in exact module-owned implementations.
 
 ## Header Index
 
-| Header | Owns | Hot-path status | Owner and use |
-|--------|------|-----------------|------------------------|
-| `algo.hpp` | Master include for all algo headers. | Depends on included header. | C++ SDK wrapper and convenience includes. |
-| `aligned_atomic.hpp` | Cache-line-isolated lock-free integral atomics and explicit relaxed counter operations. | Hot-path safe. | Installed reusable API with direct primitive evidence; no platform-runtime dependency. |
-| `platform.hpp` | Architecture detection, cache-line constants, branch hints, inline/hot/cold attributes. | Hot-path safe. | DP, Gluon, built-in modules, and public algorithm headers. |
-| `hash.hpp` | FNV-1a constants and SplitMix64 integer mixing. | Hot-path safe. | Built-in modules use FNV constants for field-wise hashes; cuckoo candidate selection consumes SplitMix64. |
-| `bits.hpp` | `popcount`, `clz`, `ctz`, power-of-two helpers, bit masks. | Hot-path safe. | Cuckoo capacity rounding and direct SDK consumers. |
-| `atomic_index_pool.hpp` | Fixed concurrent index leases with independent atomic-bit release. | Bounded acquisition; one atomic RMW per release; no allocation. | Cold logging record arena. |
-| `bounded_index_pool.hpp` | Fixed-capacity owner-local recycling for zero-based uint32 indices. | Acquire/release are O(1), allocation-free, and nonthrowing after construction. | NAT44 session slabs and QoS flow slabs. |
-| `compact_index_set.hpp` | Fixed-universe dense membership for zero-based compact identities. | `contains()` is hot-path safe after cold construction. | DP pre-resolved stage/storage reachability. |
-| `prefetch.hpp` | Five fixed-cost compiler prefetch macros. | Each macro is hot-path safe. | ACL, NAT44, QoS, cuckoo map, SIMD classifiers. |
-| `signal.hpp` | Finite-input EWMA, hysteresis, and explicit-time rate calculator. | Cold/control path. | CP consumes EWMA/hysteresis; the rate calculator is an installed tested primitive. |
-| `control.hpp` | Finite-input PID controller with derivative options and transactional anti-windup. | Cold/control path. | Installed reusable API; no platform runtime consumer. |
-| `rcu_buffer.hpp` | `rcu_buffer<T>` and `versioned_rcu_buffer<T>`. | Reader side is hot-path friendly; writer side is cold path. | CP published state and guardrails policy buffer. |
-| `single_writer_snapshot.hpp` | Fixed-width coherent publication from one owner to foreign observers. | Publish only at a bounded owner boundary; never per packet. | DP runtime-status, transition-coordinator progress, and packet-worker epoch-ledger publications. |
-| `quiescence.hpp` | Caller-placed exact readers plus one immutable backend-neutral grace domain. | One reader-local atomic publication per requested grace; domain scans are cold path. | DP global transition certificate and completion owner; fixed Bootstrap leaves the domain grace-inactive until the live trigger. |
-| `cache.hpp` | Intrusive LRU list, heap-backed LRU cache, cache-line allocation. | `lru_list` can be allocation-free; `lru_cache` is cold/read-mostly only. | Available through C++ SDK; no packet hot-path production dependency. |
-| `queue.hpp` | Static, owning-runtime, and caller-storage SPSC rings; static/runtime-capacity MPMC queues; caller-storage single-owner work queues. | All queue operations are allocation-free after construction under their exact ownership model. | NUMA-composed DATA boundaries, worker active/future staging, active control mailboxes, boundary future holds, lifecycle channels, fixed host packet-pool credits, and UDP/development queues. |
-| `bounded_service_order.hpp` | Caller-storage fair service with bounded carried allowances. | Single owner; O(1) order updates and input-count-bounded turns. | Worker RX and inbound DATA admission. |
-| `ratelimit.hpp` | Exact byte credit, token bucket, leaky bucket, and sliding window. | Hot-path safe after construction. | `byte_credit` supplies both generic token buckets and built-in QoS slab entries. |
-| `net.hpp` | Big-endian reads/writes, Internet checksums, protocol constants, and RFC 1918 classification. | Hot-path safe. | DP IPv4 parsing and NAT44/QoS packet work. |
-| `cidr.hpp` | Header-owned IPv4/CIDR parsing, formatting, and matching. | `match_cidr` is hot-path safe; parsing/formatting are cold path. | ACL and NAT44 config parsing; ACL matching; installed C++ SDK. |
-| `condition_parse.hpp` | Shared parser for `field op decimal_uint32` edge-condition syntax. | Cold path. | Axiom authoring-time validation and DP route compilation. |
-| `graph.hpp` | Identity-only DAG and deterministic topological sort with exact blocked-node evidence. | Cold path. | Axiom cycle checks and canonical order consumed by Gluon. |
-| `cuckoo.hpp` | Bucketed cuckoo map requiring an explicit semantic hasher. | Lookup is hot-path safe after construction; writes require external synchronization. | NAT44 session maps, QoS bucket map, available to modules. |
-| `simd_classify.hpp` | SoA packet batch format and SIMD/scalar batch classifiers. | Hot-path safe. | ACL SIMD batch path for large rule sets. |
-| `timer_wheel.hpp` | Static and caller-storage runtime-capacity hierarchical timer wheel. | Hot-path safe for one owner after construction. | One exact timer wheel per packet worker with active instances. |
+| Header | Owns | Owner and use |
+|--------|------|------------------------|
+| `algo.hpp` | Master include for all algo headers. | C++ SDK wrapper and convenience includes. |
+| `aligned_atomic.hpp` | Cache-line-isolated lock-free integral atomics and explicit relaxed counter operations. | Installed reusable API with direct primitive evidence; no platform-runtime dependency. |
+| `platform.hpp` | Architecture detection, cache-line constants, branch hints, inline/hot/cold attributes. | DP, Gluon, built-in modules, and public algorithm headers. |
+| `hash.hpp` | FNV-1a constants and SplitMix64 integer mixing. | Built-in modules use FNV constants for field-wise hashes; cuckoo candidate selection consumes SplitMix64. |
+| `bits.hpp` | `popcount`, `clz`, `ctz`, power-of-two helpers, bit masks. | Cuckoo capacity rounding and direct SDK consumers. |
+| `atomic_index_pool.hpp` | Fixed and caller-storage concurrent index leases with independent atomic-bit return. | Fixed logging arena and caller-storage host packet pools. |
+| `bounded_index_pool.hpp` | Fixed-capacity owner-local recycling for zero-based uint32 indices. | NAT44 session slabs and QoS flow slabs. |
+| `compact_index_set.hpp` | Fixed-universe dense membership for zero-based compact identities. | DP pre-resolved stage/storage reachability. |
+| `prefetch.hpp` | Five fixed-cost compiler prefetch macros. | ACL, NAT44, QoS, cuckoo map, SIMD classifiers. |
+| `signal.hpp` | Finite-input EWMA, hysteresis, and explicit-time rate calculator. | CP consumes EWMA/hysteresis; the rate calculator is an installed tested primitive. |
+| `control.hpp` | Finite-input PID controller with derivative options and transactional anti-windup. | Installed reusable API; no platform runtime consumer. |
+| `rcu_buffer.hpp` | `rcu_buffer<T>` and `versioned_rcu_buffer<T>`. | CP active-state, guardrails-policy and evaluation publications. |
+| `single_writer_snapshot.hpp` | Fixed-width coherent publication from one owner to foreign observers. | DP runtime-status, transition-coordinator progress, and packet-worker epoch-ledger publications. |
+| `quiescence.hpp` | Caller-placed exact readers plus one immutable backend-neutral grace domain. | DP global transition certificate and completion owner; fixed Bootstrap leaves the domain grace-inactive until the live trigger. |
+| `cache.hpp` | Intrusive LRU list, heap-backed LRU cache, cache-line allocation. | Available through C++ SDK; no packet hot-path production dependency. |
+| `queue.hpp` | Static, owning-runtime, and caller-storage SPSC rings; static/runtime-capacity MPMC queues; caller-storage single-owner work queues. | NUMA-composed DATA boundaries, worker active/future staging, active control mailboxes, boundary future holds, lifecycle channels, tracked async completions, and coordinator mailboxes. |
+| `work_queue_indices.hpp` | Internal circular sequence arithmetic shared by queues and timestamp history. | `work_queue_view` and `sliding_window`; included directly by their owning headers. |
+| `bounded_service_order.hpp` | Caller-storage fair service with bounded carried allowances. | Worker RX and inbound DATA admission. |
+| `ratelimit.hpp` | Exact byte credit, token bucket, leaky bucket, and sliding window. | `byte_credit` supplies both generic token buckets and built-in QoS slab entries. |
+| `net.hpp` | Big-endian reads/writes, Internet checksums, protocol constants, and RFC 1918 classification. | DP IPv4 parsing and NAT44/QoS packet work. |
+| `cidr.hpp` | Header-owned IPv4/CIDR parsing, formatting, and matching. | ACL and NAT44 config parsing; ACL matching; installed C++ SDK. |
+| `condition_parse.hpp` | Shared parser for `field op decimal_uint32` edge-condition syntax. | Axiom authoring-time validation and DP route compilation. |
+| `graph.hpp` | Identity-only DAG and deterministic topological sort with exact blocked-node evidence. | Axiom cycle checks and canonical order consumed by Gluon. |
+| `cuckoo.hpp` | Bucketed cuckoo map requiring an explicit semantic hasher. | NAT44 session maps, QoS bucket map, available to modules. |
+| `simd_classify.hpp` | SoA packet batch format and SIMD/scalar batch classifiers. | ACL SIMD batch path for large rule sets. |
+| `timer_wheel.hpp` | Static and caller-storage runtime-capacity hierarchical timer wheel. | One exact timer wheel per packet worker with active instances. |
 
 ## Include Pattern
 
@@ -100,22 +101,26 @@ the whole set:
 | `platform.hpp` macros | Yes | Compile-time helpers only. |
 | `hash.hpp` constants and `splitmix64` | Yes | Caller owns semantic field selection and collision policy. |
 | `bits.hpp` helpers | Yes | Inline/constexpr. |
-| `atomic_index_pool` | Cold/control use in the platform | Bounded concurrent acquisition can reject under contention; packet workers retain their admitted owner-local storage. |
-| `bounded_index_pool` | Yes | Complete PMR index storage is fixed during construction; one owner acquires and releases exact slab indices. |
+| `atomic_index_pool` / `atomic_index_pool_view` acquisition and return | Yes | Bounded source-level search over fixed storage; contention can shorten acquisition. Indexed-object lifetime belongs to each lease holder. |
+| `atomic_index_pool_view::available_approx` | No | Cold O(words) population scan; exact only after quiescence. |
+| `bounded_index_pool` | Yes | Complete PMR storage is fixed at construction; one owner acquires/releases exact slab indices in O(1). |
 | `bounded_service_order` | Yes | Caller-owned cells, one owner, at most two visits and one quantum of work per input per turn. |
 | `compact_index_set::contains` | Yes | Complete storage is allocated and populated before publication. |
 | `prefetch.hpp` macros | Yes | One caller-selected address per hint; correctness and ordering cannot depend on prefetch. |
 | `queue.hpp` SPSC rings | Yes | Exactly one producer and one consumer. |
-| `queue.hpp` dynamic MPMC queue | Yes | Construction-time power-of-two storage; `size_approx()` is observation, never reservation. |
+| `queue.hpp` MPMC queues | Yes | Construction-time power-of-two storage; `size_approx()` is observation, never reservation. |
 | `work_queue_view` | Yes, within one owner thread | Caller-owned storage; not a cross-thread queue. |
 | `cuckoo_map::find` | Yes | Safe only when concurrent writers are excluded. |
 | `ratelimit` buckets | Yes | Caller passes monotonic `now_ns`; regression rejects without credit mutation. |
+| `sliding_window` | Yes, after cold construction | Explicit PMR history; O(1) none/all expiry, O(log quota) partial expiry; no hot allocation or clock read. |
 | `net.hpp` byte-order helpers | Yes | Caller guarantees buffer length. |
 | `algo::match_cidr` | Yes | CIDR must already be parsed and valid. |
 | `condition_parse.hpp` | No | Route predicates are compiled before runtime packet admission. |
 | `simd_classify` batch functions | Yes | Caller owns batch construction and result buffers. |
 | `timer_wheel` | Yes | Single owner; not thread-safe. The runtime uses one per active worker. |
-| `rcu_buffer` reader guard | Usually | Reader cost is atomic pin/unpin; writer waits for grace period. |
+| `rcu_buffer::borrow()` / `get()` | No fixed per-call bound | `borrow()` retries publication changes; `get()` also copies `T`. |
+| `rcu_buffer::try_borrow()` and guard access/release | Yes, one explicit attempt | Pays atomic pin/revalidation/unpin costs and can return empty; the caller handles failure and bounds work and pin lifetime. |
+| `rcu_buffer::try_get()` | Only with bounded, allocation-free, nonthrowing value operations | One borrow attempt, then a `T` copy if successful; the returned value also has its own destruction cost. |
 | `single_writer_snapshot` | At loop/batch boundaries only | Exactly one writer; payload fields are atomic and observations have bounded retries. |
 | `quiescence_reader::publish_quiescent` | Transition safe points only | One exact active grace generation; never call per packet or on the fixed steady turn. |
 | `cache.hpp::lru_cache` | No | Uses `std::unordered_map` and heap allocation on insert/evict. |
@@ -177,9 +182,32 @@ returning one index never depends on another consumer completing a queue
 operation. Releasing an out-of-range or already-free index terminates. Each lease's caller
 owns object lifetime, and every caller retires before pool destruction.
 
-The cold logger composes this arena ownership with the existing MPMC queue for
-completed record indices. Packet-worker pools retain their own admitted
-ownership mechanisms.
+`atomic_index_pool_view` borrows an exact span of constructed availability words
+for a positive uint32 population. Its backing and control outlive all calls and
+leases. `acquire_prefix(count, emit)` emits only acquired indices and preserves
+the request's integral result type. It scans at most one circular word extent
+and attempts one ownership CAS per word. A multiword search may reread its
+initial word after observing it empty, even without acquiring the inspector
+claim. The emitter performs bounded nonthrowing local work; it neither reenters
+the pool nor calls foreign code.
+
+A relaxed hint records the first successful word and is stored only when its
+current value differs. A complete clean scan can certify empty; a return
+invalidates that certificate after publishing its bits. Other callers never wait
+for the inspector. One-word pools bypass both hint and certificate. Return reads
+each supplied index once and publishes contiguous same-word runs. Native atomics
+may retry internally; source-level bounds do not establish wait-free progress.
+
+Invalid or observed already-free returns terminate. A caller must return unique
+owned leases; stale returns racing a later owner are outside detection. Invalid
+input can follow valid prefix publication, with no rollback guarantee.
+`available_approx()` is a cold word-population scan, exact after quiescence and
+not a simultaneous snapshot during concurrency.
+
+The logger uses the fixed scalar pool for arena leases and an MPMC queue for
+completed record indices. Host packet storage places the prefix view and its
+word objects in the domain's checked NUMA mapping. Provider-native pools retain
+their own allocation mechanisms.
 
 ### `bounded_index_pool.hpp`
 
@@ -284,9 +312,17 @@ packet hot-path code.
 `rcu_buffer<T>` is a double-buffered publishing primitive. Readers pin the
 active slot with a guard. Before reusing the inactive slot, the writer waits
 for its readers to drain, writes the replacement, then publishes that slot.
-A guard is linear:
-destroying its buffer while either slot remains pinned emits one fixed bounded
-diagnostic and terminates before reclaiming the reader counters.
+Calls must quiesce and guards must release before buffer destruction.
+Destruction with a live pin emits one fixed bounded diagnostic and terminates
+before reclaiming the reader counters; that check does not synchronize
+destruction with new calls.
+
+`borrow()` retries when publication changes during pin acquisition, with no
+per-call retry bound. `try_borrow()` makes one attempt and returns empty on that
+race. Once acquired, a guard provides stable reference access until release.
+`get()` and `try_get()` also inherit `T`'s copy cost and exception behavior.
+The same rules apply to `versioned_rcu_buffer`; its `version()` query borrows
+after the first publication.
 
 `versioned_rcu_buffer<T>` carries one caller-authored version beside each
 publication. CP is the sole owner of monotonic control-loop and guardrails
@@ -406,7 +442,7 @@ not falsely marked `noexcept`.
 | `spsc_ring_view<T>` | Runtime-capacity SPSC arithmetic over one exact caller-owned storage extent. | The DP-local NUMA owner composes it once for DATA boundaries and boundary future-output holds. |
 | `mpmc_queue<T, Capacity>` | Fixed-capacity MPMC queue. | Available for bounded cold/control paths; packet workers use the caller-storage form where MPMC is required. |
 | `mpmc_queue_dynamic<T>` | Construction-time power-of-two MPMC storage; no enqueue/dequeue allocation. | Plan-sized fixed-record admission for the DP coordinator command mailbox. |
-| `mpmc_queue_view<T>` | Runtime-capacity MPMC arithmetic over exact caller-owned cache-line cells. | Fixed host-pool free credits and tracked-async completion delivery in their owners' exact-NUMA mappings. |
+| `mpmc_queue_view<T>` | Runtime-capacity MPMC arithmetic over exact caller-owned cache-line cells. | Tracked-async completion delivery in its owner's exact-NUMA mapping. |
 | `work_queue_view<T>` | Runtime-capacity single-owner queue over exact caller storage. | Active-control mailboxes, worker packet rings grouped by execution key, and their ready-key FIFOs. |
 
 Every SPSC usable capacity is a power of two and at least two. Static forms
@@ -428,6 +464,12 @@ inverted weakly ordered observation, and never exceeds capacity. It supports
 telemetry and quiescent checks, not credit claims; only successful
 enqueue/dequeue transfers ownership.
 
+MPMC reservation and cell publication are separate steps. A try operation may
+refuse the next cell while an earlier caller has not published or released it,
+even when another cell is available. Failure transfers no ownership and is not
+proof of global fullness or emptiness. CAS contention has no per-call step
+bound; the absence of mutexes does not make this a lock-free FIFO algorithm.
+
 The active scheduler derives its completion-ring capacity as the smallest
 power of two, at least two, that covers the complete logical async-token slot
 population. That physical value is mechanism, not another authored capacity.
@@ -435,7 +477,9 @@ Since one live slot can publish at most one terminal cell, a winning foreign
 completion never needs a caller retry loop.
 
 The single-owner work-queue view composes one `work_queue_indices` arithmetic
-core over a power-of-two caller extent of at least two slots. `valid_capacity()`
+core from `work_queue_indices.hpp` over a power-of-two caller extent of at least
+two slots. The same internal core serves sliding-window history; the rate-limiter
+header does not include the queue implementation. `valid_capacity()`
 lets a cold storage owner check that extent before allocation. Scalar operations
 are O(1); `pop_batch()` consumes an available FIFO prefix across at most two
 contiguous ranges and advances the cursor once. It requires nonthrowing move
@@ -489,8 +533,7 @@ times integer bytes per second therefore preserves every fractional byte
 without a pre-divided low-rate floor. Full-width `uint64_t` capacities and
 costs remain distinct rather than saturating to one representation. Timestamp
 zero is valid; regression rejects the operation without changing credit. A
-positive sliding-window duration is required, and reconfiguration cannot apply
-a new rate retroactively.
+new rate cannot be applied retroactively by token-bucket reconfiguration.
 
 `byte_credit` owns only the exact unsigned 128-bit balance. Its
 `consume(elapsed_ns, rate_bytes_per_sec, capacity_bytes, bytes)` first caps the
@@ -506,6 +549,20 @@ preallocated per-flow slab and context-wide runtime-clock contract. The generic
 `token_bucket` instead owns its own clock cursor; its `reconfigure()` retains
 capped whole-byte credit, discards the old fraction, and rebinds time on the
 next call. QoS activation retains exact credit and does not call `reconfigure()`.
+
+`sliding_window(max_count, window_ns, resource)` retains exact accepted events in
+`(now_ns - window_ns, now_ns]`. Its explicit non-null PMR resource must outlive
+it. Construction rejects zero duration or unrepresentable history and allocates
+one power-of-two timestamp array covering the exact logical quota. Zero quota
+deliberately denies all events; copy and move are disabled.
+
+Backward time rejects without mutation, including after a quota-denied attempt.
+A valid denied observation expires old events and advances the time baseline.
+Expiry compares elapsed time without adding a duration to an absolute timestamp.
+No-expiry and all-expired cases are O(1); partial expiry binary-searches the
+monotonic history in O(log quota). `count()` and `remaining()` describe the last
+valid observation, and `reset()` clears logical history and unbinds time in O(1).
+These operations allocate nothing and read no clock.
 
 ### `net.hpp`
 
@@ -695,6 +752,7 @@ wraparound per pool slot.
 | Gluon | `platform.hpp` | Branch hints; planning order comes from Axiom's canonical graph result. Stage metadata uses a cold `std::unordered_map`; weights are computed once into a vector. |
 | CP | `rcu_buffer.hpp`, `signal.hpp` | Published state, guardrails policy, and health correlation. |
 | DP runtime | `compact_index_set.hpp`, `platform.hpp`, `queue.hpp`, `timer_wheel.hpp`, `net.hpp`, `single_writer_snapshot.hpp`, `quiescence.hpp` | Pre-resolved storage membership, packet parsing, coherent epoch-credit publication, exact readers, source queues, active control mailboxes, and one runtime-capacity timer wheel per active worker. The immutable certificate composes exact owner publications with the reader domain; fixed Bootstrap starts no grace. Module and complete-snapshot stores separately compose `src/dp/epoch/exact_slot_table.hpp`; their epoch policy remains outside this public catalog. |
+| Host packet storage | `atomic_index_pool.hpp` | Caller-storage prefix acquisition and independent credit return on the exact storage-domain NUMA node. |
 | Ordered-CUT Boundary Protocol | `queue.hpp`, `platform.hpp`, `single_writer_snapshot.hpp` | `boundary_epoch_channel` composes one plan-sized receiver-NUMA DATA ring with per-worker exact-NUMA endpoint slabs: CUT lives with its receiver poller, ACK with its sender poller, and mutable endpoint state/publication with its owner. The channel alone owns successful DATA sequences, bounded pending control, and coherent observation. `worker_boundary_sender` composes exact sealing/gating with the ledger and sender-NUMA hold; `worker_boundary_receiver` composes exact CUT drain/fan-in/ACK policy without wrapping DATA receive; `worker_epoch_activation` preflights module stores and swappable queue roles before whole ledger promotion. Their disjoint event-edge policy publications and one-shot activation publication feed the immutable certificate; fixed Bootstrap publishes only baselines and keeps both endpoint policies OPEN. |
 | ACL module | `cidr.hpp`, `hash.hpp`, `simd_classify.hpp`, `platform.hpp`, `prefetch.hpp` | Rule parsing, FNV constants, SIMD batch path, and hot-path hints. |
 | NAT44 module | `bounded_index_pool.hpp`, `net.hpp`, `hash.hpp`, `cuckoo.hpp`, `platform.hpp`, `prefetch.hpp` | Fixed slab-index recycling, packet edits, FNV constants, session maps, and hot-path hints. |

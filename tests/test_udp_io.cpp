@@ -6,9 +6,8 @@
  * @brief Unit tests for provider-private UDP packet operations.
  * @author Fleming Patel
  *
- * These tests exercise the plan-schema-free UDP mechanics that survive the
- * provider-authority cutover: strict numeric endpoint admission, fixed-pool
- * receive ownership, and exact accepted-prefix transmit ownership.
+ * Exercises strict numeric endpoint admission, exact storage-domain receive
+ * ownership, and accepted-prefix transmit ownership without a plan schema.
  */
 
 #include <gtest/gtest.h>
@@ -27,6 +26,7 @@
 #include <exception>
 #include <memory>
 #include <utility>
+#include <vector>
 
 #include "src/common/status_or.hpp"
 #include "src/dp/backends/udp/udp_io.hpp"
@@ -276,6 +276,153 @@ void initialize_duplicate_descriptor_storage(duplicate_descriptor_storage_state 
 	state.record.storage.segment_count = 1;
 	state.record.storage.capabilities = state.operations.capabilities;
 }
+
+/** @brief Exact storage owner whose positive prefix ceiling is independent of UDP descriptors. */
+class prefix_descriptor_storage final {
+    public:
+	packet_storage_domain_operations operations{};	///< Complete immutable storage authority.
+	std::vector<uint16_t> requests;			///< Cold request sequence observed by this fixture.
+	uint32_t acquired{0};				///< Issued unique record population.
+	uint32_t returned{0};				///< Exactly retired records.
+	uint32_t stop_after{0};				///< Inject zero progress after this many accepted records.
+	bool duplicate_next{false};			///< Inject one duplicate across cold prefix calls.
+
+	/** @brief Construct real records whose operation and byte identities match this storage. */
+	prefix_descriptor_storage(uint32_t population, uint16_t prefix_limit)
+		: stop_after(population)
+		, records_(std::make_unique<packet_record[]>(population))
+		, bytes_(population)
+		, owned_(population, false)
+		, population_(population)
+		, prefix_limit_(prefix_limit)
+	{
+		requests.reserve(static_cast<std::size_t>(population) + 1u);
+		operations.state = this;
+		operations.acquire_burst = &acquire_;
+		operations.clone_writable = &decline_clone_;
+		operations.copy_origins_burst = &copy_origins_;
+		operations.release_burst = &release_;
+		operations.observe_statistics = &observe_;
+		operations.generation = 1;
+		operations.domain_index = 1;
+		operations.maximum_packet_length = 1;
+		operations.capabilities = packet_storage_capabilities::CPU_CONTIGUOUS_READ |
+					  packet_storage_capabilities::CPU_CONTIGUOUS_WRITE;
+		for (uint32_t index = 0; index < population_; ++index) {
+			auto &record = records_[index];
+			initialize_packet_record(record);
+			record.storage.data = &bytes_[index];
+			record.storage.operations = &operations;
+			record.storage.generation = operations.generation;
+			record.storage.domain_index = operations.domain_index;
+			record.storage.segment_count = 1;
+			record.storage.capabilities = operations.capabilities;
+		}
+	}
+	/** @brief Teardown verifies each issued lease had exactly one return. */
+	~prefix_descriptor_storage()
+	{
+		EXPECT_EQ(returned, acquired);
+	}
+	/** @brief Published storage addresses cannot move. */
+	prefix_descriptor_storage(const prefix_descriptor_storage &) = delete;
+	/** @brief Each issued lease belongs to this single owner. */
+	prefix_descriptor_storage &operator=(const prefix_descriptor_storage &) = delete;
+
+    private:
+	/** @brief Issue a valid short prefix until the configured no-progress edge. */
+	static uint16_t acquire_(void *state, packet_record **output, uint16_t capacity) noexcept
+	{
+		auto &self = *static_cast<prefix_descriptor_storage *>(state);
+		if (self.requests.size() == self.requests.capacity() || self.stop_after > self.population_ ||
+		    self.acquired > self.stop_after) {
+			std::terminate();
+		}
+		self.requests.push_back(capacity);
+		if (self.duplicate_next && self.acquired != 0) {
+			output[0] = &self.records_[0];
+			return 1;
+		}
+		const auto count = static_cast<uint16_t>(
+			std::min<uint32_t>(std::min(capacity, self.prefix_limit_), self.stop_after - self.acquired));
+		for (uint16_t ordinal = 0; ordinal < count; ++ordinal) {
+			const auto index = self.acquired++;
+			self.owned_[index] = true;
+			self.records_[index].storage.native_handle = &self.records_[index];
+			output[ordinal] = &self.records_[index];
+		}
+		return count;
+	}
+	/** @brief No writable-clone capability is advertised by this fixture. */
+	static packet_record *decline_clone_(void *, const packet_record *) noexcept
+	{
+		return nullptr;
+	}
+	/** @brief Preflight complete one-byte origins and initialize only the accepted prefix. */
+	static uint16_t copy_origins_(void *state, const packet_origin_view *origins, packet_record **records,
+				      uint16_t count) noexcept
+	{
+		if (state == nullptr || origins == nullptr || records == nullptr || count == 0) {
+			return 0;
+		}
+		for (uint16_t index = 0; index < count; ++index) {
+			if (origins[index].data == nullptr || origins[index].length != 1 ||
+			    origins[index].padding != 0) {
+				return 0;
+			}
+		}
+		const auto acquired = acquire_(state, records, count);
+		for (uint16_t index = 0; index < acquired; ++index) {
+			records[index]->storage.data[0] = origins[index].data[0];
+			records[index]->storage.length = 1;
+			records[index]->storage.contiguous_length = 1;
+		}
+		return acquired;
+	}
+	/** @brief Report the fixture's quiescent exact population through the complete ABI. */
+	static kinetum_provider_status observe_(void *state, kinetum_provider_storage_observation *observation,
+						kinetum_provider_diagnostic *diagnostic) noexcept
+	{
+		if (state == nullptr || observation == nullptr) {
+			return KINETUM_PROVIDER_STATUS_INVALID_ARGUMENT;
+		}
+		const auto &self = *static_cast<prefix_descriptor_storage *>(state);
+		*observation = {};
+		observation->runtime_generation = self.operations.generation;
+		observation->storage_domain_index = self.operations.domain_index;
+		observation->state = KINETUM_PROVIDER_OBSERVATION_AVAILABLE_EXACT;
+		observation->in_use = self.acquired - self.returned;
+		observation->available = self.population_ - observation->in_use;
+		if (diagnostic != nullptr) {
+			diagnostic->size = 0;
+		}
+		return KINETUM_PROVIDER_STATUS_OK;
+	}
+	/** @brief Validate and retire the exact accepted prefix through the original operation table. */
+	static void release_(void *state, packet_record *const *records, uint16_t count) noexcept
+	{
+		auto &self = *static_cast<prefix_descriptor_storage *>(state);
+		for (uint16_t ordinal = 0; ordinal < count; ++ordinal) {
+			const auto address = reinterpret_cast<std::uintptr_t>(records[ordinal]);
+			const auto base = reinterpret_cast<std::uintptr_t>(self.records_.get());
+			if (address < base || (address - base) % sizeof(packet_record) != 0) {
+				std::terminate();
+			}
+			const auto index = (address - base) / sizeof(packet_record);
+			if (index >= self.population_ || !self.owned_[index]) {
+				std::terminate();
+			}
+			self.owned_[index] = false;
+			self.records_[index].storage.native_handle = nullptr;
+			++self.returned;
+		}
+	}
+	std::unique_ptr<packet_record[]> records_;  ///< Constructed records, retained through port destruction.
+	std::vector<uint8_t> bytes_;		    ///< One real contiguous byte per record.
+	std::vector<bool> owned_;		    ///< Independent lease oracle.
+	uint32_t population_;			    ///< Exact source population; never rounded.
+	uint16_t prefix_limit_;			    ///< Fixture's positive operation ceiling.
+};
 
 /** @brief Deterministic syscall state that never accepts a UDP datagram. */
 struct blocked_datagram_state {
@@ -1227,6 +1374,62 @@ TEST(udp_io, unexpected_native_errors_fail_stop)
 		"");
 }
 
+/** @brief Cold reservation consumes positive short prefixes and retains the full descriptor population. */
+TEST(udp_io, cold_descriptors_accumulate_positive_prefixes)
+{
+	for (const uint16_t ceiling : {uint16_t{1}, uint16_t{64}, uint16_t{UINT16_MAX}}) {
+		const uint32_t population = ceiling == UINT16_MAX ? 65537u : 129u;
+		SCOPED_TRACE(ceiling);
+		prefix_descriptor_storage storage(population, ceiling);
+		ASSERT_TRUE(kinetum_provider_packet_storage_operations_are_valid(&storage.operations));
+		{
+			auto port_or = udp_rx_port::create(storage.operations, 7, population);
+			ASSERT_TRUE(port_or.is_ok()) << port_or.error().message();
+			EXPECT_EQ(storage.acquired, population);
+			EXPECT_EQ(storage.returned, 0u);
+			uint32_t remaining = population;
+			for (const auto request : storage.requests) {
+				EXPECT_EQ(request, std::min<uint32_t>(remaining, UINT16_MAX));
+				remaining -= std::min<uint32_t>(request, ceiling);
+			}
+			EXPECT_EQ(remaining, 0u);
+		}
+		EXPECT_EQ(storage.returned, population);
+	}
+}
+
+/** @brief Zero progress rejects construction and the existing owner retires its complete established prefix. */
+TEST(udp_io, cold_descriptor_zero_progress_retires_the_accumulated_prefix)
+{
+	for (const uint32_t available : {0u, 1u, 65u, 65536u}) {
+		SCOPED_TRACE(available);
+		prefix_descriptor_storage storage(available + 1u, 64);
+		storage.stop_after = available;
+		ASSERT_TRUE(kinetum_provider_packet_storage_operations_are_valid(&storage.operations));
+		auto port_or = udp_rx_port::create(storage.operations, 7, available + 1u);
+		ASSERT_FALSE(port_or.is_ok());
+		EXPECT_EQ(port_or.error().code(), common::status_code::RESOURCE_EXHAUSTED);
+		EXPECT_EQ(storage.acquired, available);
+		EXPECT_EQ(storage.returned, available);
+		ASSERT_FALSE(storage.requests.empty());
+		EXPECT_EQ(storage.requests.back(), 1u);
+	}
+}
+
+/** @brief Identity checking spans every cold prefix, not just one storage callback. */
+TEST(udp_io, cold_descriptors_reject_duplicate_across_prefixes)
+{
+	prefix_descriptor_storage storage(2, 1);
+	ASSERT_TRUE(kinetum_provider_packet_storage_operations_are_valid(&storage.operations));
+	storage.duplicate_next = true;
+	EXPECT_DEATH(
+		{
+			(void)udp_rx_port::create(storage.operations, 7, 2);
+			std::_Exit(EXIT_SUCCESS);
+		},
+		"");
+}
+
 /** @brief Prove malformed nonempty UDP TX fails stop before ownership can become ambiguous. */
 TEST(udp_io, tx_rejects_malformed_nonempty_burst)
 {
@@ -1234,16 +1437,17 @@ TEST(udp_io, tx_rejects_malformed_nonempty_burst)
 		{
 			auto pool_or = fixed_packet_pool::create(udp_test_pool_options(1, 64));
 			if (!pool_or.is_ok()) {
-				std::terminate();
+				std::_Exit(EXIT_SUCCESS);
 			}
 			auto pool = std::move(pool_or).value();
 			auto port_or = udp_tx_port::create(std::array{&pool->operations()}, 8, 1);
 			if (!port_or.is_ok()) {
-				std::terminate();
+				std::_Exit(EXIT_SUCCESS);
 			}
 			auto port = std::move(port_or).value();
 			const auto &operations = port->burst_operations();
 			(void)operations.transmit_burst(operations.state, nullptr, 1);
+			std::_Exit(EXIT_SUCCESS);
 		},
 		"");
 }

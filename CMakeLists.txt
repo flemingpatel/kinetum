@@ -1638,6 +1638,8 @@ if(KINETUM_ENABLE_TESTS)
     tests/test_rcu_buffer.cpp
     tests/test_timer_wheel.cpp
     tests/test_algo_primitives.cpp
+    tests/test_atomic_index_pool.cpp
+    tests/test_ratelimit.cpp
     tests/test_bounded_service_order.cpp
     tests/test_perf_regression.cpp
     tests/test_validation_tap_analyzer.cpp

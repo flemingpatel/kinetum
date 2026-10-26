@@ -219,11 +219,11 @@ struct runtime_storage_domain_statistics {
 	std::optional<int32_t> host_numa_node{};		  ///< Exact host NUMA node when proven.
 	uint64_t buffer_count{0};				  ///< Compiled physical record population.
 	uint64_t required_min_buffers{0};			  ///< Exact computed admission floor.
-	uint32_t safety_margin{0};				  ///< Plan-authored budget safety margin.
+	uint32_t safety_margin{0};				  ///< Formula-owned packet-burst safety term.
 	kinetum_provider_observation_state observation_state{0};  ///< Typed provider availability.
 	std::optional<uint64_t> observed_monotonic_ns{};	  ///< Platform post-callback sample when available.
 	std::optional<uint64_t> in_use{};			  ///< Exact or approximate externally owned records.
-	std::optional<uint64_t> available{};  ///< Exact or approximate immediately available records.
+	std::optional<uint64_t> available{};  ///< Exact or approximate free records; not a reservation.
 };
 
 /** @brief One logical port plus provider-native counters. */

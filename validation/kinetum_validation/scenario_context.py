@@ -519,6 +519,7 @@ class ScenarioContext:
         # Cleanup must survive unexpected test-double/library failures long
         # enough to attempt every independent owner.
         failures: List[Tuple[str, BaseException]] = []
+        interruption: Optional[asyncio.CancelledError] = None
 
         def remember_failure(owner: str, error: BaseException) -> None:
             """Retain one cleanup failure while later owners still retire."""
@@ -538,10 +539,9 @@ class ScenarioContext:
                 await owned_task
             except asyncio.CancelledError as exc:
                 current = asyncio.current_task()
-                cancelling = getattr(current, "cancelling", None)
-                caller_cancelled = callable(cancelling) and cancelling() > 0
+                caller_cancelled = current is not None and current.cancelling() > 0
                 if not task_cancel_requested or caller_cancelled:
-                    remember_failure("traffic task", exc)
+                    interruption = exc
             except BaseException as exc:  # pylint: disable=broad-exception-caught
                 remember_failure("traffic task", exc)
         if sender is not None:
@@ -559,7 +559,11 @@ class ScenarioContext:
             except BaseException as exc:  # pylint: disable=broad-exception-caught
                 remember_failure("capture", exc)
         if failures:
-            first_error = failures[0][1]
+            if interruption is not None:
+                failures.insert(0, ("traffic task", interruption))
+            first_error = next(
+                (error for _, error in failures if isinstance(error, Exception)), failures[0][1],
+            )
             message = (
                 f"{label} cleanup did not retire every owner: "
                 + "; ".join(
@@ -571,6 +575,8 @@ class ScenarioContext:
                 self.reporter.print_warning(message)
                 raise first_error
             raise RuntimeError(message) from first_error
+        if interruption is not None:
+            raise interruption
 
     async def complete_capture(
         self,

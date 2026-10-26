@@ -174,9 +174,9 @@ class udp_rx_port final {
 		    std::unique_ptr<packet_record *[]> descriptors, uint32_t descriptor_count,
 		    udp_receive_api receive_api) noexcept;
 	/**
-	 * @brief Reserve the complete descriptor population in bounded ABI bursts.
-	 * @return true after every exact credit is owned; false after a partial
-	 *         reservation that the destructor will roll back.
+	 * @brief Reserve the complete descriptor population through positive ABI prefixes.
+	 * @return true after every credit is owned; false on zero progress or cold
+	 *         allocation failure. The destructor retires the established prefix.
 	 */
 	[[nodiscard]] bool reserve_descriptor_population_() noexcept;
 
@@ -193,7 +193,7 @@ class udp_rx_port final {
 								   uint16_t capacity) noexcept;
 	/** @brief Refill currently empty queue descriptors from the exact storage owner. */
 	void replenish_descriptors_() noexcept;
-	/** @return Next descriptor record removed from the owner-local ring, or nullptr when empty. */
+	/** @return Next owned descriptor; empty or absent ring storage fails stop. */
 	[[nodiscard]] packet_record *pop_descriptor_() noexcept;
 	/**
 	 * @brief Return one queue-owned descriptor record to the owner-local ring.

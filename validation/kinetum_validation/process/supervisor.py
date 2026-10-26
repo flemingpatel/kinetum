@@ -158,7 +158,7 @@ class AsyncProcessSupervisor:
         name: str,
         cmd: List[str],
     ) -> None:
-        """Start a process with readiness detection."""
+        """Start an isolated process whose signals and retirement belong to this owner."""
         log_info("supervisor", f"starting {name}: {' '.join(cmd)}")
 
         log_path = self.output_dir / "photon.log"
@@ -173,25 +173,39 @@ class AsyncProcessSupervisor:
         self._log_files[name] = log_path
         self._log_handles[name] = log_file
 
-        try:
+        async def spawn_owned_process() -> asyncio.subprocess.Process:
+            """Claim Photon and its pipe before cancellation can unwind the caller."""
             process = await asyncio.create_subprocess_exec(
                 *cmd,
+                stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
                 env=exact_subprocess_environment(),
+                # Terminal Ctrl+C cancels the harness; Photon receives TERM
+                # only after traffic cleanup reaches its process owner.
+                start_new_session=True,
             )
+            self._processes[name] = process
+            self._stream_tasks[name] = asyncio.create_task(
+                self._stream_output(name, process)
+            )
+            return process
+
+        spawn_task = asyncio.create_task(spawn_owned_process())
+        try:
+            process = await asyncio.shield(spawn_task)
         except BaseException:
-            log_file.close()
-            self._log_handles.pop(name, None)
-            self._log_files.pop(name, None)
+            # Photon may already have spawned children while asyncio connects
+            # its pipes. Finish claiming the tree so normal cleanup owns TERM;
+            # cancelling subprocess construction can kill only its leader.
+            try:
+                await spawn_task
+            finally:
+                if name not in self._processes:
+                    log_file.close()
+                    self._log_handles.pop(name, None)
+                    self._log_files.pop(name, None)
             raise
-
-        self._processes[name] = process
-
-        # Start log streaming task
-        self._stream_tasks[name] = asyncio.create_task(
-            self._stream_output(name, process)
-        )
 
         log_info("supervisor", f"{name} started (PID: {process.pid})")
 

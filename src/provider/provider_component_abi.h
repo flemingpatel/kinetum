@@ -263,7 +263,7 @@ typedef struct KINETUM_PROVIDER_ALIGNAS(64) kinetum_provider_storage_observation
 	kinetum_provider_observation_state state;  ///< Exact availability classification.
 	uint8_t identity_padding[3];		   ///< Zeroed identity alignment padding.
 	uint64_t in_use;			   ///< Exact or approximate externally owned record count.
-	uint64_t available;			   ///< Exact or approximate immediately available count.
+	uint64_t available;			   ///< Exact or approximate free-record count; not a reservation.
 	uint8_t padding[32];			   ///< Zeroed cache-line completion.
 } kinetum_provider_storage_observation;
 
@@ -392,9 +392,10 @@ typedef struct kinetum_packet_origin_view {
  *
  * acquire_burst transfers ownership of exactly the returned prefix into the
  * caller's pointer array. It never returns more than capacity and does not
- * publish or transfer ownership through the untouched suffix. A zero result is
- * bounded exhaustion or a malformed empty request; it never authorizes a
- * fallback storage domain.
+ * publish or transfer ownership through the untouched suffix. Exhaustion or
+ * bounded contention may shorten the result, including to zero; a short prefix
+ * does not prove global exhaustion. A malformed empty request also returns zero.
+ * No refusal authorizes a fallback storage domain.
  *
  * release_burst retires every exact owned record in records[0,count). A null
  * entry inside a nonempty burst is a caller contract fault. A singular clone
@@ -404,8 +405,8 @@ typedef struct kinetum_packet_origin_view {
  *
  * copy_origins_burst validates the complete authored input before consuming
  * storage. Malformed input returns zero with no ownership transfer; valid input
- * may return a capacity-limited prefix, and the caller dispatches only that
- * exact prefix.
+ * may return a prefix limited by capacity or contention. The caller dispatches
+ * only that exact prefix.
  *
  * The table is immutable after materialization. state is opaque mutable
  * provider state: sharing this table across workers is legal only when the
@@ -417,7 +418,7 @@ typedef struct KINETUM_PROVIDER_ALIGNAS(64) kinetum_packet_storage_domain_operat
 	/** @brief Acquire and transfer one capacity-bounded owned-record prefix. */
 	uint16_t (*acquire_burst)(void *state, struct kinetum_packet_record **records,
 				  uint16_t capacity) KINETUM_PROVIDER_NOEXCEPT;
-	/** @brief Return one independently writable owned clone, or null on bounded exhaustion. */
+	/** @brief Return one independently writable owned clone, or null on exhaustion or contention. */
 	struct kinetum_packet_record *(*clone_writable)(void *state, const struct kinetum_packet_record *source)
 		KINETUM_PROVIDER_NOEXCEPT;
 	/** @brief Materialize and transfer one validated capacity-limited origin prefix. */

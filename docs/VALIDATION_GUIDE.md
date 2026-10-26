@@ -651,6 +651,24 @@ For the d430 RSS epoch workload, start the prepared TRex server explicitly with
 Software counting can limit generator throughput; the flag itself establishes
 neither sufficient capacity nor rate achievement.
 
+For the d430 fan-in profile, order TRex's `interfaces` and corresponding
+`port_info` entries as WAN0, LAN0, WAN1, spare. TRex assigns ports 0/1 and 2/3
+to separate packet-thread groups. This pairs LAN reception with WAN0 transmission;
+a receive-only pair can enter TRex's idle sleep between polls in software mode.
+The kit's defaults are:
+
+| DUT logical port | Traffic-peer PCI function | TRex port ID |
+|---|---|---|
+| `wan0` | `0000:06:00.0` | `0` |
+| `wan1` | `0000:06:00.2` | `2` |
+| `lan0` | `0000:06:00.1` | `1` |
+
+The unused traffic-peer function is `0000:06:00.3`. The operator configures TRex
+before validation; the kit does not reorder its interfaces. `--trex-port`
+overrides remain in deployment order (WAN0, WAN1, LAN0). When hosts change,
+update the runtime hardware inventory and both hosts' attachment/MAC facts
+before generating a bundle; the example records one assigned d430 host.
+
 All sidecars retain `port_counter_baseline` and `port_counter_final`, keyed by
 decimal port ID with explicit uint64 `opackets`, `ipackets`, `oerrors`, and
 `ierrors`. Readers recompute ingress TX, egress RX, and error deltas before
@@ -686,8 +704,9 @@ commit-confirmed, and rollback may use TRex for their other traffic windows.
 membership and strict scalar types. Before effects, the endpoint validates the
 request; before retaining its response, the local driver rechecks identities,
 stream/flow/PGID arithmetic, timestamps, and counters. The fixed endpoint program
-is the only command-line payload; JSON travels on SSH stdin with a 16 MiB limit
-in both directions. Generation admission proves the maximum result fits before
+is the only command-line payload. SSH stdin carries one newline-terminated JSON
+request and remains open as the cancellation channel; JSON payloads have a 16 MiB
+limit in both directions. Generation admission proves the maximum result fits before
 SSH starts. Per-flow rate divides the requested aggregate by ingress-stream
 and flow count, with no one-PPS floor. One-shot requests reject transition,
 overlap, and second-tag fields.
@@ -703,12 +722,17 @@ therefore needs no promiscuous mode. TRex observation ports temporarily enable
 promiscuous mode during traffic runs and appear in sidecar `promiscuous_ports`.
 
 **Cleanup.** Killing validation before cleanup may leave the epoch session
-transmitting. The next run resets TRex; immediate manual cleanup uses
-`client.reset()` or a `t-rex-64` restart. Normal SIGINT sends SIGTERM to active
-SSH and tracks/drains delayed SIGKILL escalation. Confirmed endpoint cleanup
-retires generation ownership before local result validation; a later evidence
-rejection fails the run without aborting retired ports again. Teardown retries
-abort only while remote retirement is unproved.
+transmitting. The next traffic run resets its selected ports; immediate manual
+cleanup uses
+`client.reset()` or a `t-rex-64` restart. Normal SIGINT closes the active request
+channel. The endpoint observes EOF between client operations, stops its claimed
+traffic, restores observation attributes and releases ports. The kit drains its
+reply and waits for exit; forced local SSH termination cannot prove remote
+retirement and remains a cleanup failure. Short actions finish before cancellation
+propagates; an already-started generation is then aborted by its existing owner.
+Confirmed endpoint cleanup retires generation ownership before local result
+validation; a later evidence rejection fails the run without aborting retired
+ports again. Teardown retries abort only while remote retirement is unproved.
 An explicit endpoint rejection before a mutating call clears provisional
 ownership without issuing an abort. Endpoint cleanup stops and releases only
 its acknowledged port claims; a read-only probe's disconnect performs neither.
@@ -1515,6 +1539,8 @@ port identities, nullable profile-owned latency source, and complete traffic
 endpoint (including the exact remote Python path). Duplicate JSON keys,
 unknown/missing fields, indirect paths,
 foreign capabilities, conflicting port identities, and scalar coercion reject.
+Recorded TRex IDs and explicit overrides define that run's port mapping;
+the observed capability membership must agree with the effective IDs.
 
 Release metadata comes from the successful held `kinetum-info --check --json`
 response admitted in [Section 6](#6-test-lifecycle). Its `build_features` must
@@ -2154,7 +2180,10 @@ one combined ownership-tree log, and one shutdown handle.
 3. Spawn the exact regular installed Photon image with `--bundle`,
    `--cp-listen`, `--dp-endpoint`, `--config-store-dir`, `--log-dir`, and
    `--log-console`, plus the selected `--log-level`. No plan, module,
-   provider, root, key, or child-image override is present.
+   provider, root, key, or child-image override is present. Its stdin is `/dev/null`
+   and it starts in a separate session so terminal signals cannot bypass the
+   harness's shutdown ordering. Cancellation during spawn waits for process and
+   pipe ownership before entering cleanup.
 4. Create `photon.log` before spawn, then pipe stdout and stderr into one
    `_stream_output` task. Flush each nonempty line to the file and pass it to
    the configured callback or stderr, with no duplicate in-memory history.
@@ -2181,6 +2210,11 @@ A Photon process already exited when harness-owned stop begins is a lifecycle
 failure even when its exit code is zero. The supervisor still drains output and
 releases local ownership before reporting that failure; an independently ended
 runtime cannot be relabeled clean teardown.
+
+Ctrl+C cancels the harness task. Its asynchronous subprocesses use separate
+sessions: traffic retirement runs before backend cleanup and Photon shutdown.
+Clean interruption exits `130`; an actual cleanup failure remains an error and
+reports the originating exception type as well as the cleanup failure.
 
 Cleanup is idempotent and never deletes the run's CP store or artifacts.
 

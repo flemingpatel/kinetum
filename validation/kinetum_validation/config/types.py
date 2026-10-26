@@ -480,7 +480,7 @@ DEPLOYMENT_SPECS: Dict[DeploymentMode, DeploymentSpec] = {
                         traffic_role="rx",
                         peer_iface="enp6s0f2np2",
                         peer_ip="10.10.2.1",
-                        traffic_port_id=1,
+                        traffic_port_id=2,
                     ),
                     PortSpec(
                         logical_name="lan0",
@@ -488,7 +488,7 @@ DEPLOYMENT_SPECS: Dict[DeploymentMode, DeploymentSpec] = {
                         traffic_role="tx",
                         peer_iface="enp6s0f1np1",
                         peer_ip="10.10.3.2",
-                        traffic_port_id=2,
+                        traffic_port_id=1,
                     ),
                 ),
                 traffic_driver=TrafficDriverType.TREX,

@@ -47,6 +47,7 @@
 #include <utility>
 
 #include <kinetum/algo/platform.hpp>
+#include <kinetum/algo/work_queue_indices.hpp>
 
 namespace kinetum::algo
 {
@@ -1371,7 +1372,7 @@ class mpmc_queue_core {
 /** @endcond */
 
 /**
- * @brief Lock-free MPMC queue over exact caller-owned aligned cells.
+ * @brief Bounded MPMC queue over exact caller-owned aligned cells.
  *
  * @tparam T Fixed queue value type.
  *
@@ -1379,10 +1380,17 @@ class mpmc_queue_core {
  * Any number of producers and consumers may operate concurrently. Construction
  * and destruction require external quiescence and caller storage must outlive
  * the view.
+ * Cursor reservation precedes cell publication/release. A try operation may
+ * refuse the next cell while an earlier caller is paused, even when another
+ * cell is available; failure transfers no ownership. Neither global fullness
+ * nor emptiness follows from that result. This is not a lock-free FIFO
+ * progress guarantee.
  *
  * @par Performance
- * No operation allocates, locks, reads a clock, performs a syscall, or formats
- * data. Every cell occupies an independent cache-line extent.
+ * Queue bookkeeping allocates no memory, takes no locks and reads no clock.
+ * Element operations retain T's own cost and side-effect contract. CAS
+ * contention has no per-call step bound. Every cell occupies an independent
+ * cache-line extent.
  */
 template <typename T>
 	requires detail::mpmc_queue_value<T>
@@ -1415,18 +1423,18 @@ class mpmc_queue_view {
 	}
 
 	/**
-	 * @brief Try to publish one copied value without waiting.
+	 * @brief Try to publish one copied value.
 	 * @param value Value copied into one claimed cell.
-	 * @return true after publication; false when all cells are occupied.
+	 * @return true after publication; false when the next cell cannot be reserved.
 	 */
 	[[nodiscard]] bool try_enqueue(const T &value) noexcept(std::is_nothrow_copy_assignable_v<T>)
 	{
 		return core_.try_enqueue(value);
 	}
 	/**
-	 * @brief Try to consume one published value without waiting.
+	 * @brief Try to consume one published value.
 	 * @param[out] out Destination assigned after one cell is claimed.
-	 * @return true after consumption; false when no value is published.
+	 * @return true after consumption; false when the next cell is not consumable.
 	 */
 	[[nodiscard]] bool try_dequeue(T &out) noexcept(std::is_nothrow_move_assignable_v<T>)
 	{
@@ -1453,7 +1461,7 @@ class mpmc_queue_view {
 };
 
 /**
- * @brief Lock-free MPMC bounded queue.
+ * @brief Bounded MPMC queue with embedded storage.
  *
  * Uses per-slot sequence numbers for coordination.
  * Suitable for stats collection and control plane messaging.
@@ -1463,11 +1471,12 @@ class mpmc_queue_view {
  *
  * @par Thread Safety
  * Any number of producers and consumers may operate concurrently. Destruction
- * requires all callers to be quiescent.
+ * requires all callers to be quiescent. Try-operation availability and progress
+ * follow mpmc_queue_view; a failed try is not proof of global fullness or emptiness.
  *
  * @par Performance
- * Storage is embedded in the queue. Enqueue and dequeue are bounded lock-free
- * operations and allocate no memory.
+ * Storage is embedded in the queue. Bookkeeping takes no lock and allocates no
+ * memory; element operations and contention follow mpmc_queue_view.
  */
 template <typename T, std::size_t Capacity = 1024>
 	requires detail::mpmc_queue_value<T>
@@ -1485,10 +1494,10 @@ class mpmc_queue {
 	}
 
 	/**
-	 * @brief Try to enqueue one copied element without waiting.
+	 * @brief Try to enqueue one copied element.
 	 *
 	 * @param value Value copied into a claimed cell.
-	 * @return true when one cell was claimed and published; false when full.
+	 * @return true after publication; false when the next cell cannot be reserved.
 	 */
 	[[nodiscard]] bool try_enqueue(const T &value) noexcept(std::is_nothrow_copy_assignable_v<T>)
 	{
@@ -1496,10 +1505,10 @@ class mpmc_queue {
 	}
 
 	/**
-	 * @brief Try to dequeue one element without waiting.
+	 * @brief Try to dequeue one element.
 	 *
 	 * @param[out] out Destination assigned after one cell is claimed.
-	 * @return true when one value was consumed; false when empty.
+	 * @return true after consumption; false when the next cell is not consumable.
 	 */
 	[[nodiscard]] bool try_dequeue(T &out) noexcept(std::is_nothrow_move_assignable_v<T>)
 	{
@@ -1538,7 +1547,7 @@ class mpmc_queue {
 // =============================================================================
 
 /**
- * @brief Lock-free bounded MPMC queue with construction-time capacity.
+ * @brief Bounded MPMC queue with construction-time capacity.
  *
  * This is the runtime-capacity form of mpmc_queue. It uses the same per-cell
  * sequence-number algorithm and allocates all cells during construction; no
@@ -1554,6 +1563,8 @@ class mpmc_queue {
  * Any number of producers and consumers may call try_enqueue and try_dequeue
  * concurrently. Destruction and capacity inspection require external lifetime
  * ownership; size_approx is observational and not a reservation.
+ * Try-operation availability and progress follow mpmc_queue_view; a failed try
+ * is not proof of global fullness or emptiness.
  * Monotonic positions use unsigned modular arithmetic. Capacity is restricted
  * to the lower half of the counter range, so a modular difference above that
  * half-range unambiguously denotes a sequence behind the requested position.
@@ -1561,8 +1572,8 @@ class mpmc_queue {
  * @par Performance
  * Cell storage is allocated once by the cold constructor. Each cell starts on
  * its own cache-line boundary so concurrent reservations of adjacent positions
- * do not false-share publication sequences. Enqueue and dequeue are bounded
- * lock-free operations with no allocation, lock, or exception.
+ * do not false-share publication sequences. Bookkeeping takes no lock and
+ * allocates no memory; element operations and contention follow mpmc_queue_view.
  */
 template <typename T>
 	requires detail::mpmc_queue_value<T>
@@ -1596,10 +1607,10 @@ class mpmc_queue_dynamic {
 	mpmc_queue_dynamic &operator=(mpmc_queue_dynamic &&) = delete;
 
 	/**
-	 * @brief Try to enqueue one copied value without waiting.
+	 * @brief Try to enqueue one copied value.
 	 *
 	 * @param value Value to publish.
-	 * @return true when one cell was claimed and published; false when full.
+	 * @return true after publication; false when the next cell cannot be reserved.
 	 */
 	[[nodiscard]] bool try_enqueue(const T &value) noexcept
 	{
@@ -1607,10 +1618,10 @@ class mpmc_queue_dynamic {
 	}
 
 	/**
-	 * @brief Try to dequeue one value without waiting.
+	 * @brief Try to dequeue one value.
 	 *
 	 * @param[out] out Destination assigned only after one cell is claimed.
-	 * @return true when one value was consumed; false when empty.
+	 * @return true after consumption; false when the next cell is not consumable.
 	 */
 	[[nodiscard]] bool try_dequeue(T &out) noexcept
 	{
@@ -1676,100 +1687,6 @@ class mpmc_queue_dynamic {
 // =============================================================================
 // Work Queue (Single-Threaded, Caller Storage)
 // =============================================================================
-
-/** @cond INTERNAL_IMPLEMENTATION */
-namespace detail
-{
-
-/** @brief Shared power-of-two head/tail arithmetic for every work-queue owner. */
-class work_queue_indices final {
-    public:
-	/**
-	 * @param capacity Candidate exact usable slot population.
-	 * @return Whether it fits the power-of-two modular sequence domain.
-	 */
-	[[nodiscard]] static constexpr bool valid_capacity(std::size_t capacity) noexcept
-	{
-		return capacity >= 2u && (capacity & (capacity - 1u)) == 0u && capacity <= COUNTER_HALF_RANGE;
-	}
-
-	/**
-	 * @brief Construct one empty exact-capacity sequence owner.
-	 * @param capacity Power-of-two usable capacity in the modular half range.
-	 */
-	explicit work_queue_indices(std::size_t capacity) noexcept
-		: capacity_(capacity)
-		, mask_(capacity - 1u)
-	{
-		if (!valid_capacity(capacity_)) {
-			std::terminate();
-		}
-	}
-
-	/** @return true when no sequence is live. */
-	[[nodiscard]] KINETUM_ALWAYS_INLINE bool empty() const noexcept
-	{
-		return head_ == tail_;
-	}
-	/** @return true when every exact usable slot is live. */
-	[[nodiscard]] KINETUM_ALWAYS_INLINE bool full() const noexcept
-	{
-		return size() >= capacity_;
-	}
-	/** @return Exact current live sequence count. */
-	[[nodiscard]] KINETUM_ALWAYS_INLINE std::size_t size() const noexcept
-	{
-		return head_ - tail_;
-	}
-	/** @return Exact construction-time usable capacity. */
-	[[nodiscard]] KINETUM_ALWAYS_INLINE std::size_t capacity() const noexcept
-	{
-		return capacity_;
-	}
-	/** @return Storage ordinal for the next publication. */
-	[[nodiscard]] KINETUM_ALWAYS_INLINE std::size_t producer_slot() const noexcept
-	{
-		return head_ & mask_;
-	}
-	/** @return Storage ordinal for the next consumption. */
-	[[nodiscard]] KINETUM_ALWAYS_INLINE std::size_t consumer_slot() const noexcept
-	{
-		return tail_ & mask_;
-	}
-	/** @brief Commit one already-constructed publication. */
-	KINETUM_ALWAYS_INLINE void commit_push() noexcept
-	{
-		++head_;
-	}
-	/**
-	 * @brief Commit an already-consumed FIFO prefix.
-	 * @param count Number of live values whose ownership has been transferred.
-	 */
-	KINETUM_ALWAYS_INLINE void commit_pop(std::size_t count = 1u) noexcept
-	{
-		tail_ += count;
-	}
-	/** @brief Reset a proven-empty sequence owner to its canonical state. */
-	void reset_empty() noexcept
-	{
-		if (!empty()) {
-			std::terminate();
-		}
-		head_ = 0u;
-		tail_ = 0u;
-	}
-
-    private:
-	static constexpr std::size_t COUNTER_HALF_RANGE =
-		std::numeric_limits<std::size_t>::max() / 2u;  ///< Largest unambiguous modular capacity.
-	std::size_t capacity_{0};			       ///< Exact usable slot population.
-	std::size_t mask_{0};				       ///< Capacity-minus-one slot mask.
-	std::size_t head_{0};				       ///< Next owner publication sequence.
-	std::size_t tail_{0};				       ///< Next owner consumption sequence.
-};
-
-}  // namespace detail
-/** @endcond */
 
 /**
  * @brief Runtime-capacity single-owner FIFO over exact caller storage.

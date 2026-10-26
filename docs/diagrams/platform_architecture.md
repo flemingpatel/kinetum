@@ -662,7 +662,7 @@ if (Authored zero-copy share?) then (yes)
 elseif (Authored bounded copy?) then (yes)
     :Reserve destination record
     and compiled staging;
-    if (Capacity available?) then (yes)
+    if (Destination record acquired?) then (yes)
         :Copy bytes and metadata;
         :Transfer to the destination owner,
         then release source storage;

@@ -23,9 +23,10 @@
  * - rcu_buffer.hpp: RCU double-buffer (torn-read-free config publishing)
  * - single_writer_snapshot.hpp: Bounded coherent owner-to-observer publication
  * - cache.hpp: Exact-owner intrusive LRU, cold LRU cache, aligned allocation
- * - queue.hpp: Lock-free queues (SPSC, MPMC)
+ * - queue.hpp: Bounded SPSC, MPMC, and single-owner queues
+ * - work_queue_indices.hpp: Shared internal single-owner circular indices
  * - quiescence.hpp: Exact reader grace generations
- * - ratelimit.hpp: Exact-rational token, leaky, and sliding-window limits
+ * - ratelimit.hpp: Exact byte-credit meters and rolling event windows
  * - net.hpp: Network algorithms (byte order and IPv4 helpers)
  * - cidr.hpp: CIDR parsing and matching
  * - condition_parse.hpp: Edge-condition syntax parser
@@ -68,3 +69,4 @@
 #include <kinetum/algo/simd_classify.hpp>
 #include <kinetum/algo/single_writer_snapshot.hpp>
 #include <kinetum/algo/timer_wheel.hpp>
+#include <kinetum/algo/work_queue_indices.hpp>

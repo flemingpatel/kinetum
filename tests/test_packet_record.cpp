@@ -9,13 +9,19 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <array>
+#include <cstdio>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <string>
 #include <thread>
 #include <type_traits>
 #include <utility>
+#include <vector>
+#include <string_view>
 
 #include "src/dp/fixed_packet_pool.hpp"
 #include "tests/numa_test_support.hpp"
@@ -50,6 +56,131 @@ namespace
 		.generation = generation,
 		.host_numa_node = kinetum::test::required_memory_numa_node(),
 	};
+}
+
+/** @brief Build empty metadata independently of the production reset helper, including padding. */
+[[nodiscard]] packet_private expected_empty_metadata() noexcept
+{
+	packet_private result;
+	std::memset(&result, 0, sizeof(result));
+	result.ingress_port = UINT16_MAX;
+	result.egress_port = UINT16_MAX;
+	result.next_stage = UINT16_MAX;
+	result.current_stage = UINT16_MAX;
+	result.next_stage_instance = UINT16_MAX;
+	result.current_stage_instance = UINT16_MAX;
+	result.module_next_stage = UINT16_MAX;
+	return result;
+}
+
+/** @brief Retain exact pre-call evidence only for still-owned records in a death-test child. */
+struct return_rejection_evidence {
+	fixed_packet_pool *owner{nullptr};	 ///< Pool retained until the child exits.
+	std::array<packet_record *, 2> owned{};	 ///< Only these still-owned objects may be inspected.
+	std::array<packet_record, 2> before{};	 ///< Bytes immediately before the rejected call.
+	uint32_t available{0};			 ///< Quiescent free population before the call.
+	bool armed{false};			 ///< Setup and snapshots are complete.
+	bool marker_claim{false};		 ///< A within-burst duplicate can clear the first marker.
+};
+return_rejection_evidence rejection;  ///< Process-local child observation, never production state.
+
+/** @brief Prove termination preceded publication and did not arise from setup or destruction. */
+[[noreturn]] void check_return_rejection() noexcept
+{
+	if (!rejection.armed || rejection.owner == nullptr ||
+	    rejection.owner->available_approx() != rejection.available) {
+		std::_Exit(EXIT_SUCCESS);
+	}
+	for (std::size_t index = 0; index < rejection.owned.size(); ++index) {
+		if (rejection.owned[index] == nullptr) {
+			continue;
+		}
+		const auto offset = rejection.marker_claim && index == 0 ? sizeof(void *) : 0u;
+		if (offset != 0 && rejection.owned[index]->storage.native_handle != nullptr &&
+		    rejection.owned[index]->storage.native_handle != rejection.before[index].storage.native_handle) {
+			std::_Exit(EXIT_SUCCESS);
+		}
+		if (std::memcmp(reinterpret_cast<const std::byte *>(rejection.owned[index]) + offset,
+				reinterpret_cast<const std::byte *>(&rejection.before[index]) + offset,
+				sizeof(packet_record) - offset) != 0) {
+			std::_Exit(EXIT_SUCCESS);
+		}
+	}
+	std::fputs("return rejected before publication\n", stderr);
+	std::_Exit(86);
+}
+
+/** @brief Apply one malformed return only after establishing and snapshotting exact live ownership. */
+[[noreturn]] void reject_return(std::string_view fault)
+{
+	std::set_terminate(&check_return_rejection);
+	auto made = fixed_packet_pool::create(provider_free_pool_options(2, 385, 128, 64, 7, 11));
+	auto foreign_made = fixed_packet_pool::create(provider_free_pool_options(1, 385, 128, 64, 8, 17));
+	if (!made.is_ok() || !foreign_made.is_ok()) {
+		std::_Exit(EXIT_SUCCESS);
+	}
+	auto pool = std::move(made).value();
+	auto foreign = std::move(foreign_made).value();
+	rejection.owner = pool.get();
+	const auto &operations = pool->operations();
+	if (pool->acquire_burst(rejection.owned.data(), 2) != 2) {
+		std::_Exit(EXIT_SUCCESS);
+	}
+	for (auto *record : rejection.owned) {
+		std::memset(&record->metadata, 0xa5, sizeof(record->metadata));
+	}
+	auto input = rejection.owned;
+	auto *state = operations.state;
+	uint16_t count = 2;
+	if (fault == "generation") {
+		++rejection.owned[1]->storage.generation;
+	} else if (fault == "domain") {
+		rejection.owned[1]->storage.domain_index = 8;
+	} else if (fault == "capabilities") {
+		rejection.owned[1]->storage.capabilities ^= packet_storage_capabilities::WRITABLE_CLONE;
+	} else if (fault == "segments") {
+		rejection.owned[1]->storage.segment_count = 2;
+	} else if (fault == "operations") {
+		rejection.owned[1]->storage.operations = &foreign->operations();
+	} else if (fault == "data") {
+		rejection.owned[1]->storage.data = rejection.owned[0]->storage.data;
+	} else if (fault == "unaligned_data") {
+		++rejection.owned[1]->storage.data;
+	} else if (fault == "handle") {
+		rejection.owned[1]->storage.native_handle = nullptr;
+	} else if (fault == "foreign_handle") {
+		rejection.owned[1]->storage.native_handle = rejection.owned[0];
+	} else if (fault == "null_entry") {
+		input[1] = nullptr;
+	} else if (fault == "unaligned") {
+		input[1] = reinterpret_cast<packet_record *>(reinterpret_cast<std::uintptr_t>(input[1]) + 1u);
+	} else if (fault == "foreign") {
+		if (foreign->acquire_burst(&input[1], 1) != 1) {
+			std::_Exit(EXIT_SUCCESS);
+		}
+	} else if (fault == "duplicate_prefix") {
+		input[1] = input[0];
+		rejection.marker_claim = true;
+	} else if (fault == "duplicate_return") {
+		operations.release_burst(operations.state, &input[0], 1);
+		rejection.owned[0] = nullptr;  // Retain a stale pointer value only; never inspect returned memory.
+		count = 1;
+	} else if (fault == "empty") {
+		count = 0;
+	} else if (fault == "null_state") {
+		state = nullptr;
+	} else if (fault != "null_array") {
+		std::_Exit(EXIT_SUCCESS);
+	}
+	for (std::size_t index = 0; index < rejection.owned.size(); ++index) {
+		if (rejection.owned[index] != nullptr) {
+			rejection.before[index] = *rejection.owned[index];
+		}
+	}
+	rejection.available = pool->available_approx();
+	rejection.armed = true;
+	operations.release_burst(state, fault == "null_array" ? nullptr : input.data(), count);
+	std::_Exit(EXIT_SUCCESS);  // Survival cannot fall through to a live-pool destructor.
 }
 
 }  // namespace
@@ -352,16 +483,17 @@ TEST(packet_record, fixed_pool_rejects_duplicate_retirement)
 		{
 			auto pool_or = fixed_packet_pool::create(provider_free_pool_options(2, 64, 0, 64, 3, 5));
 			if (!pool_or.is_ok()) {
-				std::terminate();
+				std::_Exit(EXIT_SUCCESS);
 			}
 			auto pool = std::move(pool_or).value();
 			packet_record *record = nullptr;
 			if (pool->acquire_burst(&record, 1) != 1) {
-				std::terminate();
+				std::_Exit(EXIT_SUCCESS);
 			}
 			const auto &operations = pool->operations();
 			operations.release_burst(operations.state, &record, 1);
 			operations.release_burst(operations.state, &record, 1);
+			std::_Exit(EXIT_SUCCESS);
 		},
 		"");
 }
@@ -373,18 +505,19 @@ TEST(packet_record, fixed_pool_rejects_duplicate_within_retirement_burst)
 		{
 			auto pool_or = fixed_packet_pool::create(provider_free_pool_options(2, 64, 0, 64, 3, 5));
 			if (!pool_or.is_ok()) {
-				std::terminate();
+				std::_Exit(EXIT_SUCCESS);
 			}
 			auto pool = std::move(pool_or).value();
 			packet_record *record = nullptr;
 			if (pool->acquire_burst(&record, 1) != 1) {
-				std::terminate();
+				std::_Exit(EXIT_SUCCESS);
 			}
 			packet_record *records[2]{};
 			records[0] = record;
 			records[1] = record;
 			const auto &operations = pool->operations();
 			operations.release_burst(operations.state, records, 2);
+			std::_Exit(EXIT_SUCCESS);
 		},
 		"");
 }
@@ -396,12 +529,13 @@ TEST(packet_record, fixed_pool_rejects_null_retirement)
 		{
 			auto pool_or = fixed_packet_pool::create(provider_free_pool_options(1, 64, 0, 64, 3, 5));
 			if (!pool_or.is_ok()) {
-				std::terminate();
+				std::_Exit(EXIT_SUCCESS);
 			}
 			auto pool = std::move(pool_or).value();
 			packet_record *records[]{nullptr};
 			const auto &operations = pool->operations();
 			operations.release_burst(operations.state, records, 1);
+			std::_Exit(EXIT_SUCCESS);
 		},
 		"");
 }
@@ -413,11 +547,12 @@ TEST(packet_record, fixed_pool_rejects_empty_retirement_burst)
 		{
 			auto pool_or = fixed_packet_pool::create(provider_free_pool_options(1, 64, 0, 64, 3, 5));
 			if (!pool_or.is_ok()) {
-				std::terminate();
+				std::_Exit(EXIT_SUCCESS);
 			}
 			auto pool = std::move(pool_or).value();
 			const auto &operations = pool->operations();
 			operations.release_burst(operations.state, nullptr, 0);
+			std::_Exit(EXIT_SUCCESS);
 		},
 		"");
 }
@@ -452,6 +587,62 @@ TEST(packet_record, fixed_pool_origin_copy_validates_before_storage_credit)
 	operations.release_burst(operations.state, records, accepted);
 	EXPECT_EQ(pool->outstanding(), 0u);
 	EXPECT_EQ(pool->available_approx(), 2u);
+}
+
+/** @brief Every immutable return fact rejects before publication, including later malformed records. */
+TEST(packet_record, fixed_pool_rejects_complete_malformed_return_class_before_publication)
+{
+	for (const auto *fault : {"generation", "domain", "capabilities", "segments", "operations", "data",
+				  "unaligned_data", "handle", "foreign_handle", "null_entry", "unaligned", "foreign",
+				  "duplicate_prefix", "duplicate_return", "empty", "null_state", "null_array"}) {
+		SCOPED_TRACE(fault);
+		EXPECT_EXIT(reject_return(fault), ::testing::ExitedWithCode(86), "return rejected before publication");
+	}
+}
+
+/** @brief Reacquisition initializes every metadata byte over the full uint16 operation range. */
+TEST(packet_record, fixed_pool_initialized_prefixes_survive_poisoned_reuse)
+{
+	const auto expected = expected_empty_metadata();
+	for (const uint32_t population : {1u, 2u, 63u, 64u, 65u, 4096u, 65537u}) {
+		SCOPED_TRACE(population);
+		auto made = fixed_packet_pool::create(provider_free_pool_options(population, 385, 128, 64, 7, 11));
+		ASSERT_TRUE(made.is_ok()) << made.error().message();
+		auto pool = std::move(made).value();
+		const auto &operations = pool->operations();
+		std::vector<packet_record *> records(65536u, nullptr);
+		for (uint32_t round = 0; round < 4u; ++round) {
+			for (const uint16_t request : {uint16_t{0}, uint16_t{1}, uint16_t{63}, uint16_t{64},
+						       uint16_t{65}, uint16_t{UINT16_MAX}}) {
+				std::fill(records.begin(), records.end(), nullptr);
+				const auto accepted =
+					operations.acquire_burst(operations.state, records.data(), request);
+				EXPECT_EQ(accepted, std::min<uint32_t>(request, population));
+				for (uint16_t ordinal = 0; ordinal < accepted; ++ordinal) {
+					auto &record = *records[ordinal];
+					EXPECT_EQ(std::memcmp(&record.metadata, &expected, sizeof(expected)), 0);
+					EXPECT_EQ(record.storage.length, 0u);
+					EXPECT_EQ(record.storage.contiguous_length, 0u);
+					EXPECT_EQ(record.storage.native_handle, &record);
+					EXPECT_EQ(reinterpret_cast<std::uintptr_t>(record.storage.data) % 64u, 0u);
+					std::memset(&record.metadata, 0xa5, sizeof(record.metadata));
+					record.storage.length = 129;
+					record.storage.contiguous_length = 129;
+				}
+				EXPECT_TRUE(std::all_of(records.begin() + accepted, records.end(),
+							[](auto *record) { return record == nullptr; }));
+				if (round == 0 && request == 63 && accepted > 1) {
+					EXPECT_EQ(reinterpret_cast<std::uintptr_t>(records[1]->storage.data) -
+							  reinterpret_cast<std::uintptr_t>(records[0]->storage.data),
+						  448u);
+				}
+				if (accepted != 0) {
+					operations.release_burst(operations.state, records.data(), accepted);
+				}
+			}
+		}
+		EXPECT_EQ(pool->available_approx(), population);
+	}
 }
 
 }  // namespace kinetum::dp

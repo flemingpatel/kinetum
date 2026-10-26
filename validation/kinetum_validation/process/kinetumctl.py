@@ -606,9 +606,11 @@ class KinetumCtl:
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
+                stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env=exact_subprocess_environment(),
+                start_new_session=True,
             )
 
             stdout, stderr = await communicate_bounded_subprocess(

@@ -19,7 +19,8 @@
 
 ### 1.1 General Rule
 
-All identifiers use `snake_case` unless specified otherwise below.
+The following conventions apply to C and C++ identifiers. Python conventions
+follow the table.
 
 | Element | Convention | Example |
 |---------|-----------|---------|
@@ -27,13 +28,18 @@ All identifiers use `snake_case` unless specified otherwise below.
 | Member variables (private) | `snake_case` with trailing underscore | `state_`, `plan_`, `cores_` |
 | Functions and methods | `snake_case` | `probe_host()`, `maybe_pin_worker_()` |
 | Classes and structs | `snake_case` | `partitioned_runtime`, `host_topology` |
-| Enum class names | `snake_case` | `provider_role`, `log_level` |
-| Enum values | `UPPER_CASE` | `IO_DRIVER`, `STORAGE_DOMAIN`, `RUNNING` |
+| Enum class names | `snake_case` | `provider_contract_role`, `log_level` |
+| Enum values | `UPPER_CASE` | `IO_DRIVER`, `PACKET_STORAGE`, `RUNNING` |
 | Namespaces | `snake_case` | `kinetum::quark`, `kinetum::dp` |
 | File names | `snake_case` | `runtime_compat.hpp`, `dp_main.cpp` |
-| Constants (`constexpr`, `const`) | `UPPER_CASE` | `DEFAULT_TIMEOUT`, `MAX_BATCH_SIZE` |
+| Named constants | `UPPER_CASE` | `DEFAULT_TIMEOUT`, `MAX_BATCH_SIZE` |
 | Macros | `UPPER_CASE` with prefix | `KINETUM_LOG_ERROR`, `KINETUM_UNLIKELY` |
 | Template parameters | `snake_case` | `template <typename value_type>` |
+
+Ordinary local variables retain `snake_case` when declared `const`.
+Python uses `snake_case` for modules, functions and variables, `CapWords` for
+classes, `UPPER_CASE` for constants, and a leading underscore for non-public
+members, following [PEP 8](https://peps.python.org/pep-0008/#naming-conventions).
 
 ### 1.2 Framework-Mandated Exceptions
 
@@ -48,14 +54,16 @@ framework APIs, use the framework's convention. Do not wrap or rename.
 | gRPC generated | PascalCase service classes | `ControlService::Service` | Generated code in `gen/` |
 | DPDK | snake_case with `rte_` prefix | `rte_eal_init()`, `rte_mbuf` | `src/dp/backends/dpdk/` |
 
-Rule: framework-mandated identifiers are used as-is at the call site. Internal code
-wrapping or extending framework types must follow our `snake_case` convention.
+Framework-mandated identifiers are used as-is at the call site. Other identifiers
+in wrappers and extensions follow the conventions for their language.
 
 ---
 
 ## 2. Comment Style
 
 ### 2.1 Three Comment Syntaxes
+
+For C and C++:
 
 | Syntax | Purpose | Parsed by Doxygen |
 |--------|---------|-------------------|
@@ -98,9 +106,8 @@ functions, and methods.
  * @param host Host topology from probe_host().
  * @return Compatibility decision and bounded diagnostics.
  */
-compat_report validate_runtime_compat(
-    const kinetum::provider::compiled_provider_topology& topology,
-    const host_topology& host);
+compat_report validate_runtime_compat(const kinetum::provider::compiled_provider_topology &topology,
+				      const host_topology &host);
 ```
 
 Document an out-of-line function's purpose, parameters, return, ownership,
@@ -115,7 +122,7 @@ Doxygen. Put implementation reasoning in `//` comments beside the relevant code.
 
 Every authored Python module starts with a concise module docstring. Every
 class, exception, public or private function, method, property, and nested
-callable has a docstring unless it is a framework-mandated one-line protocol
+named function has a docstring unless it is a framework-mandated one-line protocol
 method whose inherited contract is exact and obvious. Tests follow the same
 rule; a test method's docstring states the behavior proved, not the mechanics of
 the assertions.
@@ -133,8 +140,8 @@ bounds that a caller must know. Do not copy type annotations into prose. A
 module or class docstring owns shared context once; individual methods document
 only their distinct contract.
 
-Generated Python and third-party code are excluded. The complete owned Python
-tree is checked for missing declarations rather than only changed files.
+Generated Python and third-party code are excluded. Check the complete owned
+Python tree for missing declaration documentation, not only changed files.
 
 ### 2.5 Trailing Member Documentation (`///<`)
 
@@ -143,18 +150,18 @@ enum values:
 
 ```cpp
 enum class log_level {
-  DEBUG = 1,  ///< Cold detail, emitted only when the selected filter admits it.
-  INFO = 2,   ///< Informational record.
-  WARN = 3,   ///< Warning record.
-  ERROR = 4,  ///< Error record.
-  FATAL = 5,  ///< Critical diagnostic; the caller owns the terminal action.
+	DEBUG = 1,  ///< Cold detail, emitted only when the selected filter admits it.
+	INFO = 2,   ///< Informational record.
+	WARN = 3,   ///< Warning record.
+	ERROR = 4,  ///< Error record.
+	FATAL = 5,  ///< Critical diagnostic; the caller owns the terminal action.
 };
 
 struct host_topology {
-  std::vector<host_cpu> cpus;  ///< Sorted CPU IDs with exact/unknown NUMA ownership.
-  std::vector<int32_t> memory_numa_nodes;  ///< Sorted nodes with available memory.
-  int32_t online_count{0};  ///< Number of system-online CPUs.
-  bool valid{false};  ///< Whether topology discovery succeeded.
+	std::vector<host_cpu> cpus;		 ///< Sorted CPU IDs with exact/unknown NUMA ownership.
+	std::vector<int32_t> memory_numa_nodes;	 ///< Sorted nodes with available memory.
+	int32_t online_count{0};		 ///< Number of system-online CPUs.
+	bool valid{false};			 ///< Whether topology discovery succeeded.
 };
 ```
 
@@ -184,7 +191,7 @@ Comment quality rules:
 ### 3.1 Header Files (`.hpp`)
 
 ```cpp
-// Copyright (c) 2026 Fleming Patel. All rights reserved.
+// Copyright (c) <year> <copyright holder>. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
 #pragma once
@@ -192,12 +199,9 @@ Comment quality rules:
 /**
  * @file filename.hpp
  * @brief Single-line purpose statement.
- * @author Fleming Patel
+ * @author <author name>
  *
- * Detailed description (1-3 paragraphs):
- * - Architecture overview
- * - Key design decisions
- * - Usage patterns
+ * Additional ownership, design, or usage context when needed.
  *
  * @par Thread Safety
  * Thread safety guarantees (if applicable).
@@ -206,7 +210,8 @@ Comment quality rules:
 #include <standard_library>
 #include "project/includes"
 
-namespace kinetum::subsystem {
+namespace kinetum::subsystem
+{
 
 // declarations
 
@@ -223,13 +228,13 @@ prefer the owning header.
 ### 3.2 Source Files (`.cpp`)
 
 ```cpp
-// Copyright (c) 2026 Fleming Patel. All rights reserved.
+// Copyright (c) <year> <copyright holder>. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
 /**
  * @file filename.cpp
  * @brief Single-line purpose statement.
- * @author Fleming Patel
+ * @author <author name>
  *
  * Implementation details (if needed beyond header docs).
  */
@@ -239,7 +244,8 @@ prefer the owning header.
 #include <standard_library>
 #include "project/includes"
 
-namespace kinetum::subsystem {
+namespace kinetum::subsystem
+{
 
 // implementation
 
@@ -248,10 +254,14 @@ namespace kinetum::subsystem {
 
 ### 3.3 File Header Rules
 
-1. **License first.** Lines 1-2 are always copyright + SPDX. Use `//` (not parsed by Doxygen).
+For authored C and C++ files:
+
+1. **License first.** Copyright and SPDX precede code. Preserve existing notices;
+   fill new-file template placeholders with the actual year and copyright holder.
+   Use `//` (not parsed by Doxygen).
 2. **`#pragma once`** for all headers. No `#ifndef` include guards.
 3. **`@file` block** uses `/** */` (parsed by Doxygen). Placed after `#pragma once` in headers, after license in source files.
-4. **`@author Fleming Patel`** in every `@file` block.
+4. **`@author`** names the actual author; preserve existing attribution.
 5. **Include order:** own header first (in `.cpp`), then standard library, then project includes.
 
 ### 3.4 License Declaration Scope
@@ -279,6 +289,8 @@ clang-format -i <file>
 
 ### 4.2 Key Formatting Rules
 
+For C and C++, as configured in `.clang-format`:
+
 - Indentation: tabs, 8-wide (Linux kernel style)
 - Column limit: 120
 - Braces: K&R style for control structures, own line for functions
@@ -291,7 +303,8 @@ clang-format -i <file>
 ### 4.3 Python Lint
 
 Owned Python code must pass Flake8 and Pylint with the repository configurations
-before handoff. Fix production findings instead of adding suppressions.
+before handoff. Use four-space indentation and the configured 120-column limit.
+Fix production findings instead of adding suppressions.
 
 ---
 
@@ -318,7 +331,7 @@ another target.
 
 ### 5.2 Constants
 
-Use `constexpr` for compile-time constants. Use `UPPER_CASE` naming:
+In C++, use `constexpr` for named compile-time constants and `UPPER_CASE` naming:
 
 ```cpp
 constexpr int MAX_BATCH_SIZE = 64;
@@ -326,25 +339,29 @@ constexpr uint64_t FNV1A_OFFSET_BASIS = 14695981039346656037ULL;
 constexpr auto DEFAULT_TIMEOUT = std::chrono::seconds(30);
 ```
 
-Do not use `#define` for constants. Do not use the `k` prefix (e.g., `kMaxSize`).
+Do not use `#define` for C++ constants or the `k` prefix (e.g., `kMaxSize`).
+The C ABI uses prefixed macros where C11 requires them.
 
 ### 5.3 Enums
 
-Use `enum class` (scoped enums). Enum class names are `snake_case`.
-Enum values are `UPPER_CASE`:
+In C++, use `enum class` (scoped enums). Enum class names are `snake_case`;
+values are `UPPER_CASE`. C ABI enumerators retain their `KINETUM_` prefix.
 
 ```cpp
-enum class provider_role {
-  PROCESS_FACILITY,   ///< Process- or device-scoped native environment
-  IO_DRIVER,          ///< Packet ingress/egress implementation
-  STORAGE_DOMAIN,     ///< Packet record and payload ownership
-  EXECUTION_PROVIDER, ///< Stage execution target
+enum class provider_contract_role : uint8_t {
+	PROCESS_FACILITY,    ///< Generation-scoped process service.
+	IO_DRIVER,	     ///< Native endpoint and queue-transfer owner.
+	PACKET_STORAGE,	     ///< Packet byte/record ownership domain.
+	EXECUTION,	     ///< Stage execution resource owner.
+	STORAGE_TRANSITION,  ///< Explicit storage-domain handoff mechanism.
 };
 ```
 
 ### 5.4 Namespaces
 
-All platform code lives under `kinetum::` with a subsystem qualifier:
+C++ interfaces live under `kinetum::` with a subsystem qualifier; C ABI entry
+points retain C linkage. File-local implementation helpers use an anonymous
+namespace.
 
 | Namespace | Subsystem |
 |-----------|-----------|
@@ -550,8 +567,9 @@ size, alignment, standard-layout/trivial-copy properties where applicable, and
 every field offset. Cache-line writer/reader ownership belongs in the type's
 Doxygen. A C ABI uses fixed-width storage and is compiled as both C11 and C++20.
 
-ABI admission requires exact generated identity in both older and newer
-directions. Callback presence, padding, descriptor size, or matching major
+Module admission requires exact `KINETUM_MODULE_ABI_VERSION` equality; provider
+admission requires the exact generated ABI identity. Both reject older and newer
+mismatches. Callback presence, padding, descriptor size, or matching major
 version never implies compatibility. An intentional layout change updates the
 single header, all implementations, layout assertions, rejection fixtures,
 SDK docs, and package proofs in one cut. No dual reader or defaulting shim
@@ -613,6 +631,9 @@ for the ownership and publication rules, and
 
 ## 7. Error Handling
 
+The following rules govern C++ status returns and C ABI boundaries. Python uses
+exceptions with the documented ownership and cleanup contracts in Section 2.4.
+
 - Use `kinetum::common::status` and `kinetum::common::status_or<T>` for
   fallible operations. A `status_or<T>` alternative is fixed at construction;
   replace a surrounding owner instead of assigning the result object.
@@ -655,11 +676,18 @@ Google Test fixtures use PascalCase per framework convention:
 
 ```cpp
 class CpStatsForwardingTest : public ::testing::Test {
- protected:
-  void SetUp() override { ... }
+    protected:
+	void SetUp() override
+	{
+		...
+	}
 };
 
-TEST_F(CpStatsForwardingTest, forwards_aggregate_counters) { ... }
+/** @brief Forward aggregate dataplane counters in the CP reply. */
+TEST_F(CpStatsForwardingTest, forwards_aggregate_counters)
+{
+	...
+}
 ```
 
 Test case names (second argument to `TEST` / `TEST_F`) use `snake_case`.
