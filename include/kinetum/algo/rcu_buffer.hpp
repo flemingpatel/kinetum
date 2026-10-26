@@ -10,26 +10,29 @@
  *
  * This implements a Read-Copy-Update inspired double buffer pattern:
  * - Two storage slots, one active, one standby
- * - Reader pins current slot via atomic counter
+ * - Reader pins current slot and revalidates publication
  * - Writer waits for readers == 0 before writing to standby
- * - Lock-free hot path (reader pins via atomic counter)
- * - Cold path waits for readers to leave the active slot
+ * - borrow() retries publication changes; try_borrow() makes one attempt
+ * - Copying readers inherit the value type's cost and exception behavior
  *
  * @section rcu_design Design Philosophy
  *
- * The key insight: WRITER waits, not READER.
- * - Reader: Lock-free read with RAII guard
- * - Writer: May wait for a grace period
+ * A writer waits before reusing a pinned slot. Readers revalidate slot identity
+ * before accessing the value and retain their pin throughout that access.
+ * - borrow(): retries publication changes without a per-call retry bound
+ * - try_borrow(): one pin/revalidation attempt, returning empty on a race
+ * - Writer: may wait for readers of the inactive slot to finish
  *
- * This is the opposite of seqlock where reader retries on torn read.
+ * Revalidation precedes payload access; readers do not copy a value and then
+ * check whether that copy raced a writer.
  * Publication is cold work per Platform Engineering Guide. Kinetum uses this
- * primitive for CP published state and guardrails policy; DP packet
- * configuration uses its own exact generation-bound slots.
+ * primitive for CP active-state, guardrails-policy and evaluation publications.
+ * DP packet configuration uses its own exact generation-bound slots.
  *
  * @section rcu_safety Thread Safety
  *
- * - Multiple readers: Safe (lock-free, concurrent)
- * - Single writer: Safe (serialized externally or via mutex)
+ * - Multiple readers: Safe (concurrent slot pins)
+ * - Single writer: Safe (callers serialize multiple writers)
  * - Reader + writer: Safe (RCU protocol guarantees no torn reads)
  *
  * Active-slot publication, reader pinning/revalidation, and the writer's
@@ -39,18 +42,19 @@
  * ordering: the writer's acquiring zero check then observes completed reads.
  *
  * @par Lifetime
- * Every read guard must resolve before its buffer is destroyed. Destruction
- * with a live pin emits one fixed diagnostic and terminates before reader
- * storage can be reclaimed.
+ * All calls must be quiescent and every read guard resolved before buffer
+ * destruction. Destruction with a live pin emits one fixed diagnostic and
+ * terminates before reader storage can be reclaimed; this check does not
+ * synchronize destruction with new calls.
  *
  * @section rcu_performance Synchronization Characteristics
  *
  * | Operation | Behavior |
  * |-----------|----------|
- * | borrow()  | Pins current slot with an RAII guard |
- * | try_borrow() | Returns empty if a swap is in progress |
- * | get() (copy) | Copies from the active slot under a guard |
- * | store() | Waits for readers before updating standby |
+ * | borrow() | Pins a slot, retrying if publication changes |
+ * | try_borrow() | One attempt; empty when revalidation rejects the slot |
+ * | get() (copy) | Borrows then copies T; copying may allocate or throw |
+ * | store() | Waits for inactive-slot readers before reuse |
  *
  * @section rcu_usage Usage
  *
@@ -66,7 +70,7 @@
  *     process(guard->field1, guard->field2);
  * } // guard releases automatically
  *
- * // Reader (hot path) - copy for local use
+ * // Reader - copy for local use, with T's copy cost
  * my_config copy = buffer.get();
  * @endcode
  */
@@ -155,16 +159,15 @@ inline void spin_backoff(uint32_t iteration) noexcept
 // =============================================================================
 
 /**
- * @brief RCU-style double buffer for lock-free reading with writer grace period.
+ * @brief Double-buffered publication with pinned readers and writer grace.
  *
- * @tparam T Value type. Can be any type (trivially copyable or complex like
- *           std::string, std::vector). Complex types work because:
- *           - Writer waits for readers == 0 before modifying standby
- *           - A guard excludes writer mutation of its pinned slot
- *           - No concurrent read/write ever happens
+ * @tparam T Default-constructible value type. store()/emplace() require assignment
+ *           from T&&; copying readers also require copy construction. Nontrivial
+ *           types such as std::string and std::vector are supported because a
+ *           writer never modifies a pinned value.
  *
  * Thread safety:
- * - Multiple readers: Safe (lock-free)
+ * - Multiple readers: Safe (concurrent slot pins)
  * - Single writer: Safe (must be externally serialized if multiple writers)
  * - Reader + writer: Safe (RCU protocol)
  */
@@ -393,7 +396,7 @@ class rcu_buffer {
 		// Grace period: wait for readers on inactive slot
 		wait_for_readers(next);
 
-		// Construct in-place
+		// Assign the replacement constructed from the caller's arguments.
 		slots_[next].value = T(std::forward<Args>(args)...);
 
 		// Publish
@@ -402,16 +405,16 @@ class rcu_buffer {
 	}
 
 	// =========================================================================
-	// Reader Interface (Hot Path)
+	// Reader Interface
 	// =========================================================================
 
 	/**
-	 * @brief Borrow a read guard (hot path, lock-free).
+	 * @brief Borrow a pinned read guard, retrying publication changes.
 	 *
 	 * Returns an RAII guard that pins the current slot. The slot will not be
 	 * overwritten while any guard exists.
 	 *
-	 * May retry briefly if caught during the exact moment of a swap.
+	 * Concurrent publication can force retries; there is no per-call retry bound.
 	 *
 	 * @return RAII guard providing access to current value
 	 */
@@ -455,10 +458,10 @@ class rcu_buffer {
 	}
 
 	/**
-	 * @brief Get a copy of the current value (hot path).
+	 * @brief Copy the current value under a borrowed guard.
 	 *
 	 * Convenience method that borrows, copies, and releases under one guard.
-	 * Use when you need a local copy to work with.
+	 * Inherits borrow()'s retries and T's copy cost, allocation and exceptions.
 	 *
 	 * @return Copy of current value
 	 */
@@ -470,6 +473,8 @@ class rcu_buffer {
 
 	/**
 	 * @brief Try once to get a copy without retry.
+	 *
+	 * A successful borrow still incurs T's copy cost, allocation and exceptions.
 	 *
 	 * @return Copy if successful, std::nullopt if slot was changing
 	 */
@@ -502,12 +507,12 @@ class rcu_buffer {
 
 	/**
 	 * @brief Wait for all readers on a slot to finish.
- *
+	 *
 	 * Before reuse, the writer has published the other slot. That publication
 	 * and this zero check share the reader's pin/revalidation order, so an
 	 * accepted older reader remains counted. The acquiring load also pairs
 	 * with the last reader's release.
- *
+	 *
 	 * @param slot_idx Slot to wait on
 	 */
 	void wait_for_readers(uint8_t slot_idx)
@@ -542,7 +547,7 @@ class rcu_buffer {
  *
  * Extends rcu_buffer with:
  * - Version number (epoch) for each stored value
- * - Version query without full borrow
+ * - Exact version accessible through the pinned guard
  *
  * Used by control-plane published state and guardrails policy readers.
  */
@@ -726,7 +731,7 @@ class versioned_rcu_buffer {
 	// =========================================================================
 
 	/**
-	 * @brief Borrow with epoch access (hot path).
+	 * @brief Borrow the value and epoch, retrying publication changes.
 	 * @return Guard pinning the current value and its epoch.
 	 */
 	[[nodiscard]] read_guard borrow() const
@@ -748,7 +753,7 @@ class versioned_rcu_buffer {
 	}
 
 	/**
-	 * @brief Get a copy of the current value (hot path).
+	 * @brief Copy the current value, inheriting borrow retries and T's copy behavior.
 	 * @return Copy read under one slot guard.
 	 */
 	[[nodiscard]] T get() const
@@ -758,6 +763,7 @@ class versioned_rcu_buffer {
 
 	/**
 	 * @brief Try to get a copy without retry.
+	 * A successful borrow still incurs T's copy cost, allocation and exceptions.
 	 * @return Copy on success, or empty when publication changed concurrently.
 	 */
 	[[nodiscard]] std::optional<T> try_get() const

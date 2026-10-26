@@ -16,13 +16,14 @@ from .trex_protocol import REMOTE_REQUEST_KEYS, generation_pgid_layout, require_
 
 
 _REMOTE_TREX_SCRIPT_TEMPLATE = r"""
-'''Execute one admitted TRex action and retire its exact client and port claims.'''
+'''Execute one admitted TRex action; retire or hand off its acknowledged port claims.'''
 
 import contextlib
 import ipaddress
 import json
 import math
 import os
+import select
 import struct
 import sys
 import time
@@ -67,10 +68,46 @@ def reject_duplicate_pairs(pairs):
     return result
 
 
+def read_request_frame():
+    '''Read one bounded newline-terminated JSON frame without consuming the cancellation channel.'''
+    frame = bytearray()
+    while len(frame) <= JSON_DOCUMENT_CAPACITY:
+        chunk = os.read(sys.stdin.fileno(), min(65536, JSON_DOCUMENT_CAPACITY + 1 - len(frame)))
+        if not chunk:
+            raise ValueError("remote spec ended before its frame delimiter")
+        frame.extend(chunk)
+        if b"\n" in chunk:
+            if chunk.index(b"\n") != len(chunk) - 1 or len(frame) == 1:
+                raise ValueError("remote spec has extra or empty framing")
+            return bytes(frame[:-1])
+    raise ValueError("remote spec exceeds its frame bound")
+
+
+def check_cancellation(timeout_s=0.0):
+    '''Observe EOF only between client operations, never interrupting a mutating RPC.'''
+    readable, _, _ = select.select([sys.stdin], [], [], timeout_s)
+    if readable:
+        if os.read(sys.stdin.fileno(), 1):
+            raise ValueError("unexpected input after the remote request")
+        raise InterruptedError("remote request channel closed")
+
+
+def wait_for_traffic(client, ports, timeout):
+    '''Poll cancellation while traffic runs, then preserve TRex's own RX-filter retirement.'''
+    deadline = time.monotonic() + timeout
+    while client.is_traffic_active(ports=ports):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError("remote traffic completion timed out")
+        check_cancellation(min(remaining, 0.01))
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise RuntimeError("remote traffic completion timed out")
+    client.wait_on_traffic(ports=ports, timeout=remaining)
+
+
 try:
-    raw_spec = sys.stdin.buffer.read(JSON_DOCUMENT_CAPACITY + 1)
-    if not raw_spec or len(raw_spec) > JSON_DOCUMENT_CAPACITY:
-        raise ValueError("remote spec is empty or oversized")
+    raw_spec = read_request_frame()
     spec = json.loads(
         raw_spec.decode("utf-8"),
         object_pairs_hook=reject_duplicate_pairs,
@@ -706,8 +743,10 @@ client = None
 promisc_ports = []
 release_ports_on_exit = True
 try:
+    check_cancellation()
     client = STLClient(server=spec["trex_server"])
     connect_client(client)
+    check_cancellation()
     ports = list(spec["ports"])
 
     if action in {
@@ -1023,6 +1062,9 @@ try:
     num_flows = spec["num_flows"]
     per_stream_pps = float(spec["pps"]) / float(len(ingress_ports) * num_flows)
     admitted_identity = admit_instrument(client, ports, egress_ports, 0)
+    for operation in ("is_traffic_active", "wait_on_traffic"):
+        if not callable(getattr(client, operation, None)):
+            fail("TRex API lacks traffic completion operation: " + operation, 2)
     with contextlib.redirect_stdout(sys.stderr):
         acquire_ports(client, ports)
         client.reset(ports=ports)
@@ -1053,10 +1095,7 @@ try:
     start_mono = time.monotonic()
     with contextlib.redirect_stdout(sys.stderr):
         client.start(ports=ingress_ports, duration=duration_s, force=True)
-        client.wait_on_traffic(
-            ports=ingress_ports,
-            timeout=duration_s + 30.0,
-        )
+        wait_for_traffic(client, ingress_ports, duration_s + 30.0)
         client.get_stats(ports=ports)
         port_counter_final = absolute_port_counters(client, ports)
     elapsed_s = time.monotonic() - start_mono
@@ -1092,6 +1131,8 @@ try:
     }
 
     emit(payload_out)
+except InterruptedError:
+    fail("TRex remote action cancelled", 130)
 except Exception as exc:  # pragma: no cover - depends on endpoint runtime
     fail("TRex remote execution failed: {}".format(exc), 1)
 finally:

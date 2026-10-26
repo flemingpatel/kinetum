@@ -130,7 +130,7 @@ Vocabulary you'll see throughout this doc:
 | **Idempotency key**   | Caller identity. Snapshot, policy, Confirm, and safety-intent retries bind it to their exact durable content/result identity. No volatile key cache exists. |
 | **CAS check**         | Presence of `expected_revision`, including zero, causes `failed_precondition` if current revision differs. Absence skips CAS. |
 | **Exact transition identity** | CP-allocated epoch, mutation sequence, validation hash, and idempotency key shared by Prepare, Activate, Abort, and Status. CP durably constructs it and the exact DP client carries it unchanged through every retry. |
-| **RCU buffer**        | `versioned_rcu_buffer` - lock-free single-writer/many-reader publishing primitive, used for `cp_published_state` and `GuardrailsPolicy`. |
+| **RCU buffer**        | `versioned_rcu_buffer` publishes to pinned readers; its sole writer waits before reusing a pinned slot. Used for `cp_published_state` and `GuardrailsPolicy`. |
 | **Pending confirm**   | Optional state embedded in `TRANSITION_AUTHORITY.pb`, created atomically with exact COMPLETE promotion. Confirmation retains one keyed success until the next allocation. |
 | **Rollback intent**   | One durable desired action carrying guarded/target content, cause, policy/runtime generation, optional predecessor sequence, retained key, and observation times. It is not a second transition state machine. |
 | **Evaluator state**   | `UNCONFIGURED`, `DISABLED`, `BASELINE_BUILDING`, `ARMED`, `EVALUATING`, or `ROLLBACK_PENDING`. |
@@ -358,7 +358,7 @@ the submitter, destroys the context, and occurs before revision CAS, durable
 store work, DP contact, or idempotency-key consumption.
 
 Every enqueue and dequeue participates in the same mutex protocol as the
-condition-variable predicate. The generic MPMC primitive supplies bounded,
+condition-variable predicate. The generic MPMC primitive supplies fixed-capacity,
 allocation-free cell publication; the mutex closes the check-to-wait edge and
 makes `queue_depth()` exact. These are distinct responsibilities, not two
 competing queue authorities. Multiple gRPC threads may submit concurrently,
@@ -1032,10 +1032,11 @@ struct guardrails_runtime_state {
 };
 ```
 
-The `handle_set_guardrails_policy_` mutation handler is the only writer. It
-publishes only after the config store durably commits the same generation and
-hash. The guardrails runner reads this low-cost process-local view;
-`GetGuardrails` reads the durable record directly. There is one semantic writer
+The control loop restores or initializes policy before starting its worker.
+During live operation, `handle_set_guardrails_policy_` publishes only after the
+config store durably commits the same generation and hash. The guardrails runner
+reads this process-local view; `GetGuardrails` reads the durable record directly.
+There is one semantic writer
 and no service-local policy copy.
 
 #### 12.3 `validate_guardrails_policy()` shared free function

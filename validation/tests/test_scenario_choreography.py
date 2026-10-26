@@ -1075,6 +1075,53 @@ class TestScenarioChoreography(unittest.IsolatedAsyncioTestCase):
             self.assertIn("exited before harness-requested shutdown: 1", str(raised.exception))
             self.assertTrue(str(raised.exception).startswith("validation cleanup reported failures:"))
 
+    async def test_cancelled_traffic_task_is_control_flow_without_masking_cleanup_failure(self) -> None:
+        """Expected interruption stays quiet after retirement; a real cleanup failure still wins."""
+        for failure in (None, RuntimeError('injected retirement failure')):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as directory:
+                reporter = MagicMock()
+                orchestrator = ValidationOrchestrator(_config(Path(directory), ValidationTestType.STANDARD), reporter)
+                traffic = MagicMock(stop_capture=AsyncMock())
+                orchestrator._traffic = traffic  # pylint: disable=protected-access
+                sender = MagicMock(abort=AsyncMock(side_effect=failure))
+                work = asyncio.create_task(asyncio.Event().wait())
+
+                async def interrupt_and_retire(owner=orchestrator, source=sender, task=work):
+                    """Deliver cancellation while this owner retires its separately owned task."""
+                    asyncio.current_task().cancel()
+                    await owner.scenario_context().retire_scenario_traffic(
+                        'scenario', source, task, cancel_task=True, capture_active=True,
+                    )
+
+                caller = asyncio.create_task(interrupt_and_retire())
+                expected = asyncio.CancelledError if failure is None else RuntimeError
+                with self.assertRaises(expected) as raised:
+                    await caller
+                if failure is None:
+                    reporter.print_warning.assert_not_called()
+                else:
+                    self.assertIn('CancelledError', str(raised.exception))
+                    self.assertIn('injected retirement failure', str(raised.exception))
+                self.assertTrue(work.done())
+                sender.abort.assert_awaited_once()
+                sender.cleanup.assert_called_once()
+                traffic.stop_capture.assert_awaited_once()
+
+    async def test_cleanup_cancellation_cannot_hide_another_owners_failure(self) -> None:
+        """A later real retirement failure remains fatal after an earlier owner's cancellation."""
+        with tempfile.TemporaryDirectory() as directory:
+            orchestrator = ValidationOrchestrator(_config(Path(directory), ValidationTestType.STANDARD), MagicMock())
+            traffic = MagicMock(teardown=AsyncMock(side_effect=asyncio.CancelledError()))
+            backend = MagicMock(teardown=AsyncMock(side_effect=RuntimeError('backend failure')))
+            orchestrator._traffic = traffic  # pylint: disable=protected-access
+            orchestrator._backend = backend  # pylint: disable=protected-access
+            supervisor = MagicMock(stop_all=AsyncMock())
+            orchestrator._supervisor = supervisor  # pylint: disable=protected-access
+            with self.assertRaisesRegex(RuntimeError, 'backend failure') as raised:
+                await orchestrator._cleanup()  # pylint: disable=protected-access
+            self.assertIn('CancelledError', str(raised.exception))
+            supervisor.stop_all.assert_awaited_once()
+
     async def test_unexpected_orchestration_error_cannot_become_partial_success(self) -> None:
         """Execution evidence and every cleanup owner survive joint failure."""
         with tempfile.TemporaryDirectory() as directory:

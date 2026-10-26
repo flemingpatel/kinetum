@@ -380,7 +380,7 @@ class NativeSender:
         return stats
 
     async def _spawn_sender(self, cmd: list[str], generation_tagged: bool) -> None:
-        """Spawn one child while closing the SIGUSR1 startup race.
+        """Isolate terminal signals and close the SIGUSR1 startup race for one child.
 
         Generation mode blocks SIGUSR1 on the creating thread before spawn, so
         the child inherits a blocked signal. The native image installs its
@@ -391,9 +391,11 @@ class NativeSender:
         if not generation_tagged:
             self._process = await asyncio.create_subprocess_exec(
                 *cmd,
+                stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env=exact_subprocess_environment(),
+                start_new_session=True,
             )
             return
 
@@ -409,9 +411,11 @@ class NativeSender:
         try:
             self._process = await asyncio.create_subprocess_exec(
                 *cmd,
+                stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env=exact_subprocess_environment(),
+                start_new_session=True,
             )
         except BaseException:
             try:

@@ -41,9 +41,9 @@ from ..engine.json_contract import (
 )
 from ..process.system_tools import (
     SSH_EXECUTABLE,
-    communicate_bounded_subprocess,
     exact_subprocess_environment,
     require_system_executable,
+    communicate_cooperative_subprocess,
 )
 from ..config.types import (
     AnalysisResult,
@@ -963,7 +963,7 @@ class TRexTrafficDriver(TrafficDriver):
     def _validate_remote_request(self, spec: Dict[str, Any]) -> str:
         """Validate one complete endpoint request before starting SSH."""
         action = require_string(spec.get("action"), "TRex action")
-        if action not in _REMOTE_REQUEST_KEYS:
+        if action not in _REMOTE_REQUEST_KEYS or action not in _REMOTE_SUCCESS_KEYS:
             raise RuntimeError("trex remote action is undeclared")
         require_exact_keys(spec, _REMOTE_REQUEST_KEYS[action], f"TRex {action} request")
         self._require_exact_port_array(
@@ -1187,27 +1187,31 @@ class TRexTrafficDriver(TrafficDriver):
         cmd = self._ssh_prefix + [self._remote_shell_command(remote_args)]
         timeout_s = self._remote_timeout_s(spec)
         log_info("trex", f"remote action: {action}")
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=exact_subprocess_environment(),
-        )
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=exact_subprocess_environment(),
+                start_new_session=True,
+            )
+        except BaseException:
+            # No request bytes crossed stdin, so a remote action cannot have
+            # started. Do not issue a compensating port mutation for that case.
+            if action == "generation_start":
+                self._active_generation_session = None
+            raise
         self._remote_proc = proc
         if action == "exchange_udp":
             self._udp_exchange_incomplete = True
         try:
-            stdout, stderr = await communicate_bounded_subprocess(
+            stdout, stderr, interruption = await communicate_cooperative_subprocess(
                 proc,
                 timeout_s,
                 _REMOTE_TERMINATE_GRACE_S,
-                spec_bytes,
+                spec_bytes + b"\n",
             )
-        except asyncio.TimeoutError as exc:
-            raise RuntimeError(
-                f"trex remote action '{action}' timed out after {timeout_s:.1f}s"
-            ) from exc
         finally:
             if self._remote_proc is proc and proc.returncode is not None:
                 self._remote_proc = None
@@ -1228,6 +1232,8 @@ class TRexTrafficDriver(TrafficDriver):
         if stderr:
             self._log_remote_stderr(stderr_text)
 
+        # Completion can win the interruption race. Its reply still passes the
+        # ordinary action contract before cancellation or timeout propagates.
         try:
             payload = self._parse_remote_stdout(stdout)
         except RuntimeError as exc:
@@ -1239,35 +1245,53 @@ class TRexTrafficDriver(TrafficDriver):
                 raise RuntimeError(message) from exc
             raise
 
-        if "ok" not in payload:
-            raise RuntimeError("trex remote action omitted its result classification")
-        ok = require_bool(payload["ok"], "TRex remote result")
-        if proc.returncode != 0 and ok:
-            raise RuntimeError(
-                "trex remote action exited after success; endpoint cleanup is unproved"
-            )
-        if not ok:
-            require_exact_keys(payload, {"ok", "error", "mutation_attempted"}, "TRex remote failure")
-            mutation_attempted = require_bool(payload["mutation_attempted"], "TRex mutation attempt")
-            if action == "exchange_udp" and not mutation_attempted:
-                self._udp_exchange_incomplete = False
-            error = self._safe_remote_text(
-                require_string(payload["error"], "TRex remote error"), 2000
-            )
-            tail = self._stderr_tail(stderr_text)
-            if tail:
-                error = f"{error}; {tail}"
-            raise TRexRemoteFailure(
-                f"trex remote action failed: {error}",
-                mutation_attempted,
-            )
-        if action not in _REMOTE_SUCCESS_KEYS:
-            raise RuntimeError("trex remote action has no response contract")
-        expected_keys = _REMOTE_SUCCESS_KEYS[action]
-        require_exact_keys(payload, expected_keys, f"TRex {action} response")
-        if require_string(payload["action"], "TRex response action") != action:
-            raise RuntimeError("trex remote response action disagrees with request")
-        self._validate_remote_success(payload, action, spec)
+        if interruption is not None and proc.returncode != 0:
+            require_exact_keys(payload, {"ok", "error", "mutation_attempted"}, "TRex interrupted action")
+            mutated = require_bool(payload["mutation_attempted"], "TRex interrupted mutation attempt")
+            require_string(payload["error"], "TRex interrupted error")
+            if require_bool(payload["ok"], "TRex interrupted outcome") or (
+                proc.returncode != 130 and mutated
+            ):
+                raise RuntimeError("trex interrupted action did not prove remote cleanup") from interruption
+            if not mutated:
+                if action == "generation_start":
+                    self._active_generation_session = None
+                elif action == "exchange_udp":
+                    self._udp_exchange_incomplete = False
+        else:
+            if "ok" not in payload:
+                raise RuntimeError("trex remote action omitted its result classification")
+            ok = require_bool(payload["ok"], "TRex remote result")
+            if proc.returncode != 0 and ok:
+                raise RuntimeError(
+                    "trex remote action exited after success; endpoint cleanup is unproved"
+                )
+            if not ok:
+                require_exact_keys(payload, {"ok", "error", "mutation_attempted"}, "TRex remote failure")
+                mutation_attempted = require_bool(payload["mutation_attempted"], "TRex mutation attempt")
+                if action == "exchange_udp" and not mutation_attempted:
+                    self._udp_exchange_incomplete = False
+                error = self._safe_remote_text(
+                    require_string(payload["error"], "TRex remote error"), 2000
+                )
+                tail = self._stderr_tail(stderr_text)
+                if tail:
+                    error = f"{error}; {tail}"
+                raise TRexRemoteFailure(
+                    f"trex remote action failed: {error}",
+                    mutation_attempted,
+                )
+            expected_keys = _REMOTE_SUCCESS_KEYS[action]
+            require_exact_keys(payload, expected_keys, f"TRex {action} response")
+            if require_string(payload["action"], "TRex response action") != action:
+                raise RuntimeError("trex remote response action disagrees with request")
+            self._validate_remote_success(payload, action, spec)
+        if interruption is not None:
+            if isinstance(interruption, asyncio.TimeoutError):
+                raise RuntimeError(
+                    f"trex remote action '{action}' timed out after {timeout_s:.1f}s"
+                ) from interruption
+            raise interruption
         return payload
 
     def _validate_instrument_admission(self, payload: Dict[str, Any], request: Dict[str, Any]) -> None:
@@ -1882,7 +1906,7 @@ class TRexTrafficDriver(TrafficDriver):
             raise RuntimeError("trex PGID aggregates disagree with generation totals")
 
     def cancel_remote_action(self) -> None:
-        """Terminate the active remote action, if one is running."""
+        """Request remote cancellation through EOF and retain bounded escalation."""
         proc = self._remote_proc
         if proc is None or proc.returncode is not None:
             return
@@ -1908,7 +1932,7 @@ class TRexTrafficDriver(TrafficDriver):
         self,
         proc: asyncio.subprocess.Process,
     ) -> None:
-        """Escalate a cancelled remote action if SIGTERM does not complete."""
+        """Reap unresponsive SSH after the grace without claiming remote retirement."""
         await asyncio.sleep(_REMOTE_TERMINATE_GRACE_S)
         if proc.returncode is None:
             with contextlib.suppress(ProcessLookupError):
@@ -1921,6 +1945,10 @@ class TRexTrafficDriver(TrafficDriver):
                 raise RuntimeError(
                     "trex remote process did not retire after forced exit"
                 ) from exc
+            # Normal completion can win the signal/reap race. Its output owner
+            # still validates the terminal reply before accepting retirement.
+            if proc.returncode not in (0, 130):
+                raise RuntimeError("trex remote action retirement is unproved after forced SSH exit")
 
     async def _await_remote_kill_task(self) -> None:
         """Wait for the tracked remote-kill task so Ctrl-C leaves no pending task."""
@@ -1951,12 +1979,13 @@ class TRexTrafficDriver(TrafficDriver):
 
     @staticmethod
     def _request_remote_termination(proc: asyncio.subprocess.Process) -> None:
-        """Send SIGTERM to a remote SSH subprocess if it is still active."""
+        """Close the request channel so the endpoint can retire its own port claims."""
         if proc.returncode is not None:
             return
-        with contextlib.suppress(ProcessLookupError):
-            proc.terminate()
-            log_warn("trex", "remote action termination requested")
+        if proc.stdin is None:
+            raise RuntimeError("trex cancellation channel is unavailable")
+        proc.stdin.close()
+        log_info("trex", "remote action cancellation requested")
 
     def _log_remote_stderr(self, stderr_text: str) -> None:
         """Log suspicious endpoint stderr lines and keep banners verbose-only."""

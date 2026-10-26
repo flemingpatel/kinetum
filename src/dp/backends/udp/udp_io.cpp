@@ -293,7 +293,9 @@ bool udp_rx_port::reserve_descriptor_population_() noexcept
 					std::terminate();
 				}
 			}
-			if (acquired != requested) {
+			// A positive prefix advances the exact cold population. Only zero
+			// progress fails; the port owner retires every established descriptor.
+			if (acquired == 0) {
 				return false;
 			}
 		}

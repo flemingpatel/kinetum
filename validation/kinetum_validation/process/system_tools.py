@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import math
 import os
 from pathlib import Path
@@ -197,6 +198,84 @@ async def communicate_bounded_subprocess(
             "subprocess communication completed without terminal process status"
         )
     return result
+
+
+async def communicate_cooperative_subprocess(
+    process: asyncio.subprocess.Process,
+    timeout_s: float,
+    grace_s: float,
+    input_data: bytes,
+) -> Tuple[bytes, bytes, Optional[BaseException]]:
+    """Keep stdin open through completion; EOF requests cooperative cancellation.
+
+    A cancelled or timed-out caller still drains the endpoint's terminal reply.
+    Forced local exit cannot prove downstream retirement and always raises.
+    The caller validates a completed reply before propagating the interruption.
+
+    Parameters
+    ----------
+    process : asyncio.subprocess.Process
+        Owned child with stdin, stdout and stderr pipes and no other pipe reader.
+    timeout_s : float
+        Positive finite action-completion bound.
+    grace_s : float
+        Positive finite bound for cooperation and each forced local retirement step.
+    input_data : bytes
+        Complete self-delimiting request; its framing belongs to the caller.
+
+    Returns
+    -------
+    Tuple[bytes, bytes, Optional[BaseException]]
+        Complete stdout, stderr and any interruption awaiting caller validation.
+
+    Raises
+    ------
+    RuntimeError
+        If bounds or pipes are invalid, or cooperative retirement is unproved.
+    """
+    if any(not math.isfinite(bound) or bound <= 0 for bound in (timeout_s, grace_s)):
+        raise RuntimeError("subprocess completion and retirement bounds must be positive")
+    if process.stdin is None or process.stdout is None or process.stderr is None:
+        raise RuntimeError("cooperative subprocess requires all three pipes")
+    readers = tuple(asyncio.create_task(operation) for operation in (
+        process.stdout.read(), process.stderr.read(), process.wait(),
+    ))
+    completion = asyncio.gather(*readers)
+    interruption: Optional[BaseException] = None
+    try:
+        try:
+            # Like communicate(), retain an early child's result even when it
+            # closes input before the parent's final drain completes.
+            with contextlib.suppress(BrokenPipeError, ConnectionResetError):
+                process.stdin.write(input_data)
+                await process.stdin.drain()
+            output, diagnostic, _status = await asyncio.wait_for(asyncio.shield(completion), timeout_s)
+        except BaseException as error:  # pylint: disable=broad-exception-caught
+            interruption = error
+            process.stdin.close()
+            try:
+                output, diagnostic, _status = await asyncio.wait_for(asyncio.shield(completion), grace_s)
+            except BaseException as retirement_error:
+                for task in readers:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*readers, return_exceptions=True)
+                try:
+                    await terminate_and_drain_subprocess(process, grace_s)
+                except BaseException as local_error:
+                    raise RuntimeError("subprocess exit or output cleanup is unproved") from local_error
+                raise RuntimeError(
+                    "subprocess cooperative retirement is unproved after forced exit"
+                ) from retirement_error
+        return output, diagnostic, interruption
+    finally:
+        process.stdin.close()
+        if not completion.done():
+            completion.cancel()
+        for task in readers:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(completion, *readers, return_exceptions=True)
 
 
 def require_system_executable(path: Path, purpose: str) -> str:

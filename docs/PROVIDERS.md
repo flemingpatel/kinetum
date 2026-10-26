@@ -245,10 +245,11 @@ shape. Unknown roles, status values, or capability bits reject.
 
 Product version, ABI identity, and file SHA-256 answer different questions:
 release identity, declaration identity, and artifact identity. The ABI has no
-size negotiation or extension area. Changed declarations regenerate its
-identity; the runtime and components rebuild together. C11 and C++20 assertions
-pin sizes, alignments, and offsets. `CMakeLists.txt` declares the provider schema
-inputs and generates `provider_build_identity.h` during configuration.
+size negotiation or extension area. Changes to the header or schema bytes
+regenerate its identity; the runtime and components rebuild together. C11 and
+C++20 assertions pin sizes, alignments, and offsets. `CMakeLists.txt` declares
+the provider schema inputs and generates `provider_build_identity.h` during
+configuration.
 
 ### 6. Factory Calls and Borrowed Data
 
@@ -475,12 +476,14 @@ not the join result; a failed join retains the borrow.
 | Storage acquire | Returned prefix becomes caller-owned. | Untouched output suffix transfers nothing. |
 | RX burst | `transferred_count` records become worker-owned; `rejected_count` inputs were already retired by the provider. | The sum cannot exceed requested capacity. Both zero means no consumed input. |
 | TX burst | Returned prefix becomes provider-owned. | Worker keeps the untouched suffix; the provider cannot free or translate it. |
-| Writable clone | A new record owns independent bytes and metadata. | Exhaustion returns no clone and preserves the source. |
-| Active-origin copy | Validated borrowed bytes become storage-owned records for the returned prefix. | Malformed input transfers nothing; valid input may be capacity-limited. |
+| Writable clone | A new record owns independent bytes and metadata. | Exhaustion or contention returns no clone and preserves the source. |
+| Active-origin copy | Validated borrowed bytes become storage-owned records for the returned prefix. | Malformed input transfers nothing; capacity or contention may shorten valid input. |
 | Storage transition | Returned prefix becomes destination-owned; each consumed source is preserved or retired according to the declared mechanism. | Caller retains the source suffix. |
 | Storage release | Every supplied owned record is retired through its original domain. | A null record in a nonempty release burst violates the contract. |
 
-Rejected-only RX is consumed input, but transfers no records or epoch credits.
+Storage acquisition may return a short prefix, including zero, under bounded
+contention. That result does not establish global exhaustion. Rejected-only RX
+is consumed input, but transfers no records or epoch credits.
 
 The runtime saves lengths, metadata, and original storage identity before a TX
 callback because accepted records may already be reclaimed when it returns.
@@ -717,7 +720,7 @@ same ABI, admission, and ownership rules as DPDK.
 
 | Mechanism | Implementation |
 |---|---|
-| Host storage | One fixed mapping for free-credit queue controls/cells, records and payload, sized from the plan and shared budget. Exact NUMA binding precedes first touch; the mapping is prefaulted before publication. Cache-line-rounded payload strides prevent adjacent writable slots sharing a line. |
+| Host storage | One fixed mapping for index-search control, availability words, records and payload, sized from the plan and shared budget. Exact NUMA binding precedes first touch; the mapping is prefaulted before publication. Cache-line-rounded payload strides prevent adjacent writable slots sharing a line. |
 | CPU execution | Execution identity and CPU access proof; platform workers execute the stages. |
 | Zero-copy share | Same-domain handoff preserving the original record. |
 | Bounded copy | Preallocated staging plus destination storage, with exact source retirement after accepted copies. |
@@ -727,8 +730,10 @@ UDP requires contiguous CPU-readable storage, also writable for RX; the storage
 domain remains an explicit binding rather than an implicit part of the driver.
 Each RX queue pre-acquires its entire uint32 descriptor population from that
 domain. Acquire/release and I/O calls split that population into checked uint16
-bursts. Partial reservation returns every credit. `recvmmsg`
-fills the queue-owned records; a truncated datagram is never published.
+bursts. Positive short acquisitions advance cold reservation; zero progress
+fails construction and returns every established credit. Live replenishment
+stops on a short result. `recvmmsg` fills the queue-owned records; a truncated
+datagram is never published.
 
 Before bind, each RX socket installs a drop-all filter. Activation replaces all
 filters with accept-all only after workers are ready. Deactivation restores

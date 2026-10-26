@@ -259,9 +259,9 @@ struct mutation_result {
 /**
  * @brief Runtime state for guardrails policy propagation.
  *
- * Uses versioned_rcu_buffer for lock-free writer->reader publishing
- * per Platform Engineering Guide. The control_loop worker
- * thread writes policy via store(), the guardrails_runner reads via borrow().
+ * Uses versioned_rcu_buffer for coherent publication through pinned slots
+ * per Platform Engineering Guide. The control_loop publishes policy via
+ * store(); the guardrails_runner reads it via borrow().
  */
 struct guardrails_runtime_state {
 	kinetum::algo::versioned_rcu_buffer<kinetum::control::v1::GuardrailsPolicy> policy;  ///< Coherent policy.

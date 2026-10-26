@@ -114,13 +114,11 @@ class TestTRexEndpointAdmission(unittest.TestCase):
                 "action": action, "ports": [0, 1, 2], "egress_ports": [2],
                 "trex_server": "127.0.0.1", "trex_api_path": "", "work_dir": work_dir,
             }
-            if action == "generation_start":
+            if action in ("generation_start", "run"):
                 spec.update({
                     "duration_s": 90.0, "pps": 400000, "packet_size": 1514,
                     "num_flows": flows, "src_ip": "10.0.0.1", "dst_ip": "198.51.100.9",
                     "sport": 10000, "dport": 20000,
-                    "initial_generation_tag": 1, "next_generation_tag": 2,
-                    "transition_time_s": 15.0, "overlap_window_ms": 60000,
                     "trex_identity": copy.deepcopy(expected_identity),
                     "ingress_streams": [
                         {"logical_name": f"wan{port}", "port_id": port,
@@ -128,6 +126,13 @@ class TestTRexEndpointAdmission(unittest.TestCase):
                         for port in (0, 1)
                     ],
                 })
+                if action == "generation_start":
+                    spec.update({
+                        "initial_generation_tag": 1, "next_generation_tag": 2,
+                        "transition_time_s": 15.0, "overlap_window_ms": 60000,
+                    })
+                else:
+                    spec.update({"mode": "standard", "generation_tag": 0})
             elif action == "exchange_udp":
                 marker = b"e" * 16
                 packet = bytes.fromhex("4500002c00000000401100000a000001c63364094e20c34f00180000") + marker
@@ -165,7 +170,13 @@ class TestTRexEndpointAdmission(unittest.TestCase):
             original_directory = os.getcwd()
             standard_output = io.StringIO()
             standard_error = io.StringIO()
-            with io.TextIOWrapper(io.BytesIO(json.dumps(spec).encode("utf-8"))) as standard_input:
+            read_fd, write_fd = os.pipe()
+            with (
+                os.fdopen(read_fd, "r", encoding="utf-8") as standard_input,
+                os.fdopen(write_fd, "wb", buffering=0) as request,
+            ):
+                frame = json.dumps(spec).encode("utf-8") + b"\n"
+                self.assertEqual(request.write(frame), len(frame))
                 try:
                     with (
                         mock.patch.dict(sys.modules, modules),
@@ -188,6 +199,23 @@ class TestTRexEndpointAdmission(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(result["trex_identity"], identity)
         self.assertEqual(client.mutations, [])
+
+    def test_missing_traffic_wait_api_rejects_before_port_mutation(self):
+        """Cancellable traffic requires both active observation and native RX-drain operations."""
+        identity = complete_trex_identity()
+        for operation in ('is_traffic_active', 'wait_on_traffic'):
+            with self.subTest(operation=operation):
+                client = InstrumentClient(identity)
+                with mock.patch.multiple(
+                    client, is_traffic_active=mock.Mock(return_value=False),
+                    wait_on_traffic=mock.Mock(), create=True,
+                ):
+                    setattr(client, operation, None)
+                    code, result = self._execute(client, 'run', identity)
+                self.assertNotEqual(code, 0)
+                self.assertFalse(result['mutation_attempted'])
+                self.assertIn(operation, result['error'])
+                self.assertEqual(client.mutations, [])
 
     def test_missing_connection_hook_rejects_before_native_connection(self):
         """An unsupported API cannot silently regain clear-on-connect behavior."""

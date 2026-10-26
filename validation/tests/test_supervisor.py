@@ -2,6 +2,11 @@
 
 import asyncio
 import json
+import os
+import pty
+import select
+import signal
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -10,6 +15,7 @@ from unittest import mock
 from kinetum_validation.config.types import ProcessConfig
 from kinetum_validation.process.supervisor import AsyncProcessSupervisor
 from kinetum_validation.process.kinetumctl import parse_health_ready
+from tests.process_signal_fixtures import fixture_command
 
 
 def _logging_status() -> dict:
@@ -159,6 +165,22 @@ class _ExitedProcess:
 class TestSupervisorRetirement(unittest.IsolatedAsyncioTestCase):
     """An independently exited Photon cannot be reported as clean teardown."""
 
+    async def test_spawn_failure_releases_log_ownership_and_preserves_the_error(self) -> None:
+        """Failed native process creation leaves no child, stream task or open-log owner."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            supervisor = AsyncProcessSupervisor(
+                ProcessConfig(runtime_root=root / 'runtime', validation_root=root / 'kit'), root,
+            )
+            with self.assertRaises(FileNotFoundError):
+                await supervisor._start_process(  # pylint: disable=protected-access
+                    'kinetum_photon', [str(root / 'missing-photon')],
+                )
+            self.assertFalse(supervisor._processes)  # pylint: disable=protected-access
+            self.assertFalse(supervisor._stream_tasks)  # pylint: disable=protected-access
+            self.assertFalse(supervisor._log_handles)  # pylint: disable=protected-access
+            self.assertFalse(supervisor._log_files)  # pylint: disable=protected-access
+
     async def test_pre_stop_exit_fails_after_complete_local_cleanup(self) -> None:
         """Even exit zero is a lifecycle failure when Photon dies early."""
         supervisor = AsyncProcessSupervisor(
@@ -176,3 +198,49 @@ class TestSupervisorRetirement(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(supervisor._processes)  # pylint: disable=protected-access
         self.assertFalse(supervisor._stream_tasks)  # pylint: disable=protected-access
+
+
+class TestTerminalInterrupt(unittest.TestCase):
+    """A real terminal interrupt cancels the harness without bypassing child ownership."""
+
+    def test_ctrl_c_preserves_ordered_shutdown_and_real_cleanup_failures(self):
+        """Spawn, readiness, running and capture cancellation use TERM; bad exits still fail."""
+        for phase in ('spawn', 'startup', 'running', 'capture'):
+            for child_exit in (0, 7):
+                with self.subTest(phase=phase, child_exit=child_exit), tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory).resolve()
+                    master, slave = pty.openpty()
+                    try:
+                        with subprocess.Popen(
+                            fixture_command('harness', str(root), phase, str(child_exit)),
+                            stdin=slave, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            start_new_session=True, bufsize=0,
+                        ) as process:
+                            os.close(slave)
+                            slave = None
+                            try:
+                                self.assertTrue(select.select([process.stdout], [], [], 10.0)[0])
+                                self.assertEqual(process.stdout.readline(), b'INTERRUPT_READY\n')
+                                os.write(master, b'\x03')
+                                stdout, stderr = process.communicate(timeout=10.0)
+                            finally:
+                                if process.poll() is None:
+                                    os.killpg(process.pid, signal.SIGKILL)
+                                    process.wait()
+                        self.assertEqual(stdout, b'')
+                        self.assertEqual(process.returncode, 130 if child_exit == 0 else 1, stderr.decode())
+                        for name in ('child', 'capture') if phase == 'capture' else ('child',):
+                            child_identity = json.loads((root / (name + '.json')).read_text())
+                            self.assertEqual(child_identity['process_group'], child_identity['pid'])
+                            self.assertEqual(child_identity['session'], child_identity['pid'])
+                            self.assertEqual((root / (name + '-signal.txt')).read_text(), str(signal.SIGTERM))
+                        if child_exit == 0:
+                            self.assertIn(b'Interrupted by user', stderr)
+                            self.assertNotIn(b'Fatal error', stderr)
+                        else:
+                            self.assertIn(b'execution=CancelledError', stderr)
+                            self.assertIn(b'shutdown did not complete cleanly: 7', stderr)
+                    finally:
+                        os.close(master)
+                        if slave is not None:
+                            os.close(slave)

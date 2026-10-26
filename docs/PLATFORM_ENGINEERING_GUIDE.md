@@ -11,6 +11,10 @@ The application matrix and delegation index point to their component references;
 [`TECHNICAL_REFERENCES.md`](TECHNICAL_REFERENCES.md) collects normative
 specifications and technical background.
 
+The guide evolves through design review. Revise a rule when evidence supports
+a better approach, explain the rationale, and keep affected code and
+documentation consistent.
+
 ---
 
 ## Table of Contents
@@ -65,8 +69,8 @@ specifications and technical background.
 
 ## Part 1: Principles
 
-These principles govern every implementation and survive rewrites. When code
-violates a principle, the code changes.
+These principles govern every implementation. Follow them until design review
+accepts a replacement; an implementation defect does not change the contract.
 
 ### P-1: Mechanism vs Policy
 
@@ -163,9 +167,10 @@ come from the plan: region and boundary topology; exact process facilities;
 I/O-driver, packet-storage, and execution-provider instances; logical and
 driver-local ports; queues and stream ownership; storage transitions; module
 IDs and load order; worker ownership; runtime-service CPU/NUMA ownership; and
-every bounded capacity. The runtime may compile these records into compact
-indices, but it must not synthesize a provider, queue zero, CPU execution,
-storage domain, missing lane boundary, worker placement, process-service role,
+deployment-specific capacities. Fixed ABI limits and internal mechanism bounds
+remain with their compile-time owners. The runtime may compile plan records
+into compact indices, but it must not synthesize a provider, queue zero, CPU
+execution, storage domain, missing lane boundary, worker placement, process-service role,
 native attachment, or transition. The plan carries deterministic identity
 fields and is the single artifact a deployment is built around. CLI flags may
 select process-control endpoints or physical validation infrastructure; they
@@ -188,13 +193,15 @@ content identity).
 **Why.** Concurrent writers make mutation order nondeterministic even when
 each individual write is correct.
 
-**Rule.** Every mutable state in the platform has exactly one writer at a
-time. The writer may be a single thread, a single control loop, or a
-single ownership token, but it is not multiple threads writing concurrently.
-Other code reads through an explicit publication mechanism (RCU snapshots,
-versioned buffers, atomic pointer swaps). Publication readers never take a lock or
-wait on the writer; writers may wait at the publication boundary for an
-RCU grace period. No reader observes a partially-written value.
+**Rule.** Give mutable runtime state one semantic mutation authority: a worker,
+control loop, or explicit ownership token. Shared synchronization primitives
+may coordinate concurrent callers through atomics; that metadata does not grant
+another writer access to worker or control-loop state.
+Foreign readers use an explicit coherent publication mechanism without taking
+the mutation owner's lock. Pin acquisition may retry when publication changes,
+but readers never access a partially written value. RCU writers may wait for
+existing readers before reusing a slot; exact module views follow their separate
+epoch-lifetime contract.
 
 **Where this appears.** CP `control_loop` is the single semantic writer
 for snapshot and policy mutations (apply, confirm, rollback, guardrails). DP workers
@@ -212,10 +219,10 @@ configuration ownership.
 **Why.** Duplicate queues, hash maps, and rate limiters develop different
 invariants, defects, and performance. Each variant makes consolidation harder.
 
-**Rule.** When you need a primitive, use what is in `include/kinetum/algo/`. If
-`include/kinetum/algo/` does not have what you need, add it there (with tests and
-documentation), then use it. Do not roll a one-off implementation inside
-your component just because the shared primitive does not yet exist.
+**Rule.** Reusable algorithms and synchronization primitives belong in
+`include/kinetum/algo/`. Use the existing implementation or add the missing
+primitive there with tests and documentation. Do not create a component-local
+copy. OS services and subsystem-specific composition remain with their owners.
 
 `include/kinetum/algo/` owns reusable queues, publications, hash tables, and
 quiescence mechanisms. DP epoch states, CUT/ACK identity, module lifecycle, and
@@ -226,8 +233,7 @@ types.
 **Where this appears.** `docs/ALGORITHM_LIBRARY.md` (the canonical primitive
 index: cuckoo_map, versioned_rcu_buffer, single_writer_snapshot,
 quiescence_domain, spsc_ring_static, token_bucket, timer_wheel, simd_classify,
-CIDR helpers, signal smoothing). Anything new built outside this directory and
-then re-implemented later is a code smell.
+CIDR helpers, signal smoothing).
 
 ### P-8: Deterministic Boundary Semantics Over Best-Effort
 
@@ -336,7 +342,7 @@ violate bounded packet work.
   compact indices without changing container size after construction.
 - Bounded rings sized at construction (`spsc_ring_static<T, Capacity>`).
 - Fixed-size batch buffers carried on `kinetum_batch_t`.
-- `std::array<T, N>` instead of `std::vector<T>` when N is bounded.
+- `std::array<T, N>` when the required extent is known at compile time.
 
 **Where this appears.** `DATA_PLANE.md` (the DP hot path is zero-allocation
 by construction), `MODULE_SDK.md` (the module ABI passes pre-allocated
@@ -359,8 +365,8 @@ owner rather than the compiled work budget.
   path.
 - Lock-free atomics with explicit memory ordering for the rare cases where
   cross-worker state matters (counters, telemetry).
-- RCU publication (Pat-8) for any state the cold path needs to mutate while
-  the hot path reads.
+- RCU publication (Pat-8) where each reader needs a pinned snapshot. Module
+  configuration uses the exact admitted epoch view (Pat-7 and Pat-10).
 - SPSC rings (Pat-11) for cross-worker handoff.
 
 **Where this appears.** `DATA_PLANE.md` and `src/modules/README.md` describe
@@ -383,7 +389,8 @@ the target is already known.
 
 **Use instead.**
 
-- Raw pointers with epoch-bound lifetime (the epoch arena owns the memory).
+- Raw pointers with an explicit owner and lifetime, such as a prepared policy
+  view retained by its epoch arena.
 - Return codes (`bool`, `kinetum::common::status_or<T>`) instead of
   throwing.
 - CRTP (curiously recurring template pattern) for static polymorphism;
@@ -457,8 +464,8 @@ that reader never accesses the written field.
 
 **Use instead.**
 
-- `alignas(CACHE_LINE_SIZE)` on per-core state (`CACHE_LINE_SIZE` is
-  defined in `include/kinetum/algo/cache.hpp`).
+- `alignas(CACHE_LINE_SIZE)` on per-core state. The platform's 64-byte alignment
+  unit is defined in `include/kinetum/algo/platform.hpp`.
 - Explicit padding between per-core fields in shared structs.
 - `kinetum::algo::cuckoo_bucket` uses `alignas(CACHE_LINE_SIZE)` so each
   bucket begins on its own line. Generic key/value size determines whether its
@@ -536,9 +543,9 @@ misses.
   code images, provider tables, command publications, and process-managed
   stacks retain their own ownership contracts; locality of a borrowed pointer
   never establishes locality of its pointee.
-- A fixed host packet pool places its free-credit queue controls and cells,
-  records and payload rows in one checked mapping on the domain's exact node.
-  Rounding queue storage never grants additional logical packet credits.
+- A fixed host packet pool places its shared index-search control, availability
+  words, records and payload rows in one checked mapping on the domain's exact
+  node. Padding bits never grant credits beyond the authored record population.
 
 **Where this appears.** `GLUON.md` (NUMA-aware core selection and exact
 storage-domain placement from hardware inventory), `DATA_PLANE.md` (provider
@@ -608,10 +615,10 @@ a reader.
 - `kinetum::algo::rcu_buffer<T>` for the basic two-slot RCU buffer.
 - `kinetum::algo::versioned_rcu_buffer<T>` adds epoch tracking for platform
   control-state publication.
-- `borrow()` returns a RAII `read_guard` that pins the slot until
-  destruction; `try_borrow()` is the non-blocking variant. Every guard resolves
-  before its buffer; buffer destruction with a live pin fails stop before
-  reclaiming reader state.
+- `borrow()` returns a RAII `read_guard` and may retry publication changes;
+  `try_borrow()` makes one attempt and returns empty on a race. A successful
+  guard pins its slot until release. Every guard resolves before its buffer;
+  buffer destruction with a live pin fails stop before reclaiming reader state.
 - `store()` waits for readers on the inactive slot to drain (via
   `spin_backoff(iteration)`), then writes and swaps `active_` atomically.
 - Active-slot publication, reader pinning and revalidation, and the writer's
@@ -664,11 +671,12 @@ consistency to close its publication-versus-pin race.
 - A quiescence reader acquire-observes one active grace and release-publishes
   exactly that adjacent generation through its own cache-line atomic. The cold
   coordinator never accepts a skipped generation through monotonic maximum.
-- Choose process-signal ownership by execution shape. An event-loop host blocks
-  its signals before thread creation and consumes them through one descriptor
-  on the owning loop. A tight single-thread child may instead install a
-  `sigaction` handler that writes only one `volatile sig_atomic_t` flag, then
-  observe that flag in its existing loop. When such a signal triggers a
+- Choose native process-signal ownership by execution shape. Block the owned
+  signals before thread creation and consume them on one owner through
+  `signalfd` (CP/DP) or synchronous `sigtimedwait` (Photon). A tight single-thread
+  child may instead install a `sigaction` handler that writes only one
+  `volatile sig_atomic_t` flag, then observe that flag in its existing loop.
+  When such a signal triggers a
   post-spawn edge, the spawning owner blocks it before child creation, the
   child installs the handler before unblocking, and the parent restores its
   exact prior mask on every spawn outcome. A signal handler never invokes a
@@ -716,9 +724,10 @@ same-turn endpoint batch, never one sample per boundary. Ordinary turns, fixed
 execution, packet work, and provider burst operations gain no clock read;
 incomplete timestamp pairs remain absent rather than manufacturing a duration.
 
-Every post-commit resource is preallocated and audited before PREPARED. Once
-both certificate legs complete, reclamation first preflights the complete old
-module/snapshot claim set, then withdraws exact store-bound claims and dispatches
+Resources needed for activation, completion, and retirement are preallocated
+and audited before PREPARED. Once both certificate legs complete, reclamation
+first preflights the complete old module/snapshot claim set, then withdraws
+exact store-bound claims and dispatches
 reverse-canonical RETIRE while overlapping only independent image/executor
 pairs. Exact task, image, context, epoch, and claim identity plus SUCCESS are
 required before claim consumption and issuing-store completion. The old
@@ -775,14 +784,15 @@ qualification evidence.
 
 ### Pat-11: Bounded Queues and SPSC Rings
 
-**Rule.** Inter-thread and inter-region communication uses bounded,
+**Rule.** Queued inter-thread and inter-region transport uses bounded,
 fixed-capacity queues, sized at construction. Unbounded queues are
 forbidden in the platform: they trade observable backpressure for hidden
 memory growth and silent latency.
 
-**Rationale.** A full bounded queue forces the producer to block, count a drop,
-or backpressure upstream. An unbounded queue hides overload as growing memory
-use, eventual OOM, or unpredictable tail latency.
+**Rationale.** A bounded queue exposes overload to its caller. The caller must
+apply its contract: reject admission, count a permitted drop, or backpressure
+upstream. Packet owners must not block. An unbounded queue hides overload as
+growing memory use, eventual OOM, or unpredictable tail latency.
 
 **Use instead.**
 
@@ -808,13 +818,18 @@ use, eventual OOM, or unpredictable tail latency.
   enqueue/dequeue remains the ownership authority.
 - `kinetum::algo::mpmc_queue_view<T>` when one subsystem supplies exact
   cache-line cell storage and placement. Static, dynamic, and caller-storage
-  forms delegate to one sequence/publication core. Fixed host-pool credits and
-  tracked async completions use the caller-storage form.
+  forms delegate to one sequence/publication core. Tracked async completions
+  use the caller-storage form. Host-pool free indices instead use independent
+  atomic bits: returning one credit cannot depend on an unrelated queue lease.
 - MPMC cell copy and move assignment are non-throwing type requirements: a
   reserved producer or consumer cursor has no rollback operation.
-- `try_push`/`try_pop` (SPSC/work queues) and
-  `try_enqueue`/`try_dequeue` (MPMC queues) are non-blocking; full or empty is
-  a normal condition the caller handles, not an error.
+- Failed try operations transfer no ownership. SPSC/work queues report their
+  observed full or empty condition. MPMC may also refuse the next cell while
+  an earlier reservation remains unpublished or unreleased, even if another
+  cell is available. Callers must preserve ownership through that condition;
+  refusal alone does not prove duplicate retirement or global exhaustion.
+  MPMC CAS retries have no per-call step bound, and mutex-free implementation
+  does not establish lock-free FIFO progress.
 - SPSC batches publish one completed cursor per accepted prefix. Conditional
   consumption validates and admits each FIFO element before consuming it;
   refusal retains that head and its suffix. Its nonthrowing callback performs
@@ -894,7 +909,9 @@ math gives consumers one tested implementation of these edge cases.
   policy. It caps retained credit before saturating refill and consumption.
 - `leaky_bucket`: meters bytes against a bounded level that drains at a fixed
   rate. It permits bursts up to capacity; it does not queue or pace packets.
-- `sliding_window`: for positive-duration time-window counters.
+- `sliding_window`: exact event counts in a positive-duration rolling interval,
+  with construction-time history from an explicit non-null PMR resource. Valid
+  quota denials still advance its time baseline; backward time rejects unchanged.
 - State belongs to the caller's flow or tenant; storage is the caller's responsibility.
 - Timestamp zero is ordinary input. In standalone limiters, regression rejects without
   resetting credit or event count, and no rate is pre-divided into a zero
@@ -1011,38 +1028,44 @@ policy).
 
 ### Pat-16: Profiling and Regression Discipline
 
-**Rule.** Every hot-path change is measured. Performance is part of the
-correctness contract: a change that regresses throughput or tail latency
-is treated as a defect, not a tradeoff. Benchmarks are reproducible, run on a
-declared qualified reference host, and gate sign-off through the benchmark
-harness.
+**Rule.** Measure hot-path changes against a declared baseline on representative
+workloads. Agree the required metrics and coverage before acceptance; confirmed
+regressions within that scope block acceptance. Report the tested conditions and
+measurement limits. An unavailable metric or an unrun check is not a pass.
 
-**Rationale.** Measure protocol safety and capacity separately. A correct
-transition can still exhaust staging, backpressure RX, and cause hardware
-misses when processing falls behind. Throughput and polling regressions are
-release defects; they do not justify weakening safety bounds.
+**Rationale.** Evaluate protocol safety, capacity and latency separately. A
+correct transition can still exhaust staging, backpressure RX, and cause
+hardware misses when processing falls behind. Correctness and measurement
+validity remain acceptance requirements.
 
 **Use instead.**
 
-- `validation/kinetum_benchmark` for multi-run distributions; see
-  `VALIDATION_GUIDE.md` Section 18.
-- `perf stat` with `cache-misses`, `cache-references`, `branch-misses`,
-  `branches`, `cycles`, `instructions` for low-level CPU behavior.
-- `perf record` / `perf report` for hotspot identification.
+- Record the optimized build, compiler, ISA, hardware, placement, workload,
+  configuration, commands and raw results. Hold comparison inputs constant;
+  measure changes to code, queue capacity, host settings and traffic tools
+  separately.
+- Repeat matched comparisons to distinguish changes from run-to-run variation.
+  Cover relevant packet sizes, flow populations, batch sizes and loads, including
+  partial batches and low load. State the warm-up and restart policy.
+- Verify generator and receiver capacity before attributing packet loss or a
+  throughput limit to the dataplane. Define timing boundaries and measurement
+  scope; transition duration is not packet latency.
+- Use `validation/kinetum_benchmark` for repeated scenario distributions and
+  focused native benchmarks for component costs.
+- Use `perf stat` for hardware events such as `cycles`, `instructions`,
+  `branches`, `branch-misses`, `cache-references` and `cache-misses`, subject to
+  target validation. Use `perf record` / `perf report` to locate CPU costs.
 - Verify event support, sampling fields, multiplexing and processor errata
   before attributing a hardware count. Invalid data addresses cannot locate
   an object, and a latency-filtered sample cannot establish an unconditional
-  cache-hit rate. Keep instrumented profiles separate from native results.
-- Compare matched fresh starts, including partial batches and low load. Inspect
-  generated instructions on each supported architecture; a microbenchmark
-  establishes a mechanism's cost, not an application throughput gain.
-- The physical-I/O validation harness's transition telemetry
-  (`transition_metrics.jsonl`) is the canonical regression source for
-  Ordered-CUT Boundary Protocol behavior.
-- Target qualification traces the ordinary turn refresh, the health-return
-  sample, and all four transition-edge sample classes. It rejects a
-  syscall-backed worker call path, a per-boundary sampling loop, or a sample
-  reachable from ordinary fixed/packet/provider execution.
+  cache-hit rate.
+- Keep instrumented profiles separate from runs without profiling. Inspect
+  generated instructions on each supported architecture. A component timing
+  does not establish application throughput or end-to-end packet latency.
+- Retain traffic evidence, exact runtime observations and
+  `transition_metrics.jsonl` together for Ordered-CUT regression checks.
+- Apply the worker-clock qualification requirements in
+  [Coding Guidelines, Section 6](CODING_GUIDELINES.md#6-hot-path-rules).
 
 **Where this appears.** `VALIDATION_GUIDE.md` Section 18 (benchmarks) and
 Section 17 (structured result artifacts).
@@ -1167,7 +1190,7 @@ authenticate a publisher: an attacker could replace both manifest and payload.
   strict metadata. No compatibility subset or kit attestation is implied.
   Deployment bundles contain configuration and modules, never platform
   binaries or provider releases.
-- Two-phase apply (Pat-9): Prepare is the fallible validation/construction step;
+- Two-phase apply (P-9): Prepare is the fallible validation/construction step;
   Activate commits only an exact prepared transaction.
 
 **Where this appears.** `KINETUM_PACK.md` (deployment-bundle format and
@@ -1392,8 +1415,8 @@ state per packet adds a stale gate that can contradict the admitted queue.
 - Keep driver construction and packet admission distinct. Provider factories
   publish cold operation records; one provider-neutral generation owner calls
   the exact whole-driver lifecycle only at the set-wide startup and shutdown
-  boundaries. RX/TX burst operations remain branch-free and carry no dormant
-  lifecycle selector on the packet path.
+  boundaries. RX/TX bursts use the pre-resolved operations without a lifecycle
+  selector on the packet path.
 - Claim each successfully established native resource in non-failing
   provider-local state before the next fallible native operation. Unwind failed
   startup in reverse dependency order, and fail stop before reclaiming backing
@@ -1571,8 +1594,8 @@ workflow is in `GETTING_STARTED.md`; the website workflow is in
 
 ## Pattern Application Matrix
 
-An `X` marks a pattern required by that component's hot path or correctness
-contract. A blank means it does not apply, typically on a cold-path surface.
+An `X` marks direct application in that component's hot path or correctness
+contract. A blank does not exempt a component from the interfaces it consumes.
 
 | Pattern | SDK | DP | Modules | Algo | CP | Gluon | Quark | Photon |
 |---------|-----|----|---------|------|----|----|----|----|
@@ -1581,7 +1604,7 @@ contract. A blank means it does not apply, typically on a cold-path surface.
 | Pat-3: No hot-path shared_ptr/exceptions/virtual/RTTI | X | X | X | X | | | | |
 | Pat-4: SoA batch | X | X | X | | | | | |
 | Pat-5: Cache-line alignment | X | X | X | X | | | | |
-| Pat-6: NUMA / hugepages | | X | | | | X | X | |
+| Pat-6: NUMA / hugepages | X | X | X | | | X | X | |
 | Pat-7: Owner-local + generation scoping | X | X | X | | | | | |
 | Pat-8: RCU / versioned RCU / exact QSBR | X | X | X | X | X | | | |
 | Pat-9: Aligned atomics / lock-free | X | X | X | X | X | | | |
@@ -1598,7 +1621,7 @@ contract. A blank means it does not apply, typically on a cold-path surface.
 | Pat-20: Provider dependency firewall | | X | | | | | X | X |
 | Pat-21: Linear ownership across foreign calls | X | X | X | | X | | | X |
 | Pat-22: Predicate-closed waiting | | X | | X | X | | | X |
-| Pat-23: Release projection ownership | X | X | X | | | | | X |
+| Pat-23: Release projection ownership | X | X | X | X | X | X | X | X |
 
 Notes:
 
@@ -1617,7 +1640,8 @@ Notes:
   pack's producer self-gate and standalone verification are named in the
   delegation index instead. Photon's cell records its pre-spawn runtime-bundle
   admission.
-- Pat-16 applies to every component: every change is measured.
+- Pat-16 governs performance claims in every component; required measurements
+  follow the declared scope and workload.
 - Pat-18 applies to validation tooling through `VALIDATION_GUIDE.md`; the
   matrix names the runtime and planning surfaces that own the mechanism.
 - Pat-19's DP cell is the private loader/admission side of the contract; its

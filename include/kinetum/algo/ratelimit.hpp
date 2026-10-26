@@ -9,8 +9,8 @@
  * @author Fleming Patel
  *
  * Contains:
- * - Token Bucket: Standard rate limiting with burst allowance
- * - Exact integer-rational accrual without floating-point
+ * - Token and leaky buckets with exact integer-rational byte accrual
+ * - Exact sliding-window event counts with explicit resource-owned history
  *
  * Token Bucket Algorithm:
  * - Tokens accumulate at rate R (bytes/second)
@@ -23,11 +23,17 @@
  * QoS module share byte_credit; QoS owns its context-local flow slab and clock.
  */
 
+#include <algorithm>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
+#include <memory_resource>
 #include <stdexcept>
+#include <vector>
 
 #include <kinetum/algo/platform.hpp>
+#include <kinetum/algo/work_queue_indices.hpp>
 
 namespace kinetum::algo
 {
@@ -336,87 +342,144 @@ class leaky_bucket {
 // =============================================================================
 
 /**
- * @brief Simple sliding window counter for request rate limiting.
- *
- * Counts events in a sliding time window. Useful for API rate
- * limiting where you want "N requests per M seconds".
+ * @brief Exact event-count limit over the rolling interval (now - window, now].
  *
  * @par Thread Safety
- * One caller owns each window. Shared use requires external synchronization.
+ * One caller owns each window; the explicit memory resource outlives it.
+ * Copy and move are disabled to preserve that storage ownership.
+ *
+ * @par Performance
+ * Construction allocates one timestamp array. No-expiry and all-expired calls
+ * are O(1); partial expiry binary-searches the FIFO in O(log quota). allow/reset
+ * allocate nothing, lock nothing, and read no clock.
  */
 class sliding_window {
     public:
 	/**
-	 * @brief Construct sliding window.
-	 * @param max_count Maximum events allowed in one window; zero deliberately
-	 *        denies every event.
-	 * @param window_ns Positive window duration in nanoseconds.
-	 * @throws std::invalid_argument when @p window_ns is zero.
+	 * @brief Allocate the complete exact-window history before admission.
+	 * @param max_count Maximum retained events; zero deliberately denies all events.
+	 * @param window_ns Positive interval duration in nanoseconds.
+	 * @param resource Non-null storage owner that outlives the window.
+	 * @throws std::invalid_argument for zero duration or a null resource.
+	 * @throws std::length_error for unrepresentable history geometry, before allocation.
+	 * @throws std::bad_alloc when the resource cannot supply the complete history.
 	 */
-	sliding_window(uint64_t max_count, uint64_t window_ns)
+	sliding_window(uint64_t max_count, uint64_t window_ns, std::pmr::memory_resource *resource)
 		: max_count_(max_count)
-		, window_ns_(window_ns)
-		, count_(0)
-		, window_start_ns_(0)
-		, initialized_(false)
+		, window_ns_(checked_duration_(window_ns))
+		, timestamps_(history_capacity_(max_count), checked_resource_(resource))
+		, positions_(timestamps_.size())
 	{
-		if (window_ns_ == 0u) {
-			throw std::invalid_argument("sliding_window: window duration must be positive");
-		}
 	}
+	/** @brief History storage has one owner. */
+	sliding_window(const sliding_window &) = delete;
+	/** @brief History ownership cannot be copied. */
+	sliding_window &operator=(const sliding_window &) = delete;
+	/** @brief Preserve the exact resource and history owner. */
+	sliding_window(sliding_window &&) = delete;
+	/** @brief History ownership cannot be replaced by moving. */
+	sliding_window &operator=(sliding_window &&) = delete;
 
 	/**
-	 * @brief Check if event should be allowed.
-	 * @param now_ns Explicit monotonic timestamp in nanoseconds.
-	 * @return true if counted; false at the configured limit or on timestamp
-	 *         regression.
+	 * @brief Expire old events and admit one event below the exact quota.
+	 * @param now_ns Explicit monotonic observation; zero is an ordinary timestamp.
+	 * @return True after admission; false for quota denial or backward time.
+	 * Backward time leaves all state unchanged. A valid denied attempt advances
+	 * the observation baseline and expires history, without adding an event.
 	 */
-	[[nodiscard]]
-	KINETUM_ALWAYS_INLINE bool allow(uint64_t now_ns) noexcept
+	[[nodiscard]] KINETUM_ALWAYS_INLINE bool allow(uint64_t now_ns) noexcept
 	{
-		if (KINETUM_UNLIKELY(!initialized_)) {
-			window_start_ns_ = now_ns;
-			initialized_ = true;
-		} else if (KINETUM_UNLIKELY(now_ns < window_start_ns_)) {
+		if (initialized_ && now_ns < last_ns_) {
 			return false;
-		} else if (now_ns - window_start_ns_ >= window_ns_) {
-			window_start_ns_ = now_ns;
-			count_ = 0;
 		}
-
-		if (count_ < max_count_) {
-			++count_;
-			return true;
+		last_ns_ = now_ns;
+		initialized_ = true;
+		const auto retained = positions_.size();
+		if (retained != 0 && expired_(now_ns, 0)) {
+			if (expired_(now_ns, retained - 1u)) {
+				positions_.commit_pop(retained);
+			} else {
+				// Monotonic timestamps make expiry a prefix predicate. The oldest
+				// is expired and the newest is live; locate the first live event.
+				std::size_t lower = 1u, upper = retained - 1u;
+				while (lower < upper) {
+					const auto middle = lower + (upper - lower) / 2u;
+					if (expired_(now_ns, middle)) {
+						lower = middle + 1u;
+					} else {
+						upper = middle;
+					}
+				}
+				positions_.commit_pop(lower);
+			}
 		}
-
-		return false;
+		if (positions_.size() >= max_count_) {
+			return false;
+		}
+		timestamps_[positions_.producer_slot()] = now_ns;
+		positions_.commit_push();
+		return true;
 	}
 
-	/** @return Exact accepted event count in the current window. */
-	[[nodiscard]] constexpr uint64_t count() const noexcept
+	/** @return Retained accepted events at the last valid observation; reads no clock. */
+	[[nodiscard]] uint64_t count() const noexcept
 	{
-		return count_;
+		return positions_.size();
 	}
-	/** @return Saturated number of events still available in the current window. */
-	[[nodiscard]] constexpr uint64_t remaining() const noexcept
+	/** @return Exact unused quota at the last valid observation. */
+	[[nodiscard]] uint64_t remaining() const noexcept
 	{
-		return (count_ < max_count_) ? (max_count_ - count_) : 0;
+		return max_count_ - positions_.size();
 	}
-
-	/** @brief Clear event count and unbind the timestamp baseline. */
+	/** @brief Clear logical history and unbind time in O(1), retaining the allocation. */
 	void reset() noexcept
 	{
-		count_ = 0;
-		window_start_ns_ = 0;
+		positions_.commit_pop(positions_.size());
+		positions_.reset_empty();
+		last_ns_ = 0u;
 		initialized_ = false;
 	}
 
     private:
-	uint64_t max_count_;	    ///< Maximum accepted events in one window.
-	uint64_t window_ns_;	    ///< Exact positive window duration in nanoseconds.
-	uint64_t count_;	    ///< Accepted events in the current window.
-	uint64_t window_start_ns_;  ///< First timestamp bound to the current window.
-	bool initialized_;	    ///< Whether `window_start_ns_` carries a timestamp.
+	/** @return Positive duration; zero rejects before history allocation. */
+	static uint64_t checked_duration_(uint64_t duration)
+	{
+		if (duration == 0u) {
+			throw std::invalid_argument("sliding_window: window duration must be positive");
+		}
+		return duration;
+	}
+	/** @return Non-null explicit resource; no default-heap fallback is permitted. */
+	static std::pmr::memory_resource *checked_resource_(std::pmr::memory_resource *resource)
+	{
+		if (resource == nullptr) {
+			throw std::invalid_argument("sliding_window: memory resource must be non-null");
+		}
+		return resource;
+	}
+	/** @return Representable power-of-two timestamp extent without changing the logical quota. */
+	static std::size_t history_capacity_(uint64_t quota)
+	{
+		constexpr auto MAXIMUM =
+			std::numeric_limits<std::ptrdiff_t>::max() / static_cast<std::ptrdiff_t>(sizeof(uint64_t));
+		constexpr auto CEILING = std::bit_floor(static_cast<std::size_t>(MAXIMUM));
+		if (quota > CEILING) {
+			throw std::length_error("sliding_window: timestamp history exceeds representable storage");
+		}
+		return std::bit_ceil(std::max<std::size_t>(2u, static_cast<std::size_t>(quota)));
+	}
+	/** @return Whether a retained timestamp lies outside the validated observation's interval. */
+	[[nodiscard]] bool expired_(uint64_t now_ns, std::size_t offset) const noexcept
+	{
+		return now_ns - timestamps_[positions_.consumer_slot(offset)] >= window_ns_;
+	}
+
+	uint64_t max_count_;			 ///< Exact logical event quota.
+	uint64_t window_ns_;			 ///< Positive duration, never added to an absolute timestamp.
+	std::pmr::vector<uint64_t> timestamps_;	 ///< One construction-time circular history allocation.
+	detail::work_queue_indices positions_;	 ///< Sole FIFO index authority, shared with work queues.
+	uint64_t last_ns_{0};			 ///< Last valid observation, including a quota-denied call.
+	bool initialized_{false};		 ///< Whether time is bound, including timestamp zero.
 };
 
 }  // namespace kinetum::algo

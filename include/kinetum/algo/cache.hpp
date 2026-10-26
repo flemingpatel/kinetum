@@ -304,12 +304,12 @@ class lru_cache {
 	using eviction_callback = std::function<void(const K &, V &)>;
 
 	/**
-     * @brief Construct LRU cache.
-     * @param capacity Maximum number of entries
-     * @param on_evict Optional callback when entry is evicted
+	 * @brief Construct LRU cache.
+	 * @param capacity Maximum number of entries
+	 * @param on_evict Optional callback when entry is evicted
 	 * @throws std::invalid_argument when @p capacity is zero, or any allocation
 	 *         exception from complete map reservation.
-     */
+	 */
 	explicit lru_cache(std::size_t capacity, eviction_callback on_evict = nullptr)
 		: capacity_(capacity)
 		, on_evict_(std::move(on_evict))
@@ -339,11 +339,11 @@ class lru_cache {
 	lru_cache &operator=(lru_cache &&) = delete;
 
 	/**
-     * @brief Get value by key, updating LRU order.
+	 * @brief Get value by key, updating LRU order.
 	 * @param key Key to look up
 	 * @return Pointer to value, or nullptr if not found
 	 * @throws Any exception emitted by the caller's hash or equality operation.
-     */
+	 */
 	KINETUM_ALWAYS_INLINE
 	V *get(const K &key)
 	{
@@ -360,11 +360,11 @@ class lru_cache {
 	}
 
 	/**
-     * @brief Get value without updating LRU order (peek).
+	 * @brief Get value without updating LRU order (peek).
 	 * @param key Key to look up
 	 * @return Pointer to value, or nullptr if not found
 	 * @throws Any exception emitted by the caller's hash or equality operation.
-     */
+	 */
 	[[nodiscard]] const V *peek(const K &key) const
 	{
 		auto it = map_.find(key);
@@ -372,13 +372,13 @@ class lru_cache {
 	}
 
 	/**
-     * @brief Insert or update entry.
-     * @param key Key
+	 * @brief Insert or update entry.
+	 * @param key Key
 	 * @param value Value
 	 * @return true if inserted, false if updated existing
 	 * @throws Any exception from allocation, key/value construction or
 	 *         assignment, hashing, equality, or the pre-eviction callback.
-     */
+	 */
 	template <typename KK, typename VV>
 	bool put(KK &&key, VV &&value)
 	{
@@ -412,11 +412,11 @@ class lru_cache {
 	}
 
 	/**
-     * @brief Remove entry by key.
+	 * @brief Remove entry by key.
 	 * @param key Key to remove
 	 * @return true if removed, false if not found
 	 * @throws Any exception emitted by the caller's hash or equality operation.
-     */
+	 */
 	bool erase(const K &key)
 	{
 		auto it = map_.find(key);

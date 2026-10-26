@@ -886,8 +886,8 @@ was consumed; violating the input bound fails stop.
 
 The I/O/storage implementation has already constructed every returned
 `packet_record`: DPDK recovers the record from the mbuf private area; UDP
-acquires one from its fixed host pool. Core code then stamps only generic
-metadata authority:
+receives into records reserved from its declared storage domain. Core code then
+stamps only generic metadata authority:
 
 - `timestamp_ns = worker_now_ns`
 - `epoch = worker_epoch_ledger.source_epoch`
@@ -1042,11 +1042,12 @@ to resolve ownership. Selector input and callback contracts are in
 [Module SDK](MODULE_SDK.md#module-context-selection).
 
 The compiled fan-out array statically bounds singular clone invocations. A
-clone failure or full fan-out staging array increments the owner worker's
+clone refusal or unavailable local reservation increments the owner worker's
 active telemetry bank's `fanout_overflow`. Capacity is checked before a clone
 is requested, so the runtime never creates a clone it cannot stage; a storage-
 domain clone failure increments the same owner-local field and that successor
-receives no packet. There is no shared payload, heap fallback, provider
+receives no packet. Refusal can include storage contention and does not prove
+global exhaustion. There is no shared payload, heap fallback, provider
 conversion, or unbounded module-selected clone loop.
 
 **TX-stage handling** (`stage->kind() == STAGE_KIND_TX`) is described
@@ -2062,7 +2063,7 @@ uncertainty after an irreversible native effect is fail-stop.
 | `numa_layout` / `numa_owner<T>` | Cold checked typed layout and move-only root ownership over one exact-node prefaulted mapping. Subsystem destructors retire nested objects before the mapping owner unmaps it. |
 | `config_snapshot_epoch_store` | Coordinator-owned canonical snapshot slots: stage, publish, exact lookup, and claimed retirement. |
 | `frozen_transition_participants` | Immutable, bidirectionally validated membership projected once from compiled topology and retained by identity. |
-| `epoch_transition_command_mailbox` | Plan-sized MPMC queue of borrowed command contexts; one wake-only eventfd and unconditional producer completion. Destroying an unresolved context terminates. |
+| `epoch_transition_command_mailbox` | Plan-sized MPMC queue of borrowed command contexts; one wake-only eventfd and unconditional producer completion. A `RESOURCE_EXHAUSTED` admission refusal can be transient while the next queue cell is being released. Destroying an unresolved context terminates. |
 | `epoch_transition_coordinator` | Sole transition phase, snapshot, Bootstrap retry, allocator watermark, transaction identity, lease, terminal-journal, and progress owner. |
 | `epoch_transition_preparation` | Candidate controls/arenas, image/executor dispatch, result collection, reverse partial retirement, cancellation grace, and lease timer. No packet commit or independent phase. |
 | `epoch_transition_completion` | Preallocated COMMITTING/RETIRING owner of certificate, reader grace, retirement claims, deadlines, and final status. COMPLETE requires all old slots empty. |

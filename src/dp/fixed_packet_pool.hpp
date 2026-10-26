@@ -9,16 +9,15 @@
  * @author Fleming Patel
  *
  * The pool allocates its complete record population, payload backing, and free
- * queue before packet admission. Acquires, writable clones, origin copies, and
+ * index bitmap before packet admission. Acquires, writable clones, origin copies, and
  * burst retirement perform no allocation or locking. Each payload slot begins
  * on a cache-line boundary so concurrent owners never share writable payload
  * cache lines merely because the configured maximum length is unaligned.
  *
  * @par Thread Safety
- * The bounded free-credit queue is MPMC. Distinct callers may acquire and
- * retire distinct records concurrently; each acquired record still has one
- * exact owner. Destruction requires complete quiescence and zero outstanding
- * records.
+ * Atomic availability bits permit concurrent acquisition and retirement of
+ * distinct records; each acquired record still has one exact owner. Destruction
+ * requires complete quiescence and zero outstanding records.
  */
 
 #include <cstddef>
@@ -26,7 +25,7 @@
 #include <memory>
 #include <span>
 
-#include <kinetum/algo/queue.hpp>
+#include <kinetum/algo/atomic_index_pool.hpp>
 #include "src/common/status_or.hpp"
 #include "src/dp/numa_memory.hpp"
 #include "src/dp/packet.hpp"
@@ -37,12 +36,12 @@ namespace kinetum::dp
 /** @brief Construction contract for one fixed host storage domain. */
 struct fixed_packet_pool_options {
 	uint32_t record_count{0};			///< Exact logical packet-credit population.
-	uint32_t data_room_bytes{0};			///< Exact bytes reserved for each payload slot.
-	uint32_t headroom_bytes{0};			///< Exact bytes preceding packet data.
+	uint32_t data_room_bytes{0};			///< Authored data-room size, including headroom.
+	uint32_t headroom_bytes{0};			///< Authored headroom before aligned packet data.
 	uint32_t alignment_bytes{0};			///< Exact record and packet-data alignment.
 	uint16_t domain_index{INVALID_STORAGE_DOMAIN};	///< Compiled storage-domain index.
 	uint32_t generation{1};				///< Nonzero materialization generation.
-	/** Exact Linux memory node for queue controls, cells, records and payload; negative rejects. */
+	/** Exact Linux memory node for index controls, words, records and payload; negative rejects. */
 	int32_t host_numa_node{-1};
 };
 
@@ -84,7 +83,7 @@ class fixed_packet_pool final {
 	 *
 	 * @param records Destination record-pointer array.
 	 * @param capacity Maximum records to acquire.
-	 * @return Exact acquired prefix length.
+	 * @return Exact acquired prefix length; exhaustion or contention may shorten it.
 	 */
 	[[nodiscard]] uint16_t acquire_burst(packet_record **records, uint16_t capacity) noexcept;
 
@@ -94,28 +93,34 @@ class fixed_packet_pool final {
 		return options_.record_count;
 	}
 
-	/** @return Approximate concurrent count of records owned outside the pool, bounded by capacity. */
+	/** @return Cold O(words) in-use observation, bounded by capacity; exact after quiescence. */
 	[[nodiscard]] uint32_t outstanding() const noexcept;
 
-	/** @return Approximate concurrent free-record count, saturated to uint32_t. */
+	/** @return Cold O(words) free-population scan; approximate concurrently, exact after quiescence. */
 	[[nodiscard]] uint32_t available_approx() const noexcept;
 
-	/** @return Complete live queue/record/payload mapping for cold placement inspection. */
+	/** @return Complete live bitmap/record/payload mapping for cold placement inspection. */
 	[[nodiscard]] const numa_memory_region &storage_region() const noexcept
 	{
 		return backing_;
 	}
 
     private:
+	/** @brief Initialize an acquired prefix; the internal span has at most UINT16_MAX slots. */
+	template <std::size_t extent>
+	uint16_t acquire_records_(std::span<packet_record *, extent> records) noexcept;
+	/** @brief Validate and retire one exact nonempty prefix without reading published records. */
+	template <std::size_t extent>
+	void release_records_(std::span<packet_record *const, extent> records) noexcept;
 	/** @brief Cold checked geometry; all byte offsets are computed by numa_layout. */
 	struct storage_layout;
 	/** @brief Caller-storage free-credit publication mechanism. */
-	using free_queue = algo::mpmc_queue_view<packet_record *>;
+	using free_index_pool = algo::atomic_index_pool_view;
 	/**
-	 * @brief Construct the admitted pool in its complete prefaulted mapping.
+	 * @brief Bind the admitted pool to its complete prefaulted mapping.
 	 *
 	 * @param options Exact storage-domain shape.
-	 * @param layout Checked queue, record and payload geometry.
+	 * @param layout Checked bitmap, record and payload geometry.
 	 * @param backing Complete aligned and prefaulted memory-region owner.
 	 */
 	fixed_packet_pool(fixed_packet_pool_options options, const storage_layout &layout,
@@ -126,7 +131,7 @@ class fixed_packet_pool final {
 	 * @param state Borrowed pool instance.
 	 * @param records Destination for newly owned record pointers.
 	 * @param capacity Maximum records to acquire.
-	 * @return Acquired prefix length, or zero for invalid input or exhaustion.
+	 * @return Acquired prefix length, or zero for invalid input, exhaustion, or contention.
 	 */
 	[[nodiscard]] static uint16_t acquire_burst_(void *state, packet_record **records, uint16_t capacity) noexcept;
 
@@ -134,7 +139,7 @@ class fixed_packet_pool final {
 	 * @brief Produce one independent writable record in this exact domain.
 	 * @param state Borrowed destination pool instance.
 	 * @param source Live record from this pool, borrowed without ownership transfer.
-	 * @return Newly owned deep copy, or nullptr on invalid source or exhaustion.
+	 * @return Newly owned deep copy, or nullptr on invalid source, exhaustion, or contention.
 	 */
 	[[nodiscard]] static packet_record *clone_writable_(void *state, const packet_record *source) noexcept;
 
@@ -150,14 +155,16 @@ class fixed_packet_pool final {
 							  packet_record **records, uint16_t count) noexcept;
 
 	/**
-	 * @brief Retire every exact owned record; malformed or duplicate ownership fails stop.
+	 * @brief Retire exact leases; malformed ownership, within-burst duplicates, and returns before reacquisition fail stop.
 	 * @param state Borrowed pool instance that owns every record.
 	 * @param records Non-null array of distinct live records transferred back to the pool.
 	 * @param count Positive number of records to retire.
+	 * Stale pointers racing or following a later owner violate the caller contract
+	 * and are outside duplicate detection. No record is read after its bit is returned.
 	 */
 	static void release_burst_(void *state, packet_record *const *records, uint16_t count) noexcept;
 	/**
-	 * @brief Publish one cold lock-free approximate occupancy observation.
+	 * @brief Publish one cold O(words) approximate occupancy observation.
 	 * @param state Borrowed pool instance.
 	 * @param observation Destination for generation, domain identity, and occupancy state.
 	 * @param diagnostic Optional caller-owned diagnostic buffer, cleared on success.
@@ -174,8 +181,8 @@ class fixed_packet_pool final {
 	[[nodiscard]] bool owns_(const packet_record *record) const noexcept;
 
 	/**
-	 * @param record Exact record slot owned by this pool; a foreign address fails stop.
-	 * @return Mutable payload address reserved for this record slot.
+	 * @param record Candidate record address.
+	 * @return Reserved payload address, or nullptr for a foreign or misaligned slot.
 	 */
 	[[nodiscard]] uint8_t *payload_for_(const packet_record *record) const noexcept;
 
@@ -185,16 +192,17 @@ class fixed_packet_pool final {
 	 */
 	[[nodiscard]] packet_record *record_for_index_(std::size_t index) const noexcept;
 
-	fixed_packet_pool_options options_;		  ///< Immutable materialized pool shape.
-	numa_memory_region backing_;			  ///< Complete aligned and prefaulted backing owner.
-	std::size_t record_stride_{0};			  ///< Exact bytes between aligned record objects.
-	std::size_t payload_stride_{0};			  ///< Cache-line-isolated payload-slot stride.
-	std::size_t payload_data_offset_{0};		  ///< Offset preserving headroom before aligned data.
-	packet_storage_domain_operations operations_{};	  ///< Immutable published storage table.
-	uint8_t *record_storage_{nullptr};		  ///< Aligned backing for placement-constructed records.
-	uint8_t *payload_storage_{nullptr};		  ///< Aligned backing for exact payload slots.
-	free_queue *free_records_{nullptr};		  ///< Mutable queue control placed in backing_.
-	std::span<free_queue::storage_type> free_cells_;  ///< Queue cells sharing the same exact node and lifetime.
+	fixed_packet_pool_options options_;		 ///< Immutable materialized pool shape.
+	numa_memory_region backing_;			 ///< Complete aligned and prefaulted backing owner.
+	std::size_t record_shift_{0};			 ///< Log2 of the exact power-of-two record stride in bytes.
+	std::size_t payload_stride_{0};			 ///< Cache-line-isolated payload-slot stride.
+	std::size_t payload_data_offset_{0};		 ///< Offset preserving headroom before aligned data.
+	packet_storage_domain_operations operations_{};	 ///< Immutable published storage table.
+	uint8_t *record_storage_{nullptr};		 ///< Aligned backing for placement-constructed records.
+	uint8_t *payload_storage_{nullptr};		 ///< Aligned backing for exact payload slots.
+	free_index_pool *free_records_{nullptr};	 ///< Shared prefix-search control placed in backing_.
+	std::span<free_index_pool::storage_type>
+		free_words_;  ///< Availability words with the same exact node and lifetime.
 };
 
 }  // namespace kinetum::dp

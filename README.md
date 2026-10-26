@@ -1,9 +1,11 @@
 # Kinetum (0.1.0)
 
-Kinetum is a Linux packet-processing platform whose production hot path
-targets DPDK. It validates declared packet pipelines, plans them across
-CPU cores, runs them as a long-lived dataplane, and applies configuration
-snapshots through an epoch-based reconfiguration subsystem.
+Kinetum is a Linux packet-processing platform. You define a pipeline and its
+I/O and storage resources; Kinetum plans the work across CPU cores and runs it
+as a dataplane. DPDK provides production packet I/O. Built-in ACL, NAT44, and
+QoS modules provide filtering, address translation, and rate control; the SDK
+supports custom modules. A separate control plane manages live configuration
+changes and rollback.
 
 Kinetum provides a common runtime and control plane for custom packet-processing
 applications composed from reusable pipeline stages. It separates application
@@ -100,6 +102,10 @@ Kinetum 0.1.0 is the initial experimental release.
 - `tooling/tests/`                    Python tests for environment and release tooling
 - `validation/tests/`                 validation, benchmark, and private wheel tests
 - `docs/`                             platform documentation
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for bug reports, proposals and pull requests.
 
 ## License
 
