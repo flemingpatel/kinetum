@@ -485,6 +485,10 @@ alignment), `DATA_PLANE.md` (region state alignment), `MODULE_SDK.md`
 node selected for their owner. A provider whose admitted memory contract uses
 hugepages must use and prove that backing; an explicit host-storage provider
 does not acquire a hugepage requirement by implication.
+Optional page-size advice cannot relax usable capacity, caller alignment,
+placement or lifetime requirements, and does not prove huge-page backing.
+Prefaulting establishes initial residency; it does not pin pages or prevent
+later faults after reclamation.
 Placement covers root controls and nested worker-private execution storage,
 including immutable routing tables. Preallocation, alignment, a stored node
 number, or moving a container into local memory does not place its backing

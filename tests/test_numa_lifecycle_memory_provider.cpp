@@ -8,8 +8,10 @@
  *
  * The tests exercise the allocator directly rather than inferring behavior
  * through a module generation. They pin compiled-budget validation, exact byte
- * and derived-slot bounds, mapping-failure rollback, unlocked NUMA work under
- * concurrent callers, and fail-stop release/lifetime contracts.
+ * and derived-slot bounds, mapping-failure rollback, concurrent allocation
+ * ownership, and fail-stop release/lifetime contracts.
+ * An unexpected return from an invalid release exits the child normally,
+ * before a live-owner destructor could satisfy the death expectation.
  */
 
 #include <gtest/gtest.h>
@@ -20,11 +22,11 @@
 #include <barrier>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <memory>
-#include <optional>
 #include <span>
 #include <thread>
 #include <utility>
@@ -34,7 +36,8 @@
 #include "src/common/status.hpp"
 #include "src/dp/lifecycle/lifecycle_context.hpp"
 #include "src/dp/lifecycle/numa_lifecycle_memory_provider.hpp"
-#include "src/quark/host_probe.hpp"
+#include "tests/memory_mapping_test_support.hpp"
+#include "tests/numa_test_support.hpp"
 
 namespace kinetum::dp::lifecycle
 {
@@ -63,8 +66,11 @@ class lifecycle_block_owner final {
 	{
 	}
 
+	/** @brief Release ownership cannot be copied. */
 	lifecycle_block_owner(const lifecycle_block_owner &) = delete;
+	/** @brief Release ownership cannot be copy-assigned. */
 	lifecycle_block_owner &operator=(const lifecycle_block_owner &) = delete;
+	/** @brief An existing guard cannot be replaced without retiring its block. */
 	lifecycle_block_owner &operator=(lifecycle_block_owner &&) = delete;
 
 	/**
@@ -111,21 +117,17 @@ void expect_allocation_failure(lifecycle_memory_provider &provider, int32_t numa
 }
 
 /**
- * @brief Select one process-allowed memory NUMA node.
- *
- * @return Lowest exact allocatable node, or null when the host cannot prove one.
+ * @brief Fail a death expectation without terminating on an unrelated setup error.
+ * @param reason Static description of the failed fixture prerequisite.
  */
-[[nodiscard]] std::optional<int32_t> live_numa_node()
+[[noreturn]] void fail_death_test_setup(const char *reason) noexcept
 {
-	const auto host = quark::probe_host();
-	if (!host.valid || host.memory_numa_nodes.empty()) {
-		return std::nullopt;
-	}
-	return host.memory_numa_nodes.front();
+	std::fprintf(stderr, "fixture setup failed: %s\n", reason);
+	std::_Exit(EXIT_SUCCESS);
 }
 
 /**
- * @brief Build one exact single-node provider or abort inside a death child.
+ * @brief Build one exact single-node provider inside a death child.
  *
  * @param numa_node Exact host NUMA node.
  * @param capacity Exact byte budget for the node.
@@ -141,7 +143,7 @@ void expect_allocation_failure(lifecycle_memory_provider &provider, int32_t numa
 	}};
 	auto provider_or = numa_lifecycle_memory_provider::create(budgets);
 	if (!provider_or.is_ok()) {
-		std::abort();
+		fail_death_test_setup("lifecycle provider construction");
 	}
 	return std::move(provider_or).value();
 }
@@ -155,6 +157,7 @@ void release_empty_block(int32_t numa_node)
 {
 	auto provider = make_death_test_provider(numa_node, 1u);
 	provider->release({});
+	std::_Exit(EXIT_SUCCESS);
 }
 
 /**
@@ -167,15 +170,16 @@ void release_block_twice(int32_t numa_node)
 	auto provider = make_death_test_provider(numa_node, 1u);
 	auto block_or = provider->allocate(numa_node, 1u, TEST_ALIGNMENT, true);
 	if (!block_or.is_ok()) {
-		std::abort();
+		fail_death_test_setup("duplicate-release allocation");
 	}
 	const auto block = block_or.value();
 	provider->release(block);
 	provider->release(block);
+	std::_Exit(EXIT_SUCCESS);
 }
 
 /**
- * @brief Trigger fail-stop by changing one released block's exact extent.
+ * @brief Trigger fail-stop by changing one live block's exact extent.
  *
  * @param numa_node Exact host NUMA node.
  */
@@ -184,11 +188,12 @@ void release_mismatched_block(int32_t numa_node)
 	auto provider = make_death_test_provider(numa_node, 2u);
 	auto block_or = provider->allocate(numa_node, 1u, TEST_ALIGNMENT, true);
 	if (!block_or.is_ok()) {
-		std::abort();
+		fail_death_test_setup("mismatched-release allocation");
 	}
 	auto block = block_or.value();
 	block.size = 2u;
 	provider->release(block);
+	std::_Exit(EXIT_SUCCESS);
 }
 
 /**
@@ -201,20 +206,21 @@ void release_stale_block_after_slot_reuse(int32_t numa_node)
 	auto provider = make_death_test_provider(numa_node, 2u);
 	auto first_or = provider->allocate(numa_node, 1u, TEST_ALIGNMENT, true);
 	if (!first_or.is_ok()) {
-		std::abort();
+		fail_death_test_setup("initial slot-reuse allocation");
 	}
 	const auto stale = first_or.value();
 	provider->release(stale);
 	auto replacement_or = provider->allocate(numa_node, 1u, TEST_ALIGNMENT, true);
 	if (!replacement_or.is_ok()) {
-		std::abort();
+		fail_death_test_setup("replacement slot-reuse allocation");
 	}
 	const auto replacement = replacement_or.value();
 	if (replacement.provider_token.opaque_identity != stale.provider_token.opaque_identity ||
 	    replacement.provider_token.reuse_nonce == stale.provider_token.reuse_nonce) {
-		std::abort();
+		fail_death_test_setup("exact slot reuse with a distinct nonce");
 	}
 	provider->release(stale);
+	std::_Exit(EXIT_SUCCESS);
 }
 
 /**
@@ -227,7 +233,7 @@ void destroy_provider_with_live_block(int32_t numa_node)
 	auto provider = make_death_test_provider(numa_node, 1u);
 	auto block_or = provider->allocate(numa_node, 1u, TEST_ALIGNMENT, true);
 	if (!block_or.is_ok()) {
-		std::abort();
+		fail_death_test_setup("live-ownership allocation");
 	}
 	provider.reset();
 }
@@ -235,78 +241,82 @@ void destroy_provider_with_live_block(int32_t numa_node)
 /** @brief Reject malformed, duplicate, and unordered compiled budgets. */
 TEST(numa_lifecycle_memory_provider, compiled_budget_validation_is_exact)
 {
-	EXPECT_EQ(
-		numa_lifecycle_memory_provider::create(std::span<const numa_lifecycle_memory_budget>{}).error().code(),
-		status_code::INVALID_ARGUMENT);
-
 	const std::array negative_node{numa_lifecycle_memory_budget{-1, 1, 1}};
-	EXPECT_EQ(numa_lifecycle_memory_provider::create(negative_node).error().code(), status_code::INVALID_ARGUMENT);
 	const std::array zero_context{numa_lifecycle_memory_budget{0, 0, 1}};
-	EXPECT_EQ(numa_lifecycle_memory_provider::create(zero_context).error().code(), status_code::INVALID_ARGUMENT);
 	const std::array zero_capacity{numa_lifecycle_memory_budget{0, 1, 0}};
-	EXPECT_EQ(numa_lifecycle_memory_provider::create(zero_capacity).error().code(), status_code::INVALID_ARGUMENT);
 	const std::array duplicate{
 		numa_lifecycle_memory_budget{0, 1, 1},
 		numa_lifecycle_memory_budget{0, 1, 1},
 	};
-	EXPECT_EQ(numa_lifecycle_memory_provider::create(duplicate).error().code(), status_code::INVALID_ARGUMENT);
 	const std::array unordered{
 		numa_lifecycle_memory_budget{1, 1, 1},
 		numa_lifecycle_memory_budget{0, 1, 1},
 	};
-	EXPECT_EQ(numa_lifecycle_memory_provider::create(unordered).error().code(), status_code::INVALID_ARGUMENT);
+	const std::array cases{
+		std::pair{"empty", std::span<const numa_lifecycle_memory_budget>{}},
+		std::pair{"negative node", std::span<const numa_lifecycle_memory_budget>(negative_node)},
+		std::pair{"zero contexts", std::span<const numa_lifecycle_memory_budget>(zero_context)},
+		std::pair{"zero capacity", std::span<const numa_lifecycle_memory_budget>(zero_capacity)},
+		std::pair{"duplicate nodes", std::span<const numa_lifecycle_memory_budget>(duplicate)},
+		std::pair{"unordered nodes", std::span<const numa_lifecycle_memory_budget>(unordered)},
+	};
+	for (const auto &[name, budgets] : cases) {
+		SCOPED_TRACE(name);
+		const auto result = numa_lifecycle_memory_provider::create(budgets);
+		ASSERT_FALSE(result.is_ok());
+		EXPECT_EQ(result.error().code(), status_code::INVALID_ARGUMENT);
+	}
 }
 
 /** @brief Reject malformed allocation requests before any NUMA mapping. */
 TEST(numa_lifecycle_memory_provider, allocation_requires_exact_compiled_node_size_and_alignment)
 {
-	const auto numa_node = live_numa_node();
-	ASSERT_TRUE(numa_node.has_value()) << "host must expose a process-allocatable NUMA node";
-	const std::array budgets{numa_lifecycle_memory_budget{numa_node.value(), 1, 64}};
+	const int32_t numa_node = test::required_memory_numa_node();
+	ASSERT_GE(numa_node, 0);
+	const std::array budgets{numa_lifecycle_memory_budget{numa_node, 1, 64}};
 	auto provider_or = numa_lifecycle_memory_provider::create(budgets);
 	ASSERT_TRUE(provider_or.is_ok()) << provider_or.error().message();
 	auto provider = std::move(provider_or).value();
 	expect_allocation_failure(*provider, -1, 1, TEST_ALIGNMENT, status_code::INVALID_ARGUMENT);
-	expect_allocation_failure(*provider, numa_node.value(), 0, TEST_ALIGNMENT, status_code::INVALID_ARGUMENT);
-	expect_allocation_failure(*provider, numa_node.value(), 1, 3, status_code::INVALID_ARGUMENT);
-	const int32_t unknown_node = numa_node.value() == std::numeric_limits<int32_t>::max() ? numa_node.value() - 1 :
-												numa_node.value() + 1;
+	expect_allocation_failure(*provider, numa_node, 0, TEST_ALIGNMENT, status_code::INVALID_ARGUMENT);
+	expect_allocation_failure(*provider, numa_node, 1, 3, status_code::INVALID_ARGUMENT);
+	const int32_t unknown_node = numa_node == std::numeric_limits<int32_t>::max() ? numa_node - 1 : numa_node + 1;
 	expect_allocation_failure(*provider, unknown_node, 1, TEST_ALIGNMENT, status_code::FAILED_PRECONDITION);
 }
 
 /** @brief Derive one exact ownership slot for every context and epoch arena. */
 TEST(numa_lifecycle_memory_provider, ownership_slots_derive_from_context_and_exact_epoch_counts)
 {
-	const auto numa_node = live_numa_node();
-	ASSERT_TRUE(numa_node.has_value()) << "host must expose a process-allocatable NUMA node";
-	const std::array budgets{numa_lifecycle_memory_budget{numa_node.value(), 1, LIVE_BLOCKS_PER_CONTEXT + 1u}};
+	const int32_t numa_node = test::required_memory_numa_node();
+	ASSERT_GE(numa_node, 0);
+	const std::array budgets{numa_lifecycle_memory_budget{numa_node, 1, LIVE_BLOCKS_PER_CONTEXT + 1u}};
 	auto provider_or = numa_lifecycle_memory_provider::create(budgets);
 	ASSERT_TRUE(provider_or.is_ok()) << provider_or.error().message();
 	auto provider = std::move(provider_or).value();
 	std::vector<lifecycle_block_owner> blocks;
 	blocks.reserve(LIVE_BLOCKS_PER_CONTEXT);
 	for (std::size_t index = 0; index < LIVE_BLOCKS_PER_CONTEXT; ++index) {
-		auto block_or = provider->allocate(numa_node.value(), 1u, TEST_ALIGNMENT, true);
+		auto block_or = provider->allocate(numa_node, 1u, TEST_ALIGNMENT, true);
 		ASSERT_TRUE(block_or.is_ok()) << block_or.error().message();
 		blocks.emplace_back(*provider, block_or.value());
 	}
-	expect_allocation_failure(*provider, numa_node.value(), 1u, TEST_ALIGNMENT, status_code::RESOURCE_EXHAUSTED);
+	expect_allocation_failure(*provider, numa_node, 1u, TEST_ALIGNMENT, status_code::RESOURCE_EXHAUSTED);
 }
 
 /** @brief Enforce exact compiled byte capacity independently of free slots. */
 TEST(numa_lifecycle_memory_provider, byte_capacity_is_reserved_and_released_exactly)
 {
-	const auto numa_node = live_numa_node();
-	ASSERT_TRUE(numa_node.has_value()) << "host must expose a process-allocatable NUMA node";
-	const std::array budgets{numa_lifecycle_memory_budget{numa_node.value(), 1, 16}};
+	const int32_t numa_node = test::required_memory_numa_node();
+	ASSERT_GE(numa_node, 0);
+	const std::array budgets{numa_lifecycle_memory_budget{numa_node, 1, 16}};
 	auto provider_or = numa_lifecycle_memory_provider::create(budgets);
 	ASSERT_TRUE(provider_or.is_ok()) << provider_or.error().message();
 	auto provider = std::move(provider_or).value();
-	auto first_or = provider->allocate(numa_node.value(), 9u, TEST_ALIGNMENT, true);
+	auto first_or = provider->allocate(numa_node, 9u, TEST_ALIGNMENT, true);
 	ASSERT_TRUE(first_or.is_ok()) << first_or.error().message();
 	const lifecycle_block_owner first(*provider, first_or.value());
-	expect_allocation_failure(*provider, numa_node.value(), 8u, TEST_ALIGNMENT, status_code::RESOURCE_EXHAUSTED);
-	auto second_or = provider->allocate(numa_node.value(), 7u, TEST_ALIGNMENT, false);
+	expect_allocation_failure(*provider, numa_node, 8u, TEST_ALIGNMENT, status_code::RESOURCE_EXHAUSTED);
+	auto second_or = provider->allocate(numa_node, 7u, TEST_ALIGNMENT, false);
 	ASSERT_TRUE(second_or.is_ok()) << second_or.error().message();
 	const lifecycle_block_owner second(*provider, second_or.value());
 	const auto *bytes = static_cast<const uint8_t *>(second_or->data);
@@ -322,20 +332,41 @@ TEST(numa_lifecycle_memory_provider, failed_numa_mapping_rolls_back_reservation_
 	ASSERT_TRUE(provider_or.is_ok()) << provider_or.error().message();
 	auto provider = std::move(provider_or).value();
 	for (int attempt = 0; attempt < 2; ++attempt) {
-		auto block_or = provider->allocate(UNREPRESENTABLE_NODE, 1u, TEST_ALIGNMENT, true);
-		ASSERT_FALSE(block_or.is_ok());
-		EXPECT_EQ(block_or.error().code(), status_code::OUT_OF_RANGE);
+		SCOPED_TRACE(attempt);
+		expect_allocation_failure(*provider, UNREPRESENTABLE_NODE, 1u, TEST_ALIGNMENT,
+					  status_code::OUT_OF_RANGE);
 	}
+}
+
+/** @brief The real lifecycle producer requests advice while preserving exact size and caller alignment. */
+TEST(numa_lifecycle_memory_provider, advice_preserves_caller_geometry)
+{
+	const int32_t numa_node = test::required_memory_numa_node();
+	ASSERT_GE(numa_node, 0);
+	constexpr std::size_t BLOCK_BYTES = 4097u;
+	const std::array budgets{numa_lifecycle_memory_budget{numa_node, 1, BLOCK_BYTES}};
+	auto provider_or = numa_lifecycle_memory_provider::create(budgets);
+	ASSERT_TRUE(provider_or.is_ok()) << provider_or.error().message();
+	auto provider = std::move(provider_or).value();
+	auto block_or = provider->allocate(numa_node, BLOCK_BYTES, TEST_ALIGNMENT, true);
+	ASSERT_TRUE(block_or.is_ok()) << block_or.error().message();
+	const auto block = block_or.value();
+	const lifecycle_block_owner owner(*provider, block);
+	EXPECT_EQ(block.size, BLOCK_BYTES);
+	EXPECT_EQ(block.alignment, TEST_ALIGNMENT);
+	EXPECT_EQ(block.numa_node, numa_node);
+	EXPECT_EQ(reinterpret_cast<std::uintptr_t>(block.data) % TEST_ALIGNMENT, 0u);
+	EXPECT_TRUE(test::has_hugepage_advice(block.data, block.size, true));
 }
 
 /** @brief Concurrent callers retain exact independent mapping ownership. */
 TEST(numa_lifecycle_memory_provider, concurrent_allocate_and_release_conserve_every_claim)
 {
-	const auto numa_node = live_numa_node();
-	ASSERT_TRUE(numa_node.has_value()) << "host must expose a process-allocatable NUMA node";
+	const int32_t numa_node = test::required_memory_numa_node();
+	ASSERT_GE(numa_node, 0);
 	constexpr std::size_t THREAD_COUNT = 4u;
 	constexpr std::size_t BLOCK_BYTES = 32u;
-	const std::array budgets{numa_lifecycle_memory_budget{numa_node.value(), 1, THREAD_COUNT * BLOCK_BYTES}};
+	const std::array budgets{numa_lifecycle_memory_budget{numa_node, 1, THREAD_COUNT * BLOCK_BYTES}};
 	auto provider_or = numa_lifecycle_memory_provider::create(budgets);
 	ASSERT_TRUE(provider_or.is_ok()) << provider_or.error().message();
 	auto provider = std::move(provider_or).value();
@@ -349,8 +380,7 @@ TEST(numa_lifecycle_memory_provider, concurrent_allocate_and_release_conserve_ev
 			const std::size_t index = launched;
 			threads[index] = std::thread([&, index] {
 				allocation_start.arrive_and_wait();
-				auto block_or =
-					provider->allocate(numa_node.value(), BLOCK_BYTES, TEST_ALIGNMENT, true);
+				auto block_or = provider->allocate(numa_node, BLOCK_BYTES, TEST_ALIGNMENT, true);
 				if (!block_or.is_ok()) {
 					succeeded.store(false, std::memory_order_relaxed);
 				}
@@ -377,7 +407,7 @@ TEST(numa_lifecycle_memory_provider, concurrent_allocate_and_release_conserve_ev
 		thread.join();
 	}
 	EXPECT_TRUE(succeeded.load(std::memory_order_relaxed));
-	auto final_or = provider->allocate(numa_node.value(), THREAD_COUNT * BLOCK_BYTES, TEST_ALIGNMENT, true);
+	auto final_or = provider->allocate(numa_node, THREAD_COUNT * BLOCK_BYTES, TEST_ALIGNMENT, true);
 	ASSERT_TRUE(final_or.is_ok()) << final_or.error().message();
 	provider->release(final_or.value());
 }
@@ -385,28 +415,20 @@ TEST(numa_lifecycle_memory_provider, concurrent_allocate_and_release_conserve_ev
 /** @brief Malformed, mismatched, and duplicate release attempts fail stop. */
 TEST(numa_lifecycle_memory_provider, release_requires_one_exact_live_block)
 {
-	const auto numa_node = live_numa_node();
-	ASSERT_TRUE(numa_node.has_value()) << "host must expose a process-allocatable NUMA node";
-	auto canary = make_death_test_provider(numa_node.value(), 1u);
-	auto block_or = canary->allocate(numa_node.value(), 1u, TEST_ALIGNMENT, true);
-	ASSERT_TRUE(block_or.is_ok()) << block_or.error().message();
-	canary->release(block_or.value());
-	EXPECT_DEATH(release_empty_block(numa_node.value()), "");
-	EXPECT_DEATH(release_block_twice(numa_node.value()), "");
-	EXPECT_DEATH(release_mismatched_block(numa_node.value()), "");
-	EXPECT_DEATH(release_stale_block_after_slot_reuse(numa_node.value()), "");
+	const int32_t numa_node = test::required_memory_numa_node();
+	ASSERT_GE(numa_node, 0);
+	EXPECT_DEATH(release_empty_block(numa_node), "");
+	EXPECT_DEATH(release_block_twice(numa_node), "");
+	EXPECT_DEATH(release_mismatched_block(numa_node), "");
+	EXPECT_DEATH(release_stale_block_after_slot_reuse(numa_node), "");
 }
 
 /** @brief Provider destruction refuses to hide one leaked lifecycle mapping. */
 TEST(numa_lifecycle_memory_provider, destruction_with_live_ownership_fails_stop)
 {
-	const auto numa_node = live_numa_node();
-	ASSERT_TRUE(numa_node.has_value()) << "host must expose a process-allocatable NUMA node";
-	auto canary = make_death_test_provider(numa_node.value(), 1u);
-	auto block_or = canary->allocate(numa_node.value(), 1u, TEST_ALIGNMENT, true);
-	ASSERT_TRUE(block_or.is_ok()) << block_or.error().message();
-	canary->release(block_or.value());
-	EXPECT_DEATH(destroy_provider_with_live_block(numa_node.value()), "");
+	const int32_t numa_node = test::required_memory_numa_node();
+	ASSERT_GE(numa_node, 0);
+	EXPECT_DEATH(destroy_provider_with_live_block(numa_node), "");
 }
 
 }  // namespace

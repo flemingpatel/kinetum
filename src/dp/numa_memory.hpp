@@ -34,6 +34,8 @@ struct numa_memory_options {
 	std::size_t alignment_bytes{0};	 ///< Nonzero power-of-two usable-address alignment.
 	/** Exact Linux memory node; absent only when the owning contract permits ordinary host placement. */
 	std::optional<int32_t> host_numa_node;
+	/** Optional large-page advice; refusal preserves the required allocation properties. */
+	bool prefer_large_pages{false};
 };
 
 /** @brief Move-only owner of one aligned, prefaulted anonymous mapping. */
@@ -42,7 +44,7 @@ class numa_memory_region final {
 	/**
 	 * @brief Allocate, optionally bind, prefault, and prove one exact region.
 	 *
-	 * @param options Exact usable extent, alignment, and optional NUMA node.
+	 * @param options Exact usable extent, alignment, optional NUMA node, and page-size preference.
 	 * @return Completed region, or a fail-closed validation/allocation status.
 	 * Failure diagnostics use static storage and cannot allocate.
 	 */

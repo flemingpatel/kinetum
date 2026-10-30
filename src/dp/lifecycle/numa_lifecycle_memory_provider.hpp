@@ -10,13 +10,15 @@
  *
  * The adapter gives lifecycle contexts and epoch arenas their existing
  * allocate/release interface while retaining each mapping in the sole shared
- * `numa_memory_region` implementation. Its bookkeeping is cold-path state;
- * packet workers never include or call this type.
+ * `numa_memory_region` implementation. Each allocation requests transparent
+ * large-page advice before prefaulting; Linux chooses the backing without
+ * changing caller alignment or usable capacity. Its bookkeeping is cold-path
+ * state; packet workers never include or call this type.
  *
  * @par Thread Safety
  * Lifecycle executor threads may allocate and release concurrently. A mutex
- * protects only the fixed ownership table and is never held while mapping,
- * binding, prefaulting, or unmapping memory.
+ * protects the fixed ownership table and byte accounting, and is never held
+ * while mapping, binding, advising, prefaulting, or unmapping memory.
  */
 
 #include <cstddef>
@@ -46,17 +48,16 @@ struct numa_lifecycle_memory_budget {
  *
  * Free-slot acquisition and token-directed release are constant-time under the
  * cold ownership mutex. NUMA-budget selection is logarithmic in the number of
- * compiled NUMA rows. Mapping, binding, prefaulting, and unmapping occur with
- * no ownership mutex held.
+ * compiled NUMA rows.
  */
 class numa_lifecycle_memory_provider final : public lifecycle_memory_provider {
     public:
 	/**
 	 * @brief Create one provider from exact sorted compiled NUMA budgets.
 	 *
-	 * The fixed live-block population is derived as `context_count` times the
-	 * long-lived allocation ledger plus the shared exact epoch-slot count. No
-	 * caller-supplied block count or byte default exists.
+	 * The fixed live-block population sums each node's `context_count` times
+	 * its combined long-lived, internal and exact epoch-slot allocation bounds.
+	 * No caller-supplied block count or byte default exists.
 	 *
 	 * @param budgets Strictly sorted unique nonempty NUMA budget set.
 	 * @return Provider, or validation/allocation failure.
@@ -145,7 +146,7 @@ class numa_lifecycle_memory_provider final : public lifecycle_memory_provider {
 	std::size_t first_free_slot_{INVALID_LIVE_BLOCK_INDEX};	 ///< Intrusive free-list head.
 	std::size_t free_slot_count_{0};			 ///< Exact free-list population.
 	uint64_t next_allocation_nonce_{0};			 ///< Last issued nonzero allocation nonce.
-	mutable std::mutex mutex_;				 ///< Protects slot ownership only.
+	mutable std::mutex mutex_;				 ///< Protects slot ownership and byte accounting.
 };
 
 }  // namespace kinetum::dp::lifecycle

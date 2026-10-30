@@ -1481,7 +1481,7 @@ global foreign-callback mutex.
 | Object | Owner and purpose | Module packet-callback reachability |
 |---|---|---|
 | `kinetum_lifecycle_ctx` | Borrowed shell for one cold operation; points to the tracked lifecycle service table and opaque platform operation state. | Unreachable |
-| `lifecycle_context_owner` | Platform owner of exact identity, allocation arenas, telemetry registrations, deadline, and cancellation state. The kernel services its worker-local telemetry controls; cold allocation records and operation state remain private to lifecycle calls. | Unreachable |
+| `lifecycle_context_owner` | Platform owner of exact identity, tracked allocations, epoch arenas, telemetry registrations, deadline, and cancellation state. The kernel services its worker-local telemetry controls; cold allocation records and operation state remain private to lifecycle calls. | Unreachable |
 | `kinetum_ctx` | One cache-line live object containing context-local mutable state plus NUMA, CPU, and worker identity. | Direct owner-worker pointer |
 | `kinetum_prepared_config` | Exact transferred ownership record: module `owner_handle` plus immutable borrowed `packet_config` view. | Only `packet_config` is read |
 | `kinetum_batch_t::epoch_config` | Immutable view selected from the exact epoch-tagged runtime slot. | Direct batch field |
@@ -1495,7 +1495,7 @@ stable descriptor/context/config pointers and performs no manager lookup.
 
 | Callback | Calling context | Required contract |
 |---|---|---|
-| INIT | Cold setup before owner-worker launch, image-serialized | Allocate tracked context state from the exact context arena and register owner-local telemetry; transfer state only on success. |
+| INIT | Cold setup before owner-worker launch, image-serialized | Allocate tracked context state within its exact context-lifetime budget and register owner-local telemetry; transfer state only on success. |
 | PREPARE | Lifecycle executor, image-serialized | Build one immutable exact-epoch artifact in the exact epoch arena; may be expensive and cancellable; transfer one prepared record only on success. |
 | ACTIVATE | Sole packet owner worker | Bounded and infallible publication only; no parse, allocation, blocking, logging, or reclamation. |
 | `process` / `ingest` / `run` | Sole packet owner worker | Bounded hot-path work against the exact live context and exact immutable packet view. |
@@ -1527,15 +1527,26 @@ module-stage lane. Gluon lowers them into the exact `StageInstance`; the shared
 compiler emits them in `compiled_module_context` and proves checked per-NUMA
 totals, including one epoch arena for every `EXACT_EPOCH_SLOT_COUNT` slot.
 Generation admission narrows only after those checks. The lifecycle owner
-allocates and seals exactly those byte limits, so `KINETUM_ERR_NO_MEMORY` is
-the existing module-visible result when a callback exceeds its authored
-capacity. The production NUMA provider acquires and releases ledger slots in
-O(1) through an intrusive free list and an opaque slot/reuse token carried only
-by the internal lifecycle block. It validates the complete block on release,
-so exact slot reuse cannot make an old token current; no pointer scan or
-parallel ownership map exists. Mapping and unmapping remain outside the ledger
+enforces the context limit per allocation and provisions each epoch arena at
+its exact capacity. A callback exceeding its authored capacity receives
+`KINETUM_ERR_NO_MEMORY`. The production NUMA provider acquires and releases
+ledger slots in O(1) through an intrusive free list and an opaque slot/reuse
+token carried only by the internal lifecycle block. It validates the complete
+block on release, so exact slot reuse cannot make an old token current; no
+pointer scan or parallel ownership map exists. Mapping and unmapping remain outside the ledger
 mutex while the corresponding slot and byte claims stay reserved. The module
 ABI carries no capacity field or internal token identity.
+
+The lifecycle-memory provider requests `MADV_HUGEPAGE` on its anonymous mappings
+after exact NUMA binding and before prefaulting. This covers
+`lifecycle_context_owner` and its telemetry, module INIT allocations,
+histograms and complete PREPARE arenas. Caller alignment and usable capacity
+stay unchanged; advice follows effective Linux THP policy and refusal leaves
+initialization and resident-placement checks intact. Worker layouts, separately placed
+`module_context_instance` and `module_epoch_store` controls, and the host packet
+pool retain their existing page policy. Provider packet storage retains its
+own backing contract. Prefaulting establishes initial residency without pinning;
+later faults and background promotion remain possible.
 
 #### Exact two-slot artifact ownership
 

@@ -232,6 +232,9 @@ libelf/GElf before any dynamic load. libnuma development headers are mandatory
 because Quark intersects machine NUMA facts with the current process's allowed
 memory-node mask before accepting host-backed storage.
 
+Lifecycle-memory page advice follows effective host/process THP policy,
+including per-size settings; ordinary-page backing remains valid.
+
 ## 1. Build
 
 Run from the source root. CMake configures and compiles in `build/`; packaging

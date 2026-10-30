@@ -548,7 +548,7 @@ headers and libraries are source-tree interfaces, outside the installed SDK.
 | API | Header | Use |
 | --- | --- | --- |
 | `canonical_topological_order(const Pipeline&)` | `src/axiom/axiom_contract.hpp` | Validates bounded stage/edge structure, exact references, and acyclicity, then returns the deterministic smallest-ready-stage-first order. |
-| `verify_contract(const Pipeline&, const contract_options&)` | `src/axiom/axiom_contract.hpp` | Runs contract validation and returns a `Status`. |
+| `verify_contract(const Pipeline&, const contract_options&)` | `src/axiom/axiom_contract.hpp` | Runs contract validation and returns a `common::status`. |
 | `load_pipeline_pbtxt(path, contract_options)` | `src/axiom/axiom_pbtxt_io.hpp` | Strictly parses pbtxt and returns only a fully verified exact pipeline. |
 | `load_pipeline_mlir(path, contract_options)` | `src/axiom/axiom_mlir_frontend.hpp` | Parses the enabled exact MLIR subset, lowers typed fields, and returns only a fully verified pipeline. |
 

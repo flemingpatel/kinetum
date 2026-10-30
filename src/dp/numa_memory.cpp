@@ -202,6 +202,12 @@ kinetum::common::status_or<numa_memory_region> numa_memory_region::allocate(cons
 		}
 	}
 
+	if (options.prefer_large_pages) {
+		// This nonbinding hint cannot relax capacity, alignment, or NUMA ownership.
+		// Refusal leaves the same mapping subject to prefault and resident proof.
+		(void)::madvise(usable, policy_bytes, MADV_HUGEPAGE);
+	}
+
 	// Establish C++ byte-array storage explicitly for typed layouts and their
 	// implicit-lifetime arrays. Owners construct nontrivial elements afterward.
 	usable = ::new (usable) std::byte[options.usable_bytes];
@@ -209,8 +215,8 @@ kinetum::common::status_or<numa_memory_region> numa_memory_region::allocate(cons
 		return status(status_code::OUT_OF_RANGE,
 			      static_status_text("NUMA memory byte array exceeds the C++ object-size limit"));
 	}
-	// The cold owner faults every usable page before publication so packet
-	// execution never pays an anonymous-page fault for this region.
+	// Prefault every usable page before publication. This does not pin backing
+	// or prevent future page faults after reclamation.
 	std::memset(usable, 0, options.usable_bytes);
 	if (options.host_numa_node.has_value()) {
 		const int mode = MPOL_BIND | MPOL_F_STATIC_NODES;

@@ -286,7 +286,10 @@ status_or<lifecycle_memory_block> numa_lifecycle_memory_provider::allocate(int32
 		budget.bytes_in_use += size;
 	}
 
-	auto region_or = layout.allocate(numa_node);
+	auto region_or = layout.allocate(numa_node, [](numa_memory_options options) noexcept {
+		options.prefer_large_pages = true;
+		return numa_memory_region::allocate(options);
+	});
 	if (!region_or.is_ok()) {
 		std::lock_guard<std::mutex> lock(mutex_);
 		auto &slot = blocks_[slot_index];
