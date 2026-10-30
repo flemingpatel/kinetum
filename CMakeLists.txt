@@ -1625,6 +1625,7 @@ if(KINETUM_ENABLE_TESTS)
     tests/test_epoch_transition_staging.cpp
     tests/test_worker_packet_staging.cpp
     tests/test_numa_layout.cpp
+    tests/test_numa_memory.cpp
     tests/test_worker_numa_placement.cpp
     tests/test_region_worker_launcher.cpp
     tests/test_thread_affinity.cpp

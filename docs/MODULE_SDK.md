@@ -798,10 +798,18 @@ Rules:
   grace conditions allow reclamation.
 
 Long-lived context state uses `kinetum_lifecycle_allocate_context()` during
-INIT and the matching exact `kinetum_lifecycle_release_context()` during FINI.
+INIT; `kinetum_lifecycle_release_context()` releases an exact allocation during
+INIT or FINI.
 `module_base` performs that allocation for the concrete C++ object itself. A
 failed INIT transfers no state, receives no FINI, and is rolled back through
 the lifecycle owner's tracked allocations plus the concrete-object destructor.
+
+Lifecycle allocation supplies CPU-visible memory on the context's exact NUMA
+node. The platform automatically requests optional transparent huge-page advice
+for this storage, preserving requested alignment and usable size. Modules
+neither select nor assume a physical page size; these allocations grant no
+device access or DMA registration. Packet bytes remain borrowed from their
+packet-storage provider.
 
 Each lane-local module stage requires one `ModuleContextResourceBinding`;
 platform stages have none. Both `context_memory_capacity_bytes` and
@@ -1650,9 +1658,9 @@ It may reset bounded context-local metadata and publish exact pointers, but it
 cannot perform work that could fail after commit begins.
 
 INIT, PREPARE, RETIRE, and FINI are cold. They may allocate and log only
-through lifecycle services and must honor deadlines/cancellation. INIT receives
-the exact context-lifetime arena; PREPARE receives the exact epoch-artifact
-arena. C++ modules adapt those allocators through `context_memory_resource` and
+through lifecycle services and must honor deadlines/cancellation. INIT allocates
+tracked context-lifetime storage; PREPARE allocates within its exact epoch arena.
+C++ modules adapt those allocators through `context_memory_resource` and
 `epoch_memory_resource`, respectively. The C++ INIT trampoline seals the
 context resource after successful initialization. A prepared-artifact owner
 must seal its epoch resource before returning success; all built-ins do so. A

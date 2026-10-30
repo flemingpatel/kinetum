@@ -652,7 +652,11 @@ exceptions with the documented ownership and cleanup contracts in Section 2.4.
 - No exception may cross the C module/provider ABI. A catch-all immediately
   outside a foreign callback exists only to enforce that violation as
   terminate-class; it is not recovery or a hot-path alternative to `noexcept`.
-- Check return values. Do not ignore `[[nodiscard]]` returns.
+- Check return values. A documented nonbinding performance hint may explicitly
+  discard its return only when refusal preserves every required property.
+  `MADV_HUGEPAGE` meets this contract for CPU-memory allocation; mapping,
+  placement, device-registration and ownership failures remain checked.
+  Do not ignore `[[nodiscard]]` returns.
 
 ---
 

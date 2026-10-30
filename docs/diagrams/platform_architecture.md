@@ -1342,9 +1342,9 @@ view exactly; there is no current/previous search.
 
 - Canonical snapshot bytes and SHA-256 identity are verified before any slot
   becomes prepared.
-- Context memory is allocated during INIT; epoch arenas are allocated during
-  PREPARE. Their budgets are separate, and published packet-configuration views
-  are immutable.
+- Module context-state allocations occur during INIT; each complete epoch arena
+  is allocated before its PREPARE callback. Their budgets are separate, and
+  published packet-configuration views are immutable.
 - At most one retirement claim may withdraw an exact old slot; destroying an
   unresolved claim terminates.
 - Foreign lifecycle threads receive immutable/cold inputs, never a live
@@ -1777,6 +1777,7 @@ end
 group Construct the complete cold generation
     D->D: create coordinator and immutable command owner
     D->M: admit images; place context controls on owner NUMA\nINIT exact contexts; place epoch stores on the same node
+    note over D,M: Lifecycle-provider mappings: exact NUMA bind,\noptional large-page advice, prefault and resident proof.\nPhysical page size follows Linux policy.
     D->L: pre-create bounded lifecycle executors
     D->P: reserve resources; construct facilities in dependency order
     P->P: construct storage, cold drivers, execution, and transitions
