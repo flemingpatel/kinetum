@@ -198,7 +198,7 @@ class partitioned_runtime final {
 	 *
 	 * Only the exact coordinator thread may call this method.
 	 *
-	 * @return Exact steady-clock deadline, or nullopt when no transition timer is armed.
+	 * @return Earliest telemetry, preparation, or completion deadline; nullopt when none is armed.
 	 */
 	[[nodiscard]] std::optional<std::chrono::steady_clock::time_point> next_control_deadline() const noexcept;
 
@@ -219,7 +219,7 @@ class partitioned_runtime final {
 	 */
 	void shutdown() noexcept;
 
-	/** @return Sole immutable runtime-status publication. */
+	/** @return Sole coherent runtime-status publication, borrowed for this generation. */
 	[[nodiscard]] const runtime_status_publication &status_publication() const noexcept;
 
 	/**

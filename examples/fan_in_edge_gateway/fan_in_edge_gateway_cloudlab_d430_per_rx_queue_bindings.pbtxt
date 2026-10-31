@@ -96,7 +96,7 @@ io_stream_bindings {
   direction: IO_STREAM_DIRECTION_TX
   queues {
     driver_queue_id: 0
-    descriptor_count: 1024
+    descriptor_count: 2048
     tx_storage {
       storage_domain_ids: "storage_wan0_q0"
       storage_domain_ids: "storage_wan1_q0"

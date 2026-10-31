@@ -47,16 +47,17 @@ struct example_spec {
 	int32_t regions;	    ///< Region count used by the deployment.
 	int expected_handoffs;	    ///< Exact number of cross-worker stage edges.
 	uint32_t rx_descriptors;    ///< Authored descriptor population for each RX stream.
+	uint32_t tx_descriptors;    ///< Authored descriptor population for each TX stream.
 	uint64_t required_buffers;  ///< Independently derived complete per-domain ownership bound.
 };
 
 /** @brief Single-queue deployments selected by the validation profiles. */
 constexpr std::array<example_spec, 3> SINGLE_QUEUE_EXAMPLES{{
-	{"passthrough", "passthrough_tap_bindings.pbtxt", "hardware_inventory_tap.pbtxt", 1, 0, 1024u, 4480u},
+	{"passthrough", "passthrough_tap_bindings.pbtxt", "hardware_inventory_tap.pbtxt", 1, 0, 1024u, 1024u, 4480u},
 	{"fan_in_edge_gateway", "fan_in_edge_gateway_tap_bindings.pbtxt", "hardware_inventory_tap.pbtxt", 3, 2, 1024u,
-	 13312u},
+	 1024u, 13312u},
 	{"fan_in_edge_gateway", "fan_in_edge_gateway_cloudlab_d430_bindings.pbtxt",
-	 "hardware_inventory_cloudlab_d430.pbtxt", 3, 2, 2048u, 15360u},
+	 "hardware_inventory_cloudlab_d430.pbtxt", 3, 2, 2048u, 2048u, 16384u},
 }};
 
 /** @brief Parsed inputs retained while planning or removing an authored handoff. */
@@ -207,7 +208,7 @@ void expect_i40e_rss_profile(const kinetum::gluon::v1::DeploymentPlan &planned,
  * @brief Pin authored queue depths and independently derived storage floors for a shipped example.
  * @param planned Complete plan emitted from the shipped inputs.
  * @param compiled Topology admitted by the production compiler.
- * @param spec Expected RX depth and per-domain floor; every shipped TX queue has 1024 descriptors.
+ * @param spec Expected RX/TX descriptor populations and per-domain buffer floor.
  */
 void expect_storage_budget(const kinetum::gluon::v1::DeploymentPlan &planned,
 			   const kinetum::provider::compiled_provider_topology &compiled, const example_spec &spec)
@@ -216,7 +217,7 @@ void expect_storage_budget(const kinetum::gluon::v1::DeploymentPlan &planned,
 	for (const auto &stream : planned.io_streams()) {
 		EXPECT_EQ(stream.descriptor_count(), stream.direction() == kinetum::gluon::v1::IO_STREAM_DIRECTION_RX ?
 							     spec.rx_descriptors :
-							     1024u);
+							     spec.tx_descriptors);
 	}
 	for (const auto &domain : compiled.storage_domains) {
 		SCOPED_TRACE(domain.storage_domain_id);
@@ -267,7 +268,8 @@ TEST(gluon_examples, rss_bindings_plan_complete_context_selection_handoffs)
 					   3,
 					   8,
 					   2048u,
-					   38848u};
+					   2048u,
+					   40896u};
 	auto inputs_or = load_example(RSS_EXAMPLE);
 	ASSERT_TRUE(inputs_or.is_ok()) << inputs_or.error().message();
 	const auto &inputs = inputs_or.value();
@@ -309,12 +311,12 @@ TEST(gluon_examples, per_queue_storage_bindings_plan_original_domains)
 	};
 	constexpr std::array<storage_example, 2> EXAMPLES{{
 		{{"fan_in_edge_gateway", "fan_in_edge_gateway_cloudlab_d430_per_rx_queue_bindings.pbtxt",
-		  "hardware_inventory_cloudlab_d430.pbtxt", 3, 2, 2048u, 8896u},
+		  "hardware_inventory_cloudlab_d430.pbtxt", 3, 2, 2048u, 2048u, 9920u},
 		 2,
 		 1,
 		 65535u},
 		{{"fan_in_edge_gateway", "fan_in_edge_gateway_cloudlab_d430_rx_rss_2_per_rx_queue_bindings.pbtxt",
-		  "hardware_inventory_cloudlab_d430.pbtxt", 3, 8, 2048u, 13312u},
+		  "hardware_inventory_cloudlab_d430.pbtxt", 3, 8, 2048u, 2048u, 15360u},
 		 4,
 		 2,
 		 32767u},

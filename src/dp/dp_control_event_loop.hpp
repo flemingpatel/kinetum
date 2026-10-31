@@ -18,15 +18,17 @@
  * borrowed runtime descriptors must remain valid through each wait call.
  *
  * @par Performance
- * This is a cold control loop. It performs one blocking poll and bounded
- * descriptor reads, and is unreachable from packet workers.
+ * This cold control loop blocks in poll and uses bounded descriptor reads.
+ * Packet workers never enter it.
  */
 
+#include <cerrno>
 #include <chrono>
 #include <csignal>
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <type_traits>
 
 #include "src/common/status_or.hpp"
 
@@ -57,6 +59,34 @@ struct dp_control_event {
  */
 [[nodiscard]] int control_poll_timeout(std::optional<std::chrono::steady_clock::time_point> deadline,
 				       std::chrono::steady_clock::time_point now) noexcept;
+
+/**
+ * @brief Retry an interrupted control wait against its original absolute deadline.
+ *
+ * Each attempt derives a fresh relative timeout. Interrupted waits consume the
+ * same deadline; they never restart its duration. Scheduling and the native
+ * wait still determine when the caller resumes.
+ *
+ * @tparam clock_type Nonthrowing callable returning a steady-clock sample.
+ * @tparam poll_type Nonthrowing callable with poll's result and errno contract.
+ * @param deadline Original deadline, or nullopt for an indefinite wait.
+ * @param read_clock Clock sampled immediately before every attempt.
+ * @param poll_once Borrowed operation receiving the computed millisecond timeout.
+ * @return First non-interrupted native result, preserving its errno on failure.
+ */
+template <typename clock_type, typename poll_type>
+[[nodiscard]] int poll_control_deadline(std::optional<std::chrono::steady_clock::time_point> deadline,
+					clock_type &&read_clock, poll_type &&poll_once) noexcept
+{
+	static_assert(std::is_nothrow_invocable_r_v<std::chrono::steady_clock::time_point, clock_type &>);
+	static_assert(std::is_nothrow_invocable_r_v<int, poll_type &, int>);
+	for (;;) {
+		const int result = poll_once(control_poll_timeout(deadline, read_clock()));
+		if (result >= 0 || errno != EINTR) {
+			return result;
+		}
+	}
+}
 
 /** @brief Own one nonblocking signalfd and poll borrowed runtime descriptors. */
 class dp_control_event_loop final {

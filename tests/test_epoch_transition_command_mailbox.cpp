@@ -16,10 +16,13 @@
 
 #include <array>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
+#include <cstddef>
 #include <csignal>
 #include <cstdint>
 #include <cstdlib>
+#include <initializer_list>
 #include <memory>
 #include <optional>
 #include <string>
@@ -97,9 +100,11 @@ TEST(epoch_transition_command_mailbox, topology_owns_exact_role_correct_capacity
 	auto executor_owned_or = epoch_transition_command_mailbox::create(make_mailbox_topology(2u, 2u));
 	EXPECT_FALSE(executor_owned_or.is_ok());
 	auto misplaced_coordinator = make_mailbox_topology();
+	ASSERT_TRUE(misplaced_coordinator.lifecycle_services.has_value());
 	misplaced_coordinator.lifecycle_services->coordinator_service_index = 1u;
 	EXPECT_FALSE(epoch_transition_command_mailbox::create(misplaced_coordinator).is_ok());
 	auto misplaced_executor = make_mailbox_topology();
+	ASSERT_TRUE(misplaced_executor.lifecycle_services.has_value());
 	misplaced_executor.lifecycle_services->lifecycle_executor_service_indices[0] = 0u;
 	EXPECT_FALSE(epoch_transition_command_mailbox::create(misplaced_executor).is_ok());
 }
@@ -276,6 +281,62 @@ TEST(epoch_transition_command_mailbox, unresolved_context_destruction_fails_stop
 			std::_Exit(83);
 		},
 		::testing::KilledBySignal(SIGABRT), "");
+}
+
+/** @brief Interrupted attempts consume the original deadline, including fractional milliseconds and expiry. */
+TEST(dp_control_event_loop, interrupted_waits_keep_the_original_deadline)
+{
+	using clock_type = std::chrono::steady_clock;
+	auto now = clock_type::time_point{};
+	const auto deadline = now + std::chrono::milliseconds(10) + std::chrono::nanoseconds(1);
+	std::array<int, 3> timeouts{};
+	std::size_t attempts = 0u;
+	/** @brief Model elapsed native waits followed by two interruptions and one timeout. */
+	const auto poll_once = [&](int timeout) noexcept {
+		if (attempts >= timeouts.size()) {
+			errno = EIO;
+			return -1;
+		}
+		timeouts[attempts++] = timeout;
+		if (attempts == 1u) {
+			now += std::chrono::milliseconds(4);
+			errno = EINTR;
+			return -1;
+		}
+		if (attempts == 2u) {
+			now += std::chrono::milliseconds(7);
+			errno = EINTR;
+			return -1;
+		}
+		return 0;
+	};
+	const int result = poll_control_deadline(deadline, [&now]() noexcept { return now; }, poll_once);
+	EXPECT_EQ(result, 0);
+	EXPECT_EQ(attempts, timeouts.size());
+	EXPECT_EQ(timeouts, (std::array<int, 3>{11, 7, 0}));
+}
+
+/** @brief Ready and non-interrupted error results return unchanged without retrying an indefinite wait. */
+TEST(dp_control_event_loop, completed_waits_preserve_the_native_result)
+{
+	for (const int native_result : {0, 2, -1}) {
+		SCOPED_TRACE(native_result);
+		std::size_t attempts = 0u;
+		int observed_timeout = 0;
+		const int result = poll_control_deadline(
+			std::nullopt, []() noexcept { return std::chrono::steady_clock::time_point{}; },
+			[&](int timeout) noexcept {
+				++attempts;
+				observed_timeout = timeout;
+				errno = native_result < 0 ? EIO : EINTR;
+				return native_result;
+			});
+		const int observed_errno = errno;
+		EXPECT_EQ(result, native_result);
+		EXPECT_EQ(attempts, 1u);
+		EXPECT_EQ(observed_timeout, -1);
+		EXPECT_EQ(observed_errno, native_result < 0 ? EIO : EINTR);
+	}
 }
 
 /** @brief Verify command/lifecycle fairness, deadline, and signal priority exactly. */

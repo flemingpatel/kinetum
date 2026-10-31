@@ -165,7 +165,13 @@ struct host_topology {
 };
 ```
 
-For members requiring longer documentation, use a `/** */` block before the member:
+Keep shared ownership and lifetime rules in the type's Doxygen. Explain
+relationships between adjacent declarations, such as destruction order, once
+with an ordinary `//` comment above that group. Preserve readable member rows
+and let the formatter align their trailing comments.
+
+For a necessary member-specific explanation that cannot remain concise, use a
+`/** */` block before the member:
 
 ```cpp
 /**
@@ -183,6 +189,10 @@ Comment quality rules:
 - **Do not** say in comments what can be clearly stated in code.
 - **Do** state intent - explain the *why*, not the *what*.
 - **Keep** comments crisp. No filler, no redundancy.
+
+In long implementation files, use the existing titled `// ===` separators at
+cohesive phase or ownership boundaries. Keep them outside function bodies;
+avoid a banner for every function. Declaration Doxygen still owns the contract.
 
 ---
 

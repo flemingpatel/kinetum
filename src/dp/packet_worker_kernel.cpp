@@ -15,6 +15,7 @@
 #include <cstddef>
 #include <cstring>
 #include <exception>
+#include <iterator>
 #include <limits>
 #include <map>
 #include <memory>
@@ -26,6 +27,7 @@
 #include <tuple>
 #include <type_traits>
 #include <utility>
+#include <vector>
 
 #include <kinetum/algo/compact_index_set.hpp>
 #include <kinetum/algo/platform.hpp>
@@ -62,6 +64,10 @@ namespace kinetum::dp
 {
 namespace
 {
+
+// =============================================================================
+// Worker identities and cold lookup helpers
+// =============================================================================
 
 /** Fixed bound on worker-local pending packet ownership. */
 constexpr std::size_t LOCAL_STAGING_CAPACITY = kinetum::common::runtime_sizing::INTER_REGION_DATA_RING_CAPACITY;
@@ -124,6 +130,10 @@ template <typename value_type>
 }
 
 }  // namespace
+
+// =============================================================================
+// Worker execution state and operations
+// =============================================================================
 
 /** @brief Complete pre-resolved state and sole execution owner for one packet worker. */
 class packet_worker_kernel::implementation final {
@@ -194,6 +204,10 @@ class packet_worker_kernel::implementation final {
 	}
 
     private:
+	// =============================================================================
+	// Routing and stage tables
+	// =============================================================================
+
 	/** @brief Borrow immutable execution tables after their cold construction completes. */
 	template <typename value_type>
 	using execution_array = std::span<const value_type>;
@@ -204,9 +218,9 @@ class packet_worker_kernel::implementation final {
 	/** @brief One exact pre-resolved directed stage target. */
 	template <template <typename> class sequence>
 	struct route_target_record {
-		uint32_t stage_instance_index{provider::INVALID_COMPILED_PROVIDER_INDEX};  ///< Destination stage.
-		uint16_t logical_stage_index{
-			provider::INVALID_COMPILED_STAGE_INSTANCE_INDEX};	     ///< Destination logical stage.
+		uint32_t stage_instance_index{provider::INVALID_COMPILED_PROVIDER_INDEX};	///< Destination stage.
+		uint16_t logical_stage_index{provider::INVALID_COMPILED_STAGE_INSTANCE_INDEX};	///< Logical stage.
+
 		uint32_t boundary_index{provider::INVALID_COMPILED_PROVIDER_INDEX};  ///< Exact cross-worker edge.
 		uint32_t sender_ordinal{INVALID_RUNTIME_ORDINAL};  ///< Direct owner-local sender policy.
 		sequence<uint32_t> transition_by_storage_domain;   ///< Direct transition or invalid sentinel.
@@ -215,24 +229,21 @@ class packet_worker_kernel::implementation final {
 
 	/** @brief One priority matcher referring to a pre-resolved target ordinal. */
 	struct priority_route {
-		common::compiled_packet_route_condition condition{};  ///< Allocation-free predicate.
-		uint32_t group_ordinal{INVALID_RUNTIME_ORDINAL};      ///< Exact logical destination group.
-		uint32_t pull_target_ordinal{
-			INVALID_RUNTIME_ORDINAL};  ///< Same-owner PULL destination when applicable.
+		common::compiled_packet_route_condition condition{};	///< Allocation-free predicate.
+		uint32_t group_ordinal{INVALID_RUNTIME_ORDINAL};	///< Exact logical destination group.
+		uint32_t pull_target_ordinal{INVALID_RUNTIME_ORDINAL};	///< Same-owner PULL target, if any.
 	};
 
 	/** @brief Cold-proved logical destination and its complete permitted context set. */
 	template <template <typename> class sequence>
 	struct route_group_record {
-		uint16_t logical_stage_index{
-			provider::INVALID_COMPILED_STAGE_INSTANCE_INDEX};  ///< Exact logical successor.
-		uint32_t direct_target_ordinal{INVALID_RUNTIME_ORDINAL};   ///< Same-lane or explicit PULL target.
-		kinetum_select_contexts_fn select_contexts{
-			nullptr};			       ///< Exact declared selector; null for direct routes.
-		uint32_t context_count{0};		       ///< Complete generation-fixed module population.
-		sequence<uint32_t> permitted_ordinals;	       ///< Canonical permitted context set.
-		sequence<uint64_t> permitted_bitmap;	       ///< Read-only exact membership projection.
-		sequence<uint32_t> target_by_context_ordinal;  ///< Direct context-to-concrete-target lookup.
+		uint16_t logical_stage_index{provider::INVALID_COMPILED_STAGE_INSTANCE_INDEX};	///< Logical successor.
+		uint32_t direct_target_ordinal{INVALID_RUNTIME_ORDINAL};  ///< Same-lane or explicit PULL target.
+		kinetum_select_contexts_fn select_contexts{nullptr};  ///< Declared selector; null for direct routes.
+		uint32_t context_count{0};			      ///< Complete generation-fixed module population.
+		sequence<uint32_t> permitted_ordinals;		      ///< Canonical permitted context set.
+		sequence<uint64_t> permitted_bitmap;		      ///< Read-only exact membership projection.
+		sequence<uint32_t> target_by_context_ordinal;	      ///< Direct context-to-concrete-target lookup.
 	};
 	using route_group = route_group_record<execution_array>;  ///< Published immutable selector projection.
 
@@ -247,21 +258,32 @@ class packet_worker_kernel::implementation final {
 		packet_mechanism_kind mechanism{packet_mechanism_kind::RX};	      ///< Platform mechanism.
 		int32_t region_id{-1};						      ///< Sole owner region.
 		uint32_t rx_stream_index{provider::INVALID_COMPILED_PROVIDER_INDEX};  ///< Exact ingress source.
-		uint32_t stage_bound_tx_stream_index{
-			provider::INVALID_COMPILED_PROVIDER_INDEX};  ///< Exact TX-stage egress.
-		sequence<route_target_record<sequence>> targets;     ///< Unique authored outgoing targets.
-		sequence<uint32_t> target_by_stage_instance;	     ///< Global target to local ordinal.
-		sequence<uint32_t> group_by_logical_stage;	     ///< Explicit logical successor lookup.
-		sequence<route_group_record<sequence>> groups;	///< One exact destination group per logical successor.
-		sequence<uint32_t> fanout_group_ordinals;	///< Authored logical branch order.
-		sequence<priority_route> priority_routes;	///< Compiler-established evaluation order.
-		membership_type reachable_storage_domains;	///< O(1) executable-domain gate.
-		sequence<uint32_t> execution_keys;		///< Pre-resolved EXECUTE key by storage domain.
-		sequence<uint32_t> boundary_send_keys;		///< Post-transition sender key by carried domain.
+		uint32_t stage_bound_tx_stream_index{provider::INVALID_COMPILED_PROVIDER_INDEX};  ///< TX-stage egress.
+
+		sequence<route_target_record<sequence>> targets;  ///< Unique authored outgoing targets.
+		sequence<uint32_t> target_by_stage_instance;	  ///< Global target to local ordinal.
+		sequence<uint32_t> group_by_logical_stage;	  ///< Explicit logical successor lookup.
+		sequence<route_group_record<sequence>> groups;	  ///< One group per logical successor.
+		sequence<uint32_t> fanout_group_ordinals;	  ///< Authored logical branch order.
+		sequence<priority_route> priority_routes;	  ///< Compiler-established evaluation order.
+		membership_type reachable_storage_domains;	  ///< O(1) executable-domain gate.
+		sequence<uint32_t> execution_keys;		  ///< Pre-resolved EXECUTE key by storage domain.
+		sequence<uint32_t> boundary_send_keys;		  ///< Post-transition sender key by carried domain.
 	};
 	using stage_runtime = stage_record<execution_array, algo::compact_index_set_view>;  ///< Frozen stage tables.
 
-	/** @brief Transient packet prefixes, placed and prefaulted on the owning worker's NUMA node. */
+	// =============================================================================
+	// Packet scratch and I/O streams
+	// =============================================================================
+
+	/**
+	 * @brief Transient packet prefixes, placed and prefaulted on the owning worker's NUMA node.
+	 *
+	 * RX slots are null before each call. Within the requested range, only the
+	 * returned prefix may be populated; those slots are cleared after their last
+	 * read. Pending output retains local reservations until dispatch, and
+	 * pending_count bounds reads of its record array.
+	 */
 	struct alignas(kinetum::algo::CACHE_LINE_SIZE) execution_scratch {
 		std::array<packet_record *, MAX_BURST> rx_records{};	  ///< Exact provider RX prefix.
 		std::array<packet_record *, MAX_BURST> local_records{};	  ///< One key's dequeued ownership prefix.
@@ -269,13 +291,12 @@ class packet_worker_kernel::implementation final {
 		module_batch_scratch module{};				  ///< Sole packet ABI projection.
 		kinetum_context_selection_batch selection{};		  ///< Read-only selector flow projection.
 		std::array<uint32_t, MAX_BURST> selected_contexts{};	  ///< Selector output ordinals.
-		std::array<packet_record *, MAX_BURST>
-			pending_records{};  ///< Contiguous output group retaining reservations until dispatch.
-		stage_runtime *pending_stage{nullptr};	    ///< Exact source of the pending prefix.
-		const route_group *pending_group{nullptr};  ///< Exact pending logical destination.
-		uint32_t pending_domain{
-			provider::INVALID_COMPILED_PROVIDER_INDEX};  ///< Retained local reservation owner.
-		uint16_t pending_count{0};  ///< Occupied output prefix; bounds every scratch read.
+
+		std::array<packet_record *, MAX_BURST> pending_records{};	     ///< Contiguous output prefix.
+		stage_runtime *pending_stage{nullptr};				     ///< Source stage.
+		const route_group *pending_group{nullptr};			     ///< Logical destination.
+		uint32_t pending_domain{provider::INVALID_COMPILED_PROVIDER_INDEX};  ///< Retained reservation domain.
+		uint16_t pending_count{0};					     ///< Occupied output prefix.
 	};
 	static_assert(std::is_standard_layout_v<execution_scratch>);
 	static_assert(std::is_trivially_destructible_v<execution_scratch>);
@@ -285,8 +306,10 @@ class packet_worker_kernel::implementation final {
 	struct rx_stream_runtime {
 		uint32_t telemetry_ordinal{UINT32_MAX};	 ///< Pre-resolved owner-local stream counter row.
 		bool owned{false};			 ///< Whether this compact stream is polled here.
+
 		const provider::compiled_provider_io_stream *facts{nullptr};  ///< Immutable stream facts.
 		const packet_rx_burst_operations *operations{nullptr};	      ///< Direct provider burst target.
+
 		uint32_t stage_instance_index{provider::INVALID_COMPILED_PROVIDER_INDEX};  ///< RX stage.
 		uint32_t storage_domain_index{provider::INVALID_COMPILED_PROVIDER_INDEX};  ///< Native RX storage.
 		uint32_t delivery_key{INVALID_RUNTIME_ORDINAL};	 ///< Exact RX_DELIVER key in either role.
@@ -298,8 +321,10 @@ class packet_worker_kernel::implementation final {
 	struct tx_stream_record {
 		uint32_t telemetry_ordinal{UINT32_MAX};	 ///< Pre-resolved owner-local stream counter row.
 		bool owned{false};			 ///< Whether this compact stream is submitted here.
+
 		const provider::compiled_provider_io_stream *facts{nullptr};  ///< Immutable stream facts.
 		const packet_tx_burst_operations *operations{nullptr};	      ///< Direct provider burst target.
+
 		uint32_t stage_instance_index{provider::INVALID_COMPILED_PROVIDER_INDEX};  ///< Attached TX stage.
 		membership_type accepted_storage_domains;	  ///< Immutable O(1) TX storage admission.
 		sequence<uint32_t> transition_by_storage_domain;  ///< Stage-to-stream transition table.
@@ -307,18 +332,31 @@ class packet_worker_kernel::implementation final {
 	using tx_stream_runtime =
 		tx_stream_record<execution_array, algo::compact_index_set_view>;  ///< Frozen TX input.
 
-	/** @brief One grouped exact provider transition invocation. */
+	// =============================================================================
+	// Storage handoff and retirement
+	// =============================================================================
+
+	/**
+	 * @brief One grouped exact provider transition invocation.
+	 *
+	 * The returned prefix consumes source ownership and provides destination
+	 * records. Unaccepted sources remain unchanged and resume through retry_key.
+	 * Destination slots are null before each call; only the returned prefix may
+	 * be populated, and those slots are cleared after dispatch.
+	 */
 	struct transition_batch {
 		std::array<packet_private, MAX_BURST> metadata{};  ///< Authority snapshot across callback.
-		bool owned{false};				   ///< Transition belongs to this worker schedule.
+
+		bool owned{false};	 ///< Transition belongs to this worker schedule.
 		bool configured{false};	 ///< One endpoint use established retry/post behavior.
 		const provider::compiled_storage_transition *facts{nullptr};  ///< Immutable transition facts.
 		const kinetum_provider_storage_transition_operations *operations{nullptr};  ///< Burst target.
+
 		packet_work_phase retry_phase{packet_work_phase::STAGE_DELIVER};  ///< Unaccepted suffix state.
-		uint32_t retry_key{INVALID_RUNTIME_ORDINAL};  ///< Exact source-domain continuation key.
-		uint32_t completed_key{
-			INVALID_RUNTIME_ORDINAL};  ///< Exact destination-domain key; absent for direct TX.
+		uint32_t retry_key{INVALID_RUNTIME_ORDINAL};	  ///< Exact source-domain continuation key.
+		uint32_t completed_key{INVALID_RUNTIME_ORDINAL};  ///< Destination-domain key; absent for direct TX.
 		transition_post_action post_action{transition_post_action::LOCAL_EXECUTE};  ///< Accepted prefix state.
+
 		std::array<packet_record *, MAX_BURST> sources{};	///< Exact attempted source owners.
 		std::array<packet_record *, MAX_BURST> destinations{};	///< Accepted destination owners.
 		uint16_t count{0};					///< Current bounded group size.
@@ -334,20 +372,31 @@ class packet_worker_kernel::implementation final {
 		uint32_t to_index{0};						   ///< Destination compact identity.
 		uint32_t from_storage_domain{0};				   ///< Source storage identity.
 		uint32_t transition_index{provider::INVALID_COMPILED_PROVIDER_INDEX};  ///< Direct operation.
+
+		/** @return The endpoint/domain key shared by sorting, duplicate checks and lookup. */
+		[[nodiscard]] auto key() const noexcept
+		{
+			return std::tuple{static_cast<uint8_t>(from_kind), from_index, static_cast<uint8_t>(to_kind),
+					  to_index, from_storage_domain};
+		}
 	};
 
-	/** @brief One grouped exact provider TX invocation. */
+	/**
+	 * @brief One grouped exact provider TX invocation.
+	 *
+	 * Metadata, lengths and storage domains are captured before TX. Accepted
+	 * records may already be reclaimed when the call returns; their accounting
+	 * uses these snapshots.
+	 */
 	template <typename stream_type>
 	struct tx_batch_record {
-		std::array<packet_private, MAX_BURST>
-			metadata{};		     ///< Pre-call epoch/stage and suffix-integrity snapshots.
-		bool owned{false};		     ///< Stream belongs to this worker.
-		const stream_type *stream{nullptr};  ///< Stable pre-resolved stream.
-		std::array<packet_record *, MAX_BURST> records{};  ///< Exact caller-owned records.
-		std::array<uint32_t, MAX_BURST> lengths{};	   ///< Pre-call byte counts for accepted ownership.
-		std::array<uint16_t, MAX_BURST>
-			storage_domains{};  ///< Pre-call original domains; accepted records may be gone.
-		uint16_t count{0};	    ///< Current bounded group size.
+		std::array<packet_private, MAX_BURST> metadata{};   ///< Epoch/stage and suffix-integrity snapshots.
+		bool owned{false};				    ///< Stream belongs to this worker.
+		const stream_type *stream{nullptr};		    ///< Stable pre-resolved stream.
+		std::array<packet_record *, MAX_BURST> records{};   ///< Exact caller-owned records.
+		std::array<uint32_t, MAX_BURST> lengths{};	    ///< Pre-call byte counts for accepted ownership.
+		std::array<uint16_t, MAX_BURST> storage_domains{};  ///< Pre-call original domains.
+		uint16_t count{0};				    ///< Current bounded group size.
 	};
 	using tx_batch = tx_batch_record<tx_stream_runtime>;  ///< Live TX batch bound to a published stream.
 
@@ -358,17 +407,26 @@ class packet_worker_kernel::implementation final {
 		uint16_t count{0};					      ///< Current bounded group size.
 	};
 
+	// =============================================================================
+	// Execution table publication
+	// =============================================================================
+
 	/** @brief One owner-local queue entry in the fixed hot iteration order. */
 	struct local_queue_schedule_entry {
 		uint32_t storage_domain_index{provider::INVALID_COMPILED_PROVIDER_INDEX};  ///< Global domain index.
 		local_work_staging *staging{nullptr};  ///< Stable active/future role owner.
 	};
 
-	/** @brief Complete frozen tables and scratch borrowed from the kernel's one allocation. */
+	/**
+	 * @brief Complete frozen tables and scratch borrowed from the kernel's one allocation.
+	 *
+	 * The mapping must remain live while these views are used. Module, staging
+	 * and boundary pointers borrow separate owners; placing their pointer arrays
+	 * on this worker's node does not establish the pointees' placement.
+	 */
 	struct execution_views {
 		std::span<lifecycle::lifecycle_context_owner *> module_telemetry;  ///< Exact worker context projection.
-		std::span<lifecycle::lifecycle_context_owner *>
-			module_telemetry_by_context;			     ///< Direct context return lookup.
+		std::span<lifecycle::lifecycle_context_owner *> module_telemetry_by_context;  ///< Direct return lookup.
 		std::span<local_work_staging *> local_staging_by_domain;     ///< Direct domain role lookup.
 		std::span<release_batch> release_batches;		     ///< Mutable retirement groups.
 		std::span<local_queue_schedule_entry> local_queue_schedule;  ///< Immutable domain service order.
@@ -385,6 +443,10 @@ class packet_worker_kernel::implementation final {
 		std::span<packet_record *> fanout_clones;		  ///< Mutable clone prefix.
 		execution_scratch *scratch{nullptr};			  ///< Exact local callback and packet scratch.
 	};
+
+	// =============================================================================
+	// Worker operations
+	// =============================================================================
 
 	/** @return OK after binding exact module and source-role activation participants. */
 	[[nodiscard]] common::status initialize_epoch_activation_();
@@ -754,6 +816,10 @@ class packet_worker_kernel::implementation final {
 	[[nodiscard]] static bool publish_active_recirculated_(void *state, uint32_t stage_instance_index,
 							       packet_record *record) noexcept;
 
+	// =============================================================================
+	// Generation references and worker state
+	// =============================================================================
+
 	uint32_t worker_index_{0};				    ///< Exact compact worker identity.
 	const provider::compiled_provider_topology &topology_;	    ///< Sole immutable graph authority.
 	const provider::materialized_provider_runtime &providers_;  ///< Exact provider generation.
@@ -790,7 +856,7 @@ class packet_worker_kernel::implementation final {
 	numa_owner<module::worker_module_health> module_health_;      ///< Exact module-health claim owner.
 	numa_owner<worker_epoch_activation> epoch_activation_;	      ///< Exact local activation order.
 	worker_lifecycle_context lifecycle_;			      ///< Sole worker-local launch and exit record.
-	kinetum::algo::quiescence_reader quiescence_reader_;	      ///< Caller-placed exact config reader.
+	kinetum::algo::quiescence_reader quiescence_reader_;	      ///< Worker-owned exact config reader.
 	source_kernel_kind source_kernel_{source_kernel_kind::NO_SOURCES};  ///< Once-selected source loop.
 	receive_burst_function homogeneous_receive_burst_{nullptr};	    ///< Sole homogeneous callback target.
 	bool outbound_closed_{false};					    ///< Exact-once shutdown publication.
@@ -802,9 +868,12 @@ class packet_worker_kernel::implementation final {
 	std::size_t telemetry_cadence_returns_expected_{0};  ///< Ordinary completed banks awaiting return.
 	bool module_telemetry_sweep_queued_{false};	     ///< One coalesced cadence behind the active sweep.
 	bool telemetry_return_poll_requested_{false};	     ///< One bounded reclaimed-return probe is due.
-	const worker_runtime_command_record *observed_command_{
-		nullptr};  ///< Last non-STOP command consumed by this owner.
+	const worker_runtime_command_record *observed_command_{nullptr};  ///< Last consumed non-STOP command.
 };
+
+// =============================================================================
+// Cold construction and publication into worker NUMA storage
+// =============================================================================
 
 /** @brief Fallible topology construction whose heap-backed tables never enter packet execution. */
 class packet_worker_kernel::implementation::construction final {
@@ -946,6 +1015,10 @@ class packet_worker_kernel::implementation::construction final {
 		return domain < local_staging_by_domain_.size() ? local_staging_by_domain_[domain] : nullptr;
 	}
 
+	// =============================================================================
+	// Construction state
+	// =============================================================================
+
 	uint32_t worker_index_{0};				    ///< Exact compact worker identity.
 	const provider::compiled_provider_topology &topology_;	    ///< Sole immutable graph authority.
 	const provider::materialized_provider_runtime &providers_;  ///< Exact provider generation.
@@ -1037,6 +1110,8 @@ common::status_or<numa_owner<packet_worker_kernel>> packet_worker_kernel::implem
 		      std::is_trivially_destructible_v<published_group> &&
 		      std::is_trivially_destructible_v<published_stream> &&
 		      std::is_trivially_destructible_v<published_tx_batch>);
+	static_assert(std::is_trivially_copyable_v<published_stage> && std::is_trivially_copyable_v<published_target> &&
+		      std::is_trivially_copyable_v<published_group> && std::is_trivially_copyable_v<published_stream>);
 
 	/** @brief Cold geometry of one selector's nested immutable arrays. */
 	struct group_layout {
@@ -1044,6 +1119,7 @@ common::status_or<numa_owner<packet_worker_kernel>> packet_worker_kernel::implem
 		std::size_t permitted_bitmap{0u};    ///< Exact context-membership words.
 		std::size_t targets{0u};	     ///< Context-to-target lookup.
 	};
+
 	/** @brief Cold geometry of one stage's complete nested execution tables. */
 	struct stage_layout {
 		std::size_t targets{0u};		  ///< Directed target records.
@@ -1058,6 +1134,7 @@ common::status_or<numa_owner<packet_worker_kernel>> packet_worker_kernel::implem
 		std::vector<std::size_t> target_domains;  ///< One transition-map offset per target.
 		std::vector<group_layout> group_arrays;	  ///< One complete selector layout per group.
 	};
+
 	/** @brief Cold geometry of one TX stream's admission and conversion arrays. */
 	struct stream_layout {
 		std::size_t domains{0u};      ///< Exact accepted-domain words.
@@ -1084,7 +1161,7 @@ common::status_or<numa_owner<packet_worker_kernel>> packet_worker_kernel::implem
 	std::size_t tx_order_offset = 0u;
 	std::size_t inbound_offset = 0u;
 	std::size_t fanout_offset = 0u;
-	/** @return One exact geometry refusal before any final kernel mapping exists. */
+	/** @brief Report geometry overflow before any final kernel mapping exists. */
 	const auto overflow = [] {
 		return common::status(common::status_code::OUT_OF_RANGE, "worker execution layout overflows");
 	};
@@ -1201,32 +1278,30 @@ common::status_or<numa_owner<packet_worker_kernel>> packet_worker_kernel::implem
 		auto targets = numa_layout::storage<published_target>(region, placement.targets, source.targets.size());
 		for (std::size_t target = 0u; target < source.targets.size(); ++target) {
 			const auto &entry = source.targets[target];
-			std::construct_at(&targets[target], published_target{
-								    .stage_instance_index = entry.stage_instance_index,
-								    .logical_stage_index = entry.logical_stage_index,
-								    .boundary_index = entry.boundary_index,
-								    .sender_ordinal = entry.sender_ordinal,
-								    .transition_by_storage_domain =
-									    copy(entry.transition_by_storage_domain,
-										 placement.target_domains[target]),
-							    });
+			const published_target target_view{
+				.stage_instance_index = entry.stage_instance_index,
+				.logical_stage_index = entry.logical_stage_index,
+				.boundary_index = entry.boundary_index,
+				.sender_ordinal = entry.sender_ordinal,
+				.transition_by_storage_domain =
+					copy(entry.transition_by_storage_domain, placement.target_domains[target]),
+			};
+			std::construct_at(&targets[target], target_view);
 		}
 		auto groups = numa_layout::storage<published_group>(region, placement.groups, source.groups.size());
 		for (std::size_t group = 0u; group < source.groups.size(); ++group) {
 			const auto &entry = source.groups[group];
 			const auto &arrays = placement.group_arrays[group];
-			std::construct_at(
-				&groups[group],
-				published_group{
-					.logical_stage_index = entry.logical_stage_index,
-					.direct_target_ordinal = entry.direct_target_ordinal,
-					.select_contexts = entry.select_contexts,
-					.context_count = entry.context_count,
-					.permitted_ordinals = copy(entry.permitted_ordinals, arrays.permitted_ordinals),
-					.permitted_bitmap = copy(entry.permitted_bitmap, arrays.permitted_bitmap),
-					.target_by_context_ordinal =
-						copy(entry.target_by_context_ordinal, arrays.targets),
-				});
+			const published_group group_view{
+				.logical_stage_index = entry.logical_stage_index,
+				.direct_target_ordinal = entry.direct_target_ordinal,
+				.select_contexts = entry.select_contexts,
+				.context_count = entry.context_count,
+				.permitted_ordinals = copy(entry.permitted_ordinals, arrays.permitted_ordinals),
+				.permitted_bitmap = copy(entry.permitted_bitmap, arrays.permitted_bitmap),
+				.target_by_context_ordinal = copy(entry.target_by_context_ordinal, arrays.targets),
+			};
+			std::construct_at(&groups[group], group_view);
 		}
 		const std::size_t limit = source.reachable_storage_domains.value_limit();
 		auto words = numa_layout::storage<uint64_t>(region, placement.domains,
@@ -1240,28 +1315,27 @@ common::status_or<numa_owner<packet_worker_kernel>> packet_worker_kernel::implem
 				}
 			}
 		}
-		std::construct_at(
-			&views.stages[index],
-			published_stage{
-				.owned = source.owned,
-				.telemetry_ordinal = source.telemetry_ordinal,
-				.facts = source.facts,
-				.logical = source.logical,
-				.module_store = source.module_store,
-				.mechanism = source.mechanism,
-				.region_id = source.region_id,
-				.rx_stream_index = source.rx_stream_index,
-				.stage_bound_tx_stream_index = source.stage_bound_tx_stream_index,
-				.targets = targets,
-				.target_by_stage_instance = copy(source.target_by_stage_instance, placement.by_stage),
-				.group_by_logical_stage = copy(source.group_by_logical_stage, placement.by_logical),
-				.groups = groups,
-				.fanout_group_ordinals = copy(source.fanout_group_ordinals, placement.fanout),
-				.priority_routes = copy(source.priority_routes, placement.priorities),
-				.reachable_storage_domains = domains,
-				.execution_keys = copy(source.execution_keys, placement.execute_keys),
-				.boundary_send_keys = copy(source.boundary_send_keys, placement.send_keys),
-			});
+		const published_stage stage_view{
+			.owned = source.owned,
+			.telemetry_ordinal = source.telemetry_ordinal,
+			.facts = source.facts,
+			.logical = source.logical,
+			.module_store = source.module_store,
+			.mechanism = source.mechanism,
+			.region_id = source.region_id,
+			.rx_stream_index = source.rx_stream_index,
+			.stage_bound_tx_stream_index = source.stage_bound_tx_stream_index,
+			.targets = targets,
+			.target_by_stage_instance = copy(source.target_by_stage_instance, placement.by_stage),
+			.group_by_logical_stage = copy(source.group_by_logical_stage, placement.by_logical),
+			.groups = groups,
+			.fanout_group_ordinals = copy(source.fanout_group_ordinals, placement.fanout),
+			.priority_routes = copy(source.priority_routes, placement.priorities),
+			.reachable_storage_domains = domains,
+			.execution_keys = copy(source.execution_keys, placement.execute_keys),
+			.boundary_send_keys = copy(source.boundary_send_keys, placement.send_keys),
+		};
+		std::construct_at(&views.stages[index], stage_view);
 	}
 	for (std::size_t index = 0u; index < tx_streams_.size(); ++index) {
 		const auto &source = tx_streams_[index];
@@ -1278,17 +1352,17 @@ common::status_or<numa_owner<packet_worker_kernel>> packet_worker_kernel::implem
 				}
 			}
 		}
-		std::construct_at(&views.tx_streams[index],
-				  published_stream{
-					  .telemetry_ordinal = source.telemetry_ordinal,
-					  .owned = source.owned,
-					  .facts = source.facts,
-					  .operations = source.operations,
-					  .stage_instance_index = source.stage_instance_index,
-					  .accepted_storage_domains = domains,
-					  .transition_by_storage_domain =
-						  copy(source.transition_by_storage_domain, placement.transitions),
-				  });
+		const published_stream stream_view{
+			.telemetry_ordinal = source.telemetry_ordinal,
+			.owned = source.owned,
+			.facts = source.facts,
+			.operations = source.operations,
+			.stage_instance_index = source.stage_instance_index,
+			.accepted_storage_domains = domains,
+			.transition_by_storage_domain =
+				copy(source.transition_by_storage_domain, placement.transitions),
+		};
+		std::construct_at(&views.tx_streams[index], stream_view);
 	}
 	for (std::size_t index = 0u; index < tx_batches_.size(); ++index) {
 		const auto &source = tx_batches_[index];
@@ -1339,6 +1413,7 @@ common::status_or<numa_owner<packet_worker_kernel>> packet_worker_kernel::implem
 	}
 	auto *placed = new (numa_layout::storage<implementation>(region, root_offset).data())
 		implementation(*this, views);
+	// Construct here to retain access to the facade's private constructor.
 	auto *facade = new (numa_layout::storage<packet_worker_kernel>(region, facade_offset).data())
 		packet_worker_kernel(placed);
 	auto owner = adopt_numa_owner(facade, std::move(region));
@@ -1447,6 +1522,10 @@ packet_worker_kernel::implementation::construction::initialize(const std::vector
 	}
 	return common::status::ok();
 }
+
+// =============================================================================
+// Storage roles, work keys and bounded input admission
+// =============================================================================
 
 common::status packet_worker_kernel::implementation::construction::initialize_storage_()
 {
@@ -1816,6 +1895,10 @@ common::status packet_worker_kernel::implementation::construction::initialize_in
 	return common::status::ok();
 }
 
+// =============================================================================
+// Boundary policies and module ownership
+// =============================================================================
+
 common::status packet_worker_kernel::implementation::construction::initialize_boundaries_(
 	const std::vector<boundary_epoch_channel *> &boundaries, numa_owner<worker_boundary_sender> boundary_sender,
 	numa_owner<worker_boundary_receiver> boundary_receiver)
@@ -2149,6 +2232,10 @@ common::status packet_worker_kernel::implementation::initialize_active_scheduler
 	return common::status::ok();
 }
 
+// =============================================================================
+// Stream and stage materialization
+// =============================================================================
+
 common::status packet_worker_kernel::implementation::construction::initialize_transition_batches_()
 {
 	transition_batches_.resize(topology_.storage_transitions.size());
@@ -2190,14 +2277,10 @@ common::status packet_worker_kernel::implementation::construction::initialize_tr
 		previous = transition_index;
 		have_previous = true;
 	}
-	const auto key = [](const transition_lookup_entry &entry) {
-		return std::tuple{static_cast<uint8_t>(entry.from_kind), entry.from_index,
-				  static_cast<uint8_t>(entry.to_kind), entry.to_index, entry.from_storage_domain};
-	};
 	std::sort(transition_lookup_.begin(), transition_lookup_.end(),
-		  [&](const auto &left, const auto &right) { return key(left) < key(right); });
+		  [](const auto &left, const auto &right) { return left.key() < right.key(); });
 	for (std::size_t index = 1; index < transition_lookup_.size(); ++index) {
-		if (key(transition_lookup_[index - 1]) == key(transition_lookup_[index])) {
+		if (transition_lookup_[index - 1].key() == transition_lookup_[index].key()) {
 			return common::status::failed_precondition(
 				"worker owns competing transitions for one exact packet-path state");
 		}
@@ -2292,13 +2375,12 @@ common::status packet_worker_kernel::implementation::construction::initialize_st
 common::status packet_worker_kernel::implementation::construction::initialize_stages_()
 {
 	stages_.resize(topology_.stage_instances.size());
-	std::vector<bool> active_schedule(stages_.size(), false);
+	algo::compact_index_set active_schedule(stages_.size());
 	for (const uint32_t stage_index : schedule_->active_stage_instance_indices) {
-		if (stage_index >= active_schedule.size() || active_schedule[stage_index]) {
+		if (!active_schedule.insert(stage_index)) {
 			return common::status::failed_precondition(
 				"worker active schedule contains an unknown or duplicate stage instance");
 		}
-		active_schedule[stage_index] = true;
 	}
 	std::size_t maximum_fanout = 0;
 	std::size_t observed_active_stages = 0u;
@@ -2319,7 +2401,7 @@ common::status packet_worker_kernel::implementation::construction::initialize_st
 		}
 		const auto &logical = topology_.logical_stages[facts.logical_stage_index];
 		const bool active = logical.execution_mode == provider::compiled_stage_execution_mode::ACTIVE;
-		const bool scheduled_active = active_schedule[stage_index];
+		const bool scheduled_active = active_schedule.contains(stage_index);
 		if (logical.logical_stage_index != facts.logical_stage_index || active != scheduled_active) {
 			return common::status::failed_precondition(
 				"packet worker active schedule disagrees with exact stage execution mode");
@@ -2426,6 +2508,10 @@ common::status packet_worker_kernel::implementation::construction::initialize_st
 	return common::status::ok();
 }
 
+// =============================================================================
+// Bootstrap epoch binding
+// =============================================================================
+
 void packet_worker_kernel::implementation::bind_bootstrap_epoch(uint64_t bootstrap_epoch, uint64_t now_ns) noexcept
 {
 	if (bootstrap_epoch == 0 || now_ns == 0u || epoch_ledger_ == nullptr || boundary_sender_ == nullptr ||
@@ -2494,12 +2580,17 @@ void packet_worker_kernel::implementation::bind_bootstrap_epoch(uint64_t bootstr
 	publish_boundary_transport_();
 }
 
+// =============================================================================
+// Cold route and transition resolution
+// =============================================================================
+
 common::status packet_worker_kernel::implementation::construction::initialize_stage_routes_(stage_runtime &stage)
 {
 	if (!stage.owned || stage.facts == nullptr || stage.logical == nullptr) {
 		return common::status::failed_precondition("worker route compilation requires one owned stage");
 	}
 
+	/** @brief Deduplicate a directed target and resolve its per-domain handoffs. */
 	const auto resolve_target = [&](uint32_t destination_index) -> common::status_or<uint32_t> {
 		if (destination_index >= topology_.stage_instances.size()) {
 			return common::status(common::status_code::OUT_OF_RANGE,
@@ -2814,20 +2905,14 @@ uint32_t packet_worker_kernel::implementation::construction::find_transition_(
 {
 	const auto requested = std::tuple{static_cast<uint8_t>(from_kind), from_index, static_cast<uint8_t>(to_kind),
 					  to_index, from_storage_domain};
-	const auto iterator =
-		std::lower_bound(transition_lookup_.begin(), transition_lookup_.end(), requested,
-				 [](const transition_lookup_entry &entry, const auto &key) {
-					 return std::tuple{static_cast<uint8_t>(entry.from_kind), entry.from_index,
-							   static_cast<uint8_t>(entry.to_kind), entry.to_index,
-							   entry.from_storage_domain} < key;
-				 });
+	const auto iterator = std::lower_bound(transition_lookup_.begin(), transition_lookup_.end(), requested,
+					       [](const transition_lookup_entry &entry, const auto &key) {
+						       return entry.key() < key;
+					       });
 	if (iterator == transition_lookup_.end()) {
 		return provider::INVALID_COMPILED_PROVIDER_INDEX;
 	}
-	const auto found = std::tuple{static_cast<uint8_t>(iterator->from_kind), iterator->from_index,
-				      static_cast<uint8_t>(iterator->to_kind), iterator->to_index,
-				      iterator->from_storage_domain};
-	return found == requested ? iterator->transition_index : provider::INVALID_COMPILED_PROVIDER_INDEX;
+	return iterator->key() == requested ? iterator->transition_index : provider::INVALID_COMPILED_PROVIDER_INDEX;
 }
 
 boundary_epoch_channel *
@@ -2871,6 +2956,10 @@ common::status packet_worker_kernel::implementation::construction::configure_tra
 	batch.post_action = post_action;
 	return common::status::ok();
 }
+
+// =============================================================================
+// Packet ownership and input service
+// =============================================================================
 
 local_work_staging *packet_worker_kernel::implementation::local_staging_(uint32_t storage_domain_index) noexcept
 {
@@ -2942,9 +3031,11 @@ algo::service_result packet_worker_kernel::implementation::poll_one_rx_(rx_strea
 	}
 	const uint64_t source_epoch = epoch_ledger_->source_epoch();
 	const bool future_role = source_epoch != epoch_ledger_->active_epoch();
-	// Select the queue role once for the complete provider burst. The normal
-	// fixed/active role remains the predicted branch and every packet in the
-	// returned prefix inherits the same already observed source identity.
+	/**
+	 * @brief Admit one complete provider burst into its preselected epoch role.
+	 * Fixed/active admission remains the predicted branch at the call site.
+	 * Every returned record inherits the source epoch observed before the call.
+	 */
 	const auto poll_role = [&]<bool future>() noexcept {
 		std::size_t available = 0u;
 		if constexpr (future) {
@@ -3102,6 +3193,10 @@ algo::service_result packet_worker_kernel::implementation::drain_one_boundary_(b
 									    algo::service_disposition::YIELDED};
 }
 
+// =============================================================================
+// Bounded stage execution and routing
+// =============================================================================
+
 template <bool has_active_scheduler, bool has_async_scheduler>
 void packet_worker_kernel::implementation::process_local_queues_() noexcept
 {
@@ -3245,6 +3340,7 @@ void packet_worker_kernel::implementation::execute_module_batch_(std::span<packe
 		return;
 	}
 	const std::span<packet_record *const> occupied{scratch_->module_records.data(), count};
+	/** @brief Invoke the passive ABI with this stage's exact epoch view. */
 	const auto execute_passive = [&]() noexcept {
 		return execute_module_batch_mechanism(*stage.module_store,
 						      static_cast<uint16_t>(stage.facts->stage_instance_index),
@@ -3683,6 +3779,10 @@ packet_worker_kernel::implementation::resolve_tx_stream_(const packet_record &re
 	return &tx_streams_[stream_index];
 }
 
+// =============================================================================
+// Storage transitions, TX and terminal release
+// =============================================================================
+
 bool packet_worker_kernel::implementation::queue_transition_(uint32_t transition_index, packet_record *record,
 							     uint32_t reserved_domain) noexcept
 {
@@ -3726,6 +3826,8 @@ void packet_worker_kernel::implementation::flush_transition_(transition_batch &b
 	const uint16_t attempted = batch.count;
 	const uint32_t source_domain = batch.facts->from_storage_domain_index;
 	const uint32_t destination_domain = batch.facts->to_storage_domain_index;
+	// Transfer consumes the accepted source ownership. Validate returned
+	// destinations against snapshots; only unaccepted sources retain their old identity.
 	const uint16_t accepted = batch.operations->transfer_burst(batch.operations->state, batch.sources.data(),
 								   batch.destinations.data(), attempted);
 	if (accepted > attempted) {
@@ -3854,6 +3956,8 @@ void packet_worker_kernel::implementation::flush_tx_(tx_batch &batch) noexcept
 			std::terminate();
 		}
 	}
+	// TX may already have reclaimed accepted records. All accepted accounting
+	// below uses the pre-call snapshots, never those record pointers.
 	uint64_t accepted_bytes = 0u;
 	for (uint16_t first = 0; first < accepted;) {
 		const uint64_t epoch = batch.metadata[first].epoch;
@@ -3977,6 +4081,10 @@ void packet_worker_kernel::implementation::flush_releases_() noexcept
 		flush_release_(*batch);
 	}
 }
+
+// =============================================================================
+// Packet state, draining and coherent observations
+// =============================================================================
 
 void packet_worker_kernel::implementation::promote_next_stage_(packet_record &record) const noexcept
 {
@@ -4183,6 +4291,10 @@ void packet_worker_kernel::implementation::close_outbound_boundaries_() noexcept
 	outbound_closed_ = true;
 }
 
+// =============================================================================
+// ACTIVE origin, retention and recirculation
+// =============================================================================
+
 uint32_t packet_worker_kernel::implementation::emit_active_origins_(void *state, uint32_t stage_instance_index,
 								    uint64_t epoch, uint64_t now_ns,
 								    const kinetum_emit_batch_t *batch, uint32_t budget,
@@ -4348,6 +4460,10 @@ bool packet_worker_kernel::implementation::publish_active_recirculated_(void *st
 	return true;
 }
 
+// =============================================================================
+// Worker commands, transition progress and the owner loop
+// =============================================================================
+
 KINETUM_ALWAYS_INLINE bool packet_worker_kernel::implementation::consume_runtime_command_() noexcept
 {
 	const auto *command = commands_->observe();
@@ -4512,6 +4628,7 @@ void packet_worker_kernel::implementation::run_loop_(poll_source_type poll_sourc
 				module_telemetry_sweep_queued_ = false;
 			}
 		}
+		/** @brief Service bounded inputs and dispatch, then flush every staged operation. */
 		const auto service_queued_work = [&]() noexcept {
 			input_scheduler_->service([&](const worker_input_endpoint &input,
 						      uint16_t allowance) noexcept -> algo::service_result {
@@ -4611,6 +4728,7 @@ void packet_worker_kernel::implementation::run() noexcept
 	const bool has_async_scheduler = has_active_scheduler && active_scheduler_->has_async_work();
 	switch (source_kernel_) {
 	case source_kernel_kind::NO_SOURCES: {
+		/** @brief Reject RX polling for a worker with no configured native source. */
 		const auto poll_source = [](uint32_t, uint16_t, uint64_t) noexcept -> algo::service_result {
 			std::terminate();
 		};
@@ -4628,6 +4746,7 @@ void packet_worker_kernel::implementation::run() noexcept
 		if (receive_burst == nullptr) {
 			std::terminate();
 		}
+		/** @brief Poll through the shared callback selected during construction. */
 		const auto poll_source = [this, receive_burst](uint32_t ordinal, uint16_t allowance,
 							       uint64_t cached_time) noexcept {
 			return poll_one_rx_(*rx_inputs_[ordinal], receive_burst, allowance, cached_time);
@@ -4642,6 +4761,7 @@ void packet_worker_kernel::implementation::run() noexcept
 		return;
 	}
 	case source_kernel_kind::HETEROGENEOUS: {
+		/** @brief Poll the exact callback belonging to the selected RX stream. */
 		const auto poll_source = [this](uint32_t ordinal, uint16_t allowance, uint64_t cached_time) noexcept {
 			auto &stream = *rx_inputs_[ordinal];
 			return poll_one_rx_(stream, stream.operations->receive_burst, allowance, cached_time);
@@ -4658,6 +4778,10 @@ void packet_worker_kernel::implementation::run() noexcept
 	}
 	std::terminate();
 }
+
+// =============================================================================
+// Public kernel interface
+// =============================================================================
 
 common::status_or<numa_owner<packet_worker_kernel>> packet_worker_kernel::create(
 	uint32_t worker_index, const provider::compiled_provider_topology &topology,
