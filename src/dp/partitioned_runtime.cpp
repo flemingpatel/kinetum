@@ -10,13 +10,13 @@
 #include "src/dp/partitioned_runtime.hpp"
 
 #include <algorithm>
-#include <cerrno>
 #include <chrono>
 #include <cstddef>
 #include <cstdio>
 #include <exception>
 #include <iterator>
 #include <limits>
+#include <memory>
 #include <new>
 #include <optional>
 #include <span>
@@ -67,6 +67,10 @@ using kinetum::common::status_or;
 
 namespace
 {
+
+// =============================================================================
+// Admission, failure diagnostics and fixed control results
+// =============================================================================
 
 /**
  * @brief Validate packet-worker construction facts before provider side effects.
@@ -252,6 +256,10 @@ template <typename request_type>
 	return common::reject_invalid_protobuf_enum_values_recursive(request, contract_name);
 }
 
+// =============================================================================
+// Producer-owned command contexts borrowed by the coordinator
+// =============================================================================
+
 /** @brief Stack-owned Bootstrap payload retained until unconditional completion. */
 class bootstrap_command_context final : public epoch_transition_command_context {
     public:
@@ -272,6 +280,10 @@ class transaction_command_context final : public epoch_transition_command_contex
 };
 
 }  // namespace
+
+// =============================================================================
+// Generation construction and ownership
+// =============================================================================
 
 /** @brief Complete generation transaction, command consumer, and reverse-retirement owner. */
 class partitioned_runtime::implementation final {
@@ -485,6 +497,10 @@ class partitioned_runtime::implementation final {
 	}
 
     private:
+	// =============================================================================
+	// Telemetry and boundary ownership
+	// =============================================================================
+
 	/**
 	 * @brief Materialize exact-NUMA telemetry channels and worker bank owners.
 	 * @return OK after complete worker/context binding; otherwise no live bank exists.
@@ -839,6 +855,10 @@ class partitioned_runtime::implementation final {
 		return status::ok();
 	}
 
+	// =============================================================================
+	// Construction-failure retirement
+	// =============================================================================
+
 	/** @brief Retire every owner created after provider materialization. */
 	void retire_construction_owners_() noexcept
 	{
@@ -878,6 +898,10 @@ class partitioned_runtime::implementation final {
 	}
 
     public:
+	// =============================================================================
+	// Bootstrap and transition command admission
+	// =============================================================================
+
 	/**
 	 * @brief Admit, prepare, activate, and publish one exact fixed epoch.
 	 *
@@ -1057,6 +1081,10 @@ class partitioned_runtime::implementation final {
 		return modules_->lifecycle_notification_descriptor();
 	}
 
+	// =============================================================================
+	// Coordinator event and deadline service
+	// =============================================================================
+
 	/** @copydoc partitioned_runtime::service_command_notifications */
 	[[nodiscard]] status service_command_notifications() noexcept
 	{
@@ -1216,6 +1244,10 @@ class partitioned_runtime::implementation final {
 	}
 
     private:
+	// =============================================================================
+	// Command dispatch and transition completion
+	// =============================================================================
+
 	/**
 	 * @brief Validate, submit, and unconditionally await one fixed identity command.
 	 *
@@ -1281,6 +1313,9 @@ class partitioned_runtime::implementation final {
 
 	/**
 	 * @brief Execute one queue-owned command and publish completion exactly once.
+	 *
+	 * Completion releases the producer's stack lifetime. Read or write the
+	 * borrowed context only before passing it to the mailbox's complete().
 	 *
 	 * @param command Exact taken command record.
 	 */
@@ -1812,6 +1847,10 @@ class partitioned_runtime::implementation final {
 	}
 
     public:
+	// =============================================================================
+	// Shutdown, retirement and generation observations
+	// =============================================================================
+
 	/** @brief Stop and retire every owner in strict reverse dependency order. */
 	void shutdown() noexcept
 	{
@@ -1931,11 +1970,12 @@ class partitioned_runtime::implementation final {
 				.revents = 0,
 			};
 			const auto deadline = preparation_->next_deadline();
-			const int timeout = control_poll_timeout(deadline, now);
-			int result = 0;
-			do {
-				result = ::poll(&descriptor, 1, timeout);
-			} while (result < 0 && errno == EINTR);
+			/** @brief Wait on the still-owned lifecycle result descriptor. */
+			const auto poll_once = [&descriptor](int timeout) noexcept {
+				return ::poll(&descriptor, 1, timeout);
+			};
+			const int result = poll_control_deadline(
+				deadline, []() noexcept { return std::chrono::steady_clock::now(); }, poll_once);
 			if (result < 0 || (descriptor.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
 				std::terminate();
 			}
@@ -1973,6 +2013,7 @@ class partitioned_runtime::implementation final {
 		if (telemetry_aggregator_ == nullptr) {
 			std::terminate();
 		}
+		/** @brief Observe worker exit publications before joining their thread handles. */
 		const auto all_workers_exited = [this]() noexcept {
 			return std::all_of(worker_contexts_.begin(), worker_contexts_.end(),
 					   [](const worker_lifecycle_context *context) {
@@ -2028,11 +2069,12 @@ class partitioned_runtime::implementation final {
 				.events = POLLIN,
 				.revents = 0,
 			};
-			const int timeout = control_poll_timeout(wake_deadline, now);
-			int result = 0;
-			do {
-				result = ::poll(&descriptor, 1, timeout);
-			} while (result < 0 && errno == EINTR);
+			/** @brief Wait on the still-owned lifecycle result descriptor. */
+			const auto poll_once = [&descriptor](int timeout) noexcept {
+				return ::poll(&descriptor, 1, timeout);
+			};
+			const int result = poll_control_deadline(
+				wake_deadline, []() noexcept { return std::chrono::steady_clock::now(); }, poll_once);
 			if (result < 0 || (descriptor.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
 				std::terminate();
 			}
@@ -2053,7 +2095,7 @@ class partitioned_runtime::implementation final {
 		}
 	}
 
-	/** @brief Retire the claimed generation without retaining the gate mutex. */
+	/** @brief Drain the active epoch and retire the generation's owned resources. */
 	void shutdown_owned_() noexcept
 	{
 		if (!worker_threads_.empty()) {
@@ -2113,6 +2155,10 @@ class partitioned_runtime::implementation final {
 		modules_.reset();
 		providers_.reset();
 	}
+
+	// =============================================================================
+	// Worker launch and facility registration
+	// =============================================================================
 
 	/**
 	 * @brief Launch every packet worker behind the complete activation gate.
@@ -2226,6 +2272,10 @@ class partitioned_runtime::implementation final {
 		}
 	}
 
+	// =============================================================================
+	// Owned resources and borrowed command state
+	// =============================================================================
+
 	kinetum::gluon::v1::DeploymentPlan plan_;			       ///< Exact canonical generation plan.
 	std::unique_ptr<provider::compiled_provider_topology> topology_;       ///< Stable sole compiled authority.
 	std::unique_ptr<epoch_transition_coordinator> coordinator_;	       ///< Sole phase/store/participant owner.
@@ -2241,8 +2291,9 @@ class partitioned_runtime::implementation final {
 	std::optional<std::chrono::steady_clock::time_point> next_telemetry_service_;  ///< Next cold service time.
 	std::unique_ptr<epoch_transition_preparation> preparation_;  ///< Sole transient PREPARE/abort owner.
 	std::unique_ptr<epoch_transition_completion> completion_;    ///< Sole COMMITTING/RETIRING owner.
-	/** Declared before channel borrowers so reverse member destruction retires slabs afterward. */
-	std::vector<std::unique_ptr<boundary_epoch_worker_slab>> endpoint_slabs_;
+
+	// Slabs precede channel borrowers so reverse member destruction retires slabs afterward.
+	std::vector<std::unique_ptr<boundary_epoch_worker_slab>> endpoint_slabs_;   ///< Endpoint storage.
 	std::vector<std::unique_ptr<boundary_epoch_channel>> boundaries_;	    ///< Exact DATA/CUT/ACK owners.
 	std::vector<boundary_epoch_channel *> boundary_views_;			    ///< Compact direct boundary table.
 	std::vector<numa_owner<boundary_future_output_hold>> future_output_holds_;  ///< Future queues.
@@ -2252,12 +2303,14 @@ class partitioned_runtime::implementation final {
 	std::vector<numa_owner<packet_worker_kernel>> kernels_;			    ///< Pre-resolved packet workers.
 	std::unique_ptr<kinetum::algo::quiescence_domain> quiescence_domain_;	    ///< Exact frozen reader domain.
 	std::unique_ptr<epoch_transition_certificate> transition_certificate_;	    ///< Immutable proof graph.
-	std::vector<worker_lifecycle_context *>
-		worker_contexts_;		      ///< Exact ordered borrows into worker-local kernel storage.
-	std::size_t worker_count_{0};		      ///< Exact worker array and kernel population.
-	std_thread_worker_launcher worker_launcher_;  ///< Provider-neutral all-or-none launch gate.
-	std::vector<std::thread> worker_threads_;     ///< Exact joinable packet-worker owners.
-	runtime_status_publication runtime_status_;   ///< Sole foreign readiness/epoch observation.
+
+	// Kernels retain their lifecycle records through worker join.
+	std::vector<worker_lifecycle_context *> worker_contexts_;  ///< Ordered kernel-owned lifecycle borrows.
+	std::size_t worker_count_{0};				   ///< Exact worker array and kernel population.
+	std_thread_worker_launcher worker_launcher_;		   ///< Provider-neutral all-or-none launch gate.
+	std::vector<std::thread> worker_threads_;		   ///< Exact joinable packet-worker owners.
+
+	runtime_status_publication runtime_status_;		 ///< Sole foreign readiness/epoch observation.
 	runtime_telemetry_source_owner telemetry_source_owner_;	 ///< Generation-scoped complete source claims.
 	uint64_t runtime_generation_{0};  ///< Exact nonzero provider/runtime generation identity.
 	transaction_command_context *held_prepare_context_{nullptr};   ///< Unresolved original PREPARE producer.
@@ -2266,6 +2319,10 @@ class partitioned_runtime::implementation final {
 	uint64_t telemetry_reservation_epoch_{0};  ///< Complete pre-commit target-bank reservation, or zero.
 	bool shutdown_complete_{false};		   ///< Owner-thread idempotent retirement publication.
 };
+
+// =============================================================================
+// Public runtime construction and interface
+// =============================================================================
 
 status_or<std::unique_ptr<partitioned_runtime>> partitioned_runtime::create(packet_runtime_generation_input input)
 {
@@ -2331,6 +2388,8 @@ status_or<std::unique_ptr<partitioned_runtime>> partitioned_runtime::create(pack
 	}
 
 	try {
+		// Direct new retains access to the private facade constructor. Allocation
+		// precedes the ownership move, so its failure leaves implementation intact.
 		return std::unique_ptr<partitioned_runtime>(new partitioned_runtime(std::move(implementation)));
 	} catch (const std::bad_alloc &) {
 		implementation->fail_stop_construction("failed to allocate packet runtime generation handle");

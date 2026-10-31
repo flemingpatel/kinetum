@@ -505,7 +505,7 @@ package "DPDK component" as DPDK {
         uses = facility_dpdk_0 + storage_dpdk_0
         native path = DPDK ethdev + device PMD
         configures = wan0 RX0, wan1 RX0, lan0 TX0
-        descriptors = RX 2048 per queue, TX 1024
+        descriptors = RX 2048 per queue, TX 2048
         exposes = RX/TX burst + driver lifecycle
     }
     FACILITY -[hidden]down-> STORAGE
@@ -1825,7 +1825,7 @@ participant "Claimed telemetry source" as S
 
 group Cold commands and lifecycle work
     RPC->C: plan-sized MPMC mailbox: fixed command + borrowed context
-    C->C: service signalfd and compiled monotonic deadlines
+    C->C: service signalfd and telemetry / transition deadlines
     C->L: bounded task channels
     L-->C: bounded result rings; eventfd only wakes
     C->P: whole-driver activation / deactivation at lifecycle boundaries

@@ -101,7 +101,7 @@ io_stream_bindings {
   direction: IO_STREAM_DIRECTION_TX
   queues {
     driver_queue_id: 0
-    descriptor_count: 1024
+    descriptor_count: 2048
     tx_storage { storage_domain_ids: "storage_dpdk_0" }
   }
   steering { kind: TRAFFIC_STEERING_KIND_NONE }

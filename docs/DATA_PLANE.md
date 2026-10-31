@@ -268,7 +268,7 @@ admits installed providers, and materializes a generation before publishing
 | 10 | Start the control service | Build the TLS or insecure gRPC server around the complete runtime. Control readiness is not packet permission. |
 | 11 | Restore exact bootstrap | A gRPC producer validates CP's durable canonical request, publishes one fixed mailbox record, and waits unconditionally. The main/coordinator thread orchestrates lifecycle-executor preparation for every context, launches workers behind the activation gate, owner-activates every view, commits the complete snapshot plus allocator watermarks, and waits for every worker to publish `RUNNING` while packet bodies remain closed. |
 | 12 | Activate packet I/O and publish `PACKET_READY` | Invoke the mandatory whole-driver activation callbacks in canonical order, publish one coherent runtime-status snapshot, and only then release every worker into its exact active-epoch packet loop. |
-| 13 | Serve and supervise | The main/coordinator thread blocks in `poll()` over `signalfd`, command and lifecycle `eventfd`s, and the current monotonic transition deadline. It gives termination first priority and due deadlines priority over ordinary work, executes at most one command per command turn, drains lifecycle result rings independently of wake counts, alternates simultaneously ready command/lifecycle sources, and probes committed certificate progress at the existing bounded cadence. |
+| 13 | Serve and supervise | The main/coordinator thread blocks in `poll()` over `signalfd`, command and lifecycle `eventfd`s, and the earliest monotonic telemetry or transition deadline. It gives termination first priority and due deadlines priority over ordinary work, executes at most one command per command turn, drains lifecycle result rings independently of wake counts, alternates simultaneously ready command/lifecycle sources, and probes committed certificate progress at the existing bounded cadence. |
 | 14 | Teardown in dependency order | Close command admission and complete queued callers, initiate bounded gRPC shutdown, cancel and drain held pre-commit Prepare/Abort contexts, apply COMMITTING/RETIRING shutdown law to any held Activate, release-publish STOP, drain and join workers, deactivate provider I/O in reverse order, and finish a provable RETIRING generation (including exact worker-command completion after STOP) before retiring module/snapshot ownership. Then stop lifecycle services, destroy kernels, future holds, DATA boundaries, modules, and providers, release the admitted catalog last, and wait for handler exit. |
 
 The host process connects signal, RPC, and supervisor shutdown to that one
@@ -305,7 +305,7 @@ fully published generation.
 
 | Thread                     | Count                | Lifecycle                                                                            |
 | -------------------------- | -------------------- | ------------------------------------------------------------------------------------ |
-| Main/coordinator thread    | 1                    | Runs ordered admission, consumes the plan-sized command mailbox, blocks in descriptor-driven `poll()` for command or termination events, and owns server/runtime teardown. |
+| Main/coordinator thread    | 1                    | Runs ordered admission, services command/lifecycle descriptors and telemetry/transition deadlines, consumes termination signals, and owns server/runtime teardown. |
 | Merged gRPC server thread pool | managed by gRPC | Serves one `dataplane_control_service` backed by the complete runtime. Bootstrap and transition producers wait unconditionally after successful enqueue; the original Activate context remains owned through COMPLETE or update freeze; Health reads immutable status. |
 | Runtime workers | one per compiled `(region,lane)` execution owner | Materialized before `CONTROL_READY`, launched behind an all-or-none activation gate during exact bootstrap, and released into their pre-resolved execution/RX schedule only at `PACKET_READY`. |
 | Cold lifecycle coordinator | exactly one role on the main/coordinator thread | Remains on the planned caller-owned native thread or exact provider-facility main thread; the launcher never creates a second coordinator thread. |
@@ -1999,11 +1999,11 @@ provider, logging, gRPC, lifecycle, or packet thread exists, `dp_main` blocks SI
 SIGTERM, and SIGUSR1 and creates a nonblocking `signalfd`. Every subsequently created thread
 inherits that mask. After the service is running, the main/coordinator
 thread blocks in `poll()` over that descriptor, the command and lifecycle
-`eventfd` sources, and the current transition deadline; a selected signal
-therefore cannot asynchronously interrupt a provider or packet owner.
+`eventfd` sources, and the earliest telemetry or transition deadline. A selected
+signal therefore cannot asynchronously interrupt a provider or packet owner.
 
 SIGUSR1 requests checked log reopen without entering runtime teardown. A due
-transition deadline retains priority, and reopen cannot starve ready command or
+coordinator deadline retains priority, and reopen cannot starve ready command or
 lifecycle work. On SIGINT or SIGTERM, `dp_main` first closes command admission and
 completes every queued but unstarted producer with application `UNAVAILABLE`.
 Previously accepted Prepare/Abort/Activate contexts may still be held across

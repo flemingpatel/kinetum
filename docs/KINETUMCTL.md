@@ -1230,7 +1230,7 @@ default d430 PCI profile.
         "storage_domain_id": "storage_dpdk_0",
         "host_numa_node": 0,
         "buffer_count": "131071",
-        "required_min_buffers": "15360",
+        "required_min_buffers": "16384",
         "safety_margin": 64,
         "observation_state": "PROVIDER_OBSERVATION_STATE_AVAILABLE_APPROXIMATE",
         "observed_monotonic_ns": "1778446450955300",

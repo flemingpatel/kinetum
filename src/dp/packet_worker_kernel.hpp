@@ -194,7 +194,7 @@ class packet_worker_kernel final {
 	 * The runtime binds the address into its exact domain before worker launch.
 	 * No caller may retain mutable access after CONTROL_READY.
 	 *
-	 * @return Stable caller-owned reader storage for this worker.
+	 * @return Borrowed worker-owned reader storage, valid for the kernel's lifetime.
 	 */
 	[[nodiscard]] kinetum::algo::quiescence_reader &quiescence_reader_registration() noexcept;
 	/** @return The sole worker-local lifecycle record, borrowed by the launcher until join. */

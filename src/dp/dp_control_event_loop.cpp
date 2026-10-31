@@ -96,12 +96,11 @@ status_or<dp_control_event> dp_control_event_loop::wait(int command_descriptor, 
 		pollfd{.fd = lifecycle_descriptor, .events = POLLIN, .revents = 0},
 	};
 	for (;;) {
-		const int timeout = reopen_pending_ ? 0 :
-						      control_poll_timeout(deadline, std::chrono::steady_clock::now());
-		const int result = ::poll(descriptors, 3, timeout);
-		if (result < 0 && errno == EINTR) {
-			continue;
-		}
+		const int result = poll_control_deadline(
+			deadline, []() noexcept { return std::chrono::steady_clock::now(); },
+			[this, &descriptors](int timeout) noexcept {
+				return ::poll(descriptors, 3, reopen_pending_ ? 0 : timeout);
+			});
 		if (result < 0) {
 			return status::internal_error("DP control poll failed: " + std::string(std::strerror(errno)));
 		}
