@@ -533,9 +533,11 @@ class DocumentationBuildTest(unittest.TestCase):
         cases = (
             (good_java, good_dot, None),
             ("java 21 2023-09-19", good_dot, None),
+            ("openjdk 21.0.13.0.3 2026-10-24", good_dot, None),
             ("openjdk 210.0.8 2025-07-15", good_dot, "Java 21"),
             ("openjdk 22.0.1 2024-04-16", good_dot, "Java 21"),
             ("openjdk 21-ea 2023-07-01", good_dot, "Java 21"),
+            ("openjdk 21.0.13.0.3-ea", good_dot, "Java 21"),
             (good_java, "dot - graphviz version 2.43.00 (0)", "Graphviz 2.43.0"),
             (good_java, "dot - graphviz version 2.43.0 (0)\nother", "Graphviz 2.43.0"),
         )
