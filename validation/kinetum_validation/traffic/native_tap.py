@@ -87,7 +87,7 @@ class NativeTapTrafficDriver(TrafficDriver):
 
     @property
     def requires_sustained_generation_overlap(self) -> bool:
-        """Return false because SIGUSR1 performs one immediate tag switch."""
+        """Return false because one sender changes tags without simultaneous populations."""
         return False
 
     async def setup(self) -> None:

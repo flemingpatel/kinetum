@@ -72,6 +72,14 @@ class TrafficSender(Protocol):
         """Start sending packets with the next bounded generation tag."""
         raise NotImplementedError
 
+    def require_generation_active(self) -> None:
+        """Reject known termination of the owned generation session.
+
+        Remote session ownership alone does not prove offered load. The
+        orchestrator separately requires advancing DUT ingress measurements.
+        """
+        raise NotImplementedError
+
     async def end_generation_overlap(self) -> None:
         """End initial/next generation-tag coexistence when supported."""
         raise NotImplementedError

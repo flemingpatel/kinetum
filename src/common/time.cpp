@@ -6,14 +6,12 @@
  * @brief Time utilities implementation.
  * @author Fleming Patel
  *
- * Implements time functions using C++ std::chrono library. The implementation
- * is straightforward and relies on the standard library for platform-specific
- * clock access.
+ * Uses std::chrono for platform clock access.
  *
  * Hot Path Timing:
  * - cached_ns(): thread-local timestamp shared by one worker-loop turn
  * - update_cached_ns(): ordinary once-per-turn steady-clock refresh
- * - now_ns(): one additional post-health sample only after a real callback
+ * - now_ns(): supplemental post-health callback and transition batch samples
  */
 
 #include "src/common/time.hpp"

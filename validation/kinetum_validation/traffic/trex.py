@@ -58,7 +58,9 @@ from .trex_protocol import (
     REMOTE_REQUEST_KEYS as _REMOTE_REQUEST_KEYS,
     REMOTE_SUCCESS_KEYS as _REMOTE_SUCCESS_KEYS,
     TRexRemoteFailure,
+    generation_flow_expected_tx,
     generation_pgid_layout,
+    require_generation_flow_plan,
     require_trex_capacity,
 )
 
@@ -189,6 +191,11 @@ class TRexSender:
         )
         if self._initial_generation_paused["paused_stream_ids"] != expected_ids:
             raise RuntimeError("trex paused stream identities disagree with the session")
+
+    def require_generation_active(self) -> None:
+        """Require the acknowledged session claim; DUT counters establish its actual load."""
+        if self._cancel_requested or self._generation_session is None:
+            raise RuntimeError("trex generation session ended before qualification")
 
     async def finish_generation_tags(self) -> PacketStats:
         """Stop generation-tag traffic and return PGID-backed statistics."""
@@ -716,8 +723,8 @@ class TRexTrafficDriver(TrafficDriver):
             raw["steady_state_target_pps"] == packet_config.pps,
             raw["requested_overlap_window_ms"]
             == self.config.epoch.overlap_window_ms,
-            raw["transition_time_s_requested"]
-            == self.config.epoch.transition_time_s,
+            raw["initial_duration_s_requested"]
+            == self.config.epoch.initial_duration_s,
             set(_generation_counts(
                 raw["generation_tag_counts"], "TRex TX generation tags"
             ))
@@ -828,7 +835,7 @@ class TRexTrafficDriver(TrafficDriver):
         spec.update({
             "initial_generation_tag": initial_generation_tag,
             "next_generation_tag": next_generation_tag,
-            "transition_time_s": self.config.epoch.transition_time_s,
+            "initial_duration_s": self.config.epoch.initial_duration_s,
             "overlap_window_ms": self.config.epoch.overlap_window_ms,
         })
         return spec
@@ -893,7 +900,6 @@ class TRexTrafficDriver(TrafficDriver):
                     "port_id": stream["port_id"],
                     "flow_id": num_flows - 1,
                     "role": role,
-                    "expected_tx": _UINT64_MAX,
                 }
                 observation_row = {
                     key: value
@@ -901,6 +907,7 @@ class TRexTrafficDriver(TrafficDriver):
                     if key != "pg_id"
                 }
                 observation_row.update({
+                    "expected_tx": _UINT64_MAX,
                     "tx_pkts": _UINT64_MAX,
                     "rx_pkts": _UINT64_MAX,
                 })
@@ -1084,8 +1091,8 @@ class TRexTrafficDriver(TrafficDriver):
                     raise RuntimeError("trex one-shot run identity is inexact")
         if action in {"generation_start", "generation_finish"}:
             pgid_demand = generation_pgid_layout(len(normalized_ingress), num_flows)["demand"]
-            transition = require_number(
-                spec["transition_time_s"], "TRex request transition time",
+            initial_duration = require_number(
+                spec["initial_duration_s"], "TRex request initial duration",
                 minimum=0.0,
             )
             overlap_ms = require_int(
@@ -1102,11 +1109,11 @@ class TRexTrafficDriver(TrafficDriver):
             )
             tags_exact = initial_tag != next_tag
             timing_exact = (
-                0.0 < transition < duration
-                and transition + overlap_ms / 1000.0 < duration
+                0.0 < initial_duration < duration
+                and initial_duration + overlap_ms / 1000.0 < duration
             )
             counter_extent_exact = (
-                pps * (duration + overlap_ms / 1000.0) <= _UINT64_MAX
+                2 * pps * duration <= _UINT64_MAX
             )
             if not all((tags_exact, timing_exact, counter_extent_exact)):
                 raise RuntimeError(
@@ -1138,10 +1145,7 @@ class TRexTrafficDriver(TrafficDriver):
             )
         if action == "generation_finish":
             self._require_port_counters(spec["port_counter_baseline"], "baseline")
-            if not require_array(
-                spec["generation_flow_plan"], "TRex generation flow plan"
-            ):
-                raise RuntimeError("trex generation flow plan is empty")
+            self._validate_generation_flow_plan(spec["generation_flow_plan"], spec)
             next_start = require_number(
                 spec["next_start_monotonic"], "TRex next monotonic start",
                 minimum=0.0,
@@ -1423,9 +1427,7 @@ class TRexTrafficDriver(TrafficDriver):
                 payload["promiscuous_ports"], self._egress_port_ids,
                 "TRex generation promiscuous ports",
             )
-            self._validate_generation_session(
-                payload, initial, following, request
-            )
+            self._validate_generation_session(payload, request)
         if action in {"generation_resume_next", "generation_pause_initial"}:
             field, role = (
                 ("resumed_stream_ids", "next")
@@ -1477,7 +1479,7 @@ class TRexTrafficDriver(TrafficDriver):
                 payload["expected_tx_count"], "TRex expected TX", minimum=1,
                 maximum=_UINT64_MAX,
             )
-            self._validate_generation_finish(payload)
+            self._validate_generation_finish(payload, request)
 
     def _require_port_counters(
         self, value: object, name: str,
@@ -1646,8 +1648,6 @@ class TRexTrafficDriver(TrafficDriver):
     def _validate_generation_session(
         self,
         payload: Dict[str, Any],
-        initial_tag: int,
-        next_tag: int,
         request: Dict[str, Any],
     ) -> None:
         """Validate exact stream and flow ownership returned at session start."""
@@ -1659,108 +1659,17 @@ class TRexTrafficDriver(TrafficDriver):
         )
         if any(len(stream_ids) != num_flows for stream_ids in initial_ids.values()):
             raise RuntimeError("trex generation stream per-port cardinality is inexact")
-        pgids = generation_pgid_layout(len(self._ingress_port_ids), num_flows)
-        expected_per_role = len(pgids["initial"])
+        self._validate_generation_flow_plan(payload["generation_flow_plan"], request)
 
-        plan = require_array(
-            payload["generation_flow_plan"], "TRex generation flow plan"
+    @staticmethod
+    def _validate_generation_flow_plan(value: object, request: Dict[str, Any]) -> None:
+        """Apply the shared endpoint/consumer grammar to the admitted request's flow identities."""
+        require_generation_flow_plan(
+            value, request["ingress_streams"], request["num_flows"],
+            request["initial_generation_tag"], request["next_generation_tag"],
         )
-        if len(plan) != pgids["demand"]:
-            raise RuntimeError("trex generation flow-plan cardinality is inexact")
-        seen_pg_ids = set()
-        seen_relations = set()
-        logical_by_port = {
-            row["port_id"]: row["logical_name"] for row in self._ingress_streams
-        }
-        stream_index_by_port = {
-            row["port_id"]: index
-            for index, row in enumerate(self._ingress_streams)
-        }
-        duration_s = require_number(
-            payload["duration_s"], "TRex generation duration", minimum=0.0
-        )
-        transition_s = require_number(
-            request["transition_time_s"], "TRex requested transition time",
-            minimum=0.0,
-        )
-        overlap_s = require_int(
-            request["overlap_window_ms"], "TRex requested overlap", minimum=1,
-            maximum=_UINT32_MAX,
-        ) / 1000.0
-        if (
-            transition_s <= 0.0
-            or overlap_s <= 0.0
-            or transition_s + overlap_s >= duration_s
-        ):
-            raise RuntimeError("trex generation timing is outside the request domain")
-        per_flow_pps = (
-            require_int(
-                request["pps"], "TRex requested PPS", minimum=1,
-                maximum=1_000_000_000,
-            )
-            / float(expected_per_role)
-        )
-        for item in plan:
-            row = require_object(item, "TRex generation flow-plan row")
-            require_exact_keys(
-                row,
-                {
-                    "pg_id", "generation_tag", "logical_name", "port_id",
-                    "flow_id", "role", "expected_tx",
-                },
-                "TRex generation flow-plan row",
-            )
-            pg_id = require_int(
-                row["pg_id"], "TRex PGID", minimum=1, maximum=_UINT32_MAX
-            )
-            tag = require_int(
-                row["generation_tag"], "TRex flow generation tag", minimum=0,
-                maximum=_GENERATION_TAG_MAX,
-            )
-            port_id = require_int(
-                row["port_id"], "TRex flow port", minimum=0,
-                maximum=_UINT32_MAX,
-            )
-            flow_id = require_int(
-                row["flow_id"], "TRex flow identity", minimum=0,
-                maximum=num_flows - 1,
-            )
-            role = require_string(row["role"], "TRex generation flow role")
-            expected_tag = initial_tag if role == "pre_overlap" else next_tag
-            if role not in {"pre_overlap", "post_overlap"} or tag != expected_tag:
-                raise RuntimeError("trex generation flow role and tag disagree")
-            if (
-                port_id not in logical_by_port
-                or require_string(row["logical_name"], "TRex logical port")
-                != logical_by_port[port_id]
-            ):
-                raise RuntimeError("trex generation flow port identity disagrees")
-            expected_tx = require_int(
-                row["expected_tx"], "TRex expected flow TX", minimum=0,
-                maximum=_UINT64_MAX,
-            )
-            expected_pg_id = pgids["next" if role == "post_overlap" else "initial"][
-                stream_index_by_port[port_id] * num_flows + flow_id
-            ]
-            expected_flow_tx = int(round(
-                per_flow_pps
-                * (
-                    duration_s - transition_s
-                    if role == "post_overlap"
-                    else transition_s + overlap_s
-                )
-            ))
-            if pg_id != expected_pg_id or expected_tx != expected_flow_tx:
-                raise RuntimeError(
-                    "trex generation flow arithmetic disagrees with the request"
-                )
-            relation = (port_id, flow_id, role)
-            if pg_id in seen_pg_ids or relation in seen_relations:
-                raise RuntimeError("trex generation flow identity is duplicated")
-            seen_pg_ids.add(pg_id)
-            seen_relations.add(relation)
 
-    def _validate_generation_finish(self, payload: Dict[str, Any]) -> None:
+    def _validate_generation_finish(self, payload: Dict[str, Any], request: Dict[str, Any]) -> None:
         """Validate exact timing and PGID accounting at session completion."""
         if require_string(
             payload["generation_overlap_method"], "TRex overlap method"
@@ -1820,21 +1729,24 @@ class TRexTrafficDriver(TrafficDriver):
         ):
             raise RuntimeError("trex overlap target arithmetic disagrees")
         require_number(
-            payload["transition_time_s_requested"],
-            "TRex requested transition time", minimum=0.0,
+            payload["initial_duration_s_requested"],
+            "TRex requested initial duration", minimum=0.0,
         )
         plan = require_array(
             payload["generation_flow_plan"], "TRex generation flow plan"
         )
-        plan_by_pgid = {}
-        for item in plan:
-            row = require_object(item, "TRex generation flow-plan row")
-            pg_id = require_int(
-                row["pg_id"], "TRex PGID", minimum=1, maximum=_UINT32_MAX
-            )
-            if pg_id in plan_by_pgid:
-                raise RuntimeError("trex generation PGID is duplicated")
-            plan_by_pgid[pg_id] = row
+        self._validate_generation_flow_plan(plan, request)
+        if plan != request["generation_flow_plan"]:
+            raise RuntimeError("trex finished flow plan differs from its session")
+        expected_by_role = {
+            "pre_overlap": generation_flow_expected_tx(
+                request["pps"], len(self._ingress_port_ids), request["num_flows"], initial_pause - start_sample,
+            ),
+            "post_overlap": generation_flow_expected_tx(
+                request["pps"], len(self._ingress_port_ids), request["num_flows"], next_pause - next_start,
+            ),
+        }
+        plan_by_pgid = {row["pg_id"]: row for row in plan}
         observed = require_object(
             payload["generation_pgid_stats"], "TRex generation PGID stats"
         )
@@ -1871,10 +1783,6 @@ class TRexTrafficDriver(TrafficDriver):
                     maximum=_UINT32_MAX,
                 ),
                 "role": require_string(row["role"], "TRex PGID role"),
-                "expected_tx": require_int(
-                    row["expected_tx"], "TRex PGID expected TX", minimum=0,
-                    maximum=_UINT64_MAX,
-                ),
             }
             if any(
                 observed_value != expected[field]
@@ -1889,11 +1797,14 @@ class TRexTrafficDriver(TrafficDriver):
                 row["rx_pkts"], "TRex PGID RX", minimum=0,
                 maximum=_UINT64_MAX,
             )
-            expected_tx = normalized_identity["expected_tx"]
+            expected_tx = require_int(
+                row["expected_tx"], "TRex PGID expected TX", minimum=1, maximum=_UINT64_MAX,
+            )
+            if expected_tx != expected_by_role[normalized_identity["role"]]:
+                raise RuntimeError("trex PGID expected TX disagrees with its measured interval")
             if (
                 rx_packets > tx_packets
-                or expected_tx > 0
-                and tx_packets * 100 < expected_tx * 95
+                or tx_packets * 100 < expected_tx * 95
             ):
                 raise RuntimeError("trex PGID traffic achievement is incomplete")
             tx_by_tag[tag] = tx_by_tag.setdefault(tag, 0) + tx_packets

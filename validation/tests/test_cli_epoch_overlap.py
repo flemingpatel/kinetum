@@ -99,6 +99,15 @@ def _installed_roots(tmpdir):
 class TestEpochOverlapCLI(unittest.TestCase):
     """Validate CLI admission for orchestrated TRex epoch-overlap runs."""
 
+    def test_old_epoch_timing_option_is_rejected_by_both_entry_points(self):
+        """The initial-interval contract has one spelling and no transition-time alias."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            roots = _installed_roots(tmpdir)
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                _validation_args(*roots, "--epoch-transition-time", "5")
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            _benchmark_args("--epoch-transition-time", "5")
+
     def test_storage_profile_selects_the_same_fixture_in_both_clis(self):
         """Both entry points select explicit per-queue bindings independently of RSS."""
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -140,6 +149,10 @@ class TestEpochOverlapCLI(unittest.TestCase):
         self.assertIn("--runtime-root", stderr.getvalue())
         with mock.patch.object(sys, "argv", ["kinetum_validation", "--runtime-root", "/opt/kinetum"]):
             defaults = validation_cli.parse_args()
+        self.assertEqual(defaults.epoch_duration, 30.0)
+        self.assertEqual(_benchmark_args().epoch_duration, 30.0)
+        self.assertEqual(BenchmarkConfig(runtime_root=Path("/opt/kinetum"),
+                                         validation_root=Path("/var/tmp/kinetum-validation/data")).epoch_duration, 30.0)
         self.assertEqual(
             defaults.validation_root,
             Path(validation_cli.__file__).resolve().parent / "data",
@@ -150,7 +163,7 @@ class TestEpochOverlapCLI(unittest.TestCase):
             args = _validation_args(
                 runtime_root, validation_root,
                 "--epoch-duration", "15",
-                "--epoch-transition-time", "5",
+                "--epoch-initial-duration", "5",
                 "--epoch-overlap-ms", "500",
             )
 
@@ -486,10 +499,13 @@ class TestEpochOverlapCLI(unittest.TestCase):
             for extra_args in (
                 (
                     "--epoch-duration", "5.2",
-                    "--epoch-transition-time", "5",
+                    "--epoch-initial-duration", "5",
                     "--epoch-overlap-ms", "500",
                 ),
                 ("--epoch-overlap-ms", str(1 << 32)),
+                ("--epoch-overlap-ms", str(1 << 4096)),
+                ("--epoch-pps", str(1 << 4096)),
+                ("--pps", str(1 << 4096), "--duration", "1"),
             ):
                 with self.subTest(extra_args=extra_args):
                     args = _validation_args(*installed_roots, *extra_args)
@@ -609,7 +625,7 @@ class TestEpochOverlapCLI(unittest.TestCase):
 
         args = _benchmark_args(
             "--epoch-duration", "15",
-            "--epoch-transition-time", "5",
+            "--epoch-initial-duration", "5",
             "--epoch-overlap-ms", "500",
             "--inclusion-policy", "all-runs",
         )
@@ -781,10 +797,12 @@ class TestEpochOverlapCLI(unittest.TestCase):
         for extra_args in (
             (
                 "--epoch-duration", "5.2",
-                "--epoch-transition-time", "5",
+                "--epoch-initial-duration", "5",
                 "--epoch-overlap-ms", "500",
             ),
             ("--epoch-overlap-ms", str(1 << 32)),
+            ("--epoch-overlap-ms", str(1 << 4096)),
+            ("--epoch-pps", str(1 << 4096)),
         ):
             with self.subTest(extra_args=extra_args):
                 args = _benchmark_args(*extra_args)

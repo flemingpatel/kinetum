@@ -26,7 +26,8 @@ follow the table.
 |---------|-----------|---------|
 | Variables (local, member, global) | `snake_case` | `packet_count`, `burst_size` |
 | Member variables (private) | `snake_case` with trailing underscore | `state_`, `plan_`, `cores_` |
-| Functions and methods | `snake_case` | `probe_host()`, `maybe_pin_worker_()` |
+| Functions and methods | `snake_case` | `probe_host()`, `bootstrap()` |
+| Private helper methods (including static) | `snake_case` with trailing underscore | `run_loop_()`, `validate_record_()` |
 | Classes and structs | `snake_case` | `partitioned_runtime`, `host_topology` |
 | Enum class names | `snake_case` | `provider_contract_role`, `log_level` |
 | Enum values | `UPPER_CASE` | `IO_DRIVER`, `PACKET_STORAGE`, `RUNNING` |
@@ -43,19 +44,21 @@ members, following [PEP 8](https://peps.python.org/pep-0008/#naming-conventions)
 
 ### 1.2 Framework-Mandated Exceptions
 
-External frameworks mandate their own naming conventions. When calling or overriding
-framework APIs, use the framework's convention. Do not wrap or rename.
+Preserve names required by an interface, including overrides and named SDK
+hooks, even when private. Constructors, destructors and operators retain their
+language-defined spelling. Do not add forwarding wrappers solely to change naming.
 
 | Framework | Convention | Example | Where |
 |-----------|-----------|---------|-------|
+| C++ standard library | Required virtual-hook names | `do_allocate()`, `do_deallocate()` | `include/kinetum/kinetum_sdk.hpp` |
 | LLVM/MLIR | camelCase methods | `runOnOperation()`, `getAttrOfType()` | `src/axiom/mlir/` |
 | Google Test | PascalCase test fixtures | `TEST_F(CpStatsForwardingTest, ...)` | `tests/` |
 | Protobuf generated | Generated field accessors (`snake_case` in C++) | `plan.regions_size()`, `region.cpu_core_ids()` | Generated code in the build tree |
 | gRPC generated | PascalCase service classes | `ControlService::Service` | Generated code in `gen/` |
 | DPDK | snake_case with `rte_` prefix | `rte_eal_init()`, `rte_mbuf` | `src/dp/backends/dpdk/` |
 
-Framework-mandated identifiers are used as-is at the call site. Other identifiers
-in wrappers and extensions follow the conventions for their language.
+Other identifiers in wrappers and extensions follow the conventions for their
+language.
 
 ---
 
@@ -505,9 +508,11 @@ Per the Platform Engineering Guide:
   complete same-turn CUT/data-drain batch, immediately before a receiver
   ACK-publication batch, and after a sender ACK-consumption batch. Each class
   takes one sample for the complete endpoint batch, never one per boundary.
-  These samples are observation-only, occur only while that edge advances, and
-  are unreachable from ordinary turns, fixed execution, packet operations, and
-  provider burst callbacks.
+  CUT and ACK publication batches sample before the attempt, including retries.
+  Only successful enqueues record a publication time. Drain and ACK-consumption
+  batches sample after observed progress. These observation-only samples are
+  unreachable from ordinary turns, fixed execution, packet operations, and provider
+  burst callbacks.
 - Use platform primitives (`versioned_rcu_buffer`, `single_writer_snapshot`,
   `quiescence_domain`, `cuckoo_map`, `aligned_atomic`)
 

@@ -21,6 +21,7 @@ from kinetum_validation.engine.json_contract import (
 from .contracts import (
     validate_benchmark_manifest,
     validate_benchmark_result_identity,
+    validate_benchmark_epoch_load,
     validate_benchmark_run_artifacts,
     validate_benchmark_transition_multiset,
 )
@@ -157,6 +158,7 @@ def _build_scenario_raw_rows(
                 f.read(), f"{run_dir.name} test results"
             )
         validate_benchmark_result_identity(result, manifest)
+        validate_benchmark_epoch_load(result, manifest, run_dir)
         if manifest_rows[run_dir.name]["passed"] != result["all_passed"]:
             raise ValueError(
                 f"{run_dir.name} manifest and test result disagree"

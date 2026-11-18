@@ -18,7 +18,7 @@ import signal
 from pathlib import Path
 from typing import Optional, Sequence
 
-from ..config.types import PacketConfig, PacketStats
+from ..config.types import PacketConfig, PacketStats, timed_packet_count_fits
 from ..config.logger import log_info
 from ..process.system_tools import (
     communicate_bounded_subprocess,
@@ -36,9 +36,7 @@ from .json_contract import (
 
 
 _UINT64_MAX = (1 << 64) - 1
-_UINT32_MAX = (1 << 32) - 1
 _GENERATION_TAG_MAX = (1 << 16) - 1
-_MAX_RATE_LIMIT_PPS = 1_000_000_000
 _SENDER_COMPLETION_GRACE_S = 10.0
 _SENDER_RESULT_KEYS = frozenset(
     {
@@ -187,6 +185,16 @@ class NativeSender:
             raise RuntimeError("native generation overlap is not active")
         self._generation_overlap_ended = True
 
+    def require_generation_active(self) -> None:
+        """Reject a failed or finished native source before accepting later load evidence."""
+        if self._generation_tag_task is None:
+            raise RuntimeError("native generation session is absent")
+        if self._generation_tag_task.done():
+            self._generation_tag_task.result()
+            raise RuntimeError("native generation source ended before qualification")
+        if self._process is not None and self._process.returncode is not None:
+            raise RuntimeError("native generation source exited before qualification")
+
     async def finish_generation_tags(self) -> PacketStats:
         """Wait for the active generation-tag sender and return its statistics."""
         if self._generation_tag_task is None:
@@ -216,18 +224,6 @@ class NativeSender:
         if self._process is not None:
             raise RuntimeError("native sender process is already active")
         mode_valid = mode in {"standard", "generation-tagged", "timed"}
-        duration_valid = (
-            isinstance(duration_s, (int, float))
-            and not isinstance(duration_s, bool)
-            and math.isfinite(float(duration_s))
-            and duration_s > 0.0
-        )
-        ports_valid = self._ports_are_valid()
-        rate_valid = (
-            isinstance(self.config.pps, int)
-            and not isinstance(self.config.pps, bool)
-            and 0 < self.config.pps <= _MAX_RATE_LIMIT_PPS
-        )
         generation_tags_valid = (
             self._generation_tags_are_valid(
                 initial_generation_tag, next_generation_tag
@@ -235,15 +231,8 @@ class NativeSender:
             if mode == "generation-tagged"
             else initial_generation_tag == 0 and next_generation_tag == 0
         )
-        if not all((
-            mode_valid,
-            duration_valid,
-            ports_valid,
-            rate_valid,
-            generation_tags_valid,
-        )):
-            raise RuntimeError("native sender invocation is outside its exact domain")
-        if not self._packet_config_is_valid(float(duration_s)):
+        if not (mode_valid and generation_tags_valid and self._ports_are_valid()
+                and self._packet_config_is_valid(duration_s)):
             raise RuntimeError("native sender invocation is outside its exact domain")
         cmd = [
             str(self.sender_bin),
@@ -458,7 +447,7 @@ class NativeSender:
     def _packet_config_is_valid(self, duration_s: float) -> bool:
         """Return whether packet fields and run extent fit the native profile."""
         config = self.config
-        if not isinstance(config.pps, int) or isinstance(config.pps, bool):
+        if not timed_packet_count_fits(config.pps, duration_s):
             return False
         scalar_valid = all((
             isinstance(config.packet_size, int),
@@ -470,8 +459,6 @@ class NativeSender:
             isinstance(config.base_dport, int),
             not isinstance(config.base_dport, bool),
             1 <= config.base_dport <= 65535,
-            config.pps * float(duration_s) >= 1.0,
-            config.pps * float(duration_s) <= _UINT32_MAX,
         ))
         if not scalar_valid:
             return False

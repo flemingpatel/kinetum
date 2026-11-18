@@ -1107,6 +1107,125 @@ class TestScenarioChoreography(unittest.IsolatedAsyncioTestCase):
                 sender.cleanup.assert_called_once()
                 traffic.stop_capture.assert_awaited_once()
 
+    async def test_mutation_cleanup_stops_source_before_waiting_for_accepted_work(self) -> None:
+        """Source retirement releases a pending mutation without cancelling its result owner."""
+        with tempfile.TemporaryDirectory() as directory:
+            owner = ValidationOrchestrator(_config(Path(directory), ValidationTestType.STANDARD), MagicMock())
+            traffic = MagicMock(stop_capture=AsyncMock())
+            owner._traffic = traffic  # pylint: disable=protected-access
+            accepted = asyncio.Event()
+            released = asyncio.Event()
+            events = []
+
+            async def mutation():
+                """Retain accepted work until the source has retired."""
+                accepted.set()
+                await released.wait()
+                events.append("mutation collected")
+                return "complete"
+
+            async def abort_source():
+                """Stop source admission before permitting the accepted mutation to finish."""
+                events.append("source retired")
+                released.set()
+
+            sender = MagicMock(abort=AsyncMock(side_effect=abort_source))
+            work = asyncio.create_task(mutation())
+            await accepted.wait()
+            await owner.scenario_context().retire_scenario_traffic("epoch", sender, work, capture_active=True)
+            self.assertEqual(events, ["source retired", "mutation collected"])
+            self.assertEqual(work.result(), "complete")
+            sender.cancel.assert_not_called()
+            sender.abort.assert_awaited_once()
+            sender.cleanup.assert_called_once()
+            traffic.stop_capture.assert_awaited_once()
+
+    async def test_caller_cancellation_preserves_an_accepted_mutation(self) -> None:
+        """Cancellation is delivered after the independent mutation result and remaining owners retire."""
+        with tempfile.TemporaryDirectory() as directory:
+            owner = ValidationOrchestrator(_config(Path(directory), ValidationTestType.STANDARD), MagicMock())
+            traffic = MagicMock(stop_capture=AsyncMock())
+            owner._traffic = traffic  # pylint: disable=protected-access
+            retired = asyncio.Event()
+            complete = asyncio.Event()
+
+            async def abort_source():
+                """Signal that source ownership has ended without completing the mutation."""
+                retired.set()
+
+            sender = MagicMock(abort=AsyncMock(side_effect=abort_source))
+            work = asyncio.create_task(complete.wait())
+            caller = asyncio.create_task(owner.scenario_context().retire_scenario_traffic(
+                "epoch", sender, work, capture_active=True,
+            ))
+            await retired.wait()
+            caller.cancel()
+            await asyncio.sleep(0)
+            self.assertFalse(work.cancelled())
+            self.assertFalse(work.done())
+            complete.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await caller
+            self.assertTrue(work.result())
+            sender.abort.assert_awaited_once()
+            sender.cleanup.assert_called_once()
+            traffic.stop_capture.assert_awaited_once()
+
+    async def test_mutation_result_is_collected_despite_source_retirement_failure(self) -> None:
+        """A failed source stop does not erase the accepted result or skip other cleanup owners."""
+        with tempfile.TemporaryDirectory() as directory:
+            owner = ValidationOrchestrator(_config(Path(directory), ValidationTestType.STANDARD), MagicMock())
+            traffic = MagicMock(stop_capture=AsyncMock())
+            owner._traffic = traffic  # pylint: disable=protected-access
+            complete = asyncio.Event()
+
+            async def abort_source():
+                """Release the independent result, then report unresolved source retirement."""
+                complete.set()
+                raise RuntimeError("source retirement failed")
+
+            sender = MagicMock(abort=AsyncMock(side_effect=abort_source))
+            work = asyncio.create_task(complete.wait())
+            with self.assertRaisesRegex(RuntimeError, "source retirement failed"):
+                await owner.scenario_context().retire_scenario_traffic("epoch", sender, work, capture_active=True)
+            self.assertTrue(work.result())
+            sender.cleanup.assert_called_once()
+            traffic.stop_capture.assert_awaited_once()
+
+    async def test_cancellation_racing_mutation_failure_collects_both_outcomes(self) -> None:
+        """A mutation completing on the cancellation turn still contributes its failure."""
+        with tempfile.TemporaryDirectory() as directory:
+            owner = ValidationOrchestrator(_config(Path(directory), ValidationTestType.STANDARD), MagicMock())
+            traffic = MagicMock(stop_capture=AsyncMock())
+            owner._traffic = traffic  # pylint: disable=protected-access
+            retired = asyncio.Event()
+            complete = asyncio.Event()
+
+            async def mutation():
+                """Publish the failed accepted result in the same turn that cancels its caller."""
+                await complete.wait()
+                raise RuntimeError("accepted mutation failed")
+
+            async def abort_source():
+                """Expose the point where collection starts after source retirement."""
+                retired.set()
+
+            sender = MagicMock(abort=AsyncMock(side_effect=abort_source))
+            work = asyncio.create_task(mutation())
+            caller = asyncio.create_task(owner.scenario_context().retire_scenario_traffic(
+                "epoch", sender, work, capture_active=True,
+            ))
+            await retired.wait()
+            complete.set()
+            caller.cancel()
+            with self.assertRaisesRegex(RuntimeError, "accepted mutation failed") as raised:
+                await caller
+            self.assertIn("CancelledError", str(raised.exception))
+            self.assertTrue(work.done())
+            self.assertFalse(work.cancelled())
+            sender.cleanup.assert_called_once()
+            traffic.stop_capture.assert_awaited_once()
+
     async def test_cleanup_cancellation_cannot_hide_another_owners_failure(self) -> None:
         """A later real retirement failure remains fatal after an earlier owner's cancellation."""
         with tempfile.TemporaryDirectory() as directory:

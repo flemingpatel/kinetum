@@ -52,7 +52,8 @@ class worker_runtime_telemetry;
  * Bootstrap publishes one baseline. A live transition publishes once only
  * after every module callback, source-role exchange, and ledger promotion has
  * completed. The value therefore proves the old-credit preflight without
- * treating live target-epoch credit as old work.
+ * treating live target-epoch credit as old work. Its timestamp is the cached
+ * owner-turn time, not a separate sample of the configuration-view swaps.
  */
 struct alignas(kinetum::algo::CACHE_LINE_SIZE) worker_epoch_activation_snapshot {
 	uint64_t publication_generation{0};   ///< Coherent publication generation.
@@ -63,7 +64,7 @@ struct alignas(kinetum::algo::CACHE_LINE_SIZE) worker_epoch_activation_snapshot 
 	uint64_t to_epoch{0};		      ///< Exact target or Bootstrap epoch.
 	uint64_t active_epoch{0};	      ///< Exact epoch active after publication.
 	uint64_t activation_complete{0};      ///< One only for a completed live activation.
-	uint64_t activation_monotonic_ns{0};  ///< Exact owner sample for a completed live activation.
+	uint64_t activation_monotonic_ns{0};  ///< Cached activation-turn time; zero at Bootstrap.
 	std::array<uint8_t, 56> padding{};    ///< Explicit two-cache-line completion.
 };
 
@@ -249,7 +250,7 @@ class worker_epoch_activation final {
 	uint64_t last_transition_generation_{0};		    ///< Last exact activated mutation generation.
 	uint64_t last_from_epoch_{0};				    ///< Last exact activation source epoch.
 	uint64_t last_to_epoch_{0};				    ///< Last exact activation target/Bootstrap epoch.
-	uint64_t last_activation_monotonic_ns_{0};		    ///< Live activation timestamp; zero at Bootstrap.
+	uint64_t last_activation_monotonic_ns_{0};		    ///< Cached activation-turn time; zero at Bootstrap.
 	kinetum::algo::single_writer_snapshot<PUBLICATION_FIELD_COUNT>
 		publication_;  ///< Baseline and one-shot completed activation proofs.
 };

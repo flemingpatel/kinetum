@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import List
 
 from kinetum_validation.config.types import (
+    EpochConfig,
     StreamTopologyProfile,
     StorageProfile,
     TrafficEndpointConfig,
@@ -78,13 +79,13 @@ class BenchmarkConfig:
     num_flows : int
         Number of traffic-generator flows per ingress port.
     epoch_duration : float
-        Epoch test duration in seconds.
+        Requested epoch traffic window in seconds, including load qualification.
     epoch_pps : int
-        Packets per second during epoch test.
-    epoch_transition_time : float
-        Seconds of baseline epoch traffic before the transition.
+        Aggregate PPS across ingress ports; TRex overlap runs two populations at this rate.
+    epoch_initial_duration : float
+        Initial-generation interval before requesting the next traffic population.
     epoch_overlap_ms : int
-        Sustained initial/next generation-tag overlap for transition runs.
+        Minimum TRex initial/next generation-tag overlap for transition runs.
     traffic : TrafficEndpointConfig
         External traffic endpoint settings.
     verbose : bool
@@ -102,9 +103,9 @@ class BenchmarkConfig:
     packet_size: int = 64
     all_sizes: bool = True
     num_flows: int = 1
-    epoch_duration: float = 15.0
+    epoch_duration: float = EpochConfig.duration_s
     epoch_pps: int = 1000
-    epoch_transition_time: float = 5.0
+    epoch_initial_duration: float = 5.0
     epoch_overlap_ms: int = 500
     traffic: TrafficEndpointConfig = field(default_factory=TrafficEndpointConfig)
     verbose: bool = False

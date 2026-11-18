@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Awaitable, Callable, List, Optional, Tuple, TypeVar
 
 from .config.types import (
+    CONSTANTS,
     AnalysisResult,
     DeploymentMode,
     EpochTestResult,
@@ -19,9 +20,12 @@ from .config.types import (
 )
 from .engine.plan_metadata import PlanTopologyMetadata
 from .engine.qos_accounting import qos_accounting_complete
-from .process.kinetumctl import ActiveSnapshot, KinetumCtl
+from .process.kinetumctl import ActiveSnapshot, ApplyConfigResult, KinetumCtl
 from .process.telemetry import StatsResult, StatsSelection
-from .process.telemetry_validation import worker_counters_are_exact, worker_counters_advanced
+from .process.epoch_load import EpochLoadPhase
+from .process.telemetry_validation import (
+    boundary_transition_is_complete, require_stream_observation, worker_counters_are_exact, worker_counters_advanced,
+)
 from .report.console import ConsoleReporter
 from .statistics import format_number
 from .traffic import TrafficDriver
@@ -36,6 +40,8 @@ TRANSITION_STATS = StatsSelection(
     include_region_epoch_stats=True,
     include_boundary_epoch_stats=True,
 )
+
+EPOCH_LOAD_STATS = replace(TRANSITION_STATS, include_stream_stats=True)
 
 
 INITIAL_GENERATION_TAG = 1
@@ -130,32 +136,36 @@ class ScenarioContext:
             raise RuntimeError("kinetumctl not initialized")
         return await self.control.get_stats(selection)
 
+    @staticmethod
+    async def run_before_deadline(
+        action: Callable[[], Awaitable[_Observation]], deadline: float, operation: str,
+    ) -> _Observation:
+        """Invoke one cancellable operation and accept its result only before the monotonic deadline.
+
+        Expiry before dispatch leaves the action uncalled. On timeout asyncio
+        waits for the action's cancellation handling before this raises RuntimeError.
+        """
+        remaining = deadline - time.monotonic()
+        if not math.isfinite(remaining) or remaining <= 0.0:
+            raise RuntimeError(f"{operation} deadline expired")
+        try:
+            result = await asyncio.wait_for(action(), timeout=remaining)
+        except asyncio.TimeoutError as exc:
+            raise RuntimeError(f"{operation} exceeded its authored deadline") from exc
+        if time.monotonic() >= deadline:
+            raise RuntimeError(f"{operation} exceeded its authored deadline")
+        return result
+
     async def get_stats_before_deadline(
         self,
         deadline: float,
         operation: str,
         selection: StatsSelection = TRANSITION_STATS,
     ) -> StatsResult:
-        """Accept one snapshot only within the authored window.
-
-        The deadline caps the native command's retry allowance. Cancellation
-        retires its subprocess before propagating; cleanup cannot admit late data.
-        """
-        remaining = deadline - time.monotonic()
-        if not math.isfinite(remaining) or remaining <= 0.0:
-            raise RuntimeError(f"{operation} observation deadline expired")
-        try:
-            result = await asyncio.wait_for(
-                self.get_stats_snapshot(selection),
-                timeout=remaining,
-            )
-        except asyncio.TimeoutError as exc:
-            raise RuntimeError(
-                f"{operation} observation exceeded its authored deadline"
-            ) from exc
-        if time.monotonic() >= deadline:
-            raise RuntimeError(f"{operation} observation exceeded its authored deadline")
-        return result
+        """Cap the native statistics command and its retry allowance at the supplied deadline."""
+        return await self.run_before_deadline(
+            lambda: self.get_stats_snapshot(selection), deadline, f"{operation} observation",
+        )
 
     async def wait_for_observation(
         self,
@@ -248,6 +258,101 @@ class ScenarioContext:
             return True
 
         return await self.wait_for_observation(read, ready, deadline, operation, required_live_task)
+
+    def epoch_load_phase(self, expected: StatsResult) -> EpochLoadPhase:
+        """Resolve logical-ingress targets from the admitted profile and plan."""
+        if self.plan_topology is None:
+            raise RuntimeError("epoch load requires parsed plan metadata")
+        ingress_names = {port.logical_name for port in self.config.backend.rx_ports}
+        ports = [port for port in self.plan_topology.ports if port.logical_name in ingress_names]
+        if (
+            not ingress_names or {port.logical_name for port in ports} != ingress_names
+            or len(ports) != len(ingress_names) or len({port.logical_port_id for port in ports}) != len(ports)
+        ):
+            raise RuntimeError("epoch ingress ports differ from the compiled plan")
+        population_count = 2 if self.require_traffic().requires_sustained_generation_overlap else 1
+        target = self.config.epoch.pps * population_count / len(ports)
+        return EpochLoadPhase(self.plan_topology, expected, {port.logical_port_id: target for port in ports})
+
+    async def wait_for_epoch_load(
+        self, phase: EpochLoadPhase, traffic_deadline: float, sender: TrafficSender,
+    ) -> StatsResult:
+        """Qualify one phase including its fresh barrier within the remaining traffic budget."""
+        deadline = min(time.monotonic() + CONTROL_OBSERVATION_TIMEOUT_S, traffic_deadline - CONSTANTS.EPOCH_TAIL_S)
+        operation = f"epoch {phase.identity.epoch} ingress load"
+
+        async def read() -> StatsResult:
+            """Fence known source termination around each complete owner-vector read."""
+            sender.require_generation_active()
+            current = await self.get_stats_snapshot(EPOCH_LOAD_STATS)
+            sender.require_generation_active()
+            return current
+
+        return await self.wait_for_observation(read, phase.observe, deadline, operation)
+
+    async def wait_for_epoch_completion(
+        self, before: StatsResult, applied: ApplyConfigResult, deadline: float, sender: TrafficSender,
+    ) -> StatsResult:
+        """Observe the exact returned mutation and every boundary before target qualification."""
+        if self.plan_topology is None:
+            raise RuntimeError("epoch completion lacks the compiled topology")
+        cursor = before
+        before_rows = {row.boundary_id: row for row in before.boundary_epoch_stats}
+        if not before_rows or len(before_rows) != len(before.boundary_epoch_stats):
+            raise RuntimeError("epoch completion lacks exact initial boundary membership")
+
+        async def read() -> StatsResult:
+            """Keep source ownership live while collecting terminal and stream evidence."""
+            sender.require_generation_active()
+            current = await self.get_stats_snapshot(EPOCH_LOAD_STATS)
+            sender.require_generation_active()
+            return current
+
+        def ready(current: StatsResult) -> bool:
+            """Reject foreign or failed transitions and wait for exact completion publications."""
+            nonlocal cursor
+            require_stream_observation(self.plan_topology, cursor, current)
+            self.require_active_snapshot_observation(current, "epoch completion")
+            if current.transition_success_blocked or current.retirement_frozen:
+                raise RuntimeError("epoch completion is blocked or frozen")
+            if current.active_epoch < cursor.active_epoch:
+                raise RuntimeError("active epoch regressed during completion")
+            cursor = current
+            if (
+                len(current.boundary_epoch_stats) != len(before_rows)
+                or {row.boundary_id for row in current.boundary_epoch_stats} != before_rows.keys()
+            ):
+                raise RuntimeError("epoch completion changed boundary membership")
+            if any(row.endpoint_identity() != before_rows[row.boundary_id].endpoint_identity()
+                   for row in current.boundary_epoch_stats):
+                raise RuntimeError("epoch completion changed boundary endpoints or capacities")
+            if current.protocol_fault_counts != before.protocol_fault_counts:
+                raise RuntimeError("epoch completion has a protocol fault delta")
+            if current.active_epoch == before.active_epoch:
+                if (current.active_snapshot_id, current.active_revision) != (
+                    before.active_snapshot_id, before.active_revision,
+                ):
+                    raise RuntimeError("old snapshot identity changed during epoch completion")
+                return False
+            if (current.active_epoch, current.active_revision, current.active_snapshot_id) != (
+                applied.epoch, applied.revision, applied.snapshot_id,
+            ):
+                raise RuntimeError("epoch completion differs from the Apply result")
+            terminal = current.latest_terminal
+            if terminal is None or terminal.to_epoch < applied.epoch:
+                return False
+            if (
+                terminal.from_epoch != before.active_epoch or terminal.to_epoch != applied.epoch
+                or terminal.outcome != "EPOCH_TRANSITION_OUTCOME_COMPLETE"
+                or terminal.failure_code != "EPOCH_TRANSITION_FAILURE_CODE_NONE"
+            ):
+                raise RuntimeError("epoch completion lacks the exact successful terminal")
+            return current.transition_state == "EPOCH_TRANSITION_STATE_IDLE" and all(
+                boundary_transition_is_complete(row, terminal.mutation_sequence, before.active_epoch, applied.epoch)
+                for row in current.boundary_epoch_stats
+            )
+
+        return await self.wait_for_observation(read, ready, deadline, "epoch completion")
 
     @staticmethod
     def require_active_snapshot_observation(
@@ -510,9 +615,11 @@ class ScenarioContext:
         sender : TrafficSender, optional
             Exact sender owner to abort and release.
         owned_task : asyncio.Task, optional
-            Already observed scenario task whose completion must settle.
+            Owned scenario task whose terminal result must be collected.
         cancel_task : bool
-            Whether an unfinished task is cancellation-owned by this cleanup.
+            True for a task that owns traffic: cancel and join it before
+            releasing the sender. False for an independent mutation: stop
+            traffic first, then collect its outcome without cancelling it.
         capture_active : bool
             Whether this scenario opened a capture window.
         """
@@ -525,6 +632,21 @@ class ScenarioContext:
             """Retain one cleanup failure while later owners still retire."""
             failures.append((owner, error))
 
+        async def retire_sender() -> None:
+            """Attempt both sender retirement and release without skipping another owner."""
+            if sender is None:
+                return
+            try:
+                await sender.abort()
+            except BaseException as exc:  # pylint: disable=broad-exception-caught
+                remember_failure("sender abort", exc)
+            try:
+                sender.cleanup()
+            except BaseException as exc:  # pylint: disable=broad-exception-caught
+                remember_failure("sender cleanup", exc)
+
+        if not cancel_task:
+            await retire_sender()
         task_cancel_requested = False
         if owned_task is not None:
             if cancel_task and not owned_task.done():
@@ -535,24 +657,22 @@ class ScenarioContext:
                         remember_failure("sender cancel", exc)
                 owned_task.cancel()
                 task_cancel_requested = True
-            try:
-                await owned_task
-            except asyncio.CancelledError as exc:
-                current = asyncio.current_task()
-                caller_cancelled = current is not None and current.cancelling() > 0
-                if not task_cancel_requested or caller_cancelled:
-                    interruption = exc
-            except BaseException as exc:  # pylint: disable=broad-exception-caught
-                remember_failure("traffic task", exc)
-        if sender is not None:
-            try:
-                await sender.abort()
-            except BaseException as exc:  # pylint: disable=broad-exception-caught
-                remember_failure("sender abort", exc)
-            try:
-                sender.cleanup()
-            except BaseException as exc:  # pylint: disable=broad-exception-caught
-                remember_failure("sender cleanup", exc)
+            while True:
+                try:
+                    await asyncio.shield(owned_task)
+                    break
+                except asyncio.CancelledError as exc:
+                    current = asyncio.current_task()
+                    caller_cancelled = current is not None and current.cancelling() > 0
+                    if not task_cancel_requested or caller_cancelled:
+                        interruption = exc
+                    if owned_task.cancelled():
+                        break
+                except BaseException as exc:  # pylint: disable=broad-exception-caught
+                    remember_failure("scenario task", exc)
+                    break
+        if cancel_task:
+            await retire_sender()
         if capture_active:
             try:
                 await self.stop_capture_if_running()
@@ -560,12 +680,12 @@ class ScenarioContext:
                 remember_failure("capture", exc)
         if failures:
             if interruption is not None:
-                failures.insert(0, ("traffic task", interruption))
+                failures.insert(0, ("cancellation", interruption))
             first_error = next(
                 (error for _, error in failures if isinstance(error, Exception)), failures[0][1],
             )
             message = (
-                f"{label} cleanup did not retire every owner: "
+                f"{label} cleanup reported failures: "
                 + "; ".join(
                     f"{owner}: {type(error).__name__}: {error}"
                     for owner, error in failures
@@ -695,8 +815,10 @@ class ScenarioContext:
                 f"{result.protocol_faults_observed} typed protocol faults detected "
                 f"({tx} TX, {rx} RX)"
             )
+        if not result.load_qualified:
+            return "LOAD NOT QUALIFIED: old and target configurations lack complete ingress-rate evidence"
         if result.transitions_observed == 0:
-            return "TRANSITION NOT CONFIRMED: Config apply succeeded but epoch advance not detected"
+            return "TRANSITION NOT CONFIRMED: final configuration does not match the Apply result"
         return "BOUNDARY ORDERING INCONCLUSIVE: exact completion or CUT/ACK evidence is incomplete"
 
     def rollback_result_message(
@@ -733,7 +855,6 @@ class ScenarioContext:
         """
         if self.plan_topology is None:
             raise RuntimeError("final stream evidence requires parsed plan metadata")
-        expected_ids = {stream.io_stream_id for stream in self.plan_topology.io_streams}
         selection = replace(
             TRANSITION_STATS,
             include_module_metrics=True,
@@ -745,65 +866,22 @@ class ScenarioContext:
         )
         deadline = time.monotonic() + CONTROL_OBSERVATION_TIMEOUT_S
         baseline = await self.get_stats_before_deadline(deadline, "final stream publication", selection=selection)
-        if not baseline.success:
-            raise RuntimeError(f"final stream baseline query failed: {baseline.diagnostic}")
-        if (
-            baseline.collection_monotonic_ns <= 0
-            or baseline.runtime_generation <= 0 or not baseline.transition_plan_content_hash
-            or not worker_counters_are_exact(baseline)
-        ):
-            raise RuntimeError("final stream evidence lacks a valid baseline")
         barrier = baseline.collection_monotonic_ns
-        identity = (baseline.runtime_generation, baseline.transition_plan_content_hash)
-        previous = {}
-        cursor = baseline.worker_counters
-        last_collection = barrier
+        cursor = None
 
         def ready(current: StatsResult) -> bool:
             """Validate every source identity before testing the post-traffic barrier."""
-            nonlocal cursor, last_collection
-            if not current.success:
-                raise RuntimeError(f"final stream observation failed: {current.diagnostic}")
-            if (current.runtime_generation, current.transition_plan_content_hash) != identity:
-                raise RuntimeError("final stream observation changed runtime/plan identity")
-            if current.collection_monotonic_ns < last_collection:
-                raise RuntimeError("final stream collection timestamp regressed")
-            if not worker_counters_are_exact(current):
-                raise RuntimeError("final stream observation has invalid worker counters")
+            nonlocal cursor
             try:
-                worker_counters_advanced(cursor, current.worker_counters)
+                require_stream_observation(self.plan_topology, cursor, current)
             except ValueError as exc:
-                raise RuntimeError(f"final stream worker observation is invalid: {exc}") from exc
-            cursor = current.worker_counters
-            last_collection = current.collection_monotonic_ns
-            rows = {row.io_stream_id: row for row in current.stream_stats}
-            if set(rows) != expected_ids or len(rows) != len(current.stream_stats):
-                raise RuntimeError("final stream membership differs from the compiled plan")
-            for stream_id, row in rows.items():
-                counters = (row.published_monotonic_ns, row.packets, row.bytes, row.rejected_packets)
-                if (
-                    any(value is None for value in counters)
-                    or not 0 <= row.worker_index < len(cursor)
-                    or row.published_monotonic_ns <= 0
-                    or row.published_monotonic_ns > current.collection_monotonic_ns
-                ):
-                    raise RuntimeError(f"final stream observation is incomplete: {stream_id}")
-                worker = cursor[row.worker_index]
-                observed = (row.worker_index, worker.publication_generation, *counters)
-                prior = previous.get(stream_id)
-                if prior is not None and observed[1] == prior[1] and observed != prior:
-                    raise RuntimeError(f"final stream observation changed without publication: {stream_id}")
-                regressed = prior is not None and (
-                    observed[0] != prior[0] or any(after < before for before, after in zip(prior[1:], observed[1:]))
-                )
-                if row.published_monotonic_ns != worker.published_monotonic_ns or regressed:
-                    raise RuntimeError(f"final stream observation has contradictory owner or counters: {stream_id}")
-                previous[stream_id] = observed
+                raise RuntimeError(f"final stream observation failed: {exc}") from exc
+            cursor = current
             qos_complete = (
                 qos_accounting_complete(current, self.plan_topology)
                 if self.config.deployment == DeploymentMode.FAN_IN_EDGE_GATEWAY else True
             )
-            return qos_complete and all(row.published_monotonic_ns > barrier for row in cursor)
+            return qos_complete and all(row.published_monotonic_ns > barrier for row in current.worker_counters)
 
         ready(baseline)
 

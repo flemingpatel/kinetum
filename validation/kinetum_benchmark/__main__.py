@@ -52,6 +52,8 @@ from kinetum_validation.config.types import (
     StorageProfile,
     TestType,
     TrafficEndpointConfig,
+    epoch_window_has_capacity,
+    timed_packet_count_fits,
     traffic_endpoint_errors,
 )
 from kinetum_validation.process.installation import installed_root_errors
@@ -205,17 +207,17 @@ def _add_run_args(parser: argparse.ArgumentParser) -> None:
         help="Validation data directory containing examples/ and bin/ (default: %(default)s)",
     )
     # Epoch configuration
-    parser.add_argument("--epoch-duration", type=float, default=15.0,
-                        help="Epoch test duration (default: 15s)")
+    parser.add_argument("--epoch-duration", type=float, default=BenchmarkConfig.epoch_duration,
+                        help=f"Epoch traffic window (default: {BenchmarkConfig.epoch_duration:g}s)")
     parser.add_argument("--epoch-pps", type=int, default=1000,
-                        help="Epoch test PPS (default: 1000)")
-    parser.add_argument("--epoch-transition-time", type=float, default=5.0,
-                        help="Seconds of baseline epoch traffic before transition")
+                        help="Aggregate epoch PPS; doubles during TRex overlap (default: 1000)")
+    parser.add_argument("--epoch-initial-duration", type=float, default=5.0,
+                        help="Initial-generation duration before the next population starts")
     parser.add_argument(
         "--epoch-overlap-ms",
         type=int,
         default=500,
-        help="TRex sustained initial/next generation-tag overlap in uint32 ms",
+        help="Minimum TRex initial/next generation-tag overlap in uint32 ms",
     )
 
     # Output
@@ -358,26 +360,16 @@ def validate_run_args(
         errors.append("--epoch-pps must be positive")
     elif args.epoch_pps > CONSTANTS.MAX_PACKET_RATE_PPS:
         errors.append("--epoch-pps exceeds the traffic-generator domain")
-    if not math.isfinite(args.epoch_transition_time) or args.epoch_transition_time <= 0:
-        errors.append("--epoch-transition-time must be positive")
-    if args.epoch_transition_time >= args.epoch_duration:
-        errors.append("--epoch-transition-time must be less than --epoch-duration")
+    elif args.epoch_duration > 0 and not timed_packet_count_fits(args.epoch_pps, args.epoch_duration):
+        errors.append("epoch traffic must schedule between 1 and 4294967295 packets")
+    if not math.isfinite(args.epoch_initial_duration) or args.epoch_initial_duration <= 0:
+        errors.append("--epoch-initial-duration must be positive")
+    if args.epoch_initial_duration >= args.epoch_duration:
+        errors.append("--epoch-initial-duration must be less than --epoch-duration")
     if args.epoch_overlap_ms <= 0:
         errors.append("--epoch-overlap-ms must be positive")
     elif args.epoch_overlap_ms > (1 << 32) - 1:
         errors.append("--epoch-overlap-ms exceeds the uint32 evidence domain")
-    if (
-        math.isfinite(args.epoch_duration)
-        and args.epoch_pps > 0
-        and args.epoch_pps * args.epoch_duration < 1
-    ):
-        errors.append("epoch traffic must schedule at least one packet")
-    elif (
-        math.isfinite(args.epoch_duration)
-        and args.epoch_pps > 0
-        and args.epoch_pps * args.epoch_duration > (1 << 32) - 1
-    ):
-        errors.append("epoch traffic exceeds the packet sequence domain")
     selected_profile = None
     try:
         stream_topology = StreamTopologyProfile(args.stream_topology.replace("-", "_"))
@@ -404,17 +396,13 @@ def validate_run_args(
             )
     except ValueError as exc:
         errors.append(str(exc))
-    if args.backend == "dpdk-pci":
-        if (
-            args.test_type in ("epoch", "full")
-            and 0 < args.epoch_overlap_ms <= (1 << 32) - 1
-            and args.epoch_transition_time + (args.epoch_overlap_ms / 1000.0)
-            >= args.epoch_duration
-        ):
-            errors.append(
-                "--epoch-transition-time + --epoch-overlap-ms must be less "
-                "than --epoch-duration for trex epoch-overlap runs"
-            )
+    if args.test_type in ("epoch", "full") and not epoch_window_has_capacity(
+        args.epoch_duration, args.epoch_initial_duration, args.epoch_overlap_ms, args.backend == "dpdk-pci",
+    ):
+        errors.append(
+            "--epoch-duration must contain --epoch-initial-duration, both minimum load phases, "
+            "the minimum overlap and a final tail"
+        )
     endpoint = TrafficEndpointConfig(
         host=args.traffic_host,
         ssh_port=args.traffic_ssh_port,
@@ -478,7 +466,7 @@ async def cmd_run(args: argparse.Namespace) -> int:
         num_flows=args.num_flows,
         epoch_duration=args.epoch_duration,
         epoch_pps=args.epoch_pps,
-        epoch_transition_time=args.epoch_transition_time,
+        epoch_initial_duration=args.epoch_initial_duration,
         epoch_overlap_ms=args.epoch_overlap_ms,
         traffic=TrafficEndpointConfig(
             host=args.traffic_host,

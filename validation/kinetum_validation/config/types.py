@@ -59,6 +59,15 @@ class CONSTANTS:
     # transition evidence remain mandatory regardless of this tolerance.
     EPOCH_LOSS_TOLERANCE_PCT: float = 0.1
 
+    # Owner-publication intervals qualify load; collection time only fences freshness.
+    EPOCH_LOAD_INTERVAL_MIN_NS: int = 1_000_000_000
+    EPOCH_LOAD_INTERVAL_MAX_NS: int = 3_000_000_000
+    EPOCH_LOAD_REQUIRED_INTERVALS: int = 3
+    EPOCH_LOAD_RATE_TOLERANCE: float = 0.01
+    EPOCH_LOAD_RESOLUTION_LIMIT: float = 0.005
+    EPOCH_TAIL_S: float = 1.0
+    EPOCH_LOAD_MIN_PHASE_S: float = EPOCH_LOAD_REQUIRED_INTERVALS * EPOCH_LOAD_INTERVAL_MIN_NS / 1_000_000_000
+
 
 # Enums
 
@@ -601,20 +610,57 @@ class EpochConfig:
     Attributes
     ----------
     duration_s : float
-        Total epoch test duration.
+        Requested traffic window, excluding setup, drain and analysis.
     pps : int
-        Packets per second during epoch test.
-    transition_time_s : float
-        When to trigger epoch transition.
+        Aggregate PPS across ingress ports; TRex overlap runs two populations at this rate.
+    initial_duration_s : float
+        Initial-generation interval before requesting the next traffic population.
     overlap_window_ms : int
-        Sustained overlap window for traffic drivers that schedule both the
-        initial and next generation-tag streams instead of switching one live
-        sender tag.
+        Minimum TRex overlap; completion and target qualification may extend it.
+        Native TAP instead requests one pre-authored tag change at unchanged PPS.
     """
-    duration_s: float = 15.0
+    duration_s: float = 30.0
     pps: int = 1000
-    transition_time_s: float = 5.0
+    initial_duration_s: float = 5.0
     overlap_window_ms: int = 500
+
+
+def timed_packet_count_fits(pps: int, duration_s: float) -> bool:
+    """Return whether the requested rate produces 1..UINT32_MAX packets in the interval."""
+    if not isinstance(pps, int) or isinstance(pps, bool) or not 0 < pps <= CONSTANTS.MAX_PACKET_RATE_PPS:
+        return False
+    if not isinstance(duration_s, (int, float)) or isinstance(duration_s, bool):
+        return False
+    return 1 <= pps * duration_s <= (1 << 32) - 1
+
+
+def epoch_window_has_capacity(
+    duration_s: float, initial_duration_s: float, overlap_window_ms: int, sustained_overlap: bool,
+) -> bool:
+    """Reject windows that cannot contain both minimum rate phases and a final tail.
+
+    This necessary bound reserves no time guarantee for observation or Apply;
+    execution must still finish inside the original traffic deadline.
+    """
+    if (
+        not isinstance(sustained_overlap, bool)
+        or not isinstance(overlap_window_ms, int) or isinstance(overlap_window_ms, bool)
+        or not 0 < overlap_window_ms <= (1 << 32) - 1
+    ):
+        return False
+    try:
+        valid_durations = all(
+            isinstance(value, (int, float)) and not isinstance(value, bool)
+            and math.isfinite(value) and value > 0
+            for value in (duration_s, initial_duration_s)
+        )
+    except OverflowError:
+        return False
+    if not valid_durations:
+        return False
+    overlap_s = overlap_window_ms / 1000.0 if sustained_overlap else 0.0
+    minimum = max(2 * CONSTANTS.EPOCH_LOAD_MIN_PHASE_S, overlap_s)
+    return initial_duration_s + minimum + CONSTANTS.EPOCH_TAIL_S < duration_s
 
 
 @dataclass(frozen=True)
@@ -1012,6 +1058,8 @@ class EpochTestResult:
     Result of epoch transition test.
 
     ``avg_latency_us`` follows the selected profile's nullable latency law.
+    Load qualification is independent of packet conservation and the boundary
+    proof; success requires all three.
     """
     passed: bool
     duration_s: Optional[float] = None
@@ -1031,6 +1079,7 @@ class EpochTestResult:
     protocol_faults_observed: Optional[int] = None
     backpressure_events: Optional[int] = None
     boundary_ordering_validated: bool = False
+    load_qualified: bool = False
     message: str = ""
 
     @property
