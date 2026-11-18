@@ -12,7 +12,10 @@ from ..engine.json_contract import (
     MAX_TREX_RX_CAPABILITIES,
 )
 from .base import EXCHANGE_PACKET_BYTES, EXCHANGE_PACKET_LIMIT, EXCHANGE_TIMEOUT_S
-from .trex_protocol import REMOTE_REQUEST_KEYS, generation_pgid_layout, require_trex_capacity
+from .trex_protocol import (
+    REMOTE_REQUEST_KEYS, generation_flow_expected_tx, generation_pgid_layout,
+    require_generation_flow_plan, require_trex_capacity,
+)
 
 
 _REMOTE_TREX_SCRIPT_TEMPLATE = r"""
@@ -38,6 +41,12 @@ mutation_attempted = False
 
 
 __KINETUM_GENERATION_PGID_LAYOUT__
+
+
+__KINETUM_GENERATION_FLOW_EXPECTED_TX__
+
+
+__KINETUM_REQUIRE_GENERATION_FLOW_PLAN__
 
 
 __KINETUM_REQUIRE_TREX_CAPACITY__
@@ -398,17 +407,17 @@ if action in {"generation_start", "generation_finish"}:
     next_generation_tag = exact_int(
         spec["next_generation_tag"], "next_generation_tag", 0, 65535
     )
-    transition_s = exact_number(
-        spec["transition_time_s"], "transition_time_s", positive=True
+    initial_s = exact_number(
+        spec["initial_duration_s"], "initial_duration_s", positive=True
     )
     overlap_window_ms = exact_int(
         spec["overlap_window_ms"], "overlap_window_ms", 1, (1 << 32) - 1
     )
     if (
         initial_generation_tag == next_generation_tag
-        or transition_s >= duration_s
-        or transition_s + overlap_window_ms / 1000.0 >= duration_s
-        or pps * (duration_s + overlap_window_ms / 1000.0) > (1 << 64) - 1
+        or initial_s >= duration_s
+        or initial_s + overlap_window_ms / 1000.0 >= duration_s
+        or 2 * pps * duration_s > (1 << 64) - 1
     ):
         fail("generation request timing or tag identity is inexact", 2)
 if action in {
@@ -434,10 +443,13 @@ if action == "generation_finish":
     exact_number(spec["initial_pause_time"], "initial_pause_time", positive=True)
     if next_start <= start_sample or initial_pause <= next_start:
         fail("generation_finish overlap timestamps regress", 2)
-    if not isinstance(spec["generation_flow_plan"], list) or not spec[
-        "generation_flow_plan"
-    ]:
-        fail("generation_flow_plan is not a nonempty array", 2)
+    try:
+        require_generation_flow_plan(
+            spec["generation_flow_plan"], spec["ingress_streams"], num_flows,
+            initial_generation_tag, next_generation_tag,
+        )
+    except RuntimeError as exc:
+        fail(str(exc), 2)
 if action == "generation_abort":
     ingress_ports = exact_int_array(spec["ingress_ports"], "ingress_ports")
     if not ingress_ports or any(port_id not in ports for port_id in ingress_ports):
@@ -640,7 +652,7 @@ def build_generation_stream(stream, pps, spec, generation_tag, pg_id, flow_id, s
     )
 
 
-def generation_counts_from_flow_stats(flow_stats, generation_flow_plan, egress_ports):
+def generation_counts_from_flow_stats(flow_stats, generation_flow_plan, egress_ports, expected_by_role):
     '''Reduce exact PGID rows into generation TX/RX evidence.'''
     missing = []
     tx_by_generation = {}
@@ -665,7 +677,7 @@ def generation_counts_from_flow_stats(flow_stats, generation_flow_plan, egress_p
             "port_id": int(item["port_id"]),
             "flow_id": int(item["flow_id"]),
             "role": item["role"],
-            "expected_tx": int(item["expected_tx"]),
+            "expected_tx": expected_by_role[item["role"]],
             "tx_pkts": tx_pkts,
             "rx_pkts": rx_pkts,
         }
@@ -786,8 +798,6 @@ try:
     if action == "generation_start":
         ingress_ports = [stream["port_id"] for stream in ingress_streams]
         duration_s = float(spec["duration_s"])
-        transition_s = float(spec["transition_time_s"])
-        overlap_s = float(spec["overlap_window_ms"]) / 1000.0
         num_flows = spec["num_flows"]
         admitted_identity = admit_instrument(client, ports, egress_ports, generation_layout["demand"])
         pgids = iter(zip(generation_layout["initial"], generation_layout["next"]))
@@ -854,9 +864,6 @@ try:
                             "port_id": port_id,
                             "flow_id": flow_id,
                             "role": "pre_overlap",
-                            "expected_tx": int(
-                                round(per_stream_pps * (transition_s + overlap_s))
-                            ),
                         },
                         {
                             "pg_id": next_pg_id,
@@ -865,9 +872,6 @@ try:
                             "port_id": port_id,
                             "flow_id": flow_id,
                             "role": "post_overlap",
-                            "expected_tx": int(
-                                round(per_stream_pps * (duration_s - transition_s))
-                            ),
                         },
                     ])
 
@@ -977,10 +981,19 @@ try:
         if not isinstance(stats, dict) or "flow_stats" not in stats:
             fail("TRex PGID result omitted flow_stats", 1)
         flow_stats = stats["flow_stats"]
+        expected_by_role = {
+            "pre_overlap": generation_flow_expected_tx(
+                spec["pps"], len(ingress_ports), spec["num_flows"], initial_pause_mono - start_mono,
+            ),
+            "post_overlap": generation_flow_expected_tx(
+                spec["pps"], len(ingress_ports), spec["num_flows"], next_pause_mono - next_start_mono,
+            ),
+        }
         tx_by_generation, rx_by_generation, by_pg_id = generation_counts_from_flow_stats(
             flow_stats,
             generation_flow_plan,
             egress_ports,
+            expected_by_role,
         )
         tx_count = sum(tx_by_generation.values())
         rx_count = sum(rx_by_generation.values())
@@ -1026,7 +1039,7 @@ try:
             "generation_flow_plan": generation_flow_plan,
             "generation_pgid_stats": by_pg_id,
             "generation_overlap_method": "orchestrator_controlled_sustained_overlap",
-            "transition_time_s_requested": float(spec["transition_time_s"]),
+            "initial_duration_s_requested": float(spec["initial_duration_s"]),
             "requested_overlap_window_ms": int(spec["overlap_window_ms"]),
             "overlap_window_ms_measured": measured_overlap,
             "overlap_window_timestamp_source": "trex_endpoint_monotonic",
@@ -1175,6 +1188,10 @@ REMOTE_TREX_SCRIPT = _REMOTE_TREX_SCRIPT_TEMPLATE.replace(
         pprint.pformat({action: sorted(keys) for action, keys in REMOTE_REQUEST_KEYS.items()}, width=100), "    ",
     ),
 ).replace("__KINETUM_GENERATION_PGID_LAYOUT__", inspect.getsource(generation_pgid_layout).rstrip("\n")).replace(
+    "__KINETUM_GENERATION_FLOW_EXPECTED_TX__", inspect.getsource(generation_flow_expected_tx).rstrip("\n")
+).replace(
+    "__KINETUM_REQUIRE_GENERATION_FLOW_PLAN__", inspect.getsource(require_generation_flow_plan).rstrip("\n")
+).replace(
     "__KINETUM_REQUIRE_TREX_CAPACITY__", inspect.getsource(require_trex_capacity).rstrip("\n")
 ).replace("__KINETUM_CAPABILITY_TEXT_BYTES__", str(MAX_TREX_CAPABILITY_TEXT_BYTES)).replace(
     "__KINETUM_RX_CAPABILITY_LIMIT__", str(MAX_TREX_RX_CAPABILITIES)

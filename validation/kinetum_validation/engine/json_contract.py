@@ -779,6 +779,7 @@ def _validate_epoch_test_result(
         row["boundary_ordering_validated"],
         "epoch boundary-ordering result",
     )
+    require_bool(row["load_qualified"], "epoch load qualification")
     require_string(row["message"], "epoch message", allow_empty=True)
     generation_fields = (
         "initial_generation_sent", "next_generation_sent",
@@ -816,8 +817,8 @@ def _validate_epoch_test_result(
 
 
 def _epoch_success_is_complete(row: Dict[str, Any], ordering_validated: bool, traffic_driver: str) -> bool:
-    """Require one ordered transition and externally observed traffic from both generations."""
-    if row["transitions_observed"] != 1 or not ordering_validated:
+    """Require qualified load, one ordered transition and traffic from both generations."""
+    if row["transitions_observed"] != 1 or not ordering_validated or not row["load_qualified"]:
         return False
     if traffic_driver == "native_tap" and row["generation_tag_transition_seq"] < 0:
         return False
@@ -1036,7 +1037,7 @@ def validate_test_suite_result(
             "generation_tag_transition_seq", "loss_pct", "avg_latency_us",
             "zero_loss", "transitions_observed", "boundary_count",
             "completed_boundaries", "protocol_faults_observed",
-            "backpressure_events", "boundary_ordering_validated", "message",
+            "backpressure_events", "boundary_ordering_validated", "load_qualified", "message",
         },
         "commit_confirmed_test": {
             "passed", "duration_s", "confirm_success", "confirm_snapshot_id",

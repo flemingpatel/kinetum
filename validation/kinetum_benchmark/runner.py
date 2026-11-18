@@ -82,7 +82,7 @@ def write_manifest(config: BenchmarkConfig, output_dir: Path) -> None:
             "num_flows": config.num_flows,
             "epoch_duration": config.epoch_duration,
             "epoch_pps": config.epoch_pps,
-            "epoch_transition_time": config.epoch_transition_time,
+            "epoch_initial_duration": config.epoch_initial_duration,
             "epoch_overlap_ms": config.epoch_overlap_ms,
             "runtime_root": str(config.runtime_root),
             "validation_root": str(config.validation_root),
@@ -121,7 +121,7 @@ def _build_test_config(config: BenchmarkConfig, run_dir: Path) -> TestConfig:
         epoch=EpochConfig(
             duration_s=config.epoch_duration,
             pps=config.epoch_pps,
-            transition_time_s=config.epoch_transition_time,
+            initial_duration_s=config.epoch_initial_duration,
             overlap_window_ms=config.epoch_overlap_ms,
         ),
         backend=BackendConfig(

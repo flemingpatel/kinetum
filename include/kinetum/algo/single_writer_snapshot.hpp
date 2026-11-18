@@ -30,6 +30,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <utility>
 
 #include <kinetum/algo/platform.hpp>
 
@@ -70,9 +71,13 @@ class alignas(CACHE_LINE_SIZE) single_writer_snapshot {
 	 */
 	single_writer_snapshot() noexcept = default;
 
+	/** @brief Reject copying the channel's publication state. */
 	single_writer_snapshot(const single_writer_snapshot &) = delete;
+	/** @brief Reject replacement of an existing channel's writer state. */
 	single_writer_snapshot &operator=(const single_writer_snapshot &) = delete;
+	/** @brief Keep the channel at a stable address for its readers. */
 	single_writer_snapshot(single_writer_snapshot &&) = delete;
+	/** @brief Reject moving publication ownership between channel objects. */
 	single_writer_snapshot &operator=(single_writer_snapshot &&) = delete;
 
 	/**
@@ -115,8 +120,13 @@ class alignas(CACHE_LINE_SIZE) single_writer_snapshot {
 		// sequence read to observe this odd marker or a later publication.
 		sequence_.store(sequence + 1u, std::memory_order_relaxed);
 		std::atomic_thread_fence(std::memory_order_release);
-		for (std::size_t i = 0; i < field_count; ++i) {
-			fields_[i].store(fields[i], std::memory_order_relaxed);
+		// Expand publications that fit one cache line; keep larger bodies compact.
+		if constexpr (field_count < CACHE_LINE_SIZE / sizeof(std::atomic<uint64_t>)) {
+			store_fields_(fields, std::make_index_sequence<field_count>{});
+		} else {
+			for (std::size_t i = 0; i < field_count; ++i) {
+				fields_[i].store(fields[i], std::memory_order_relaxed);
+			}
 		}
 		sequence_.store(sequence + 2u, std::memory_order_release);
 		return true;
@@ -175,6 +185,17 @@ class alignas(CACHE_LINE_SIZE) single_writer_snapshot {
 	}
 
     private:
+	/**
+	 * @brief Store a fixed payload in index order within the enclosing publication.
+	 * @tparam indices Ascending field ordinals supplied by make_index_sequence.
+	 * @param fields Complete payload of the enclosing publish() call.
+	 */
+	template <std::size_t... indices>
+	void store_fields_(const std::array<uint64_t, field_count> &fields, std::index_sequence<indices...>) noexcept
+	{
+		(fields_[indices].store(fields[indices], std::memory_order_relaxed), ...);
+	}
+
 	/** @brief Greatest even sequence that can begin one final publication. */
 	static constexpr uint64_t MAX_SEQUENCE_BEFORE_PUBLISH = std::numeric_limits<uint64_t>::max() - 3u;
 

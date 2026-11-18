@@ -16,6 +16,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <string>
@@ -696,30 +697,53 @@ TEST(epoch_transition_primitives, state_machine_failed_stop_has_no_recovery_tran
 }
 
 /**
- * @brief Verify publication starts invalid and advances coherent generations.
+ * @brief Exercise both publication expressions and the largest production payload.
+ * @tparam width_type Payload width supplied as an integral_constant by the typed suite.
  */
-TEST(epoch_transition_primitives, single_writer_snapshot_requires_complete_publication)
+template <typename width_type>
+class SnapshotPublicationTest : public ::testing::Test {};
+
+/** @brief Smallest, cutoff-adjacent and largest production snapshot widths. */
+using snapshot_widths =
+	::testing::Types<std::integral_constant<std::size_t, 1>, std::integral_constant<std::size_t, 7>,
+			 std::integral_constant<std::size_t, 8>, std::integral_constant<std::size_t, 61>>;
+TYPED_TEST_SUITE(SnapshotPublicationTest, snapshot_widths);
+
+/** @brief Preserve failed reads and advance generations even when the payload is unchanged. */
+TYPED_TEST(SnapshotPublicationTest, requires_complete_publication)
 {
-	algo::single_writer_snapshot<3> publication;
-	algo::single_writer_snapshot<3>::snapshot observed{};
+	algo::single_writer_snapshot<TypeParam::value> publication;
+	typename algo::single_writer_snapshot<TypeParam::value>::snapshot observed{};
 	observed.generation = 99;
-	observed.fields = {9, 9, 9};
+	observed.fields.fill(9);
+	const auto unchanged = observed;
 
 	EXPECT_FALSE(publication.try_read(observed, 0));
 	EXPECT_FALSE(publication.try_read(observed, 2));
 	EXPECT_EQ(observed.generation, 99u);
-	EXPECT_EQ(observed.fields, (std::array<uint64_t, 3>{9, 9, 9}));
+	EXPECT_EQ(observed.fields, unchanged.fields);
+	std::array<uint64_t, TypeParam::value> values{};
+	for (std::size_t i = 0; i < values.size(); ++i) {
+		values[i] = static_cast<uint64_t>(i) + 1u;
+	}
 
-	ASSERT_TRUE(publication.publish({1, 2, 3}));
+	ASSERT_TRUE(publication.publish(values));
 	ASSERT_TRUE(publication.try_read(observed, 2));
 	EXPECT_EQ(observed.generation, 1u);
-	EXPECT_EQ(observed.fields, (std::array<uint64_t, 3>{1, 2, 3}));
+	EXPECT_EQ(observed.fields, values);
 	EXPECT_EQ(publication.completed_generation(), 1u);
 
-	ASSERT_TRUE(publication.publish({4, 5, 6}));
+	ASSERT_TRUE(publication.publish(values));
 	ASSERT_TRUE(publication.try_read(observed, 2));
 	EXPECT_EQ(observed.generation, 2u);
-	EXPECT_EQ(observed.fields, (std::array<uint64_t, 3>{4, 5, 6}));
+	EXPECT_EQ(observed.fields, values);
+	for (auto &value : values) {
+		value += 7u;
+	}
+	ASSERT_TRUE(publication.publish(values));
+	ASSERT_TRUE(publication.try_read(observed, 2));
+	EXPECT_EQ(observed.generation, 3u);
+	EXPECT_EQ(observed.fields, values);
 }
 
 /**
@@ -741,10 +765,12 @@ TEST(epoch_transition_primitives, single_writer_snapshot_guards_generation_wrap)
 /**
  * @brief Verify concurrent readers never accept a mixed publication.
  */
-TEST(epoch_transition_primitives, single_writer_snapshot_is_coherent_under_observation)
+TYPED_TEST(SnapshotPublicationTest, is_coherent_under_observation)
 {
-	algo::single_writer_snapshot<4> publication;
-	ASSERT_TRUE(publication.publish({1, 1, 1, 1}));
+	algo::single_writer_snapshot<TypeParam::value> publication;
+	std::array<uint64_t, TypeParam::value> values{};
+	values.fill(1);
+	ASSERT_TRUE(publication.publish(values));
 
 	std::atomic<bool> reader_ready{false};
 	std::atomic<bool> stop_reader{false};
@@ -755,7 +781,7 @@ TEST(epoch_transition_primitives, single_writer_snapshot_is_coherent_under_obser
 	std::thread reader([&]() {
 		reader_ready.store(true, std::memory_order_release);
 		while (!stop_reader.load(std::memory_order_acquire)) {
-			algo::single_writer_snapshot<4>::snapshot observed{};
+			typename algo::single_writer_snapshot<TypeParam::value>::snapshot observed{};
 			if (!publication.try_read(observed, 4)) {
 				continue;
 			}
@@ -788,7 +814,8 @@ TEST(epoch_transition_primitives, single_writer_snapshot_is_coherent_under_obser
 
 	bool publish_failed = false;
 	for (uint64_t value = 2; value < 10'000; ++value) {
-		if (!publication.publish({value, value, value, value})) {
+		values.fill(value);
+		if (!publication.publish(values)) {
 			publish_failed = true;
 			break;
 		}

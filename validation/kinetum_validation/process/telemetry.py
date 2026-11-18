@@ -274,6 +274,14 @@ class BoundaryEpochStatsResult:  # pylint: disable=too-many-instance-attributes
     cut_drain_duration_ns: Optional[int] = None
     ack_gate_duration_ns: Optional[int] = None
 
+    def endpoint_identity(self) -> tuple[str | int, ...]:
+        """Return the boundary's fixed endpoints and capacity metadata."""
+        return (
+            self.boundary_id, self.boundary_index, self.from_stage_instance_index, self.to_stage_instance_index,
+            self.sender_worker_index, self.receiver_worker_index, self.from_region_id, self.to_region_id,
+            self.data_ring_capacity, self.future_output_hold_capacity,
+        )
+
 
 @dataclass
 class RegionEpochStatsResult:

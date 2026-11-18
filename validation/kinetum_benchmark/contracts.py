@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, Iterable
 
-from kinetum_validation.config.types import StreamTopologyProfile, StorageProfile, TrafficEndpointConfig
+from kinetum_validation.config.types import (
+    StreamTopologyProfile, StorageProfile, TrafficEndpointConfig, epoch_window_has_capacity, timed_packet_count_fits,
+)
 from kinetum_validation.statistics import validate_percentile_population
+from kinetum_validation.process.epoch_load import require_epoch_load_artifact
 from kinetum_validation.engine.json_contract import (
     EXPECTED_SCENARIO_METRICS_BY_TEST,
     EXPECTED_TRANSITION_TYPES_BY_TEST,
@@ -221,7 +225,7 @@ def validate_benchmark_manifest(value: Dict[str, Any], completed: bool) -> None:
         config,
         {
             "pps", "count", "packet_size", "all_sizes", "num_flows",
-            "epoch_duration", "epoch_pps", "epoch_transition_time",
+            "epoch_duration", "epoch_pps", "epoch_initial_duration",
             "epoch_overlap_ms", "runtime_root", "validation_root",
         },
         "benchmark configuration",
@@ -242,22 +246,21 @@ def validate_benchmark_manifest(value: Dict[str, Any], completed: bool) -> None:
         maximum=_UINT32_MAX,
     )
     require_bool(config["all_sizes"], "benchmark all-sizes selection")
-    for name in ("epoch_duration", "epoch_transition_time"):
+    for name in ("epoch_duration", "epoch_initial_duration"):
         require_number(config[name], f"benchmark {name}", minimum=0.0)
-    overlap_fits = (
-        scenario["backend"] != "dpdk_pci"
-        or scenario["test_type"] not in {"epoch", "full"}
-        or config["epoch_transition_time"]
-        + config["epoch_overlap_ms"] / 1000.0
-        < config["epoch_duration"]
+    window_fits = (
+        scenario["test_type"] not in {"epoch", "full"}
+        or epoch_window_has_capacity(
+            config["epoch_duration"], config["epoch_initial_duration"], config["epoch_overlap_ms"],
+            scenario["backend"] == "dpdk_pci",
+        )
     )
     timing_exact = all((
         config["epoch_duration"] > 0.0,
-        config["epoch_transition_time"] > 0.0,
-        config["epoch_transition_time"] < config["epoch_duration"],
-        config["epoch_pps"] * config["epoch_duration"] >= 1.0,
-        config["epoch_pps"] * config["epoch_duration"] <= _UINT32_MAX,
-        overlap_fits,
+        config["epoch_initial_duration"] > 0.0,
+        config["epoch_initial_duration"] < config["epoch_duration"],
+        timed_packet_count_fits(config["epoch_pps"], config["epoch_duration"]),
+        window_fits,
     ))
     if not timing_exact:
         raise JsonContractError("benchmark epoch timing is contradictory")
@@ -321,6 +324,30 @@ def validate_benchmark_manifest(value: Dict[str, Any], completed: bool) -> None:
             raise JsonContractError("benchmark run error presence is contradictory")
     if observed_passed != passed:
         raise JsonContractError("benchmark passed-run count is contradictory")
+
+
+def validate_benchmark_epoch_load(result: Dict[str, Any], manifest: Dict[str, Any], run_dir: Path) -> None:
+    """Validate persisted rate proof against the benchmark's requested aggregate load."""
+    epoch = result["epoch_test"]
+    if epoch is None:
+        return
+    evidence = require_epoch_load_artifact(run_dir, epoch["load_qualified"], epoch["passed"])
+    if evidence is None:
+        return
+    scenario = manifest["scenario"]
+    profile = _benchmark_profile(scenario["deployment"], scenario["backend"],
+                                 scenario["stream_topology"], scenario["storage_profile"])
+    ingress_count = sum(port.traffic_role == "rx" for port in profile.ports)
+    if ingress_count == 0:
+        raise JsonContractError("epoch benchmark has no ingress ports")
+    population_count = 2 if scenario["traffic_driver"] == "trex" else 1
+    target = manifest["config"]["epoch_pps"] * population_count / ingress_count
+    for phase in (evidence["old"], evidence["new"]):
+        if phase is not None and (
+            len(phase["target_pps_by_port"]) != ingress_count
+            or any(rate != target for rate in phase["target_pps_by_port"].values())
+        ):
+            raise JsonContractError("epoch load targets differ from the benchmark workload")
 
 
 def validate_benchmark_run_artifacts(

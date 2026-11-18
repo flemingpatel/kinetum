@@ -21,6 +21,7 @@ from kinetum_validation.statistics import nearest_rank_percentile
 
 from .contracts import (
     validate_benchmark_result_identity,
+    validate_benchmark_epoch_load,
     validate_benchmark_run_artifacts,
     validate_benchmark_manifest,
     validate_benchmark_summary_identity,
@@ -143,6 +144,7 @@ def aggregate(input_dir: Path, inclusion_policy: str = "passed_only") -> None:
                 f.read(), f"{run_dir.name} test results"
             )
         validate_benchmark_result_identity(result, manifest)
+        validate_benchmark_epoch_load(result, manifest, run_dir)
         if manifest_rows[run_dir.name]["passed"] != result["all_passed"]:
             raise ValueError(
                 f"{run_dir.name} manifest and test result disagree"

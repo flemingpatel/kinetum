@@ -129,7 +129,7 @@ class TestTRexEndpointAdmission(unittest.TestCase):
                 if action == "generation_start":
                     spec.update({
                         "initial_generation_tag": 1, "next_generation_tag": 2,
-                        "transition_time_s": 15.0, "overlap_window_ms": 60000,
+                        "initial_duration_s": 15.0, "overlap_window_ms": 60000,
                     })
                 else:
                     spec.update({"mode": "standard", "generation_tag": 0})

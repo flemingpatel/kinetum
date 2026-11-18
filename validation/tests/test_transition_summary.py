@@ -29,6 +29,7 @@ from kinetum_benchmark.aggregator import (
     aggregate as aggregate_benchmark,
 )
 from kinetum_benchmark.contracts import (
+    validate_benchmark_epoch_load,
     validate_benchmark_manifest,
     validate_benchmark_result_identity,
     validate_benchmark_summary,
@@ -67,6 +68,7 @@ from kinetum_validation.orchestrator import TestOrchestrator as ValidationOrches
 from kinetum_validation.report.console import ConsoleReporter
 from kinetum_validation.report.artifacts import RunArtifacts
 from tests.traffic_fixtures import complete_trex_identity
+from .epoch_load_fixtures import qualified_load_evidence
 
 
 TREX_IDENTITY = complete_trex_identity()
@@ -239,9 +241,9 @@ def _epoch_benchmark_manifest() -> dict:
             "packet_size": 64,
             "all_sizes": False,
             "num_flows": 1,
-            "epoch_duration": 15.0,
+            "epoch_duration": 30.0,
             "epoch_pps": summary["epoch_pps"],
-            "epoch_transition_time": 5.0,
+            "epoch_initial_duration": 5.0,
             "epoch_overlap_ms": 500,
             "runtime_root": "/opt/kinetum",
             "validation_root": "/var/tmp/kinetum-validation",
@@ -287,7 +289,7 @@ def _epoch_test_result_artifact() -> dict:
         "rate_control_source": "userspace_native_sender",
         "latency_source": "kernel_af_packet_pcap",
         "dry_run": False,
-        "total_duration_s": 15.0,
+        "total_duration_s": 32.0,
         "setup_failed": False,
         "all_passed": True,
         "total_tests": 1,
@@ -298,7 +300,7 @@ def _epoch_test_result_artifact() -> dict:
         "nat_exchange": None,
         "epoch_test": {
             "passed": True,
-            "duration_s": 15.0,
+            "duration_s": 32.0,
             "total_sent": 100,
             "total_received": 100,
             "initial_generation_sent": 50,
@@ -315,6 +317,7 @@ def _epoch_test_result_artifact() -> dict:
             "protocol_faults_observed": 0,
             "backpressure_events": 0,
             "boundary_ordering_validated": True,
+            "load_qualified": True,
             "message": "exact",
         },
         "commit_confirmed_test": None,
@@ -507,7 +510,7 @@ def _epoch_benchmark_case(inclusion_policy: str):
             inclusion_policy=inclusion_policy, runs=2, total_duration_s=120.0,
             completed="2026-09-03T12:02:00+00:00",
         )
-        manifest["config"].update(epoch_pps=100, epoch_duration=10.5)
+        manifest["config"].update(epoch_pps=100, epoch_duration=30.0)
         manifest["scenario"].update(
             backend="dpdk_pci", traffic_driver="trex",
             latency_source=None, traffic_host="traffic-host",
@@ -544,9 +547,9 @@ def _epoch_benchmark_case(inclusion_policy: str):
                 )
             result = _as_trex_latency_unavailable(_epoch_test_result_artifact())
             result["epoch_test"].update(
-                total_sent=1100, total_received=1100,
-                initial_generation_sent=550, next_generation_sent=550,
-                initial_generation_received=550, next_generation_received=550,
+                total_sent=4500, total_received=4500,
+                initial_generation_sent=2000, next_generation_sent=2500,
+                initial_generation_received=2000, next_generation_received=2500,
                 boundary_count=2, completed_boundaries=2,
             )
             result.update(
@@ -559,6 +562,10 @@ def _epoch_benchmark_case(inclusion_policy: str):
                 result["stats_validation"].update(passed=False, message="statistics unavailable")
             (run_root / "test_results.json").write_text(
                 json.dumps(result, allow_nan=False) + "\n", encoding="utf-8"
+            )
+            (run_root / "epoch_load.json").write_text(
+                json.dumps(qualified_load_evidence(run_root, target_pps=100), allow_nan=False) + "\n",
+                encoding="utf-8",
             )
             record = _make_record(TransitionType.EPOCH, 1, 2, ack_gate_ns)
             observations = record["counter_observations"]
@@ -602,6 +609,20 @@ def _epoch_benchmark_case(inclusion_policy: str):
 class TestBenchmarkAggregation(unittest.TestCase):
     """Aggregation and reporting preserve strict per-run evidence and provenance."""
 
+    def test_epoch_load_proof_must_match_the_manifest_workload(self):
+        """A valid proof for another rate cannot qualify the benchmark's requested load."""
+        with _epoch_benchmark_case("passed_only") as root:
+            manifest = json.loads((root / "manifest.json").read_text())
+            run = root / "run_001"
+            result = json.loads((run / "test_results.json").read_text())
+            validate_benchmark_epoch_load(result, manifest, run)
+            (run / "epoch_load.json").write_text(json.dumps(qualified_load_evidence(run)), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "targets differ"):
+                validate_benchmark_epoch_load(result, manifest, run)
+            (run / "epoch_load.json").unlink()
+            with self.assertRaisesRegex(ValueError, "omitted"):
+                validate_benchmark_epoch_load(result, manifest, run)
+
     def test_partial_guardrails_keeps_elapsed_time_without_fabricating_rollback(self):
         """A failed baseline wait contributes its observed duration but no epoch step."""
         result = _single_scenario_result_artifact(
@@ -632,6 +653,7 @@ class TestBenchmarkAggregation(unittest.TestCase):
             run = root / "run_002"
             (run / "test_results.json").unlink()
             (run / "transition_metrics.jsonl").unlink()
+            (run / "epoch_load.json").unlink()
             result = ValidationSuiteResult(
                 deployment=DeploymentMode.FAN_IN_EDGE_GATEWAY, test_type=ValidationTestType.EPOCH,
                 epoch_test=EpochTestResult(passed=False, duration_s=60.0, message="statistics unavailable"),
@@ -841,6 +863,7 @@ class TestTransitionSummaryPerType(unittest.TestCase):
             },
             {"generation_tag_transition_seq": -1},
             {"boundary_ordering_validated": False},
+            {"load_qualified": False},
             {"transitions_observed": 0},
         ):
             with self.subTest(mutation=mutation):

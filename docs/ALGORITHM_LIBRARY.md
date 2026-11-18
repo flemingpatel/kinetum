@@ -350,6 +350,10 @@ sequence observations around the payload and acquire fence see the same nonzero
 even value, and it retries no more than the explicit bound supplied by its
 caller.
 
+Payload stores use compile-time indices when the sequence and fields fit in
+one platform cache line. Larger publications retain a loop; this changes
+neither their storage layout nor their publication ordering.
+
 Use it to export coherent runtime, coordinator, worker, boundary, or module
 observations without a foreign thread reading unrelated owner-local writable
 state. Publication is bounded and allocation-free, but it is not a per-packet

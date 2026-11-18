@@ -3,8 +3,10 @@
 import asyncio
 import base64
 import copy
+import json
 import tempfile
 import unittest
+from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 from textwrap import dedent
@@ -52,151 +54,104 @@ from kinetum_validation.process.telemetry import (
 )
 
 from .traffic_fixtures import complete_native_analysis
+from .epoch_load_fixtures import load_snapshot, load_topology
+
+
+_NS_PER_SECOND = 1_000_000_000
 
 
 class _FakeEpochKinetumCtl:
-    """Kinetumctl replacement for epoch timing tests."""
+    """Publish complete fixture counters at a cadence, with configuration changed only by Apply."""
 
-    def __init__(
-        self,
-        complete_boundary: bool = True,
-        baseline_epoch: int = 2,
-    ) -> None:
-        """Initialize exact baseline identity and boundary completion mode."""
-        self._stats_calls = 0
-        self._complete_boundary = complete_boundary
-        self._baseline_epoch = baseline_epoch
+    def __init__(self, sender, complete_boundary: bool = True, baseline_epoch: int = 2) -> None:
+        """Bind the source, baseline and optional missing-completion observation."""
+        self.sender = sender
+        self.complete_boundary = complete_boundary
+        self.baseline_epoch = baseline_epoch
+        self._activation_ns: int | None = None
+        self._packets_at_activation = 0
         self.config_file: Path | None = None
+        self.target_rate_ratio = 1.0
 
     async def get_stats(self, selection: StatsSelection = StatsSelection()) -> StatsResult:
-        """Return pre/post boundary telemetry snapshots."""
+        """Model cadence banks and the early old bank published at activation."""
         del selection
-        self._stats_calls += 1
-        if self._stats_calls <= 2:
-            packet_count = 0 if self._stats_calls == 1 else 10
-            return StatsResult(
-                success=True,
-                rx_packets=packet_count,
-                tx_packets=packet_count,
-                rx_bytes=packet_count * 64,
-                tx_bytes=packet_count * 64,
-                expected_workers=1,
-                execution_participant_count=1,
-                allocated_epoch_high_watermark=self._baseline_epoch,
-                collection_monotonic_ns=self._stats_calls * 100,
-                latest_bank_publication_monotonic_ns=self._stats_calls * 100,
-                worker_counters=[WorkerCounterStatsResult(
-                    worker_index=0, observation_epoch=self._baseline_epoch,
-                    publication_generation=self._stats_calls, published_monotonic_ns=self._stats_calls * 100,
-                    rx_packets=packet_count, tx_packets=packet_count, dropped_packets=0,
-                    rx_bytes=packet_count * 64, tx_bytes=packet_count * 64, fanout_overflow=0,
-                )],
-                active_epoch=self._baseline_epoch,
-                active_snapshot_id="v1",
-                active_revision=1,
-                runtime_generation=1,
-                transition_state="EPOCH_TRANSITION_STATE_IDLE",
-                protocol_fault_counts={
-                    code: 0 for code in PROTOCOL_FAULT_CODE_ORDER
-                },
-                boundary_epoch_stats=[
-                    BoundaryEpochStatsResult(boundary_id="b0"),
-                ],
-                region_epoch_stats=[
-                    RegionEpochStatsResult(
-                        region_id=0,
-                        worker_count=1,
-                        minimum_active_epoch=2,
-                        maximum_active_epoch=2,
-                        minimum_source_epoch=2,
-                        maximum_source_epoch=2,
-                        activated_participants=1,
-                    ),
-                ],
-                stage_stats=[
-                    StageStatsResult(
-                        stage_id="stage0",
-                        in_packets=packet_count,
-                        out_packets=packet_count,
-                    ),
-                ],
-            )
-        return StatsResult(
-            success=True,
-            rx_packets=110,
-            tx_packets=110,
-            rx_bytes=7040,
-            tx_bytes=7040,
-            expected_workers=1,
-            execution_participant_count=1,
-            allocated_epoch_high_watermark=3,
-            collection_monotonic_ns=self._stats_calls * 100,
-            latest_bank_publication_monotonic_ns=self._stats_calls * 100,
-            worker_counters=[WorkerCounterStatsResult(
-                worker_index=0, observation_epoch=3,
-                publication_generation=self._stats_calls, published_monotonic_ns=self._stats_calls * 100,
-                rx_packets=110, tx_packets=110, dropped_packets=0,
-                rx_bytes=7040, tx_bytes=7040, fanout_overflow=0,
-            )],
-            active_epoch=3,
-            active_snapshot_id="v2",
-            active_revision=2,
-            runtime_generation=1,
-            transition_state="EPOCH_TRANSITION_STATE_IDLE",
-            latest_terminal=EpochTransactionStatsResult(
-                mutation_sequence=3,
-                from_epoch=2,
-                to_epoch=3,
-                outcome="EPOCH_TRANSITION_OUTCOME_COMPLETE",
-                failure_code="EPOCH_TRANSITION_FAILURE_CODE_NONE",
-            ),
-            protocol_fault_counts={
-                code: 0 for code in PROTOCOL_FAULT_CODE_ORDER
-            },
-            boundary_epoch_stats=[
-                BoundaryEpochStatsResult(
-                    boundary_id="b0",
-                    data_enqueued_sequence=100,
-                    data_dequeued_sequence=100,
-                    transition_generation=3,
-                    from_epoch=2,
-                    to_epoch=3,
-                    cut_sequence=90 if self._complete_boundary else None,
-                    sender_phase="BOUNDARY_SENDER_PHASE_OPEN",
-                    receiver_phase="BOUNDARY_RECEIVER_PHASE_OPEN",
-                    cut_delivery_duration_ns=(10 if self._complete_boundary else None),
-                    cut_drain_duration_ns=(20 if self._complete_boundary else None),
-                    ack_gate_duration_ns=(40 if self._complete_boundary else None),
-                ),
-            ],
-            region_epoch_stats=[
-                RegionEpochStatsResult(
-                    region_id=0,
-                    worker_count=1,
-                    minimum_active_epoch=3,
-                    maximum_active_epoch=3,
-                    minimum_source_epoch=3,
-                    maximum_source_epoch=3,
-                    activated_participants=1,
-                ),
-            ],
-            stage_stats=[
-                StageStatsResult(
-                    stage_id="stage0", in_packets=110, out_packets=110
-                ),
-            ],
+        now_ns = self.sender.current_time_ns()
+        published_ns = now_ns // _NS_PER_SECOND * _NS_PER_SECOND
+        generation = 10 + now_ns // _NS_PER_SECOND
+        epoch = self.baseline_epoch
+        observed_epoch = epoch
+        activation_ns = self._activation_ns
+        if activation_ns is not None:
+            epoch += 1
+            steps = (now_ns - activation_ns) // _NS_PER_SECOND
+            published_ns = activation_ns + steps * _NS_PER_SECOND
+            generation = 11 + activation_ns // _NS_PER_SECOND + steps
+            observed_epoch = self.baseline_epoch if steps == 0 else epoch
+        total = sum(self.sender.population_at(published_ns / _NS_PER_SECOND))
+        if activation_ns is not None:
+            target_packets = total - self._packets_at_activation
+            total = self._packets_at_activation + int(target_packets * self.target_rate_ratio)
+        stats = load_snapshot(
+            10 + published_ns // _NS_PER_SECOND, offsets=(published_ns % _NS_PER_SECOND,) * 3, epoch=epoch,
+            counts=(total // 2 + total % 2, total // 2), generation=generation,
+            observation_epoch=observed_epoch, collected=10_000_000_000 + now_ns + 1000,
+            packet_size=self.sender.packet_size,
         )
+        stats.active_snapshot_id = "v2" if activation_ns is not None else "v1"
+        stats.active_revision = 2 if activation_ns is not None else 1
+        stats.protocol_fault_counts = {code: 0 for code in PROTOCOL_FAULT_CODE_ORDER}
+        stats.boundary_epoch_stats = [
+            BoundaryEpochStatsResult(
+                boundary_id=f"b{i}", boundary_index=i, from_stage_instance_index=i, to_stage_instance_index=2,
+                sender_worker_index=i, receiver_worker_index=2, from_region_id=i, to_region_id=2,
+                data_ring_capacity=1024, future_output_hold_capacity=1024,
+                data_enqueued_sequence=stats.worker_counters[i].rx_packets,
+                data_dequeued_sequence=stats.worker_counters[i].rx_packets,
+                sender_phase="BOUNDARY_SENDER_PHASE_OPEN", receiver_phase="BOUNDARY_RECEIVER_PHASE_OPEN",
+            ) for i in range(2)
+        ]
+        stats.region_epoch_stats = [
+            RegionEpochStatsResult(
+                region_id=i, worker_count=1, minimum_active_epoch=epoch, maximum_active_epoch=epoch,
+                minimum_source_epoch=epoch, maximum_source_epoch=epoch, activated_participants=1,
+            ) for i in range(3)
+        ]
+        stats.stage_stats = [StageStatsResult(stage_id="stage0", in_packets=total, out_packets=total)]
+        if activation_ns is not None:
+            edge = 10_000_000_000 + activation_ns
+            if self.complete_boundary:
+                stats.latest_terminal = EpochTransactionStatsResult(
+                    mutation_sequence=3, from_epoch=self.baseline_epoch, to_epoch=epoch,
+                    outcome="EPOCH_TRANSITION_OUTCOME_COMPLETE", failure_code="EPOCH_TRANSITION_FAILURE_CODE_NONE",
+                )
+                cut_total = self._packets_at_activation
+                for i, row in enumerate(stats.boundary_epoch_stats):
+                    row.transition_generation = 3
+                    row.from_epoch = self.baseline_epoch
+                    row.to_epoch = epoch
+                    row.cut_sequence = cut_total // 2 + int(i == 0 and cut_total % 2 != 0)
+                    row.cut_published_monotonic_ns = edge
+                    row.cut_observed_monotonic_ns = edge + 10
+                    row.cut_drained_monotonic_ns = edge + 30
+                    row.activation_monotonic_ns = edge + 35
+                    row.ack_published_monotonic_ns = edge + 35
+                    row.ack_observed_monotonic_ns = edge + 40
+                    row.cut_delivery_duration_ns = 10
+                    row.cut_drain_duration_ns = 20
+                    row.ack_gate_duration_ns = 40
+            else:
+                stats.transition_state = "EPOCH_TRANSITION_STATE_COMMITTING"
+        return stats
 
-    async def apply_config(
-        self, config_file: Path, expected_revision: int | None = None
-    ) -> ApplyConfigResult:
-        """Accept the transition config."""
-        if expected_revision != 1:
+    async def apply_config(self, config_file: Path, expected_revision: int | None = None) -> ApplyConfigResult:
+        """Accept one exact CAS and re-arm owner publication after the early old bank."""
+        if expected_revision != 1 or self._activation_ns is not None:
             return ApplyConfigResult(success=False, diagnostic="wrong CAS")
         self.config_file = config_file
-        return ApplyConfigResult(
-            success=True, snapshot_id="v2", revision=2, epoch=3
-        )
+        self._activation_ns = self.sender.current_time_ns()
+        self._packets_at_activation = sum(self.sender.population_at(self._activation_ns / _NS_PER_SECOND))
+        return ApplyConfigResult(success=True, snapshot_id="v2", revision=2, epoch=self.baseline_epoch + 1)
 
 
 class _SequenceStatsKinetumCtl:
@@ -222,6 +177,13 @@ class _FakeEpochSender:
     def __init__(self, clock) -> None:
         """Bind the deterministic test clock and empty session state."""
         self._clock = clock
+        self.pps = 1000
+        self.packet_size = 64
+        self.started_at = -1.0
+        self.sustained_overlap = True
+        self.active = False
+        self.stats = None
+        self.stopped_at = None
         self.finish_called_at = -1.0
         self.duration_s = 0.0
         self.initial_generation_tag = 0
@@ -238,6 +200,8 @@ class _FakeEpochSender:
     ) -> None:
         """Record generation-tag start parameters."""
         self.duration_s = duration_s
+        self.started_at = self.current_time()
+        self.active = True
         self.initial_generation_tag = initial_generation_tag
         self.next_generation_tag = next_generation_tag
 
@@ -245,12 +209,40 @@ class _FakeEpochSender:
         """Record the requested next generation tag."""
         if next_generation_tag != self.next_generation_tag:
             raise RuntimeError("generation tag mismatch")
-        self.overlap_started_at = self._clock()
+        self.overlap_started_at = self.current_time()
         self.overlap_start_count += 1
+
+    def current_time_ns(self) -> int:
+        """Read the source clock at the resolution of a worker publication."""
+        return round(self._clock() * _NS_PER_SECOND)
+
+    def current_time(self) -> float:
+        """Return the same clock sample in seconds for traffic generation."""
+        return self.current_time_ns() / _NS_PER_SECOND
+
+    def population_at(self, at_time: float) -> tuple[int, int]:
+        """Integrate the authored populations through the observed resume and pause edges."""
+        if self.started_at < 0:
+            return 0, 0
+        if self.stopped_at is not None:
+            at_time = min(at_time, self.stopped_at)
+        initial_end = at_time
+        if self.sustained_overlap and self.overlap_ended_at >= 0:
+            initial_end = min(initial_end, self.overlap_ended_at)
+        if not self.sustained_overlap and self.overlap_started_at >= 0:
+            initial_end = min(initial_end, self.overlap_started_at)
+        initial = max(0.0, initial_end - self.started_at)
+        following = max(0.0, at_time - self.overlap_started_at) if self.overlap_started_at >= 0 else 0.0
+        return int(initial * self.pps), int(following * self.pps)
+
+    def require_generation_active(self) -> None:
+        """Reject a fixture source after it has reached a terminal session state."""
+        if not self.active:
+            raise RuntimeError("fixture generation session is not active")
 
     async def end_generation_overlap(self) -> None:
         """Record that initial-generation overlap ended."""
-        self.overlap_ended_at = self._clock()
+        self.overlap_ended_at = self.current_time()
         self.overlap_end_count += 1
         self.overlap_ended = True
 
@@ -258,18 +250,25 @@ class _FakeEpochSender:
         """Return stats and record when finish was invoked."""
         if self.overlap_start_count != 1 or self.overlap_end_count != 1:
             raise RuntimeError("generation overlap did not complete both edges")
-        self.finish_called_at = self._clock()
-        stats = PacketStats(
-            tx_count=100, start_time=0.0, end_time=self.finish_called_at, duration_s=self.finish_called_at,
+        self.finish_called_at = self.current_time()
+        self.stopped_at = self.finish_called_at
+        initial, following = self.population_at(self.finish_called_at)
+        self.stats = PacketStats(
+            tx_count=initial + following, start_time=self.started_at, end_time=self.finish_called_at,
+            duration_s=self.finish_called_at - self.started_at,
+            generation_tag_counts={1: initial, 2: following},
         )
-        stats.generation_tag_counts = {1: 50, 2: 50}
-        return stats
+        self.active = False
+        return self.stats
 
     def cancel(self) -> None:
         """No active subprocess exists in this fake."""
 
     async def abort(self) -> None:
-        """No active subprocess exists in this fake."""
+        """Retire the exact fixture session without inventing a completed overlap."""
+        if self.active:
+            self.stopped_at = self.current_time()
+        self.active = False
 
     def cleanup(self) -> None:
         """No resources are held by this fake."""
@@ -286,8 +285,13 @@ class _FakeEpochTraffic:
         """Bind one sender and exact overlap choreography."""
         self.sender = sender
         self.sustained_overlap = sustained_overlap
+        self.sender.sustained_overlap = sustained_overlap
         self.pcap_file: Path | None = None
         self.filter_expr = ""
+        self.loss_fraction = 0.0
+        self.rate_ratio = 1.0
+        self.tag_fault = None
+        self.analysis = None
 
     @property
     def requires_sustained_generation_overlap(self) -> bool:
@@ -307,20 +311,44 @@ class _FakeEpochTraffic:
         pcap_file: Path,
         expected_count: int,
     ) -> AnalysisResult:
-        """Return zero-loss generation-tag analysis."""
+        """Return capture evidence with the configured tag fault or packet loss."""
         del pcap_file
+        tags = self.sender.stats.generation_tag_counts
         if not self.sustained_overlap:
-            return complete_native_analysis(((1, 50), (2, 50)), 2)
-        return AnalysisResult(
-            total_rx=expected_count,
-            valid=expected_count,
-            tag_counts={1: 50, 2: 50},
-        )
+            complete = complete_native_analysis(tuple(tags.items()), 2)
+            if self.tag_fault == "reversed":
+                complete.streams = (
+                    replace(complete.streams[0], tag_transition_count=3), complete.streams[1],
+                )
+            elif self.tag_fault == "counts":
+                first, second = complete.streams
+                complete.streams = (
+                    replace(first, tag_counts={1: first.tag_counts[1] + 1, 2: first.tag_counts[2] - 1}),
+                    replace(second, tag_counts={1: second.tag_counts[1] - 1, 2: second.tag_counts[2] + 1}),
+                )
+            self.analysis = complete
+        else:
+            missing = int(expected_count * self.loss_fraction)
+            self.analysis = AnalysisResult(
+                total_rx=expected_count - missing, valid=expected_count - missing, missing_count=missing,
+                tag_counts={1: tags[1] - missing, 2: tags[2]},
+            )
+        return self.analysis
 
     def make_sender(self, packet_config):
         """Return the fake epoch sender."""
-        del packet_config
+        self.sender.pps = packet_config.pps * self.rate_ratio
+        self.sender.packet_size = packet_config.packet_size
         return self.sender
+
+
+def _bind_epoch_fixture(orchestrator, traffic, *, complete_boundary=True, baseline_epoch=2):
+    """Supply the compiled topology and owned source required by the real epoch scenario."""
+    orchestrator._traffic = traffic  # pylint: disable=protected-access
+    orchestrator._plan_topology = load_topology()  # pylint: disable=protected-access
+    orchestrator._kinetumctl = _FakeEpochKinetumCtl(  # pylint: disable=protected-access
+        traffic.sender, complete_boundary=complete_boundary, baseline_epoch=baseline_epoch,
+    )
 
 
 class _FakePackerProcess:
@@ -506,19 +534,248 @@ class TestCanonicalBundleConstruction(unittest.IsolatedAsyncioTestCase):
             create_process.assert_not_awaited()
 
 
+@contextmanager
+def _epoch_scenario_case():
+    """Own a staged target and coherent synthetic source/clock through one scenario.
+
+    No native process is created. The scenario retains its normal admission,
+    qualification and cleanup paths; the fixture supplies their exact inputs.
+    """
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        clock = _ObservationClock()
+        config = _config_with_example_dir(root, BackendType.DPDK_PCI)
+        config.output_dir.mkdir()
+        candidate = config.process.examples_dir / config.spec.example_dir / config.spec.config_snapshot_v2
+        candidate.parent.mkdir(parents=True)
+        candidate.write_text('snapshot_id: "v2"\n', encoding="ascii")
+        traffic = _FakeEpochTraffic(_FakeEpochSender(clock.monotonic))
+        owner = ValidationOrchestrator(config)
+        _bind_epoch_fixture(owner, traffic)
+        with patch("kinetum_validation.scenario_context.time", new=clock), patch(
+            "kinetum_validation.scenarios.time", new=clock,
+        ), patch("kinetum_validation.scenario_context.asyncio.sleep", side_effect=clock.sleep):
+            yield config, clock, traffic, owner
+
+
 class TestEpochTiming(unittest.IsolatedAsyncioTestCase):
     """Epoch orchestration must preserve the configured traffic duration."""
 
+    async def test_completion_rejects_contradictions_while_waiting(self):
+        """An unfinished Apply may expose the old or target identity, in that order."""
+        with _epoch_scenario_case() as (config, clock, traffic, owner):
+            context = owner.scenario_context()
+            before = await context.control.get_stats()
+            applied = ApplyConfigResult(success=True, epoch=before.active_epoch + 2, snapshot_id="v2", revision=2)
+            incomplete = replace(before, active_epoch=applied.epoch, active_snapshot_id="v2", active_revision=2)
+            await traffic.sender.begin_generation_tags(config.epoch.duration_s, 1, 2)
+            try:
+                for polls, message in (
+                    ([replace(before, active_epoch=before.active_epoch + 1)], "differs from the Apply result"),
+                    ([replace(before, active_revision=applied.revision)], "old snapshot identity changed"),
+                    ([replace(before, boundary_epoch_stats=before.boundary_epoch_stats[:-1])], "boundary membership"),
+                    ([replace(before, protocol_fault_counts=dict.fromkeys(before.protocol_fault_counts, 1))],
+                     "protocol fault delta"),
+                    ([incomplete, before], "active epoch regressed"),
+                ):
+                    with self.subTest(message=message), patch.object(context.control, "get_stats", side_effect=polls):
+                        with self.assertRaisesRegex(RuntimeError, message):
+                            await context.wait_for_epoch_completion(before, applied, clock.now + 2, traffic.sender)
+            finally:
+                await traffic.sender.abort()
+
+    async def test_insufficient_old_load_never_dispatches_apply(self):
+        """Complete intervals below the rate band cannot authorize configuration mutation."""
+        with _epoch_scenario_case() as (config, _clock, traffic, owner):
+            traffic.rate_ratio = 0.98
+            context = owner.scenario_context()
+            with patch.object(context.control, "apply_config", wraps=context.control.apply_config) as apply:
+                result = await run_epoch_test(context)
+            apply.assert_not_called()
+            self.assertFalse(result.passed)
+            self.assertFalse(result.load_qualified)
+            self.assertFalse(traffic.sender.active)
+            self.assertEqual(traffic.sender.overlap_end_count, 0)
+            evidence = json.loads((config.output_dir / "epoch_load.json").read_text())
+            self.assertIsNone(evidence["apply"])
+            self.assertFalse(evidence["load_qualified"])
+            self.assertEqual(evidence["old"]["last_rejected_interval"]["reason"], "rate_out_of_band")
+
+    async def test_target_load_failure_preserves_completed_transition_evidence(self):
+        """A completed protocol remains recorded when the target ingress cannot meet the rate band."""
+        with _epoch_scenario_case() as (config, _clock, traffic, owner):
+            owner._kinetumctl.target_rate_ratio = 0.98  # pylint: disable=protected-access
+            result = await run_epoch_test(owner.scenario_context())
+            self.assertFalse(result.passed)
+            self.assertFalse(result.load_qualified)
+            self.assertTrue(result.boundary_ordering_validated, result.message)
+            self.assertEqual(result.transitions_observed, 1)
+            self.assertEqual(result.completed_boundaries, 2)
+            self.assertIsNone(result.total_sent)
+            self.assertFalse(traffic.sender.active)
+            self.assertEqual(traffic.sender.overlap_end_count, 0)
+            evidence = json.loads((config.output_dir / "epoch_load.json").read_text())
+            self.assertTrue(evidence["old"]["qualified"])
+            self.assertFalse(evidence["new"]["qualified"])
+            rejection = evidence["new"]["last_rejected_interval"]
+            self.assertEqual(rejection["reason"], "rate_out_of_band")
+            self.assertEqual(rejection["rates_pps"], {"0": 980, "1": 980})
+            records = (config.output_dir / "transition_metrics.jsonl").read_text().splitlines()
+            self.assertEqual(len(records), 1)
+            record = json.loads(records[0])
+            self.assertEqual(record["from_epoch"], 2)
+            self.assertEqual(record["to_epoch"], 3)
+
+    async def test_apply_timeout_retires_source_and_collects_late_success(self):
+        """An expired workload keeps the mutation owner until its late result is recorded."""
+        with _epoch_scenario_case() as (config, clock, traffic, owner):
+            context = owner.scenario_context()
+            accepted, retired = asyncio.Event(), asyncio.Event()
+            original_apply = context.control.apply_config
+            original_abort = traffic.sender.abort
+
+            async def late_apply(*args, **keywords):
+                """Keep accepted work live until source retirement permits its result."""
+                accepted.set()
+                await retired.wait()
+                return await original_apply(*args, **keywords)
+
+            async def abort_source():
+                """Release the source before completing the independent mutation."""
+                await original_abort()
+                retired.set()
+
+            async def expired_wait(tasks, timeout):
+                """Expire the observation wait without cancelling its already-accepted task."""
+                await accepted.wait()
+                clock.now += timeout
+                return set(), set(tasks)
+
+            context.control.apply_config = late_apply
+            traffic.sender.abort = abort_source
+            with patch("kinetum_validation.scenarios.asyncio.wait", side_effect=expired_wait):
+                result = await run_epoch_test(context)
+            self.assertFalse(result.passed)
+            self.assertIn("Apply exceeded", result.message)
+            self.assertFalse(traffic.sender.active)
+            self.assertEqual(traffic.sender.overlap_end_count, 0)
+            evidence = json.loads((config.output_dir / "epoch_load.json").read_text())
+            self.assertTrue(evidence["apply"]["success"])
+            self.assertFalse(evidence["load_qualified"])
+            self.assertIsNone(evidence["new"])
+
+    async def test_overlap_control_receipt_must_leave_the_reserved_tail(self):
+        """A late resume or pause fails the workload and retires the source at its reached phase."""
+        for edge in ("start_generation_overlap", "end_generation_overlap"):
+            with self.subTest(edge=edge), _epoch_scenario_case() as (config, clock, traffic, owner):
+                late_time = clock.now + config.epoch.duration_s - 0.5
+
+                async def late_receipt(*args, change=getattr(traffic.sender, edge), timer=clock, at=late_time):
+                    """Acknowledge the driver's completed action with half a second left in the window."""
+                    await change(*args)
+                    timer.now = at
+
+                with patch.object(traffic.sender, edge, side_effect=late_receipt):
+                    result = await run_epoch_test(owner.scenario_context())
+                self.assertFalse(result.passed)
+                self.assertIn("exceeded its authored deadline", result.message)
+                self.assertFalse(traffic.sender.active)
+                self.assertEqual(traffic.sender.finish_called_at, -1.0)
+                evidence = json.loads((config.output_dir / "epoch_load.json").read_text())
+                self.assertEqual(result.load_qualified, edge == "end_generation_overlap")
+                self.assertEqual(result.boundary_ordering_validated, edge == "end_generation_overlap")
+                self.assertEqual(evidence["apply"] is None, edge == "start_generation_overlap")
+
+    async def test_artifact_failure_preserves_the_original_load_error(self):
+        """Evidence I/O failure cannot hide failed qualification or skip source retirement."""
+        with _epoch_scenario_case() as (_config, _clock, traffic, owner):
+            traffic.rate_ratio = 0.98
+            with patch.object(
+                owner.artifacts, "write_epoch_load", side_effect=OSError("evidence denied"),
+            ), self.assertRaises(RuntimeError) as raised:
+                await run_epoch_test(owner.scenario_context())
+            self.assertIn("ingress load", str(raised.exception))
+            self.assertIn("evidence denied", str(raised.exception))
+            self.assertFalse(traffic.sender.active)
+
+    async def test_retirement_failure_is_retained_after_successful_load_qualification(self):
+        """A final cleanup error cannot leave the saved scenario outcome marked successful."""
+        with _epoch_scenario_case() as (config, _clock, traffic, owner):
+            with patch.object(
+                traffic.sender, "cleanup", side_effect=RuntimeError("sender cleanup failed"),
+            ), self.assertRaisesRegex(RuntimeError, "sender cleanup failed"):
+                await run_epoch_test(owner.scenario_context())
+            evidence = json.loads((config.output_dir / "epoch_load.json").read_text())
+            self.assertTrue(evidence["load_qualified"])
+            self.assertTrue(evidence["apply"]["success"])
+            self.assertIn("sender cleanup failed", evidence["failure"])
+            self.assertFalse(traffic.sender.active)
+
+    async def test_final_observation_rejects_another_pending_transition(self):
+        """An unchanged active epoch does not admit a later transition during the traffic tail."""
+        with _epoch_scenario_case() as (config, _clock, traffic, owner):
+            context = owner.scenario_context()
+            original_read = context.control.get_stats
+
+            async def read_with_later_transition(selection=StatsSelection()):
+                """Expose a new preparation beside the retained completed transition after traffic."""
+                current = await original_read(selection)
+                if traffic.sender.stopped_at is not None:
+                    current.transition_state = "EPOCH_TRANSITION_STATE_PREPARING"
+                    current.transition_active_epoch = current.active_epoch
+                    current.transition_target_epoch = current.active_epoch + 1
+                    current.allocated_epoch_high_watermark = current.transition_target_epoch
+                    current.mutation_sequence_high_watermark = current.latest_terminal.mutation_sequence + 1
+                    current.active_transaction = EpochTransactionStatsResult(
+                        mutation_sequence=current.mutation_sequence_high_watermark,
+                        from_epoch=current.active_epoch, to_epoch=current.transition_target_epoch,
+                        validation_hash=base64.b64encode(b"4" * 32).decode("ascii"),
+                        idempotency_key_digest=base64.b64encode(b"k" * 32).decode("ascii"),
+                        admitted_monotonic_ns=current.collection_monotonic_ns,
+                        outcome="EPOCH_TRANSITION_OUTCOME_NONE", failure_code="EPOCH_TRANSITION_FAILURE_CODE_NONE",
+                    )
+                return current
+
+            context.control.get_stats = read_with_later_transition
+            result = await run_epoch_test(context)
+            self.assertFalse(result.passed)
+            self.assertTrue(result.load_qualified)
+            self.assertFalse(result.boundary_ordering_validated)
+            self.assertEqual(result.transitions_observed, 1)
+            self.assertEqual(result.completed_boundaries, 2)
+            evidence = json.loads((config.output_dir / "epoch_load.json").read_text())
+            self.assertTrue(evidence["failure"])
+
+    async def test_impossible_epoch_window_rejects_before_traffic(self):
+        """Both the window and packet extent must be representable before capture or Apply."""
+        for epoch, message in (
+            (EpochConfig(duration_s=12), "cannot contain"),
+            (EpochConfig(pps=1 << 4096), "epoch rate or packet count"),
+        ):
+            with self.subTest(message=message), tempfile.TemporaryDirectory() as directory:
+                clock = _ObservationClock()
+                config = replace(_config_with_example_dir(Path(directory)), epoch=epoch)
+                config.output_dir.mkdir()
+                traffic = _FakeEpochTraffic(_FakeEpochSender(clock.monotonic), sustained_overlap=False)
+                owner = ValidationOrchestrator(config)
+                _bind_epoch_fixture(owner, traffic)
+                context = owner.scenario_context()
+                with (
+                    patch.object(traffic, "start_capture", new=AsyncMock()) as capture,
+                    patch.object(context.control, "apply_config", wraps=context.control.apply_config) as apply,
+                ):
+                    result = await run_epoch_test(context)
+                self.assertFalse(result.passed)
+                self.assertIn(message, result.message)
+                capture.assert_not_awaited()
+                apply.assert_not_called()
+                self.assertEqual(traffic.sender.started_at, -1.0)
+
     async def test_epoch_honors_authored_loss_limit_without_weakening_its_ceiling(self):
         """Zero loss is enforceable while a permissive option cannot relax the epoch ceiling."""
-        for limit, received, missing, expected_loss_pct, passed in (
-            (0, 2000, 0, 0.0, True),
-            (0, 1999, 1, 0.05, False),
-            (1, 1999, 1, 0.05, True),
-            (1, 1998, 2, 0.1, True),
-            (1, 1997, 3, 0.15, False),
-        ):
-            with self.subTest(limit=limit, received=received), tempfile.TemporaryDirectory() as temporary:
+        for limit, fraction, passed in ((0, 0, True), (0, 0.0005, False), (1, 0.0005, True),
+                                        (1, 0.001, True), (1, 0.0015, False)):
+            with self.subTest(limit=limit, fraction=fraction), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
                 clock = _ObservationClock()
                 config = replace(_config_with_example_dir(root, BackendType.DPDK_PCI), max_loss_pct=limit)
@@ -527,35 +784,26 @@ class TestEpochTiming(unittest.IsolatedAsyncioTestCase):
                 candidate.parent.mkdir(parents=True)
                 candidate.write_text('snapshot_id: "v2"\n', encoding="ascii")
                 sender = _FakeEpochSender(clock.monotonic)
-                sender_stats = PacketStats(
-                    tx_count=2000, start_time=0.0, end_time=15.0, duration_s=15.0,
-                    generation_tag_counts={1: 1000, 2: 1000},
-                )
-                sender.finish_generation_tags = AsyncMock(return_value=sender_stats)
                 traffic = _FakeEpochTraffic(sender)
-                analysis = AnalysisResult(
-                    total_rx=received, valid=received, missing_count=missing,
-                    tag_counts={1: received - 1000, 2: 1000},
-                )
-                traffic.analyze_capture = AsyncMock(return_value=analysis)
+                traffic.loss_fraction = fraction
                 orchestrator = ValidationOrchestrator(config)
-                orchestrator._traffic = traffic  # pylint: disable=protected-access
-                orchestrator._kinetumctl = _FakeEpochKinetumCtl()  # pylint: disable=protected-access
+                _bind_epoch_fixture(orchestrator, traffic)
                 context = orchestrator.scenario_context()
-                self.assertEqual(sender_stats.tx_count, analysis.valid + analysis.missing_count)
-                self.assertTrue(context.traffic_observation_is_clean(sender_stats, analysis))
-                if missing:
-                    self.assertFalse(context.traffic_observation_is_clean(
-                        sender_stats, replace(analysis, missing_count=0),
-                    ))
                 with patch("kinetum_validation.scenario_context.time", new=clock), patch(
                     "kinetum_validation.scenarios.time", new=clock,
                 ), patch("kinetum_validation.scenario_context.asyncio.sleep", side_effect=clock.sleep):
                     result = await run_epoch_test(context)
                 self.assertTrue(result.boundary_ordering_validated, result.message)
-                self.assertEqual(result.total_sent, 2000)
-                self.assertEqual(result.total_received, received)
-                self.assertAlmostEqual(result.loss_pct, expected_loss_pct)
+                self.assertTrue(result.load_qualified, result.message)
+                self.assertEqual(result.total_sent, sender.stats.tx_count)
+                self.assertEqual(result.total_received, traffic.analysis.valid)
+                self.assertEqual(sender.stats.tx_count, traffic.analysis.valid + traffic.analysis.missing_count)
+                self.assertAlmostEqual(result.loss_pct, fraction * 100, delta=100 / sender.stats.tx_count)
+                self.assertTrue(context.traffic_observation_is_clean(sender.stats, traffic.analysis))
+                if traffic.analysis.missing_count:
+                    self.assertFalse(context.traffic_observation_is_clean(
+                        sender.stats, replace(traffic.analysis, missing_count=0),
+                    ))
                 self.assertEqual(result.passed, passed, result.message)
                 if not passed:
                     self.assertIn("TRAFFIC EVIDENCE FAILED", result.message)
@@ -579,7 +827,7 @@ class TestEpochTiming(unittest.IsolatedAsyncioTestCase):
                             count=456,
                             duration_s=2.0,
                             packet_size=size,
-                            num_flows=8,
+                            num_flows=8 if sustained_overlap else 1,
                             src_ip="10.20.30.40",
                             dst_ip="192.168.2.1",
                             base_sport=12000,
@@ -599,8 +847,7 @@ class TestEpochTiming(unittest.IsolatedAsyncioTestCase):
                     sender = _FakeEpochSender(clock.monotonic)
                     traffic = _FakeEpochTraffic(sender, sustained_overlap=sustained_overlap)
                     orch = ValidationOrchestrator(config)
-                    orch._traffic = traffic  # pylint: disable=protected-access
-                    orch._kinetumctl = _FakeEpochKinetumCtl()  # pylint: disable=protected-access
+                    _bind_epoch_fixture(orch, traffic)
 
                     with patch.object(traffic, "make_sender", wraps=traffic.make_sender) as make_sender, patch(
                         "kinetum_validation.scenario_context.time", new=clock,
@@ -618,23 +865,17 @@ class TestEpochTiming(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(sender.overlap_start_count, 1)
                     self.assertEqual(sender.overlap_end_count, 1)
                     self.assertGreaterEqual(sender.finish_called_at, config.epoch.duration_s)
+                    if not sustained_overlap:
+                        self.assertEqual(result.total_received, 42_000_000)
+                        self.assertEqual(result.avg_latency_us, 10.0)
+                        self.assertEqual(
+                            [row.transition_seq for row in traffic.analysis.streams], [3_500_000, 3_500_001],
+                        )
 
     async def test_native_epoch_rejects_input_tag_faults_with_a_failed_message(self) -> None:
-        """Correct global totals cannot hide a reversed generation or incorrect per-input tag population."""
-        complete = complete_native_analysis(((1, 50), (2, 50)), 2)
-        faults = (
-            replace(complete, streams=(
-                replace(complete.streams[0], tag_transition_count=3, transition_seq=2),
-                complete.streams[1],
-            )),
-            replace(complete, streams=(
-                replace(complete.streams[0], tag_counts={1: 26, 2: 24}, transition_seq=52),
-                replace(complete.streams[1], tag_counts={1: 24, 2: 26}, transition_seq=49),
-            )),
-        )
-        for fault in faults:
-            fault.set_latency_stats(complete.latency_stats())
-            with self.subTest(streams=fault.streams), tempfile.TemporaryDirectory() as directory:
+        """Correct totals cannot hide a reversed generation or wrong per-input tag population."""
+        for fault in ("reversed", "counts"):
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 clock = _ObservationClock()
                 config = _config_with_example_dir(root)
@@ -643,20 +884,16 @@ class TestEpochTiming(unittest.IsolatedAsyncioTestCase):
                 candidate.parent.mkdir(parents=True)
                 candidate.write_text('snapshot_id: "v2"\n', encoding="ascii")
                 traffic = _FakeEpochTraffic(_FakeEpochSender(clock.monotonic), sustained_overlap=False)
-                traffic.analyze_capture = AsyncMock(return_value=fault)
+                traffic.tag_fault = fault
                 orchestrator = ValidationOrchestrator(config)
-                orchestrator._traffic = traffic  # pylint: disable=protected-access
-                orchestrator._kinetumctl = _FakeEpochKinetumCtl()  # pylint: disable=protected-access
-                with patch(
-                    "kinetum_validation.scenario_context.time", new=clock,
-                ), patch(
+                _bind_epoch_fixture(orchestrator, traffic)
+                with patch("kinetum_validation.scenario_context.time", new=clock), patch(
                     "kinetum_validation.scenarios.time", new=clock,
-                ), patch(
-                    "kinetum_validation.scenario_context.asyncio.sleep", side_effect=clock.sleep,
-                ):
+                ), patch("kinetum_validation.scenario_context.asyncio.sleep", side_effect=clock.sleep):
                     result = await run_epoch_test(orchestrator.scenario_context())
                 self.assertFalse(result.passed)
-                self.assertTrue(result.boundary_ordering_validated)
+                self.assertTrue(result.boundary_ordering_validated, result.message)
+                self.assertTrue(result.load_qualified, result.message)
                 self.assertIn("GENERATION-TAG EVIDENCE FAILED", result.message)
                 self.assertTrue((config.output_dir / "epoch_capture.traffic.json").is_file())
 
@@ -689,7 +926,7 @@ class TestEpochTiming(unittest.IsolatedAsyncioTestCase):
                 config,
                 epoch=EpochConfig(
                     duration_s=15.0,
-                    transition_time_s=5.0,
+                    initial_duration_s=5.0,
                     overlap_window_ms=500,
                 ),
                 output_dir=root / "out",
@@ -705,8 +942,7 @@ class TestEpochTiming(unittest.IsolatedAsyncioTestCase):
 
             sender = _FakeEpochSender(monotonic)
             orch = ValidationOrchestrator(config)
-            orch._traffic = _FakeEpochTraffic(sender)  # pylint: disable=protected-access
-            orch._kinetumctl = _FakeEpochKinetumCtl()  # pylint: disable=protected-access
+            _bind_epoch_fixture(orch, _FakeEpochTraffic(sender))
 
             with patch(
                 "kinetum_validation.scenario_context.time",
@@ -724,11 +960,13 @@ class TestEpochTiming(unittest.IsolatedAsyncioTestCase):
             self.assertGreaterEqual(sender.finish_called_at, config.epoch.duration_s)
             self.assertEqual(sender.overlap_start_count, 1)
             self.assertEqual(sender.overlap_end_count, 1)
-            self.assertAlmostEqual(
+            self.assertGreaterEqual(
                 sender.overlap_ended_at - sender.overlap_started_at,
                 config.epoch.overlap_window_ms / 1000.0,
             )
-            self.assertTrue(any(delay >= 9.0 for delay in sleeps))
+            self.assertGreater(sender.overlap_ended_at, sender.overlap_started_at + 6.0)
+            self.assertTrue(any(abs(delay - (config.epoch.duration_s - sender.overlap_ended_at)) < 0.001
+                                for delay in sleeps))
             self.assertTrue((config.output_dir / "transition_metrics.jsonl").is_file())
             self.assertFalse(
                 boundary_transition_is_complete(BoundaryEpochStatsResult(
@@ -745,9 +983,7 @@ class TestEpochTiming(unittest.IsolatedAsyncioTestCase):
             )
 
             unavailable = ValidationOrchestrator(config)
-            unavailable._kinetumctl = _FakeEpochKinetumCtl(  # pylint: disable=protected-access
-                baseline_epoch=0,
-            )
+            _bind_epoch_fixture(unavailable, _FakeEpochTraffic(_FakeEpochSender(monotonic)), baseline_epoch=0)
             failed = await run_epoch_test(unavailable.scenario_context())  # pylint: disable=protected-access
             self.assertFalse(failed.passed)
             self.assertIn("omitted active snapshot identity", failed.message)
@@ -778,7 +1014,7 @@ class TestEpochTiming(unittest.IsolatedAsyncioTestCase):
                 _config_with_example_dir(root, BackendType.DPDK_PCI),
                 epoch=EpochConfig(
                     duration_s=15.0,
-                    transition_time_s=5.0,
+                    initial_duration_s=5.0,
                     overlap_window_ms=500,
                 ),
                 output_dir=root / "out",
@@ -794,10 +1030,7 @@ class TestEpochTiming(unittest.IsolatedAsyncioTestCase):
 
             sender = _FakeEpochSender(monotonic)
             orch = ValidationOrchestrator(config)
-            orch._traffic = _FakeEpochTraffic(sender)  # pylint: disable=protected-access
-            orch._kinetumctl = _FakeEpochKinetumCtl(  # pylint: disable=protected-access
-                complete_boundary=False,
-            )
+            _bind_epoch_fixture(orch, _FakeEpochTraffic(sender), complete_boundary=False)
 
             with patch(
                 "kinetum_validation.scenario_context.time",
@@ -813,7 +1046,7 @@ class TestEpochTiming(unittest.IsolatedAsyncioTestCase):
 
             self.assertFalse(result.passed)
             self.assertFalse(result.boundary_ordering_validated)
-            self.assertIn("INCONCLUSIVE", result.message)
+            self.assertIn("epoch completion", result.message)
             self.assertFalse((config.output_dir / "transition_metrics.jsonl").exists())
 
     async def test_metadata_cannot_relax_the_observed_gate_requirement(self):
@@ -842,7 +1075,7 @@ class TestEpochTiming(unittest.IsolatedAsyncioTestCase):
                 _config_with_example_dir(root, BackendType.DPDK_PCI),
                 epoch=EpochConfig(
                     duration_s=15.0,
-                    transition_time_s=5.0,
+                    initial_duration_s=5.0,
                     overlap_window_ms=500,
                 ),
                 output_dir=root / "out",
@@ -861,10 +1094,7 @@ class TestEpochTiming(unittest.IsolatedAsyncioTestCase):
             orch._release_metadata = {  # pylint: disable=protected-access
                 "platform_capabilities": ["unrecognized-description"],
             }
-            orch._traffic = _FakeEpochTraffic(sender)  # pylint: disable=protected-access
-            orch._kinetumctl = _FakeEpochKinetumCtl(  # pylint: disable=protected-access
-                complete_boundary=False,
-            )
+            _bind_epoch_fixture(orch, _FakeEpochTraffic(sender), complete_boundary=False)
 
             with patch(
                 "kinetum_validation.scenario_context.time",
@@ -880,7 +1110,7 @@ class TestEpochTiming(unittest.IsolatedAsyncioTestCase):
 
             self.assertFalse(result.passed)
             self.assertFalse(result.boundary_ordering_validated)
-            self.assertIn("INCONCLUSIVE", result.message)
+            self.assertIn("epoch completion", result.message)
 
     async def test_direct_switch_closes_edge_and_requires_observed_gate(self):
         """A direct tag switch closes its logical edge without a sustained wait."""
@@ -908,7 +1138,7 @@ class TestEpochTiming(unittest.IsolatedAsyncioTestCase):
                 _config_with_example_dir(root),
                 epoch=EpochConfig(
                     duration_s=15.0,
-                    transition_time_s=5.0,
+                    initial_duration_s=5.0,
                     overlap_window_ms=500,
                 ),
                 output_dir=root / "out",
@@ -924,13 +1154,7 @@ class TestEpochTiming(unittest.IsolatedAsyncioTestCase):
 
             sender = _FakeEpochSender(monotonic)
             orch = ValidationOrchestrator(config)
-            orch._traffic = _FakeEpochTraffic(  # pylint: disable=protected-access
-                sender,
-                sustained_overlap=False,
-            )
-            orch._kinetumctl = _FakeEpochKinetumCtl(  # pylint: disable=protected-access
-                complete_boundary=False,
-            )
+            _bind_epoch_fixture(orch, _FakeEpochTraffic(sender, sustained_overlap=False), complete_boundary=False)
 
             with patch(
                 "kinetum_validation.scenario_context.time",
@@ -946,10 +1170,11 @@ class TestEpochTiming(unittest.IsolatedAsyncioTestCase):
 
             self.assertFalse(result.passed)
             self.assertFalse(result.boundary_ordering_validated)
-            self.assertIn("INCONCLUSIVE", result.message)
+            self.assertIn("epoch completion", result.message)
             self.assertEqual(sender.overlap_start_count, 1)
-            self.assertEqual(sender.overlap_end_count, 1)
-            self.assertEqual(sender.overlap_ended_at, sender.overlap_started_at)
+            self.assertEqual(sender.overlap_end_count, 0)
+            self.assertEqual(sender.overlap_ended_at, -1.0)
+            self.assertFalse(sender.active)
 
 
 class _ObservationClock:
@@ -1416,6 +1641,7 @@ class TestStreamTopologyStatsValidation(unittest.TestCase):
             tx_bytes=25600,
             expected_workers=2,
             execution_participant_count=2,
+            region_count=1,
             allocated_epoch_high_watermark=1,
             worker_counters=[WorkerCounterStatsResult(
                 worker_index=lane, observation_epoch=1, publication_generation=1, published_monotonic_ns=100,

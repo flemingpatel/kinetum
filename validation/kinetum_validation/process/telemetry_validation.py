@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import List, Optional, Sequence, Tuple
 
+from ..engine.plan_metadata import PlanTopologyMetadata
 from .telemetry import (
     _PROTOCOL_FAULT_CODES,
     _FAIL_STOP_FAILURE_CODES,
@@ -1469,6 +1470,90 @@ def worker_counters_advanced(
     return advanced and (
         min(row.published_monotonic_ns for row in after)
         > max(row.published_monotonic_ns for row in before)
+    )
+
+
+def stream_counters_advanced(
+    previous_workers: Sequence[WorkerCounterStatsResult], current_workers: Sequence[WorkerCounterStatsResult],
+    previous_streams: Sequence[StreamStatsResult], current_streams: Sequence[StreamStatsResult],
+) -> bool:
+    """Reject stream/worker discontinuities before classifying complete source progress.
+
+    Callers admit individual rows and retain one runtime namespace. Stream
+    ownership is immutable; identical worker generations require identical
+    stream counters. Partial or non-overlapping progress returns False.
+    """
+    advanced = worker_counters_advanced(previous_workers, current_workers)
+    previous = {row.io_stream_id: row for row in previous_streams}
+    current = {row.io_stream_id: row for row in current_streams}
+    if (
+        len(previous) != len(previous_streams) or len(current) != len(current_streams)
+        or set(previous) != set(current)
+    ):
+        raise ValueError("stream observation changed membership")
+    for stream_id, row in current.items():
+        prior = previous[stream_id]
+        if (row.logical_port_id, row.direction, row.worker_index, row.owning_region_id, row.driver_queue_id) != (
+            prior.logical_port_id, prior.direction, prior.worker_index, prior.owning_region_id, prior.driver_queue_id,
+        ):
+            raise ValueError(f"stream changed its identity or owner: {stream_id}")
+        before = (prior.published_monotonic_ns, prior.packets, prior.bytes, prior.rejected_packets)
+        after = (row.published_monotonic_ns, row.packets, row.bytes, row.rejected_packets)
+        generation = current_workers[row.worker_index].publication_generation
+        prior_generation = previous_workers[prior.worker_index].publication_generation
+        if any(new < old for old, new in zip(before, after)) or (generation == prior_generation and after != before):
+            raise ValueError(f"stream regressed or changed without publication: {stream_id}")
+    return advanced
+
+
+def require_stream_observation(
+    topology: PlanTopologyMetadata, previous: Optional[StatsResult], current: StatsResult,
+) -> None:
+    """Validate one complete plan-bound stream vector and its monotonic predecessor.
+
+    Configuration epochs may advance between vectors; runtime, plan, stream
+    ownership and cumulative counters must not change namespace. Callers own
+    phase identity and retain the admitted vector as their next cursor.
+    """
+    if not current.success:
+        raise ValueError(f"stream observation failed: {current.diagnostic}")
+    runtime_exact = all((
+        current.runtime_generation > 0, current.transition_plan_content_hash,
+        current.collection_monotonic_ns > 0, current.expected_workers > 0,
+    ))
+    if not runtime_exact or not worker_counters_are_exact(current) or any(
+        row.published_monotonic_ns > current.collection_monotonic_ns for row in current.worker_counters
+    ):
+        raise ValueError("stream observation lacks exact runtime and worker counters")
+    expected = {row.io_stream_id: row for row in topology.io_streams}
+    rows = {row.io_stream_id: row for row in current.stream_stats}
+    if (
+        len(expected) != len(topology.io_streams) or len(rows) != len(current.stream_stats)
+        or set(rows) != set(expected)
+    ):
+        raise ValueError("stream membership differs from the compiled plan")
+    for stream_id, row in rows.items():
+        plan = expected[stream_id]
+        if (
+            (row.logical_port_id, {"rx": "IO_STREAM_DIRECTION_RX", "tx": "IO_STREAM_DIRECTION_TX"}.get(row.direction),
+             row.driver_queue_id)
+            != (plan.logical_port_id, plan.direction, plan.driver_queue_id)
+            or not 0 <= row.worker_index < len(current.worker_counters)
+            or not _stream_row_is_exact(row, current)
+        ):
+            raise ValueError(f"stream observation has contradictory identity or counters: {stream_id}")
+    if not stream_totals_are_exact(current):
+        raise ValueError("stream counters disagree with their worker totals")
+    if previous is None:
+        return
+    if (
+        (current.runtime_generation, current.transition_plan_content_hash)
+        != (previous.runtime_generation, previous.transition_plan_content_hash)
+        or current.collection_monotonic_ns < previous.collection_monotonic_ns
+    ):
+        raise ValueError("stream observation changed runtime/plan or regressed collection time")
+    stream_counters_advanced(
+        previous.worker_counters, current.worker_counters, previous.stream_stats, current.stream_stats,
     )
 
 

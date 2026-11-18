@@ -32,35 +32,59 @@ def native_trex_port_info(identity: dict) -> list:
 def complete_native_analysis(
     generation_counts: tuple[tuple[int, int], ...], stream_count: int,
 ) -> AnalysisResult:
-    """Author a complete ordered capture from explicit source generations and inputs."""
-    packets = []
+    """Summarize a lossless round-robin capture from ordered (tag, count) runs.
+
+    Each input receives sequence IDs one round-robin cycle apart. Count each
+    input's share in one step per generation.
+    """
+    total = 0
+    tag_counts = Counter()
+    run_ends = []
     for tag, count in generation_counts:
-        first = len(packets)
-        packets.extend((sequence, tag) for sequence in range(first, first + count))
+        if count < 0:
+            raise ValueError("a generation cannot contain a negative packet count")
+        if count:
+            total += count
+            tag_counts[tag] += count
+            run_ends.append((tag, total))
+
     streams = []
     for index in range(stream_count):
-        received = [(sequence, tag) for sequence, tag in packets if sequence % stream_count == index]
-        changes = [
-            sequence for (_, previous), (sequence, tag) in zip(received, received[1:]) if tag != previous
-        ]
+        counts = Counter()
+        next_sequence = index
+        first_tag = last_tag = None
+        transition_seq = -1
+        changes = 0
+        for tag, end in run_ends:
+            sequences = range(next_sequence, end, stream_count)
+            if not sequences:
+                continue
+            if first_tag is None:
+                first_tag = tag
+            elif last_tag != tag:
+                if changes == 0:
+                    transition_seq = next_sequence
+                changes += 1
+            last_tag = tag
+            counts[tag] += len(sequences)
+            next_sequence = sequences[-1] + stream_count
+        valid = sum(counts.values())
         streams.append(StreamAnalysisResult(
             stream_index=index,
-            expected_count=len(received),
-            valid=len(received),
+            expected_count=valid,
+            valid=valid,
             duplicates=0,
             out_of_order=0,
             missing_count=0,
-            transition_seq=changes[0] if changes else -1,
-            tag_transition_count=len(changes),
-            first_tag=received[0][1] if received else None,
-            last_tag=received[-1][1] if received else None,
-            tag_counts=dict(Counter(tag for _, tag in received)),
+            transition_seq=transition_seq,
+            tag_transition_count=changes,
+            first_tag=first_tag,
+            last_tag=last_tag,
+            tag_counts=dict(counts),
         ))
     result = AnalysisResult(
-        total_rx=len(packets), valid=len(packets), streams=tuple(streams),
-        max_gap=0,
-        tag_counts=dict(Counter(tag for _, tag in packets)),
+        total_rx=total, valid=total, streams=tuple(streams), max_gap=0, tag_counts=dict(tag_counts),
     )
-    if packets:
+    if total:
         result.set_latency_stats(dict.fromkeys(("avg", "min", "max", "p50", "p99"), 10.0))
     return result

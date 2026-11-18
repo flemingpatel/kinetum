@@ -71,6 +71,8 @@ from .config.types import (
     TestConfig,
     TestType,
     TrafficEndpointConfig,
+    epoch_window_has_capacity,
+    timed_packet_count_fits,
     traffic_endpoint_errors,
 )
 from .orchestrator import run_test_suite
@@ -274,27 +276,27 @@ def parse_args() -> argparse.Namespace:
     epoch_group.add_argument(
         "--epoch-duration",
         type=float,
-        default=15.0,
-        help="Epoch test duration in seconds (default: 15)",
+        default=EpochConfig.duration_s,
+        help=f"Epoch traffic window in seconds (default: {EpochConfig.duration_s:g})",
     )
     epoch_group.add_argument(
         "--epoch-pps",
         type=int,
         default=1000,
-        help="Packets per second during epoch test (default: 1000)",
+        help="Aggregate epoch PPS across ingress ports; doubles during TRex overlap (default: 1000)",
     )
     epoch_group.add_argument(
-        "--epoch-transition-time",
+        "--epoch-initial-duration",
         type=float,
         default=5.0,
-        help="Seconds of baseline epoch traffic before config transition (default: 5)",
+        help="Initial-generation traffic duration before the next population starts (default: 5)",
     )
     epoch_group.add_argument(
         "--epoch-overlap-ms",
         type=int,
         default=500,
         help=(
-            "TRex sustained initial/next generation-tag overlap in uint32 "
+            "Minimum TRex initial/next generation-tag overlap in uint32 "
             "milliseconds (default: 500)"
         ),
     )
@@ -389,6 +391,8 @@ def _validate_numeric_args(
         errors.append("--pps must be positive")
     elif args.pps > CONSTANTS.MAX_PACKET_RATE_PPS:
         errors.append("--pps exceeds the traffic rate domain")
+    elif args.duration > 0 and not timed_packet_count_fits(args.pps, args.duration):
+        errors.append("--pps times --duration must schedule between 1 and 4294967295 packets")
     if args.count <= 0:
         errors.append("--count must be positive")
     elif args.count > (1 << 32) - 1:
@@ -413,45 +417,31 @@ def _validate_numeric_args(
         errors.append("--epoch-pps must be positive")
     elif args.epoch_pps > CONSTANTS.MAX_PACKET_RATE_PPS:
         errors.append("--epoch-pps exceeds the traffic-generator domain")
+    elif args.epoch_duration > 0 and not timed_packet_count_fits(args.epoch_pps, args.epoch_duration):
+        errors.append("epoch traffic must schedule between 1 and 4294967295 packets")
     if not math.isfinite(args.epoch_duration) or args.epoch_duration <= 0:
         errors.append("--epoch-duration must be positive")
-    if not math.isfinite(args.epoch_transition_time) or args.epoch_transition_time <= 0:
-        errors.append("--epoch-transition-time must be positive")
-    if args.epoch_transition_time >= args.epoch_duration:
-        errors.append("--epoch-transition-time must be less than --epoch-duration")
+    if not math.isfinite(args.epoch_initial_duration) or args.epoch_initial_duration <= 0:
+        errors.append("--epoch-initial-duration must be positive")
+    if args.epoch_initial_duration >= args.epoch_duration:
+        errors.append("--epoch-initial-duration must be less than --epoch-duration")
     if args.epoch_overlap_ms <= 0:
         errors.append("--epoch-overlap-ms must be positive")
     elif args.epoch_overlap_ms > (1 << 32) - 1:
         errors.append("--epoch-overlap-ms exceeds the uint32 evidence domain")
     if (
         args.test_type in ("epoch", "full")
-        and backend_type == BackendType.DPDK_PCI
-        and 0 < args.epoch_overlap_ms <= (1 << 32) - 1
-        and args.epoch_transition_time + (args.epoch_overlap_ms / 1000.0)
-        >= args.epoch_duration
+        and not epoch_window_has_capacity(
+            args.epoch_duration, args.epoch_initial_duration, args.epoch_overlap_ms,
+            backend_type == BackendType.DPDK_PCI,
+        )
     ):
         errors.append(
-            "--epoch-transition-time + --epoch-overlap-ms must be less than "
-            "--epoch-duration for trex epoch-overlap runs"
+            "--epoch-duration must contain --epoch-initial-duration, both minimum load phases, "
+            "the minimum overlap and a final tail"
         )
     if not math.isfinite(args.duration) or args.duration < 0:
         errors.append("--duration must be non-negative")
-    elif args.duration > 0 and args.pps > 0 and args.pps * args.duration < 1:
-        errors.append("--pps times --duration must schedule at least one packet")
-    elif args.duration > 0 and args.pps > 0 and args.pps * args.duration > (1 << 32) - 1:
-        errors.append("--pps times --duration exceeds the packet sequence domain")
-    if (
-        math.isfinite(args.epoch_duration)
-        and args.epoch_pps > 0
-        and args.epoch_pps * args.epoch_duration < 1
-    ):
-        errors.append("epoch traffic must schedule at least one packet")
-    elif (
-        math.isfinite(args.epoch_duration)
-        and args.epoch_pps > 0
-        and args.epoch_pps * args.epoch_duration > (1 << 32) - 1
-    ):
-        errors.append("epoch traffic exceeds the packet sequence domain")
     for option, value in (("--src-ip", args.src_ip), ("--dst-ip", args.dst_ip)):
         try:
             if str(ipaddress.IPv4Address(value)) != value:
@@ -537,7 +527,7 @@ def build_config(args: argparse.Namespace) -> TestConfig:
     epoch_config = EpochConfig(
         duration_s=args.epoch_duration,
         pps=args.epoch_pps,
-        transition_time_s=args.epoch_transition_time,
+        initial_duration_s=args.epoch_initial_duration,
         overlap_window_ms=args.epoch_overlap_ms,
     )
 

@@ -36,14 +36,15 @@ from kinetum_validation.config.types import (
     TrafficEndpointConfig,
 )
 from kinetum_validation.orchestrator import TestOrchestrator as ValidationOrchestrator
-from kinetum_validation.scenario_context import ScenarioContext
 
 from kinetum_validation.engine.json_contract import JsonContractError
 from kinetum_validation.process.kinetumctl import KinetumCtl
-from kinetum_validation.process.telemetry import StatsResult
 from kinetum_validation.traffic import trex as trex_module
 from kinetum_validation.traffic.trex import TRexTrafficDriver
-from kinetum_validation.traffic.trex_protocol import TRexRemoteFailure, generation_pgid_layout, require_trex_capacity
+from kinetum_validation.traffic.trex_protocol import (
+    TRexRemoteFailure, generation_flow_expected_tx, generation_pgid_layout, require_trex_capacity,
+)
+from tests.epoch_load_fixtures import load_snapshot, load_topology
 from tests.traffic_fixtures import complete_trex_identity, native_trex_port_info
 from tests.process_signal_fixtures import fixture_command
 
@@ -115,7 +116,7 @@ def _remote_helper(name, *dependencies):
     functions = {
         node.name: node for node in module.body if isinstance(node, ast.FunctionDef)
     }
-    namespace = {"fail": fail}
+    namespace = {"fail": fail, "math": math}
     helper_module = ast.Module(
         body=[functions[dependency] for dependency in (*dependencies, name)],
         type_ignores=[],
@@ -316,25 +317,21 @@ class _CapturingTRexDriver(TRexTrafficDriver):
                         "pg_id": 1000, "generation_tag": 1,
                         "logical_name": "wan0", "port_id": 0,
                         "flow_id": 0, "role": "pre_overlap",
-                        "expected_tx": 2750,
                     },
                     {
                         "pg_id": 1001, "generation_tag": 2,
                         "logical_name": "wan0", "port_id": 0,
                         "flow_id": 0, "role": "post_overlap",
-                        "expected_tx": 5000,
                     },
                     {
                         "pg_id": 1002, "generation_tag": 1,
                         "logical_name": "wan1", "port_id": 1,
                         "flow_id": 0, "role": "pre_overlap",
-                        "expected_tx": 2750,
                     },
                     {
                         "pg_id": 1003, "generation_tag": 2,
                         "logical_name": "wan1", "port_id": 1,
                         "flow_id": 0, "role": "post_overlap",
-                        "expected_tx": 5000,
                     },
                 ],
                 "promiscuous_ports": [2],
@@ -359,13 +356,15 @@ class _CapturingTRexDriver(TRexTrafficDriver):
                 "timestamp_source": "trex_endpoint_monotonic",
             }
         elif spec["action"] == "generation_finish":
+            expected_by_role = {"pre_overlap": 2750, "post_overlap": 5000}
             generation_pgid_stats = {
                 str(row["pg_id"]): {
                     key: value for key, value in row.items() if key != "pg_id"
                 }
                 | {
-                    "tx_pkts": row["expected_tx"],
-                    "rx_pkts": row["expected_tx"],
+                    "expected_tx": expected_by_role[row["role"]],
+                    "tx_pkts": expected_by_role[row["role"]],
+                    "rx_pkts": expected_by_role[row["role"]],
                 }
                 for row in spec["generation_flow_plan"]
             }
@@ -400,7 +399,7 @@ class _CapturingTRexDriver(TRexTrafficDriver):
                 "generation_tag_counts": {"1": 5500, "2": 10000},
                 "tag_counts": {"1": 5500, "2": 10000},
                 "generation_overlap_method": "orchestrator_controlled_sustained_overlap",
-                "transition_time_s_requested": spec["transition_time_s"],
+                "initial_duration_s_requested": spec["initial_duration_s"],
                 "requested_overlap_window_ms": 500,
                 "overlap_window_ms_measured": 500.0,
                 "overlap_window_timestamp_source": "trex_endpoint_monotonic",
@@ -476,9 +475,9 @@ class _FakeRemoteProcess:
 class _FailedGenerationStartDriver(TRexTrafficDriver):
     """Driver fake that loses the generation-start response after remote work."""
 
-    def __init__(self) -> None:
-        """Initialize one exact action ledger."""
-        super().__init__(_trex_config())
+    def __init__(self, config: ValidationConfig) -> None:
+        """Record the actions requested for this run's ports and profile."""
+        super().__init__(config)
         self.actions = []
         self.start_failure = RuntimeError("injected generation-start response loss")
         self._trex_identity = copy.deepcopy(TREX_IDENTITY)  # pylint: disable=protected-access
@@ -1035,7 +1034,7 @@ class TestTRexTrafficDriver(unittest.TestCase):  # pylint: disable=too-many-publ
 
     def test_generation_start_ambiguity_executes_exact_abort_before_return(self):
         """A lost start response must not orphan remotely owned streams."""
-        driver = _FailedGenerationStartDriver()
+        driver = _FailedGenerationStartDriver(_trex_config())
 
         with self.assertRaisesRegex(RuntimeError, "response loss"):
             asyncio.run(
@@ -1052,7 +1051,7 @@ class TestTRexTrafficDriver(unittest.TestCase):  # pylint: disable=too-many-publ
 
     def test_known_preflight_rejection_never_starts_a_compensating_abort(self):
         """An explicit before-effects rejection clears intent without taking remote ports."""
-        driver = _FailedGenerationStartDriver()
+        driver = _FailedGenerationStartDriver(_trex_config())
         driver.start_failure = TRexRemoteFailure("instrument changed before acquisition", False)
         with self.assertRaisesRegex(TRexRemoteFailure, "before acquisition"):
             asyncio.run(driver.start_generation_session(PacketConfig(), 15.0, 1, 2))
@@ -1184,24 +1183,25 @@ class TestTRexTrafficDriver(unittest.TestCase):  # pylint: disable=too-many-publ
 
     def test_generation_start_failure_preserves_failed_epoch_result(self):
         """A retired failed start remains an epoch failure in JSON instead of a second cleanup error."""
-        driver = _FailedGenerationStartDriver()
         with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            base = _trex_config()
             config = replace(
-                driver.config,
+                base, process=replace(base.process, validation_root=root / "kit"),
                 test_type=ValidationTestType.EPOCH,
-                output_dir=Path(temporary),
+                output_dir=root,
             )
+            target = config.process.examples_dir / config.spec.example_dir / config.spec.config_snapshot_v2
+            target.parent.mkdir(parents=True)
+            target.write_text('snapshot_id: "v2"\n', encoding="utf-8")
+            driver = _FailedGenerationStartDriver(config)
+            control = MagicMock(spec=KinetumCtl)
+            control.get_stats.return_value = load_snapshot(10)
             orchestrator = ValidationOrchestrator(config, reporter=MagicMock())
             orchestrator._traffic = driver  # pylint: disable=protected-access
-            orchestrator._kinetumctl = MagicMock(spec=KinetumCtl)  # pylint: disable=protected-access
-            initial = StatsResult(
-                success=True,
-                active_epoch=1,
-                active_snapshot_id="baseline",
-            )
+            orchestrator._kinetumctl = control  # pylint: disable=protected-access
+            orchestrator._plan_topology = load_topology()  # pylint: disable=protected-access
             with patch.object(orchestrator, "_setup", new=AsyncMock(return_value=True)), patch.object(
-                ScenarioContext, "get_stats_snapshot", new=AsyncMock(return_value=initial)
-            ), patch.object(
                 orchestrator, "_save_dp_stats", new=AsyncMock(return_value=StatsValidationResult())
             ):
                 result = asyncio.run(orchestrator.run())
@@ -1215,6 +1215,7 @@ class TestTRexTrafficDriver(unittest.TestCase):  # pylint: disable=too-many-publ
             self.assertIsNone(driver._completed_capture_file)  # pylint: disable=protected-access
             self.assertIsNone(driver._active_generation_session)  # pylint: disable=protected-access
             self.assertEqual(driver.actions, ["generation_start", "generation_abort"])
+            control.apply_config.assert_not_called()
             self.assertFalse((Path(temporary) / "epoch_capture.trex_stats.json").exists())
 
     def test_generation_stats_analysis_uses_tag_counts(self):
@@ -1362,7 +1363,7 @@ class TestTRexTrafficDriver(unittest.TestCase):  # pylint: disable=too-many-publ
         self.assertEqual(spec["num_flows"], 1)
         self.assertNotIn("initial_generation_tag", spec)
         self.assertNotIn("next_generation_tag", spec)
-        self.assertNotIn("transition_time_s", spec)
+        self.assertNotIn("initial_duration_s", spec)
         self.assertNotIn("overlap_window_ms", spec)
         self.assertNotIn("src_mac", spec)
         self.assertNotIn("dst_mac", spec)
@@ -1628,8 +1629,8 @@ class TestTRexTrafficDriver(unittest.TestCase):  # pylint: disable=too-many-publ
         current["2"]["ipackets"] += 15500
         flow_stats = {
             row["pg_id"]: {
-                "tx_pkts": {row["port_id"]: row["expected_tx"]},
-                "rx_pkts": {2: row["expected_tx"]},
+                "tx_pkts": {row["port_id"]: 2750 if row["role"] == "pre_overlap" else 5000},
+                "rx_pkts": {2: 2750 if row["role"] == "pre_overlap" else 5000},
             }
             for row in session["generation_flow_plan"]
         }
@@ -1869,64 +1870,53 @@ class TestTRexTrafficDriver(unittest.TestCase):  # pylint: disable=too-many-publ
 
     def test_generation_finish_requires_each_pgid_to_reach_its_target(self):
         """Aggregate traffic cannot hide one starved generation-flow row."""
-        driver = TRexTrafficDriver(_trex_config())
-        plan = [
-            {
-                "pg_id": 1000,
-                "generation_tag": 1,
-                "logical_name": "wan0",
-                "port_id": 0,
-                "flow_id": 0,
-                "role": "pre_overlap",
-                "expected_tx": 100,
-            },
-            {
-                "pg_id": 1001,
-                "generation_tag": 2,
-                "logical_name": "wan0",
-                "port_id": 0,
-                "flow_id": 0,
-                "role": "post_overlap",
-                "expected_tx": 100,
-            },
-        ]
-        observed = {
-            str(row["pg_id"]): {
-                **{key: row[key] for key in (
-                    "generation_tag", "logical_name", "port_id", "flow_id",
-                    "role", "expected_tx",
-                )},
-                "tx_pkts": 100,
-                "rx_pkts": 100,
-            }
-            for row in plan
-        }
-        payload = {
-            "generation_overlap_method": "orchestrator_controlled_sustained_overlap",
-            "overlap_window_timestamp_source": "trex_endpoint_monotonic",
-            "expected_tx_count_source": "measured_generation_intervals",
-            "start_monotonic": 10.0,
-            "next_start_monotonic": 15.0,
-            "initial_pause_monotonic": 15.5,
-            "next_pause_monotonic": 25.0,
-            "overlap_window_ms_measured": 500.0,
-            "requested_overlap_window_ms": 500,
-            "next_start_time": 1.5,
-            "initial_pause_time": 2.0,
-            "next_pause_time": 16.0,
-            "steady_state_target_pps": 1000,
-            "overlap_aggregate_target_pps": 2000,
-            "transition_time_s_requested": 5.0,
-            "generation_flow_plan": plan,
-            "generation_pgid_stats": observed,
-            "generation_tag_counts": {"1": 100, "2": 100},
-            "tag_counts": {"1": 100, "2": 100},
-        }
-        driver._validate_generation_finish(payload)  # pylint: disable=protected-access
-        payload["generation_pgid_stats"]["1001"]["tx_pkts"] = 94
-        payload["generation_tag_counts"]["2"] = 94
+        async def collect():
+            """Establish the real start, overlap and finish prerequisites."""
+            driver = _CapturingTRexDriver()
+            sender = driver.make_sender(PacketConfig())
+            await sender.begin_generation_tags(15.0, 1, 2)
+            await sender.start_generation_overlap(2)
+            await sender.end_generation_overlap()
+            await sender.finish_generation_tags()
+            return driver
+
+        driver = asyncio.run(collect())
+        payload = copy.deepcopy(driver._last_run)  # pylint: disable=protected-access
+        request = driver.specs[-1]
+        driver._validate_generation_finish(payload, request)  # pylint: disable=protected-access
+        self.assertTrue(all("expected_tx" not in row for row in payload["generation_flow_plan"]))
+        payload["generation_pgid_stats"]["1000"].update(tx_pkts=2600, rx_pkts=2600)
+        payload["generation_tag_counts"]["1"] -= 150
+        payload["tag_counts"]["1"] -= 150
         with self.assertRaisesRegex(RuntimeError, "PGID traffic achievement"):
-            driver._validate_generation_finish(payload)  # pylint: disable=protected-access
+            driver._validate_generation_finish(payload, request)  # pylint: disable=protected-access
+
+        # Independent witness: 20 s of A and 25 s of B at 500 PPS per flow.
+        # One A flow sends 8,980; the complete population still reaches 97.73%.
+        payload.update(initial_pause_monotonic=30.0, next_pause_monotonic=40.0,
+                       overlap_window_ms_measured=15000.0)
+        for row in payload["generation_pgid_stats"].values():
+            count = 10000 if row["role"] == "pre_overlap" else 12500
+            row.update(expected_tx=count, tx_pkts=count, rx_pkts=count)
+        payload["generation_pgid_stats"]["1000"].update(tx_pkts=8980, rx_pkts=8980)
+        payload["generation_tag_counts"] = {"1": 18980, "2": 25000}
+        payload["tag_counts"] = dict(payload["generation_tag_counts"])
+        request = {**request, "duration_s": 30.0, "initial_pause_monotonic": 30.0}
+        self.assertGreaterEqual(43980 * 100, 45000 * 95)
+        self.assertGreaterEqual(8980 * 100, 2750 * 95)
+        with self.assertRaisesRegex(RuntimeError, "PGID traffic achievement"):
+            driver._validate_generation_finish(payload, request)  # pylint: disable=protected-access
+
+    def test_measured_flow_rounding_preserves_operand_order_at_half_packet(self):
+        """Endpoint and consumer retain the configured flow-rate division before duration multiplication."""
+        remote = _remote_helper("generation_flow_expected_tx")
+        self.assertEqual(int(round((1.0 * 73.5) / 49.0)), 2)
+        self.assertEqual(generation_flow_expected_tx(1, 1, 49, 73.5), 1)
+        self.assertEqual(remote(1, 1, 49, 73.5), 1)
+        for function in (generation_flow_expected_tx, remote):
+            for duration in (1.0, 1 << 4096, float("nan"), float("inf"), True):
+                with self.subTest(function=function, duration=duration), self.assertRaises(RuntimeError):
+                    function(1, 1, 49, duration)
 
     def test_shared_generation_pgid_layout_preserves_unique_ids_and_demand(self):
         """The projected function and local authority agree with independent ID populations."""

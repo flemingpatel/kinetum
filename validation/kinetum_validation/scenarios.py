@@ -16,6 +16,8 @@ from .config.types import (
     RollbackTestResult,
     TestResult,
     TransitionType,
+    epoch_window_has_capacity,
+    timed_packet_count_fits,
 )
 from .process.installation import is_symlink_free_regular_file
 from .process.telemetry import StatsResult
@@ -25,6 +27,7 @@ from .scenario_context import (
     ScenarioContext,
     CONTROL_OBSERVATION_TIMEOUT_S,
     TRANSITION_STATS,
+    EPOCH_LOAD_STATS,
     INITIAL_GENERATION_TAG,
     NEXT_GENERATION_TAG,
 )
@@ -205,15 +208,73 @@ def _native_generation_transition_is_exact(analysis: AnalysisResult, initial_cou
     return True
 
 
+def _epoch_boundary_result(
+    context: ScenarioContext, before: StatsResult, after: StatsResult, applied: ApplyConfigResult,
+) -> EpochTestResult:
+    """Derive final protocol facts independently of the traffic and load verdicts."""
+    context.require_active_snapshot_observation(after, "epoch final observation")
+    if (before.runtime_generation, before.transition_plan_content_hash) != (
+        after.runtime_generation, after.transition_plan_content_hash,
+    ):
+        raise RuntimeError("runtime or plan changed across epoch evidence")
+    if before.protocol_fault_counts.keys() != after.protocol_fault_counts.keys():
+        raise RuntimeError("protocol fault membership changed")
+    faults = 0
+    for code, count in after.protocol_fault_counts.items():
+        if count < before.protocol_fault_counts[code]:
+            raise RuntimeError("protocol fault counters regressed")
+        faults += count - before.protocol_fault_counts[code]
+    previous = {row.boundary_id: row for row in before.boundary_epoch_stats}
+    current_ids = {row.boundary_id for row in after.boundary_epoch_stats}
+    if (
+        len(previous) != len(before.boundary_epoch_stats) or len(current_ids) != len(after.boundary_epoch_stats)
+        or set(previous) != current_ids
+    ):
+        raise RuntimeError("boundary membership changed across epoch evidence")
+    terminal = after.latest_terminal
+    generation = terminal.mutation_sequence if terminal is not None else 0
+    completed = 0
+    backpressure = 0
+    for row in after.boundary_epoch_stats:
+        prior = previous[row.boundary_id]
+        if row.endpoint_identity() != prior.endpoint_identity():
+            raise RuntimeError(f"boundary {row.boundary_id} changed endpoints or capacities")
+        if row.data_backpressure_events < prior.data_backpressure_events:
+            raise RuntimeError(f"boundary {row.boundary_id} backpressure regressed")
+        backpressure += row.data_backpressure_events - prior.data_backpressure_events
+        completed += int(boundary_transition_is_complete(row, generation, before.active_epoch, applied.epoch))
+        context.reporter.print_progress(
+            f"  {row.boundary_id}: cut={row.cut_sequence} enqueued={row.data_enqueued_sequence}"
+            f" dequeued={row.data_dequeued_sequence} ack_gate_ns={row.ack_gate_duration_ns}"
+        )
+    transitions = int((after.active_epoch, after.active_snapshot_id, after.active_revision) == (
+        applied.epoch, applied.snapshot_id, applied.revision,
+    ))
+    terminal_complete = terminal is not None and all((
+        after.transition_state == "EPOCH_TRANSITION_STATE_IDLE",
+        terminal.outcome == "EPOCH_TRANSITION_OUTCOME_COMPLETE",
+        terminal.failure_code == "EPOCH_TRANSITION_FAILURE_CODE_NONE",
+        terminal.from_epoch == before.active_epoch, terminal.to_epoch == applied.epoch,
+        not after.transition_success_blocked, not after.retirement_frozen,
+    ))
+    return EpochTestResult(
+        passed=False, transitions_observed=transitions, boundary_count=len(current_ids),
+        completed_boundaries=completed, protocol_faults_observed=faults, backpressure_events=backpressure,
+        boundary_ordering_validated=all((
+            transitions == 1, terminal_complete, bool(current_ids), completed == len(current_ids), faults == 0,
+        )),
+    )
+
+
 async def run_epoch_test(context: ScenarioContext) -> EpochTestResult:
     """
     Run epoch transition test (boundary-ordering validation).
 
     Validates boundary ordering during configuration transitions:
     1. Query one exact current DP epoch.
-    2. Start continuous traffic with driver-owned epoch evidence.
-    3. Dispatch one configuration mutation during the traffic window.
-    4. Continue traffic through the exact adjacent transition.
+    2. Establish the intended ingress load with separate traffic populations.
+    3. Qualify that load under the old configuration before dispatching Apply.
+    4. Retain traffic through exact completion and target-load qualification.
     5. Require exact traffic within both the authored loss limit and epoch ceiling, one
        COMPLETE terminal identity, every compiled boundary's matching
        CUT/ACK proof, and zero protocol-fault delta.
@@ -229,11 +290,8 @@ async def run_epoch_test(context: ScenarioContext) -> EpochTestResult:
     epoch_config = context.config.epoch
     pcap_file = context.config.output_dir / "epoch_capture.pcap"
 
-    # -----------------------------------------------------------------
-    # Capture exact DP truth before the traffic source starts. Traffic tags
-    # never encode this epoch; the two observations prove that packets
-    # reached DP before transition mutation begins.
-    # -----------------------------------------------------------------
+    # Capture configuration and participant identity before source admission.
+    # Traffic-generation tags never encode this configuration epoch.
     if not context.control:
         return EpochTestResult(
             passed=False,
@@ -241,7 +299,7 @@ async def run_epoch_test(context: ScenarioContext) -> EpochTestResult:
             message="Error: exact current-epoch observation is unavailable",
         )
     try:
-        traffic_start_stats = await context.get_stats_snapshot()
+        traffic_start_stats = await context.get_stats_snapshot(EPOCH_LOAD_STATS)
         _, dp_epoch_start = context.require_active_snapshot_observation(
             traffic_start_stats, "epoch traffic start"
         )
@@ -251,27 +309,69 @@ async def run_epoch_test(context: ScenarioContext) -> EpochTestResult:
             duration_s=time.monotonic() - start_time,
             message=f"Error: {exc}",
         )
-    if dp_epoch_start <= 0:
-        return EpochTestResult(
-            passed=False,
-            duration_s=time.monotonic() - start_time,
-            message="Error: exact current-epoch observation failed",
-        )
     context.reporter.print_progress(f"DP current epoch: {dp_epoch_start}")
-
-    # Traffic drivers own bounded generation-tag evidence. The tag never
-    # carries or predicts the independently validated Data Plane epoch.
 
     sender = None
     apply_task = None
+    applied = None
+    old_load = None
+    new_load = None
+    failure_reason = "epoch did not finish"
+    capture_active = False
+    protocol_result = EpochTestResult(passed=False)
+
+    async def retire_and_record() -> None:
+        """Retire every owner before recording a late Apply result, preserving all failures."""
+        failures = []
+        message = failure_reason
+
+        def remember_failure(owner: str, error: BaseException) -> None:
+            """Include each finalization failure in both the saved outcome and raised diagnostic."""
+            nonlocal message
+            failures.append(error)
+            detail = f"{owner}: {type(error).__name__}: {error}"
+            message = f"{message}; {detail}" if message else detail
+
+        try:
+            await context.retire_scenario_traffic(
+                "epoch", sender, apply_task, capture_active=capture_active,
+            )
+        except BaseException as error:  # pylint: disable=broad-exception-caught
+            remember_failure("retirement", error)
+        try:
+            context.artifacts.write_epoch_load(old_load, new_load, applied, message)
+        except BaseException as error:  # pylint: disable=broad-exception-caught
+            remember_failure("load evidence", error)
+        if failures:
+            primary = next((error for error in failures if isinstance(error, Exception)), failures[0])
+            if isinstance(primary, Exception):
+                raise RuntimeError(message) from primary
+            primary.add_note(message)
+            raise primary
+
     try:
-        # Start capture
+        sustained_overlap = context.require_traffic().requires_sustained_generation_overlap
+        if not epoch_window_has_capacity(
+            epoch_config.duration_s, epoch_config.initial_duration_s, epoch_config.overlap_window_ms, sustained_overlap,
+        ):
+            raise RuntimeError("epoch window cannot contain both load phases and the final tail")
+        if not timed_packet_count_fits(epoch_config.pps, epoch_config.duration_s):
+            raise RuntimeError("epoch rate or packet count is outside the supported range")
+        if context.config.spec.config_snapshot_v2 is None:
+            raise RuntimeError("epoch requires a target configuration snapshot")
+        config_v2 = (
+            context.config.process.examples_dir / context.config.spec.example_dir
+            / context.config.spec.config_snapshot_v2
+        )
+        if not is_symlink_free_regular_file(config_v2):
+            raise RuntimeError("config_snapshot_v2 is not an exact regular file")
+        old_load = context.epoch_load_phase(traffic_start_stats)
         context.reporter.print_progress("Starting packet capture...")
+        capture_active = True
         await context.require_traffic().start_capture(
             pcap_file, f"udp dst port {context.config.packet.base_dport}"
         )
 
-        # Create packet config for epoch test
         epoch_pkt_config = replace(
             context.config.packet,
             pps=epoch_config.pps,
@@ -279,9 +379,6 @@ async def run_epoch_test(context: ScenarioContext) -> EpochTestResult:
         )
 
         sender = context.require_traffic().make_sender(epoch_pkt_config)
-        sustained_overlap = (
-            context.require_traffic().requires_sustained_generation_overlap
-        )
 
         context.reporter.print_progress(
             f"Starting traffic: {epoch_pkt_config.pps} PPS, "
@@ -293,100 +390,96 @@ async def run_epoch_test(context: ScenarioContext) -> EpochTestResult:
             INITIAL_GENERATION_TAG,
             NEXT_GENERATION_TAG,
         )
-        transition_deadline = time.monotonic() + epoch_config.transition_time_s
-        epoch_end_deadline = time.monotonic() + epoch_config.duration_s
+        traffic_started = time.monotonic()
+        initial_deadline = traffic_started + epoch_config.initial_duration_s
+        epoch_end_deadline = traffic_started + epoch_config.duration_s
+        qualification_deadline = epoch_end_deadline - CONSTANTS.EPOCH_TAIL_S
 
-        # Wait for baseline traffic
-        transition_time = epoch_config.transition_time_s
         context.reporter.print_progress(
-            f"Baseline traffic for {transition_time}s before transition..."
+            f"Initial-generation traffic for {epoch_config.initial_duration_s}s..."
         )
-        pre_snapshot_margin = min(0.25, transition_time / 2.0)
-        await asyncio.sleep(transition_time - pre_snapshot_margin)
+        pre_snapshot_margin = min(0.25, epoch_config.initial_duration_s / 2.0)
+        await asyncio.sleep(epoch_config.initial_duration_s - pre_snapshot_margin)
 
-        # -----------------------------------------------------------------
-        # PRE-TRANSITION TELEMETRY SNAPSHOT
-        # -----------------------------------------------------------------
-        pre_stats: Optional[StatsResult] = None
-        if context.control:
-            pre_stats = await context.wait_for_traffic_progress(
-                traffic_start_stats, transition_deadline,
-                "epoch pre-transition traffic",
-                required_live_task=None,
-            )
-            context.reporter.print_progress(
-                f"Pre-transition snapshot: epoch={pre_stats.active_epoch}"
-                f" rx={pre_stats.rx_packets} tx={pre_stats.tx_packets}"
-            )
-
-        # -----------------------------------------------------------------
-        # EPOCH TRANSITION (boundary-ordering core)
-        # -----------------------------------------------------------------
+        pre_stats = await context.wait_for_traffic_progress(
+            traffic_start_stats, initial_deadline, "epoch pre-transition traffic",
+            required_live_task=None, selection=EPOCH_LOAD_STATS,
+        )
         context.reporter.print_progress(
-            f">>> TRIGGERING TRANSITION FROM EPOCH {dp_epoch_start} <<<"
+            f"Pre-transition snapshot: epoch={pre_stats.active_epoch}"
+            f" rx={pre_stats.rx_packets} tx={pre_stats.tx_packets}"
         )
 
-        # Dispatch config apply while the traffic driver creates overlap:
-        # native TAP requests its one pre-authored tag transition after
-        # apply is dispatched; TRex resumes paused next-tag PGID streams
-        # under the same orchestrator clock, then pauses initial-tag streams
-        # after the requested overlap window. The mandatory ordered boundary
-        # gate holds future-epoch packets until each exact ACK opens its
-        # sender.
-        config_v2 = None
-        if context.control and context.config.spec.config_snapshot_v2:
-            config_v2 = (
-                context.config.process.examples_dir
-                / context.config.spec.example_dir
-                / context.config.spec.config_snapshot_v2
+        # Traffic populations do not identify configuration epochs. Establish
+        # their intended load before allowing the configuration mutation.
+        remaining = initial_deadline - time.monotonic()
+        if remaining <= 0.0:
+            raise RuntimeError(
+                "source progress missed the initial traffic interval"
             )
-
-        if config_v2 and is_symlink_free_regular_file(config_v2):
-            remaining = transition_deadline - time.monotonic()
-            if remaining <= 0.0:
-                raise RuntimeError(
-                    "pre-transition evidence missed the authored transition time"
-                )
-            await asyncio.sleep(remaining)
-            apply_task = asyncio.create_task(
-                context.control.apply_config(
-                    config_v2, expected_revision=pre_stats.active_revision
-                )
-            )
-            await sender.start_generation_overlap(NEXT_GENERATION_TAG)
-            if sustained_overlap:
-                context.reporter.print_progress(
-                    "Traffic driver started sustained generation-tag overlap"
-                )
-                await asyncio.sleep(epoch_config.overlap_window_ms / 1000.0)
-            else:
-                context.reporter.print_progress(
-                    f"Generation tag changed to {NEXT_GENERATION_TAG} "
-                    "while apply was in flight"
-                )
-            await sender.end_generation_overlap()
-            if sustained_overlap:
-                context.reporter.print_progress(
-                    "Traffic driver ended initial-generation overlap after "
-                    f"{epoch_config.overlap_window_ms} ms"
-                )
-            applied = await apply_task
-            apply_task = None
-            if not applied.success:
-                raise RuntimeError(
-                    f"configuration transition failed: {applied.diagnostic}"
-                )
-            if applied.epoch <= dp_epoch_start:
-                raise RuntimeError("configuration transition returned a stale epoch")
-            dp_epoch_next = applied.epoch
+        await asyncio.sleep(remaining)
+        await context.run_before_deadline(
+            lambda: sender.start_generation_overlap(NEXT_GENERATION_TAG), qualification_deadline,
+            "starting generation overlap",
+        )
+        overlap_started = time.monotonic()
+        if sustained_overlap:
             context.reporter.print_progress(
-                f"Config v2 applied at exact epoch {dp_epoch_next}"
+                "Traffic driver started sustained generation-tag overlap"
             )
         else:
-            raise RuntimeError("config_snapshot_v2 is not an exact regular file")
+            context.reporter.print_progress(
+                f"Requested generation tag {NEXT_GENERATION_TAG} before load qualification"
+            )
+        pre_stats = await context.wait_for_epoch_load(old_load, epoch_end_deadline, sender)
+        if qualification_deadline - time.monotonic() <= CONSTANTS.EPOCH_LOAD_MIN_PHASE_S:
+            raise RuntimeError("traffic window cannot contain target qualification after Apply")
 
-        # -----------------------------------------------------------------
-        context.reporter.print_progress("Continuing traffic through transition...")
+        async def apply_configuration() -> ApplyConfigResult:
+            """Retain the accepted mutation result even when traffic qualification expires."""
+            nonlocal applied
+            applied = await context.control.apply_config(config_v2, expected_revision=pre_stats.active_revision)
+            return applied
+
+        context.reporter.print_progress(f"Applying configuration after qualified epoch {dp_epoch_start} load...")
+        sender.require_generation_active()
+        apply_task = asyncio.create_task(apply_configuration())
+        done, _ = await asyncio.wait({apply_task}, timeout=max(0.0, qualification_deadline - time.monotonic()))
+        if not done:
+            raise RuntimeError("Apply exceeded the traffic qualification window")
+        applied = await apply_task
+        apply_task = None
+        if not applied.success:
+            raise RuntimeError(
+                f"configuration transition failed: {applied.diagnostic}"
+            )
+        if applied.epoch <= dp_epoch_start:
+            raise RuntimeError("configuration transition returned a stale epoch")
+        context.reporter.print_progress(
+            f"Config v2 applied at exact epoch {applied.epoch}"
+        )
+        completed = await context.wait_for_epoch_completion(pre_stats, applied, qualification_deadline, sender)
+        protocol_result = _epoch_boundary_result(context, traffic_start_stats, completed, applied)
+        # Preserve COMPLETE even if target-load qualification later fails.
+        # The counter window includes initial traffic and old-load qualification.
+        context.artifacts.write_transition_metrics(
+            traffic_start_stats, completed, dp_epoch_start, applied.epoch, transition_type=TransitionType.EPOCH,
+        )
+        new_load = context.epoch_load_phase(completed)
+        await context.wait_for_epoch_load(new_load, epoch_end_deadline, sender)
+        if sustained_overlap:
+            minimum_end = overlap_started + epoch_config.overlap_window_ms / 1000.0
+            if minimum_end >= qualification_deadline:
+                raise RuntimeError("minimum overlap cannot finish inside the traffic window")
+            remaining_overlap = minimum_end - time.monotonic()
+            if remaining_overlap > 0.0:
+                await asyncio.sleep(remaining_overlap)
+        sender.require_generation_active()
+        await context.run_before_deadline(
+            sender.end_generation_overlap, qualification_deadline, "ending generation overlap",
+        )
+
+        context.reporter.print_progress("Completing the remaining traffic tail...")
         remaining = epoch_end_deadline - time.monotonic()
         if remaining <= 0.0:
             raise RuntimeError(
@@ -398,19 +491,15 @@ async def run_epoch_test(context: ScenarioContext) -> EpochTestResult:
         # Keep capture open for the bounded post-send dataplane drain.
         await asyncio.sleep(POST_SEND_DRAIN_S)
 
-        # -----------------------------------------------------------------
-        # ANALYZE RESULTS
-        # -----------------------------------------------------------------
         context.reporter.print_progress("Analyzing epoch transition...")
 
         analysis = await context.complete_capture(
             pcap_file=pcap_file,
             sender=stats,
         )
+        capture_active = False
 
-        # Calculate results
         loss_pct = analysis.loss_pct(stats.tx_count)
-        epoch_avg_latency = context.measured_average_latency(analysis)
         # Exact sender/capture accounting remains mandatory; the selected
         # validation profile may separately admit its bounded loss SLO.
         traffic_within_tolerance = (
@@ -454,132 +543,20 @@ async def run_epoch_test(context: ScenarioContext) -> EpochTestResult:
             )
         )
 
-        # -----------------------------------------------------------------
-        # POST-TRANSITION TELEMETRY SNAPSHOT + DELTA COMPUTATION
-        # Captured after traffic generator completes and packets settle.
-        # Delta = cumulative counters across the epoch test window,
-        # including traffic before, during, and after transition.
-        # -----------------------------------------------------------------
-        config_applied = False
-        dp_epoch_after = 0
-        post_stats: Optional[StatsResult] = None
-        boundary_count = 0
-        completed_boundaries = 0
-        protocol_faults_observed = 0
-        total_backpressure = 0
-
-        if context.control:
-            post_stats = await context.get_stats_snapshot()
-            if not post_stats.success:
-                context.reporter.print_error(
-                    "Post-transition stats collection failed", post_stats.diagnostic,
-                )
-                raise RuntimeError("Post-transition stats collection failed")
-            dp_epoch_after = post_stats.active_epoch
-            config_applied = (
-                dp_epoch_after == dp_epoch_next
-                and post_stats.active_snapshot_id == applied.snapshot_id
-                and post_stats.active_revision == applied.revision
+        # Recheck protocol state through the traffic tail without replacing
+        # the completion record or treating cross-epoch counters as a rate.
+        post_stats = await context.get_stats_snapshot(EPOCH_LOAD_STATS)
+        result = _epoch_boundary_result(context, traffic_start_stats, post_stats, applied)
+        protocol_result = result
+        if result.boundary_ordering_validated:
+            new_load.validate_observation(post_stats)
+            context.artifacts.build_transition_metrics(
+                traffic_start_stats, post_stats, dp_epoch_start, applied.epoch, transition_type=TransitionType.EPOCH,
             )
-            context.reporter.print_progress(
-                f"Post-transition snapshot: epoch={post_stats.active_epoch}"
-                f" rx={post_stats.rx_packets} tx={post_stats.tx_packets}"
-            )
-
-            if pre_stats and pre_stats.success:
-                if pre_stats.runtime_generation != post_stats.runtime_generation:
-                    raise RuntimeError(
-                        "runtime generation changed across epoch evidence"
-                    )
-                for code, post_count in post_stats.protocol_fault_counts.items():
-                    pre_count = pre_stats.protocol_fault_counts.get(code)
-                    if pre_count is None or post_count < pre_count:
-                        raise RuntimeError(
-                            "protocol fault counters regressed or changed membership"
-                        )
-                    protocol_faults_observed += post_count - pre_count
-
-            boundary_count = len(post_stats.boundary_epoch_stats)
-            terminal_generation = (
-                post_stats.latest_terminal.mutation_sequence
-                if post_stats.latest_terminal is not None
-                else 0
-            )
-            pre_bt_map = {
-                bt.boundary_id: bt
-                for bt in pre_stats.boundary_epoch_stats
-            } if pre_stats and pre_stats.success else {}
-            for bt in post_stats.boundary_epoch_stats:
-                pre_bt = pre_bt_map.get(bt.boundary_id)
-                pre_backpressure = (
-                    pre_bt.data_backpressure_events
-                    if pre_bt is not None else 0
-                )
-                if bt.data_backpressure_events < pre_backpressure:
-                    raise RuntimeError(
-                        f"boundary {bt.boundary_id} backpressure regressed"
-                    )
-                total_backpressure += (
-                    bt.data_backpressure_events - pre_backpressure
-                )
-                exact_complete = boundary_transition_is_complete(
-                    bt, terminal_generation, dp_epoch_start, dp_epoch_after
-                )
-                if exact_complete:
-                    completed_boundaries += 1
-                context.reporter.print_progress(
-                    f"  {bt.boundary_id}: cut={bt.cut_sequence}"
-                    f" enqueued={bt.data_enqueued_sequence}"
-                    f" dequeued={bt.data_dequeued_sequence}"
-                    f" ack_gate_ns={bt.ack_gate_duration_ns}"
-                )
-
-        # Transition confirmed only if DP epoch actually advanced
-        transitions_observed = 1 if config_applied else 0
-
-        # -----------------------------------------------------------------
-        # BOUNDARY-ORDERING VERDICT:
-        # 1. Exact traffic evidence within the selected loss SLO.
-        # 2. The exact target epoch completed.
-        # 3. Every boundary retained one exact CUT/ACK identity and timing.
-        # 4. No typed protocol fault appeared in the transition window.
-        # -----------------------------------------------------------------
-        terminal_complete = (
-            post_stats is not None
-            and post_stats.latest_terminal is not None
-            and post_stats.latest_terminal.outcome
-            == "EPOCH_TRANSITION_OUTCOME_COMPLETE"
-            and post_stats.latest_terminal.from_epoch == dp_epoch_start
-            and post_stats.latest_terminal.to_epoch == dp_epoch_after
-            and not post_stats.transition_success_blocked
-            and not post_stats.retirement_frozen
-        )
-        boundary_ordering_validated = (
-            transitions_observed > 0
-            and terminal_complete
-            and boundary_count > 0
-            and completed_boundaries == boundary_count
-            and protocol_faults_observed == 0
-        )
-        if (
-            boundary_ordering_validated
-            and pre_stats is not None
-            and pre_stats.success
-            and post_stats is not None
-        ):
-            context.artifacts.write_transition_metrics(
-                pre_stats, post_stats, dp_epoch_start, dp_epoch_after,
-                transition_type=TransitionType.EPOCH,
-            )
-        passed = (
-            traffic_within_tolerance
-            and generation_tags_valid
-            and transitions_observed > 0
-            and boundary_ordering_validated
-        )
-
-        result = EpochTestResult(
-            passed=passed,
+        result = replace(
+            result,
+            passed=all((traffic_within_tolerance, generation_tags_valid, result.boundary_ordering_validated,
+                        old_load.complete, new_load.complete)),
             duration_s=time.monotonic() - start_time,
             total_sent=stats.tx_count,
             total_received=analysis.valid,
@@ -590,33 +567,28 @@ async def run_epoch_test(context: ScenarioContext) -> EpochTestResult:
             generation_tag_transition_seq=(
                 analysis.transition_seq if analysis.transition_seq >= 0 else -1
             ),
-            transitions_observed=transitions_observed,
             loss_pct=loss_pct,
-            avg_latency_us=epoch_avg_latency,
-            boundary_count=boundary_count,
-            completed_boundaries=completed_boundaries,
-            protocol_faults_observed=protocol_faults_observed,
-            backpressure_events=total_backpressure,
-            boundary_ordering_validated=boundary_ordering_validated,
+            avg_latency_us=context.measured_average_latency(analysis),
+            load_qualified=old_load.complete and new_load.complete,
         )
         result.message = context.epoch_result_message(result, traffic_within_tolerance, generation_tags_valid)
-
+        failure_reason = "" if result.passed else result.message
         return result
 
     except RECOVERABLE_EXCEPTIONS as e:
-        context.reporter.print_error("Epoch test failed", str(e))
-        return EpochTestResult(
-            passed=False,
+        failure_reason = f"{type(e).__name__}: {e}"
+        context.reporter.print_error("Epoch test failed", failure_reason)
+        return replace(
+            protocol_result,
             duration_s=time.monotonic() - start_time,
+            load_qualified=old_load is not None and new_load is not None and old_load.complete and new_load.complete,
             message=f"Error: {e}",
         )
+    except BaseException as error:
+        failure_reason = f"{type(error).__name__}: {error}"
+        raise
     finally:
-        await context.retire_scenario_traffic(
-            "epoch",
-            sender,
-            apply_task,
-            capture_active=True,
-        )
+        await retire_and_record()
 
 
 async def run_commit_confirmed_test(context: ScenarioContext) -> CommitConfirmedTestResult:

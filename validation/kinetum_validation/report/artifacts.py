@@ -14,12 +14,15 @@ from ..config.types import (
 )
 from ..engine.json_contract import (
     EXPECTED_TRANSITION_TYPES_BY_TEST,
+    MAX_JSON_DOCUMENT_CHARACTERS,
     parse_exact_json_object,
     validate_test_suite_result,
     validate_transition_metric_record,
 )
 from ..process.installation import is_symlink_free_regular_file
 from ..process.telemetry import PortStatsResult, StatsResult
+from ..process.epoch_load import EpochLoadPhase, require_epoch_load_artifact, validate_epoch_load_evidence
+from ..process.kinetumctl import ApplyConfigResult
 from ..process.guardrails_observation import GuardrailsRead, parse_guardrails_json
 from .console import ConsoleReporter
 from ..statistics import nearest_rank_percentile
@@ -596,20 +599,23 @@ class RunArtifacts:
                 f" p50={dist['p50']} p95={dist['p95']} max={dist['max']}"
             )
 
-    def write_transition_metrics(
-        self,
+    @staticmethod
+    def build_transition_metrics(
         pre: StatsResult,
         post: StatsResult,
         from_epoch: int,
         to_epoch: int,
         transition_type: TransitionType = TransitionType.EPOCH,
-    ) -> None:
+    ) -> dict:
         """
-        Compute per-transition deltas and append to transition_metrics.jsonl.
+        Return validated per-transition evidence without writing a file.
 
-        Writes exact terminal boundary timing with counter deltas over their
+        Derive exact terminal boundary timing with counter deltas over their
         recorded source endpoints. Those endpoints may span an earlier apply
         when an automatic rollback completed before the next observation.
+        This same admission also checks later observations after a completion
+        record has already been saved. Contradictions raise ValueError or
+        RuntimeError; this method performs no I/O.
 
         Parameters
         ----------
@@ -663,18 +669,7 @@ class RunArtifacts:
         boundary_deltas = []
         for bt in post.boundary_epoch_stats:
             p = pre_bt.get(bt.boundary_id)
-            static_identity_changed = p is not None and any((
-                p.boundary_index != bt.boundary_index,
-                p.from_stage_instance_index != bt.from_stage_instance_index,
-                p.to_stage_instance_index != bt.to_stage_instance_index,
-                p.sender_worker_index != bt.sender_worker_index,
-                p.receiver_worker_index != bt.receiver_worker_index,
-                p.from_region_id != bt.from_region_id,
-                p.to_region_id != bt.to_region_id,
-                p.data_ring_capacity != bt.data_ring_capacity,
-                p.future_output_hold_capacity
-                != bt.future_output_hold_capacity,
-            ))
+            static_identity_changed = p is not None and p.endpoint_identity() != bt.endpoint_identity()
             if p is None or static_identity_changed or not boundary_transition_is_complete(
                 bt, terminal.mutation_sequence, from_epoch, to_epoch
             ):
@@ -833,6 +828,22 @@ class RunArtifacts:
             "stage_stats": stage_deltas,
         }
         validate_transition_metric_record(record)
+        return record
+
+    def write_transition_metrics(
+        self,
+        pre: StatsResult,
+        post: StatsResult,
+        from_epoch: int,
+        to_epoch: int,
+        transition_type: TransitionType = TransitionType.EPOCH,
+    ) -> None:
+        """Append one record admitted by build_transition_metrics and report its deltas.
+
+        Inputs follow that builder's observation and identity contract. File
+        failure propagates; it never turns incomplete evidence into success.
+        """
+        record = self.build_transition_metrics(pre, post, from_epoch, to_epoch, transition_type)
 
         metrics_file = self.output_dir / "transition_metrics.jsonl"
         with open(metrics_file, "a", encoding="utf-8") as f:
@@ -843,20 +854,20 @@ class RunArtifacts:
         )
 
         # Print key deltas for immediate visibility
-        for bd in boundary_deltas:
+        for bd in record["boundary_epoch_stats"]:
             self.reporter.print_progress(
                 f"  {bd['boundary_id']}: cut_delivery_ns="
                 f"{bd['cut_delivery_duration_ns']}"
                 f" cut_drain_ns={bd['cut_drain_duration_ns']}"
                 f" ack_gate_ns={bd['ack_gate_duration_ns']}"
             )
-        for rd in region_deltas:
+        for rd in record["region_epoch_stats"]:
             if rd["fanout_overflow_delta"] > 0:
                 self.reporter.print_warning(
                     f"  region_{rd['region_id']}: "
                     f"fanout_overflow_delta={rd['fanout_overflow_delta']}"
                 )
-        for sd in stage_deltas:
+        for sd in record["stage_stats"]:
             if sd["dropped_packets_delta"] > 0:
                 self.reporter.print_progress(
                     f"  {sd['stage_id']}: drop_delta={sd['dropped_packets_delta']}"
@@ -894,6 +905,30 @@ class RunArtifacts:
                 },
             }, output, allow_nan=False, indent=2, sort_keys=True)
             output.write("\n")
+
+    def write_epoch_load(
+        self, old: Optional[EpochLoadPhase], new: Optional[EpochLoadPhase],
+        applied: Optional[ApplyConfigResult], failure: str,
+    ) -> None:
+        """Retain bounded load witnesses even when the mutation or qualification fails.
+
+        The last E observation and first N barrier read bracket the epoch
+        change; their cross-epoch delta contributes to neither rate verdict.
+        """
+        qualified = old is not None and new is not None and old.complete and new.complete
+        payload = {
+            "run_root": str(self.output_dir),
+            "old": old.evidence() if old is not None else None,
+            "new": new.evidence() if new is not None else None,
+            "apply": asdict(applied) if applied is not None else None,
+            "load_qualified": qualified, "failure": failure,
+        }
+        validate_epoch_load_evidence(payload)
+        encoded = json.dumps(payload, allow_nan=False, indent=2, sort_keys=True) + "\n"
+        if len(encoded) > MAX_JSON_DOCUMENT_CHARACTERS:
+            raise RuntimeError("epoch load evidence exceeds its JSON bound")
+        with (self.output_dir / "epoch_load.json").open("x", encoding="utf-8") as output:
+            output.write(encoded)
 
     def write_guardrails_evaluation(
         self, armed: GuardrailsRead, decision: GuardrailsRead, arming_elapsed_s: float,
@@ -1002,6 +1037,7 @@ class RunArtifacts:
                     "boundary_ordering_validated": (
                         result.epoch_test.boundary_ordering_validated
                     ),
+                    "load_qualified": result.epoch_test.load_qualified,
                     "message": result.epoch_test.message,
                 }
 
@@ -1069,6 +1105,8 @@ class RunArtifacts:
                 if evidence.get("passed") is not result.nat_exchange.passed:
                     raise RuntimeError("NAT exchange result contradicts its packet evidence")
             self._require_transition_artifacts(result)
+            if result.epoch_test is not None and not result.dry_run:
+                require_epoch_load_artifact(self.output_dir, result.epoch_test.load_qualified, result.epoch_test.passed)
 
             with open(results_file, "x", encoding="utf-8") as f:
                 json.dump(data, f, allow_nan=False, indent=2, sort_keys=True)

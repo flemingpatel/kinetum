@@ -226,7 +226,7 @@ sudo /var/tmp/kinetum-validation/bin/python3 -I -B -X utf8 -m kinetum_validation
     --deployment fan-in-edge-gateway \
     --test-type epoch \
     --epoch-pps 20000 \
-    --epoch-duration 15 \
+    --epoch-duration 30 \
     --output-dir /tmp/kinetum_validation_epoch \
     --dry-run
 ```
@@ -351,10 +351,10 @@ short option is accepted.
 | `--validation-root` | installed package's `data/` directory | Validation resources containing `VERSION`, `bin/`, and `examples/`. An explicit selection must be absolute, symlink-free, and disjoint from the runtime root in both containment directions. |
 | `--dp-endpoint` | `127.0.0.1:50052` | DP gRPC listen address. |
 | `--cp-endpoint` | `127.0.0.1:50051` | CP gRPC listen address. |
-| `--epoch-duration` | `15.0` | Requested epoch traffic window in seconds, excluding setup, drain, and analysis. |
-| `--epoch-pps` | `1000` | Aggregate PPS for epoch, commit-confirmed, and rollback traffic, in `1..1000000000`. Epoch rate times duration must schedule at least one packet and fit uint32. |
-| `--epoch-transition-time` | `5.0` | Seconds of baseline epoch traffic before the transition. |
-| `--epoch-overlap-ms` | `500` | TRex sustained initial/next generation-tag overlap in the positive uint32 millisecond domain. Native TAP requests one pre-authored tag transition. |
+| `--epoch-duration` | `30.0` | Requested epoch traffic window in seconds, including load qualification but excluding setup, drain and analysis. |
+| `--epoch-pps` | `1000` | Aggregate PPS across ingress ports for epoch, commit-confirmed and rollback traffic, in `1..1000000000`. Each TRex epoch population uses this rate, so overlap doubles it. Epoch rate times duration must schedule at least one packet and fit uint32. |
+| `--epoch-initial-duration` | `5.0` | Initial-generation interval before requesting the next traffic population. Apply follows qualified load. |
+| `--epoch-overlap-ms` | `500` | Minimum TRex initial/next generation-tag overlap in positive uint32 milliseconds. Completion and target-load qualification may extend it. Native TAP requests one pre-authored tag change. |
 | `--output-dir` | `/tmp/kinetum_validation` | Absent absolute final path created once for CP state, logs, captures, and JSON artifacts. Existing output rejects. |
 | `--verbose`, `-v` | off | Starts Photon, CP, and DP at DEBUG instead of INFO; includes ordinary TRex stderr details and CLI error tracebacks. Process output is streamed unchanged in both modes. |
 | `--no-color` | off | Disables ANSI output in `ConsoleReporter`. |
@@ -675,9 +675,13 @@ decimal port ID with explicit uint64 `opackets`, `ipackets`, `oerrors`, and
 acceptance and again before writing. Missing fields, changed port membership,
 regression, and inconsistent totals reject; historical errors are excluded.
 
-Epoch TX/RX comes from PGIDs created for that session. Expected TX uses both
-endpoint-monotonic generation-active intervals, recorded as
-`measured_generation_intervals`. The start action retains every owned port's
+Epoch TX/RX comes from PGIDs created for that session. Aggregate and per-flow
+expected TX use the endpoint-monotonic generation-active intervals, recorded as
+`measured_generation_intervals`. The start flow plan carries identities, without
+forecast packet counts. At finish, each expectation is the rounded product of
+its configured flow rate and its population's measured active duration. The
+endpoint and consumer use the same division-before-multiplication expression.
+The start action retains every owned port's
 absolute baseline; finish must echo it unchanged. Client-local `clear_stats()`
 references cannot span reconnecting actions. Baseline-subtracted `port_tx_count`
 and `port_rx_count` must equal PGID aggregates, with zero new ingress `oerrors`
@@ -691,8 +695,10 @@ Requests and receipts preserve both identities. The
 retains raw PGIDs, requested overlap, its lower bound from
 post-resume/pre-pause samples, both generation-active intervals, target
 achievement, and endpoint-monotonic time provenance. Exactly two tag classes
-must have nonzero TX/RX. Every nonzero-target PGID must reach 95 percent of its
-target, RX cannot exceed TX, and measured overlap must cover the request.
+must have nonzero TX/RX. Each PGID must have a positive measured expectation and
+reach 95 percent of that count. RX cannot exceed TX, and measured overlap must
+cover the request. Rounding each flow can differ from rounding the aggregate;
+observed PGID totals must still reconcile exactly.
 
 Reconnects disable TRex's clear-on-connect reference update so earlier traffic
 is retained. After pausing final streams and draining traffic, one `get_stats()`
@@ -804,9 +810,10 @@ Backends own resource setup, while the selected `BackendProfile` owns the exact
 traffic driver, timestamp source, rate-control source, and nullable latency
 source. Drivers publish no duplicate capability record. Their sole
 choreography distinction is `requires_sustained_generation_overlap`: native
-TAP performs one immediate pre-authored tag switch, while TRex keeps both tag
-streams live for the configured overlap interval. Both paths publish one start
-edge, one end edge, and exact generation-separated counts before completion.
+TAP requests one pre-authored tag change, while TRex keeps both tag streams
+live through completion and load qualification for at least the configured
+overlap interval. On success, both paths complete one start edge and one end
+edge and retain exact generation-separated counts.
 None of these harness facts participates in runtime provider admission.
 
 ---
@@ -897,105 +904,129 @@ Its packets do not enter throughput, latency, or RSS-balance measurements.
 
 ## 10. epoch
 
-The epoch test runs continuous generation-tag-separated traffic, applies one
-snapshot mid-flight, and requires one coherent pre/post stats pair with exact
-terminal, protocol-fault, and every-boundary CUT/ACK evidence. The packet tag
-is a 16-bit traffic-profile discriminator; it never carries or predicts a DP
-epoch. Each result is specific to the recorded runtime, profile, and measured
-traffic interval.
+The epoch test establishes the intended ingress load before applying one
+snapshot, retains that traffic through exact completion, then qualifies load
+under the target configuration. The packet tag is a 16-bit traffic-profile
+discriminator; it never carries or predicts a DP epoch. Packet observations,
+load qualification and the Ordered-CUT Boundary Protocol proof are separate
+requirements for success.
 
-**Goal.** Validate loss and exact Ordered-CUT Boundary Protocol completion
-during one live snapshot apply: every compiled boundary must finish the same
-from/to generation with drained sequence cut, open sender/receiver phases,
-complete edge timing, and zero new typed protocol faults.
+**Goal.** Validate loss and exact boundary completion during a live snapshot
+apply under the recorded workload. Every compiled boundary must finish the
+same transition with its consumed cut, open endpoints, complete edge timing
+and zero new typed protocol faults.
 
 **Inputs.**
 
 - Deployment: must satisfy `spec.needs_modules`; `passthrough` rejects before
   run ownership or process effects for every transition-oriented test type.
-- `--epoch-duration` (default `15.0` s), `--epoch-pps` (default
-  `1000`).
-- `--packet-size` (default `64` bytes), shared by the initial and next
-  generation streams.
-- Snapshots `config_snapshot.pbtxt` (already applied during setup) and
-  `config_snapshot_v2.pbtxt` (applied during the transition).
+- `--epoch-duration` (default `30.0` s), `--epoch-pps` (default `1000`),
+  `--epoch-initial-duration` (default `5.0` s) and `--epoch-overlap-ms`
+  (default `500` ms).
+- `--packet-size` (default `64` bytes), shared by both traffic populations.
+- Snapshots `config_snapshot.pbtxt` (already active during setup) and
+  `config_snapshot_v2.pbtxt` (the Apply target).
 
 Both gateway snapshots retain a 10 Gb/s per-flow QoS rate and a 4096 KiB burst
-allowance; v2 changes DSCP marking from 10 to 20. With TRex, the aggregate
-target PPS doubles during generation overlap. Size the workload for both the
-rate and burst allowance, as well as the egress link capacity.
+allowance; v2 changes DSCP marking from 10 to 20. Each TRex population uses the
+requested aggregate PPS across ingress ports, so overlap doubles the target.
+Native TAP changes its tag at unchanged aggregate PPS. Size the workload for
+the rate, burst allowance and egress capacity.
 
 **Driver.** `scenarios.run_epoch_test(context)`.
 
 **Recipe.**
 
-1. Query one successful exact stats snapshot before starting traffic and use
-   its nonzero active epoch as `dp_epoch_start`; failure is terminal and no
-   default epoch exists.
-2. Start capture on egress.
-3. Build a packet config with `pps = epoch.pps`,
-   `duration_s = epoch.duration_s`, preserving the configured packet size and
-   flow fields.
-4. Start the selected sender's generation-tag session with explicit tags 1 and
-   2. Native TAP spawns `kinetum_tap_sender` in `--mode generation-tagged`
-   with both tags pre-authored and `SIGUSR1` blocked across spawn. TRex starts
-   initial-tag PGID streams and keeps next-tag streams paused on the traffic
-   endpoint.
-5. Let baseline traffic run until `--epoch-transition-time` (default 5.0 s),
-   reserving the final part of that interval for the pre-transition observation.
-6. Take one pre-transition snapshot with stage, worker, region, and boundary
-   rows plus mandatory transition/fault summaries. Runtime/config identity
-   must still match step 1 and DP RX must have increased, proving that traffic
-   reached the dataplane before mutation.
-7. Trigger the transition. Dispatch `KinetumCtl.apply_config(v2)` as
-   an async task, then immediately tell the traffic driver to start
-   next-tag traffic. Native TAP publishes its sole `SIGUSR1` edge; TRex resumes
-   paused next-tag PGID streams. The traffic profile and exact CP-returned epoch
-   remain independent evidence dimensions.
-8. For sustained-overlap drivers such as TRex, wait `--epoch-overlap-ms`.
-   Both drivers then complete their end edge: TRex pauses the initial-tag
-   streams; native TAP closes the logical edge without another signal. Await the
-   apply completion.
-9. Let traffic finish out the remaining duration, allow the bounded packet
-   drain, then stop capture and analyze the packet evidence.
-10. Take a post-transition stats snapshot.
-11. Require the latest terminal to be exact COMPLETE for its recorded
-    `from_epoch -> to_epoch`, no retirement freeze or success-block latch,
-    zero typed fault delta, and every boundary row to carry matching generation/from/to,
-    a cut no greater than the completed dequeue sequence, OPEN/OPEN terminal
-    phases, no pending CUT/ACK, and all three checked durations.
-12. Only after that exact gate succeeds, compute the same-generation delta and
-    append a record to `transition_metrics.jsonl` with
-    `transition_type = "epoch"`. Incomplete evidence fails the scenario and
-    produces no transition record.
+1. Read the exact current runtime/configuration identity and complete stream
+   counters. Admit the target file and traffic window before starting traffic.
+2. Start egress capture and the sender with the configured packet size, flow
+   fields, PPS and duration. Tags 1 and 2 are pre-authored. TRex starts only the
+   first population; native TAP blocks `SIGUSR1` across spawn as described in
+   [Section 14.5](#145-one-way-generation-tag-signal).
+3. During the initial interval, require advancing worker publications and
+   positive DP ingress under the original configuration.
+4. At the end of that interval, resume TRex's second population or request
+   TAP's tag change. Establish a fresh DUT publication barrier and qualify
+   the old configuration's ingress load using the rules below.
+5. Issue Apply with the observed expected revision. Keep traffic unchanged
+   while collecting its exact result, successful terminal transition and every
+   boundary's matching completion. A preparation abort can consume an epoch,
+   so the returned target must advance but need not be numerically adjacent.
+   Record that completion in `transition_metrics.jsonl` before target-load
+   qualification, which can still fail independently.
+6. Establish another publication barrier after COMPLETE and qualify load under
+   that exact target configuration. The early old bank published during
+   activation cannot serve as the target phase's seed.
+7. End overlap only after completion, target qualification and the requested
+   minimum overlap have all been satisfied. TRex pauses the initial population;
+   TAP closes its logical edge without sending another signal.
+8. Finish the remaining traffic window, allow the bounded post-send drain,
+   stop capture and analyze the selected driver's evidence.
+9. Read final telemetry and require IDLE, the same runtime/plan, the exact Apply
+   identity, unchanged boundary membership and capacities, matching COMPLETE
+   and CUT/ACK evidence, and zero protocol-fault delta through the traffic tail.
 
-**What a successful live run proves.** Traffic evidence and DP
-ownership evidence agree for one real ordered transition. It does not by
-itself qualify package identity, another architecture, a subsequent transition,
-fault injection, or throughput beyond the measured workload.
+**Load qualification.** Both phases require three consecutive complete
+intervals within one runtime, plan, configuration revision/hash and epoch.
+The first successful collection after the phase begins supplies its barrier;
+all worker publications must move beyond it before the seed is accepted.
+Repeated reads create no sample. Each interval then requires:
 
-No runtime or build selector weakens the protocol evidence gate. A physical
-negative control requires its own explicit mechanism and evidence contract; it
-cannot be inferred from missing telemetry or an alternate build label.
+| Property | Requirement |
+|----------|-------------|
+| Owner progress | Every worker advances, including workers without I/O. |
+| Owner elapsed time | Between 1 and 3 seconds for every worker. |
+| Common coverage | The earliest ending publication is later than the latest starting publication. |
+| Counter resolution | Summed one-count rate increments from a port's owners are at most 0.5% of that port's target. |
+| Rate | The measured rate on each logical ingress port is within 1% of its target. |
 
-**Pass criteria.** Exact sender/capture and two-tag accounting,
-loss within both `--max-loss` and the fixed epoch ceiling (0.1%), one observed epoch advance,
-exact terminal COMPLETE without freeze or a success-block latch, nonzero
-boundary population, `completed_boundaries == boundary_count`, and zero
-protocol-fault delta. The `zero_loss` artifact field remains literal
-`TX == RX`; it is not relabeled true for a tolerated loss. Backpressure is
-recorded but is not itself a failure; capacity/performance evaluation remains
-part of separate performance qualification.
+For each port, group its RX streams by owner and divide each owner's packet
+delta by that owner's elapsed publication time, then sum those contributions.
+RSS queues need not have equal rates. Collection time is a freshness barrier,
+not a rate denominator; TRex endpoint clocks are not subtracted from DUT clocks.
 
-Native TAP also requires each ingress to retain initial-tag then next-tag
-packets with exactly one tag change in that input. Their merged capture may
-contain several adjacent tag changes. TRex uses its separate PGID populations
-and the exact boundary observations, with no packet-order claim.
+Progress, elapsed time, common coverage and resolution determine completeness.
+Incomplete evidence waits. Exceeding the three-second owner ceiling breaks the
+streak and starts a new interval; a complete out-of-band rate does the same.
+Contradictory identities or regressed counters fail immediately. In particular,
+a zero measured rate is a rate failure only after its interval is complete.
 
-**Artifacts.** `epoch_capture.pcap` or its TRex generation/PGID sidecar,
-`photon.log`, the `epoch_test` block
-in `test_results.json`, and exactly one `transition_metrics.jsonl` record
-tagged `"epoch"`.
+Each phase, including its barrier, has a 20-second observation budget. The
+harness reserves the last second of the traffic window for the tail. Both the
+qualifying observations and the driver's overlap commands must finish before
+that tail begins. The window must contain the initial interval, both minimum
+three-second qualifications, any longer requested TRex overlap, and the tail.
+Scheduling delays and time spent in Apply count against the same deadline.
+Before issuing Apply, the harness requires room for the minimum target phase.
+
+If old-load qualification fails, Apply is not issued. Once Apply is accepted,
+expiry or cancellation stops traffic promptly while its result is still
+collected. A late success remains recorded, but cannot rescue failed workload
+qualification. Timeout does not imply rollback.
+
+**Pass criteria.** Qualified load in both phases, exact sender/capture and
+two-tag accounting, loss within both `--max-loss` and the epoch ceiling (0.1%),
+one exact completed transition, all boundary CUT/ACK rows, and zero protocol
+faults. The `zero_loss` field remains literal `TX == RX`, even when the selected
+loss tolerance permits a passing nonzero loss. Backpressure is recorded and is
+not itself a failure.
+
+Native TAP additionally requires initial-tag then next-tag packets with exactly
+one change in each input. Their merged capture may contain multiple adjacent
+tag changes. TRex requires its per-flow PGID evidence and makes no per-packet
+ordering claim.
+
+**What this proves.** The recorded workload, packet evidence and protocol
+completion agree for this run. The rate intervals bracket the transition;
+they do not establish instantaneous wire rate during it, a throughput ceiling,
+or performance outside the tested workload. No runtime or build selector
+weakens these checks.
+
+**Artifacts.** `epoch_capture.pcap` or its TRex sidecar, `epoch_load.json`,
+`photon.log`, the `epoch_test` result, and one `"epoch"` transition record when
+its protocol proof is complete. The load artifact retains partial qualification
+and an available Apply result on failure; [Section 17.5](#175-epoch_loadjson)
+defines its fields.
 
 ## 11. commit-confirmed
 
@@ -1504,6 +1535,7 @@ possible artifact.
 | `cp_store/` | non-dry-run startup | Fresh durable CP authority retained as run evidence after shutdown. |
 | `capture_<size>.pcap` or `capture_<size>.trex_stats.json` | per `standard` size | Native-TAP pcap or exact TRex counter sidecar. |
 | `epoch_capture.pcap` or `epoch_capture.trex_stats.json` | `epoch` test | Native-TAP pcap or generation/PGID TRex sidecar. |
+| `epoch_load.json` | epoch finalization after initial runtime identity is admitted, including failed qualification | Bounded old/target source observations, barriers, policy, Apply result and failure diagnostic. |
 | `commit_confirmed_capture.pcap` or matching TRex sidecar | `commit_confirmed` test | Traffic-window evidence. |
 | `rollback_capture.pcap` or matching TRex sidecar | `rollback` test | Traffic-window evidence. |
 | `<capture-stem>.capture.json` | each stopped native-TAP capture, including failed completion | tcpdump exit code, reported captured/filter/drop counters, and nullable completion error. Missing counters remain absent. |
@@ -1606,19 +1638,19 @@ A `packet_tests[]` entry:
 }
 ```
 
-The `epoch_test` block:
+The `epoch_test` block, illustrating a 30-second native-TAP window:
 
 ```json
 {
   "passed": true,
-  "duration_s": 15.04,
-  "total_sent": 15000,
-  "total_received": 15000,
-  "initial_generation_sent": 7500,
-  "next_generation_sent": 7500,
-  "initial_generation_received": 7500,
-  "next_generation_received": 7500,
-  "generation_tag_transition_seq": 7500,
+  "duration_s": 32.40,
+  "total_sent": 30000,
+  "total_received": 30000,
+  "initial_generation_sent": 5000,
+  "next_generation_sent": 25000,
+  "initial_generation_received": 5000,
+  "next_generation_received": 25000,
+  "generation_tag_transition_seq": 5000,
   "loss_pct": 0.00,
   "avg_latency_us": 142.5,
   "zero_loss": true,
@@ -1628,6 +1660,7 @@ The `epoch_test` block:
   "protocol_faults_observed": 0,
   "backpressure_events": 23,
   "boundary_ordering_validated": true,
+  "load_qualified": true,
   "message": "..."
 }
 ```
@@ -1816,6 +1849,12 @@ collection provenance, worker population, and worker measurement endpoints.
 Counter deltas describe that recorded interval, which may include an earlier
 apply when automatic rollback wins the observation race. Boundary timings
 remain bound to the exact named terminal transition.
+For an epoch run, the counter window begins before source admission and ends
+at the COMPLETE observation. It includes initial traffic and old-load
+qualification. That record survives a subsequent target-load or traffic
+failure; it does not by itself establish a passing workload.
+The final traffic-tail observation passes the same counter and membership
+checks without appending another transition record.
 Summary and benchmark readers require identical fault, boundary, region, and
 stage membership across every record, including stable boundary ID/index
 pairs. All three row families are nonempty for an admitted transition scenario.
@@ -1924,6 +1963,33 @@ nearest rank. The benchmark aggregator reads the raw JSONL and computes its own
 distributions across runs. This file is a run-local summary, not a replacement
 for the original transition records.
 
+### 17.5 epoch_load.json
+
+The epoch scenario retains its qualification evidence independently of final
+packet conservation. A failed run can therefore have qualified load, or a
+completed Apply with an unqualified target phase. A successful epoch result
+requires `load_qualified` and this artifact's matching successful verdict.
+
+| Field | Content |
+|-------|---------|
+| `run_root` | Exact absolute run directory; readers reject a proof copied from another run. |
+| `old`, `new` | Phase evidence, or null if that phase was never constructed. |
+| `apply` | The collected Apply result, including a late result after the traffic deadline, or null if unavailable. |
+| `load_qualified` | Both phases completed the required streak under the exact advancing Apply identity. |
+| `failure` | Empty on scenario success; otherwise its diagnostic, including retirement failure. |
+
+Each phase contains its runtime/configuration identity, per-port targets, policy
+bounds, barrier read, up to four qualifying endpoints and their rates, latest
+observation, and last rejected interval. Endpoints retain the worker and stream
+fields used in the calculation. Common coverage and counter resolution establish
+completeness before rate classification, as defined in [Section 10](#10-epoch).
+The last old and first target observations bracket the configuration change;
+their cross-epoch delta contributes to neither phase's rate verdict. The file
+is bounded by the shared JSON size limit and contains no polling history.
+Writers and readers recompute the retained interval verdicts from those
+endpoints. Benchmark aggregation and raw export also require targets to match
+the manifest's PPS and ingress population; the verdict flag alone is insufficient.
+
 ---
 
 ## 18. kinetum_benchmark
@@ -1980,7 +2046,7 @@ These options use the defaults and meanings from
 | Traffic endpoint | `--traffic-host`, `--traffic-ssh-port`, `--traffic-python`, `--traffic-work-dir` |
 | TRex | `--trex-server`, `--trex-api-path`, `--trex-port` |
 | Packet generation | `--pps`, `--count`, `--packet-size`, `--num-flows` |
-| Epoch traffic | `--epoch-duration`, `--epoch-pps`, `--epoch-transition-time`, `--epoch-overlap-ms` |
+| Epoch traffic | `--epoch-duration`, `--epoch-pps`, `--epoch-initial-duration`, `--epoch-overlap-ms` |
 | Installation | `--runtime-root` (required), `--validation-root` |
 | Runtime DEBUG logs and diagnostic detail | `--verbose` (`-v`) |
 
@@ -2296,7 +2362,8 @@ and platform role files under `logs/` to locate faults.
 | Standard test: `missing_count`, `duplicates`, or `out_of_order` nonzero | Absent IDs, repeated IDs, or reordering within one ingress. | Per-input rows in `<capture-stem>.traffic.json` plus the pcap. |
 | Standard test: `invalid` count high | Frames fail the complete Ethernet/IPv4/UDP generation-envelope contract: protocol/fragment/length coherence, magic, bounded sequence/tag, or valid timestamp evidence. ARP, ICMP, truncated packets, and foreign UDP all fail this gate. | Tighten the BPF filter and inspect the egress pcap for non-test or malformed traffic. |
 | Native TAP: `latency` is null | No valid timestamped Kinetum frames were accepted, or `--no-latency` was used when invoking the analyzer directly. | Check `valid`, `invalid`, and the pcap timestamps; measured latency requires capture time to follow TX time. |
-| Epoch test: `transitions_observed == 0` | CP apply failed, the bounded tag did not switch, or exact pre/post epochs agree. | `photon.log` and the `kinetumctl` result. |
+| Epoch test: `transitions_observed == 0` | The final configuration did not match the completed Apply result. | Final runtime identity and the exact CLI result; traffic tags are separate evidence. |
+| Epoch test: load qualification exhausted its window | Rate was outside the band, or source publications, common coverage or counter resolution remained insufficient. | `epoch_load.json`, its last rejected interval and the recorded policy. Apply is withheld until old-load qualification succeeds. |
 | Epoch test: `loss_pct > 0.1%` | Observed loss exceeded the epoch tolerance. | Check driver evidence, port errors, stage drops, QoS causes, and boundary deltas; a loss total alone does not identify a protocol fault. |
 | Epoch test: incomplete boundary rows or nonzero protocol-fault delta | CUT/ACK identity, drain, timing, or ownership safety did not converge exactly. | Inspect `boundary_epoch_stats`, `protocol_fault_deltas`, and the first-fault record; never infer success from packet loss alone. |
 | Commit-confirmed test: `confirm_success == false` | CP rejected snapshot/epoch/revision/key identity or the durable deadline won. | `photon.log` and the exact CLI result. |
