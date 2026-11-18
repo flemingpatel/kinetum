@@ -688,7 +688,8 @@ def _validate_native_diagram_tools(source_root: pathlib.Path) -> tuple[pathlib.P
     # Ubuntu's dot alias selects layout mode in libgvc6-config-update.
     dot = _discover_tool("dot", retain_alias=True)
     java_version = _run_small([str(java), "--version"], "Java version", source_root)
-    if not re.match(r'^(?:openjdk|java) 21(?:\.[0-9]+){0,3}(?:[ +\n]|$)', java_version):
+    # Java permits vendor-specific numeric components after the patch number.
+    if not re.match(r"^(?:openjdk|java) 21(?:\.[0-9]+)*(?:[ +\n]|$)", java_version):
         raise DocumentationError("documentation rendering requires Java 21")
     dot_version = _run_small([str(dot), "-V"], "Graphviz version", source_root)
     if not re.fullmatch(r"dot - graphviz version 2\.43\.0 \([^\r\n]+\)", dot_version):
