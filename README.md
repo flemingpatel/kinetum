@@ -12,13 +12,16 @@ applications composed from reusable pipeline stages. It separates application
 policy from execution, resource management, and live configuration coordination,
 reducing the infrastructure each application must implement.
 
-> **Epoch-transition status:** Live configuration updates use the sequence-defined
-> Ordered-CUT Boundary Protocol (DATA/CUT/ACK), exact worker ownership
-> accounting, owner-worker activation, and quiescence-gated reclamation. The
-> control plane exposes durable Prepare/Activate convergence, commit-confirmed
-> updates, and evidence-gated guardrails. Physical results apply to the tested
-> hardware and configurations; broader qualification remains incomplete.
-> Kinetum 0.1.0 has no physical TRex packet-latency measurement contract.
+> **Epoch-transition status:** On a CloudLab d430 gateway, Kinetum used the
+> Ordered-CUT Boundary Protocol to update a running pipeline in each of four
+> tested profiles. Before and after each update, the two inputs together carried
+> about 800,000 packets/s with 1,514-byte frames. Including Ethernet overhead,
+> that load represents 98.4% of the capacity of the single 10 Gb/s output link.
+> Every update completed with zero protocol faults, and the sent and received
+> test-packet counts matched in every run. Kinetum 0.1.0 does not measure
+> per-packet latency in its physical TRex tests.
+> [Protocol](docs/diagrams/ordered_cut_boundary_protocol.md) |
+> [Test method](docs/VALIDATION_GUIDE.md#10-epoch)
 
 ## Status
 
