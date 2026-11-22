@@ -87,6 +87,7 @@ namespace kinetum::dp
 {
 
 class boundary_epoch_channel;
+struct native_packet_binding;
 struct epoch_transition_certificate_worker_source;
 class worker_boundary_receiver;
 class worker_boundary_sender;
@@ -174,6 +175,8 @@ class packet_worker_kernel final {
 
 	/** @return Exact compact worker identity. */
 	[[nodiscard]] uint32_t worker_index() const noexcept;
+	/** @return The immutable native route in use, or null when this worker stages full records. */
+	[[nodiscard]] const native_packet_binding *native_binding() const noexcept;
 
 	/**
 	 * @brief Read one coherent worker-owned epoch-accounting publication.

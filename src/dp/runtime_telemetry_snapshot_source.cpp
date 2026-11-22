@@ -406,9 +406,10 @@ common::status_or<std::unique_ptr<runtime_telemetry_snapshot_source>> runtime_te
 	const provider::materialized_provider_runtime &providers, runtime_telemetry_aggregator &aggregator,
 	const runtime_status_publication &runtime_status, const epoch_transition_coordinator &coordinator,
 	const epoch_transition_certificate &certificate, const epoch_transition_completion *completion,
-	const epoch_protocol_fault_latch &protocol_faults)
+	const epoch_protocol_fault_latch &protocol_faults, std::vector<runtime_worker_packet_binding> bindings)
 {
 	if (runtime_generation == 0u || providers.runtime_generation() != runtime_generation ||
+	    bindings.size() != topology.worker_schedules.size() ||
 	    certificate.runtime_generation() != runtime_generation ||
 	    !certificate.owns_participants(coordinator.participants()) ||
 	    !coordinator.owns_protocol_faults(runtime_generation, protocol_faults) ||
@@ -421,6 +422,7 @@ common::status_or<std::unique_ptr<runtime_telemetry_snapshot_source>> runtime_te
 		auto source = std::unique_ptr<runtime_telemetry_snapshot_source>(new runtime_telemetry_snapshot_source(
 			runtime_generation, topology, providers, aggregator, runtime_status, coordinator, certificate,
 			completion, protocol_faults));
+		source->packet_bindings_ = std::move(bindings);
 		auto initialized = source->initialize_();
 		if (!initialized.is_ok()) {
 			return initialized;
@@ -904,6 +906,7 @@ runtime_telemetry_snapshot_source::collect(const runtime_telemetry_request &requ
 			snapshot.ports = port_rows_;
 		}
 		if (request.include_topology_stats) {
+			snapshot.packet_bindings = packet_bindings_;
 			snapshot.steering_profiles = steering_rows_;
 			snapshot.module_context_domains = module_context_rows_;
 		}

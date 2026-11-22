@@ -1700,8 +1700,8 @@ class mpmc_queue_dynamic {
  *
  * @par Performance
  * Construction adopts already allocated storage. Scalar operations are O(1);
- * consuming or clearing n values is O(n). Batch consumption reads at most two
- * contiguous slot ranges and advances the owner cursor once. Every operation
+ * publishing, consuming or clearing n values is O(n). Each batch uses at most
+ * two contiguous slot ranges and advances its owner cursor once. Every operation
  * is allocation-free and lock-free, using the shared mask/index core.
  *
  * @tparam T Move-constructible value type.
@@ -1779,6 +1779,33 @@ class work_queue_view {
 		}
 		new (&storage_[indices_.producer_slot()]) T(std::move(value));
 		indices_.commit_push();
+		return true;
+	}
+
+	/**
+	 * @brief Copy a complete FIFO prefix into free slots and publish it once.
+	 * @param values Nonoverlapping source values, nonnull for a nonempty prefix.
+	 * @param count Exact number of values to construct.
+	 * @return False before construction if the input is missing or the prefix does not fit.
+	 */
+	[[nodiscard]] bool try_push_prefix(const T *values, std::size_t count) noexcept
+		requires std::is_nothrow_copy_constructible_v<T>
+	{
+		if (count == 0u) {
+			return true;
+		}
+		if (values == nullptr || count > capacity() - size()) {
+			return false;
+		}
+		const auto begin = indices_.producer_slot();
+		const auto first = std::min(count, capacity() - begin);
+		for (std::size_t index = 0u; index < first; ++index) {
+			std::construct_at(reinterpret_cast<T *>(&storage_[begin + index]), values[index]);
+		}
+		for (std::size_t index = first; index < count; ++index) {
+			std::construct_at(reinterpret_cast<T *>(&storage_[index - first]), values[index]);
+		}
+		indices_.commit_push_prefix(count);
 		return true;
 	}
 

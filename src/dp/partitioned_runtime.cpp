@@ -48,6 +48,7 @@
 #include "src/dp/epoch/worker_boundary_sender.hpp"
 #include "src/dp/module/module_runtime_generation.hpp"
 #include "src/dp/packet_worker_kernel.hpp"
+#include "src/dp/worker_native_handoff.hpp"
 #include "src/dp/region_worker_launcher.hpp"
 #include "src/dp/runtime_telemetry_aggregator.hpp"
 #include "src/dp/runtime_telemetry_snapshot_source.hpp"
@@ -413,9 +414,19 @@ class partitioned_runtime::implementation final {
 		}
 		next_telemetry_service_ = telemetry_deadline.value();
 
+		std::vector<runtime_worker_packet_binding> bindings;
+		bindings.reserve(worker_count);
 		worker_contexts_.reserve(worker_count);
 		for (const auto &kernel : kernels_) {
 			worker_contexts_.push_back(&kernel->lifecycle_record());
+			if (const auto *route = kernel->native_binding()) {
+				bindings.emplace_back(runtime_native_packet_route{
+					topology_->io_streams.at(route->rx_stream).io_stream_id,
+					topology_->io_streams.at(route->tx_stream).io_stream_id,
+					topology_->storage_domains.at(route->domain).storage_domain_id});
+			} else {
+				bindings.emplace_back(std::nullopt);
+			}
 		}
 		worker_count_ = worker_count;
 		auto services = modules_->start_lifecycle_services(*providers_);
@@ -444,7 +455,8 @@ class partitioned_runtime::implementation final {
 		}
 		auto telemetry_source_or = runtime_telemetry_snapshot_source::create(
 			runtime_generation_, *topology_, *providers_, *telemetry_aggregator_, runtime_status_,
-			*coordinator_, *transition_certificate_, completion_.get(), protocol_faults_);
+			*coordinator_, *transition_certificate_, completion_.get(), protocol_faults_,
+			std::move(bindings));
 		if (!telemetry_source_or.is_ok()) {
 			return telemetry_source_or.error();
 		}

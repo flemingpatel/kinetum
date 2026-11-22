@@ -1449,6 +1449,115 @@ TEST(dpdk_io, missing_tx_storage_dependency_rejects_before_native_effects)
 	EXPECT_EQ(native.close_calls, 0u);
 }
 
+/** @brief The sole admitted pool can have a nonzero index; moving data at equal length invalidates its receipt. */
+TEST(dpdk_io, native_views_bind_a_nonzero_domain_and_check_original_data_start)
+{
+	constexpr std::array<uint32_t, 1> STORAGE_DOMAINS{1u};
+	facility_fixture facility;
+	facility.add_memory_domain(1);
+	ASSERT_EQ(facility.create(), KINETUM_PROVIDER_STATUS_OK);
+	mempool_state pool;
+	storage_fixture storage(facility, 1);
+	ASSERT_EQ(storage.create(pool), KINETUM_PROVIDER_STATUS_OK);
+	ethdev_state device;
+	io_driver_fixture driver(facility, storage);
+	driver.stream_fact(0).storage_domain_indices = STORAGE_DOMAINS.data();
+	driver.stream_fact(1).storage_domain_indices = STORAGE_DOMAINS.data();
+	ASSERT_EQ(driver.create(device), KINETUM_PROVIDER_STATUS_OK);
+	ASSERT_EQ(driver.activate(), KINETUM_PROVIDER_STATUS_OK);
+	const auto &rx = driver.driver()->operations().rx_queues[0];
+	const auto &tx = driver.driver()->operations().tx_queues[0];
+	ASSERT_NE(rx.native_storage, nullptr);
+	ASSERT_EQ(rx.native_storage, tx.native_storage);
+	ASSERT_EQ(tx.native_storage->owner, &storage.storage()->operations());
+	ASSERT_NE(rx.receive_native, nullptr);
+	ASSERT_NE(tx.transmit_native, nullptr);
+	auto &first = pool.objects[0].mbuf;
+	auto &second = pool.objects[1].mbuf;
+	std::array<kinetum_packet_native_view, 3> views{};
+	{
+		const std::array<rte_mbuf *, 2> input{&first, &second};
+		for (auto *mbuf : input) {
+			mbuf->data_len = 60u;
+			mbuf->pkt_len = mbuf->data_len;
+		}
+		native_receive_fixture receiver(input);
+		const auto received = rx.receive_native(rx.state, views.data(), 3u);
+		EXPECT_EQ(received.transferred_count, 2u);
+		EXPECT_EQ(received.rejected_count, 0u);
+		EXPECT_EQ(views[2].handle, nullptr);
+		EXPECT_EQ(views[2].length, 0u);
+	}
+	native_transmit_fixture dispatch(1);
+	EXPECT_EQ(tx.transmit_native(tx.state, views.data(), 2u), 1u);
+	ASSERT_EQ(dispatch.submitted().size(), 2u);
+	EXPECT_EQ(dispatch.submitted().front(), &first);
+	const auto *original = tx.native_storage;
+	EXPECT_EQ(original->verify(original->owner->state, &views[1], 1u), 1u);
+	const std::array<kinetum_packet_native_view, 2> duplicate{views[1], views[1]};
+	EXPECT_EQ(original->verify(original->owner->state, duplicate.data(), 2u), 0u);
+	++second.data_off;
+	EXPECT_EQ(original->verify(original->owner->state, &views[1], 1u), 0u);
+	// Only the first view can reach the driver. A return of two still fits
+	// the worker's offer but exceeds the prefix the provider actually sent.
+	EXPECT_DEATH(
+		{
+			rte_eth_fp_ops[TEST_PHYSICAL_PORT].tx_pkt_burst = [](void *, rte_mbuf **,
+									     uint16_t valid) -> uint16_t {
+				return static_cast<uint16_t>(valid + 1u);
+			};
+			(void)tx.transmit_native(tx.state, views.data(), 2u);
+			std::_Exit(EXIT_SUCCESS);
+		},
+		"");
+	--second.data_off;
+	const auto room = second.buf_len;
+	second.buf_len = static_cast<uint16_t>(second.data_off + second.data_len - 1u);
+	EXPECT_EQ(original->verify(original->owner->state, &views[1], 1u), 0u);
+	EXPECT_EQ(tx.transmit_native(tx.state, &views[1], 1u), 0u);
+	second.buf_len = room;
+	rte_mbuf_refcnt_set(&second, 2u);
+	original->release(original->owner->state, &views[1], 1u);
+	EXPECT_EQ(rte_mbuf_refcnt_read(&second), 1u);
+	EXPECT_EQ(driver.deactivate(), KINETUM_PROVIDER_STATUS_OK);
+}
+
+/** @brief Full-record TX and cloning reject an out-of-room view while its owner can still reclaim it. */
+TEST(dpdk_io, full_record_range_must_fit_before_copy_or_transmit)
+{
+	facility_fixture facility;
+	ASSERT_EQ(facility.create(), KINETUM_PROVIDER_STATUS_OK);
+	mempool_state pool;
+	storage_fixture storage(facility);
+	ASSERT_EQ(storage.create(pool), KINETUM_PROVIDER_STATUS_OK);
+	ethdev_state device;
+	io_driver_fixture driver(facility, storage);
+	ASSERT_EQ(driver.create(device), KINETUM_PROVIDER_STATUS_OK);
+	const auto &owner = storage.storage()->operations();
+	ASSERT_EQ(driver.activate(), KINETUM_PROVIDER_STATUS_OK);
+	const auto &tx = driver.driver()->operations().tx_queues[0];
+	auto &mbuf = pool.objects[0].mbuf;
+	rte_mbuf_refcnt_set(&mbuf, 2u);
+	mbuf.data_len = 60u;
+	mbuf.pkt_len = mbuf.data_len;
+	mbuf.data_off = static_cast<uint16_t>(mbuf.buf_len - mbuf.data_len);
+	auto *record = dp::initialize_dpdk_packet_record(&mbuf, owner);
+	ASSERT_NE(record, nullptr);
+	native_transmit_fixture dispatch(0);
+	EXPECT_EQ(tx.transmit_burst(tx.state, &record, 1u), 0u);
+	ASSERT_EQ(dispatch.submitted().size(), 1u);
+	{
+		native_transmit_fixture refused(0);
+		--mbuf.buf_len;
+		EXPECT_EQ(tx.transmit_burst(tx.state, &record, 1u), 0u);
+		EXPECT_TRUE(refused.submitted().empty());
+		EXPECT_EQ(owner.clone_writable(owner.state, record), nullptr);
+		owner.release_burst(owner.state, &record, 1u);
+		EXPECT_EQ(rte_mbuf_refcnt_read(&mbuf), 1u);
+	}
+	EXPECT_EQ(driver.deactivate(), KINETUM_PROVIDER_STATUS_OK);
+}
+
 /** @brief Mixed-pool TX preserves native mbuf order and ownership across partial acceptance. */
 TEST(dpdk_io, mixed_pool_tx_preserves_original_mbufs_and_accepted_prefix)
 {
@@ -1468,6 +1577,8 @@ TEST(dpdk_io, mixed_pool_tx_preserves_original_mbufs_and_accepted_prefix)
 	const auto &tx = driver.driver()->operations().tx_queues[0];
 	std::array<rte_mbuf *, 3> mbufs{&first_pool.objects[0].mbuf, &second_pool.objects[0].mbuf,
 					&first_pool.objects[1].mbuf};
+	EXPECT_EQ(tx.native_storage, nullptr);
+	EXPECT_EQ(tx.transmit_native, nullptr);
 	std::array<kinetum_packet_record *, 3> records{};
 	for (std::size_t index = 0; index < mbufs.size(); ++index) {
 		mbufs[index]->pkt_len = 64;

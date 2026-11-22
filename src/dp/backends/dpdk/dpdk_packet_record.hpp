@@ -8,9 +8,8 @@
  * @brief Provider-private mapping between rte_mbuf and packet_record.
  * @author Fleming Patel
  *
- * This header is private to the DPDK provider implementation. Core packet,
- * engine, boundary, SDK, and runtime interfaces carry packet_record pointers
- * and never include native DPDK declarations.
+ * Only the DPDK provider interprets mbufs. General routing and cross-worker
+ * boundaries use full records. A bound local handoff carries an opaque view.
  */
 
 #include <cstddef>
@@ -137,6 +136,16 @@ initialize_dpdk_packet_record(rte_mbuf *mbuf, const packet_storage_domain_operat
 }
 
 /**
+ * @param mbuf Live mbuf whose bytes will be accessed or offered to a queue.
+ * @return Whether its segment's advertised bytes fit the original backing room.
+ */
+[[nodiscard]] inline bool dpdk_packet_range_is_valid(const rte_mbuf &mbuf) noexcept
+{
+	return mbuf.buf_addr != nullptr && mbuf.data_off <= mbuf.buf_len &&
+	       mbuf.data_len <= mbuf.buf_len - mbuf.data_off;
+}
+
+/**
  * @brief Prove one record is the exact current view of its native DPDK owner.
  *
  * @param record Provider-neutral record to validate.
@@ -154,8 +163,8 @@ dpdk_packet_record_matches_storage(const packet_record *record,
 		return false;
 	}
 	auto *mbuf = static_cast<rte_mbuf *>(record->storage.native_handle);
-	return dpdk_packet_record(mbuf) == record && dpdk_packet_is_contiguous(*mbuf) &&
-	       record->storage.data == rte_pktmbuf_mtod(mbuf, uint8_t *) &&
+	return dpdk_packet_record(mbuf) == record && dpdk_packet_is_contiguous(*mbuf) && mbuf->buf_addr != nullptr &&
+	       mbuf->data_off <= mbuf->buf_len && record->storage.data == rte_pktmbuf_mtod(mbuf, uint8_t *) &&
 	       record->storage.length == rte_pktmbuf_pkt_len(mbuf) &&
 	       record->storage.contiguous_length == rte_pktmbuf_data_len(mbuf) &&
 	       record->storage.segment_count == mbuf->nb_segs;

@@ -49,13 +49,14 @@ class WorkerPacketStagingTest : public ::testing::Test {
 
 /** @brief Closed ownership contradictions exercised before any destructor can mask the target. */
 enum class staging_violation {
-	ACTIVE_ROTATION,    ///< Rotate while queued old work remains.
-	RESERVED_ROTATION,  ///< Rotate with an outstanding capacity claim.
-	ABSENT_ROTATION,    ///< Rotate a fixed/non-source domain.
-	NON_RX_FUTURE,	    ///< Publish executable work into an inert future role.
-	UNKNOWN_KEY,	    ///< Commit through an ordinal absent from the compiled key set.
-	RECURSIVE_SERVICE,  ///< Re-enter ready service from its callback.
-	LIVE_DESTRUCTION,   ///< Reclaim backing storage while a future pointer remains owned.
+	ACTIVE_ROTATION,       ///< Rotate while queued old work remains.
+	RESERVED_ROTATION,     ///< Rotate with an outstanding capacity claim.
+	ABSENT_ROTATION,       ///< Rotate a fixed/non-source domain.
+	ABSENT_FUTURE_PREFIX,  ///< Publish an RX prefix on a domain with only an active role.
+	NON_RX_FUTURE,	       ///< Publish executable work into an inert future role.
+	UNKNOWN_KEY,	       ///< Commit through an ordinal absent from the compiled key set.
+	RECURSIVE_SERVICE,     ///< Re-enter ready service from its callback.
+	LIVE_DESTRUCTION,      ///< Reclaim backing storage while a future pointer remains owned.
 };
 
 /**
@@ -98,7 +99,11 @@ void violate_staging(int32_t numa_node, staging_violation violation)
 	}};
 	const std::array<worker_packet_staging_domain, 1> DOMAINS{{
 		{0u, 4u,
-		 violation == staging_violation::ABSENT_ROTATION ? std::nullopt : std::optional<std::size_t>(4u), KEYS},
+		 (violation == staging_violation::ABSENT_ROTATION ||
+		  violation == staging_violation::ABSENT_FUTURE_PREFIX) ?
+			 std::nullopt :
+			 std::optional<std::size_t>(4u),
+		 KEYS},
 	}};
 	auto owner_or = worker_packet_staging::create(DOMAINS, numa_node);
 	if (!owner_or.is_ok()) {
@@ -113,6 +118,11 @@ void violate_staging(int32_t numa_node, staging_violation violation)
 	record.metadata.epoch = 1u;
 	std::array<packet_record *, 4> scratch{};
 	switch (violation) {
+	case staging_violation::ABSENT_FUTURE_PREFIX: {
+		packet_record *value = &record;
+		domain.commit_future_prefix(0u, std::span<packet_record *const>(&value, 1u));
+		break;
+	}
 	case staging_violation::ACTIVE_ROTATION:
 		if (!domain.reserve_active()) {
 			std::_Exit(EXIT_SUCCESS);
@@ -784,10 +794,10 @@ TEST_F(WorkerPacketStagingTest, counted_reservations_preserve_shared_capacity)
 /** @brief Contradictory publication, service, rotation and destruction fail at their own ownership edge. */
 TEST_F(WorkerPacketStagingTest, ownership_contradictions_fail_stop)
 {
-	for (const auto violation :
-	     {staging_violation::ACTIVE_ROTATION, staging_violation::RESERVED_ROTATION,
-	      staging_violation::ABSENT_ROTATION, staging_violation::NON_RX_FUTURE, staging_violation::UNKNOWN_KEY,
-	      staging_violation::RECURSIVE_SERVICE, staging_violation::LIVE_DESTRUCTION}) {
+	for (const auto violation : {staging_violation::ACTIVE_ROTATION, staging_violation::RESERVED_ROTATION,
+				     staging_violation::ABSENT_ROTATION, staging_violation::ABSENT_FUTURE_PREFIX,
+				     staging_violation::NON_RX_FUTURE, staging_violation::UNKNOWN_KEY,
+				     staging_violation::RECURSIVE_SERVICE, staging_violation::LIVE_DESTRUCTION}) {
 		SCOPED_TRACE(static_cast<int>(violation));
 		EXPECT_DEATH(violate_staging(numa_node_, violation), "");
 	}

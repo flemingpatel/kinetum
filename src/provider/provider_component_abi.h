@@ -456,7 +456,7 @@ typedef struct KINETUM_PROVIDER_ALIGNAS(8) kinetum_packet_storage_descriptor {
 	uint8_t padding[4];					     ///< Zeroed field-alignment padding.
 } kinetum_packet_storage_descriptor;
 
-/** Sole packet representation transferred through the dataplane. */
+/** Full record used for general routing, module execution and cross-worker transfers. */
 typedef struct KINETUM_PROVIDER_ALIGNAS(64) kinetum_packet_record {
 	kinetum_packet_storage_descriptor storage;  ///< Exact provider-backed storage.
 	kinetum_packet_private metadata;	    ///< Sole writable metadata authority.
@@ -474,6 +474,24 @@ typedef struct kinetum_packet_rx_burst_result {
 	uint16_t transferred_count;  ///< Exact compact prefix transferred to the caller.
 	uint16_t rejected_count;     ///< Native inputs consumed and discarded before transfer.
 } kinetum_packet_rx_burst_result;
+
+/** @brief Original contiguous range transferred across a synchronous worker-local native handoff. */
+typedef struct kinetum_packet_native_view {
+	void *handle;		 ///< Opaque identity interpreted by the provider.
+	const void *data_start;	 ///< Opaque witness of the first byte at admission.
+	uint32_t length;	 ///< Exact admitted byte count.
+	uint32_t reserved;	 ///< Must be zero.
+} kinetum_packet_native_view;
+
+/** @brief Original storage owner's optional contract for synchronous native views. */
+typedef struct kinetum_packet_native_storage_operations {
+	const kinetum_packet_storage_domain_operations *owner;	///< Exact materialized storage table and state.
+	/** @return One if every retained view still names its original live contiguous range. */
+	uint8_t (*verify)(void *state, const kinetum_packet_native_view *views,
+			  uint16_t count) KINETUM_PROVIDER_NOEXCEPT;
+	/** @brief Retire the complete verified prefix through its original storage owner. */
+	void (*release)(void *state, const kinetum_packet_native_view *views, uint16_t count) KINETUM_PROVIDER_NOEXCEPT;
+} kinetum_packet_native_storage_operations;
 
 /**
  * @brief Validate the complete consumed-input bound for one receive result.
@@ -504,7 +522,12 @@ typedef struct KINETUM_PROVIDER_ALIGNAS(64) kinetum_packet_rx_burst_operations {
 							uint16_t capacity) KINETUM_PROVIDER_NOEXCEPT;
 	uint16_t maximum_burst;	 ///< Maximum admitted destination capacity.
 	uint16_t logical_port;	 ///< Exact logical ingress port.
-	uint8_t padding[44];	 ///< Zeroed cache-line geometry padding.
+	uint8_t padding[4];	 ///< Zeroed pointer alignment.
+	/** @brief Transfer a compact native prefix; leave every unused requested entry zero. */
+	kinetum_packet_rx_burst_result (*receive_native)(void *state, kinetum_packet_native_view *views,
+							 uint16_t capacity) KINETUM_PROVIDER_NOEXCEPT;
+	const kinetum_packet_native_storage_operations *native_storage;	 ///< Present exactly with receive_native.
+	uint8_t tail_padding[24];					 ///< Zeroed cache-line geometry padding.
 } kinetum_packet_rx_burst_operations;
 
 /**
@@ -529,7 +552,12 @@ typedef struct KINETUM_PROVIDER_ALIGNAS(64) kinetum_packet_tx_burst_operations {
 	uint8_t (*maybe_flush)(void *state) KINETUM_PROVIDER_NOEXCEPT;
 	uint16_t maximum_burst;	 ///< Maximum admitted source count.
 	uint16_t logical_port;	 ///< Exact logical egress port.
-	uint8_t padding[28];	 ///< Zeroed cache-line geometry padding.
+	uint8_t padding[4];	 ///< Zeroed pointer alignment.
+	/** @brief Borrow views and consume exactly the returned prefix before returning to the worker. */
+	uint16_t (*transmit_native)(void *state, const kinetum_packet_native_view *views,
+				    uint16_t count) KINETUM_PROVIDER_NOEXCEPT;
+	const kinetum_packet_native_storage_operations *native_storage;	 ///< Present exactly with transmit_native.
+	uint8_t tail_padding[8];					 ///< Zeroed cache-line geometry padding.
 } kinetum_packet_tx_burst_operations;
 
 /** Fixed-width compiled CPU-owner kind. */
@@ -1150,6 +1178,14 @@ static inline uint8_t kinetum_provider_packet_storage_operations_are_valid(
 	return 1;
 }
 
+/** @param native Optional storage extension. @return One for an absent capability or a complete original owner. */
+static inline uint8_t kinetum_provider_native_storage_is_valid(const kinetum_packet_native_storage_operations *native)
+	KINETUM_PROVIDER_NOEXCEPT
+{
+	return native == NULL || (kinetum_provider_packet_storage_operations_are_valid(native->owner) &&
+				  native->verify != NULL && native->release != NULL);
+}
+
 /**
  * @brief Validate one exact receive-queue operation record.
  *
@@ -1162,8 +1198,15 @@ kinetum_provider_rx_operations_are_valid(const kinetum_packet_rx_burst_operation
 {
 	uint32_t index;
 	if (operations == NULL || operations->state == NULL || operations->receive_burst == NULL ||
-	    operations->maximum_burst == 0 || operations->logical_port == KINETUM_INVALID_PORT) {
+	    operations->maximum_burst == 0 || operations->logical_port == KINETUM_INVALID_PORT ||
+	    (operations->receive_native == NULL) != (operations->native_storage == NULL) ||
+	    !kinetum_provider_native_storage_is_valid(operations->native_storage)) {
 		return 0;
+	}
+	for (index = 0; index < (uint32_t)sizeof(operations->tail_padding); ++index) {
+		if (operations->tail_padding[index] != 0) {
+			return 0;
+		}
 	}
 	for (index = 0; index < (uint32_t)sizeof(operations->padding); ++index) {
 		if (operations->padding[index] != 0) {
@@ -1186,8 +1229,15 @@ kinetum_provider_tx_operations_are_valid(const kinetum_packet_tx_burst_operation
 	uint32_t index;
 	if (operations == NULL || operations->state == NULL || operations->transmit_burst == NULL ||
 	    operations->flush == NULL || operations->maybe_flush == NULL || operations->maximum_burst == 0 ||
-	    operations->logical_port == KINETUM_INVALID_PORT) {
+	    operations->logical_port == KINETUM_INVALID_PORT ||
+	    (operations->transmit_native == NULL) != (operations->native_storage == NULL) ||
+	    !kinetum_provider_native_storage_is_valid(operations->native_storage)) {
 		return 0;
+	}
+	for (index = 0; index < (uint32_t)sizeof(operations->tail_padding); ++index) {
+		if (operations->tail_padding[index] != 0) {
+			return 0;
+		}
 	}
 	for (index = 0; index < (uint32_t)sizeof(operations->padding); ++index) {
 		if (operations->padding[index] != 0) {
@@ -2112,6 +2162,27 @@ KINETUM_PROVIDER_STATIC_ASSERT(KINETUM_PROVIDER_ALIGNOF(kinetum_packet_record) =
 KINETUM_PROVIDER_STATIC_ASSERT(offsetof(kinetum_packet_record, metadata) == 48, "packet metadata offset changed");
 KINETUM_PROVIDER_STATIC_ASSERT(offsetof(kinetum_packet_record, storage) == 0, "packet storage offset changed");
 KINETUM_PROVIDER_STATIC_ASSERT(sizeof(kinetum_packet_rx_burst_result) == 4, "RX result size changed");
+KINETUM_PROVIDER_STATIC_ASSERT(sizeof(kinetum_packet_native_view) == 24 &&
+				       KINETUM_PROVIDER_ALIGNOF(kinetum_packet_native_view) == 8 &&
+				       offsetof(kinetum_packet_native_view, handle) == 0 &&
+				       offsetof(kinetum_packet_native_view, data_start) == 8 &&
+				       offsetof(kinetum_packet_native_view, length) == 16 &&
+				       offsetof(kinetum_packet_native_view, reserved) == 20,
+			       "native view layout changed");
+KINETUM_PROVIDER_STATIC_ASSERT(sizeof(kinetum_packet_native_storage_operations) == 24 &&
+				       KINETUM_PROVIDER_ALIGNOF(kinetum_packet_native_storage_operations) == 8 &&
+				       offsetof(kinetum_packet_native_storage_operations, owner) == 0 &&
+				       offsetof(kinetum_packet_native_storage_operations, verify) == 8 &&
+				       offsetof(kinetum_packet_native_storage_operations, release) == 16,
+			       "native storage operations layout changed");
+KINETUM_PROVIDER_STATIC_ASSERT(offsetof(kinetum_packet_rx_burst_operations, receive_native) == 24 &&
+				       offsetof(kinetum_packet_rx_burst_operations, native_storage) == 32 &&
+				       offsetof(kinetum_packet_rx_burst_operations, tail_padding) == 40,
+			       "native RX operations layout changed");
+KINETUM_PROVIDER_STATIC_ASSERT(offsetof(kinetum_packet_tx_burst_operations, transmit_native) == 40 &&
+				       offsetof(kinetum_packet_tx_burst_operations, native_storage) == 48 &&
+				       offsetof(kinetum_packet_tx_burst_operations, tail_padding) == 56,
+			       "native TX operations layout changed");
 KINETUM_PROVIDER_STATIC_ASSERT(KINETUM_PROVIDER_ALIGNOF(kinetum_packet_rx_burst_result) == 2,
 			       "RX result alignment changed");
 KINETUM_PROVIDER_STATIC_ASSERT(offsetof(kinetum_packet_rx_burst_result, transferred_count) == 0,
@@ -2660,6 +2731,8 @@ KINETUM_PROVIDER_TYPE_TRAITS_ASSERT(kinetum_provider_io_observation_batch);
 KINETUM_PROVIDER_TYPE_TRAITS_ASSERT(kinetum_packet_private);
 KINETUM_PROVIDER_TYPE_TRAITS_ASSERT(kinetum_packet_origin_view);
 KINETUM_PROVIDER_TYPE_TRAITS_ASSERT(kinetum_packet_storage_domain_operations);
+KINETUM_PROVIDER_TYPE_TRAITS_ASSERT(kinetum_packet_native_view);
+KINETUM_PROVIDER_TYPE_TRAITS_ASSERT(kinetum_packet_native_storage_operations);
 KINETUM_PROVIDER_TYPE_TRAITS_ASSERT(kinetum_packet_storage_descriptor);
 KINETUM_PROVIDER_TYPE_TRAITS_ASSERT(kinetum_packet_record);
 KINETUM_PROVIDER_TYPE_TRAITS_ASSERT(kinetum_packet_rx_burst_result);

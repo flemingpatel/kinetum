@@ -83,6 +83,7 @@ class runtime_telemetry_snapshot_source final : public runtime_telemetry_source 
 	 * @param certificate Sole immutable worker/boundary source graph.
 	 * @param completion Completion progress owner, or null when transitions are disabled.
 	 * @param protocol_faults Process-generation protocol safety-fault authority.
+	 * @param bindings One cold worker selection per compact index, transferred into this source.
 	 * @return Complete source or a cold allocation/membership failure.
 	 */
 	[[nodiscard]] static common::status_or<std::unique_ptr<runtime_telemetry_snapshot_source>>
@@ -90,7 +91,7 @@ class runtime_telemetry_snapshot_source final : public runtime_telemetry_source 
 	       const provider::materialized_provider_runtime &providers, runtime_telemetry_aggregator &aggregator,
 	       const runtime_status_publication &runtime_status, const epoch_transition_coordinator &coordinator,
 	       const epoch_transition_certificate &certificate, const epoch_transition_completion *completion,
-	       const epoch_protocol_fault_latch &protocol_faults);
+	       const epoch_protocol_fault_latch &protocol_faults, std::vector<runtime_worker_packet_binding> bindings);
 
 	runtime_telemetry_snapshot_source(const runtime_telemetry_snapshot_source &) = delete;
 	runtime_telemetry_snapshot_source &operator=(const runtime_telemetry_snapshot_source &) = delete;
@@ -150,6 +151,7 @@ class runtime_telemetry_snapshot_source final : public runtime_telemetry_source 
 	const epoch_transition_completion *completion_{nullptr};       ///< Optional committed progress source.
 	const epoch_protocol_fault_latch &protocol_faults_;	       ///< Process-generation safety-fault authority.
 	std::vector<runtime_storage_domain_statistics> storage_rows_;  ///< Immutable compiled storage rows.
+	std::vector<runtime_worker_packet_binding> packet_bindings_;   ///< Actual cold worker selections.
 	std::vector<runtime_io_port_statistics> port_rows_;	       ///< Immutable compiled port rows.
 	std::vector<runtime_traffic_steering_statistics> steering_rows_;  ///< Immutable steering rows.
 	std::vector<runtime_module_context_domain> module_context_rows_;  ///< Immutable module-context populations.

@@ -14,6 +14,7 @@
  * The worker's complete domain/role population is constructed before launch.
  */
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -44,6 +45,7 @@ struct worker_packet_staging_domain {
 };
 
 class worker_packet_staging;
+struct native_packet_slot;
 
 /**
  * @brief Borrow one domain's swappable queue roles from the worker allocation.
@@ -65,24 +67,77 @@ class worker_packet_staging;
  */
 class alignas(algo::CACHE_LINE_SIZE) packet_epoch_input_staging final {
 	friend class worker_packet_staging;
-	using packet_queue = algo::work_queue_view<packet_record *>;  ///< Shared owner-local pointer arithmetic.
-	using ready_queue = algo::work_queue_view<uint32_t>;	      ///< Shared owner-local ready-key arithmetic.
-	static constexpr uint32_t NO_SERVICE = UINT32_MAX;  ///< No key currently borrowed by a service callback.
+	template <typename payload>
+	using payload_queue = algo::work_queue_view<payload *>;	 ///< Typed owner-local pointer FIFO.
+	using packet_queue = payload_queue<packet_record>;	 ///< General-routing payload.
+	using native_queue = payload_queue<native_packet_slot>;	 ///< Worker-local native receipt.
+	static_assert(std::is_same_v<packet_queue::storage_type, native_queue::storage_type>);
+	using ready_queue = algo::work_queue_view<uint32_t>;  ///< Shared owner-local ready-key arithmetic.
+	static constexpr uint32_t NO_SERVICE = UINT32_MAX;    ///< No key currently borrowed by a service callback.
 
-	/** @brief Mutable key controls, separated from all pointer arrays by construction. */
+	/** @brief One ready-key membership and its generation-fixed typed FIFO. */
 	struct key_state {
+		/** @brief Exactly one FIFO lifetime is active from key construction through destruction. */
+		union queues {
+			packet_queue records;  ///< Full-record storage when native_payload is false.
+			native_queue slots;    ///< Native slot storage when native_payload is true.
+			/** @brief The enclosing key starts its selected member's lifetime. */
+			queues() noexcept
+			{
+			}
+			/** @brief The enclosing key ends that same member's lifetime before the union is destroyed. */
+			~queues() noexcept
+			{
+			}
+		};
 		/**
-		 * @brief Bind one empty pointer ring to its exact key-major storage extent.
 		 * @param storage Uninitialized pointer slots in the worker mapping.
-		 * @param capacity Exact physical ring extent, equal to the shared role bound.
+		 * @param capacity Exact physical extent shared by either payload type.
+		 * @param native Immutable worker representation selected at construction.
 		 */
-		key_state(packet_queue::storage_type *storage, std::size_t capacity) noexcept
-			: queue(storage, capacity)
+		key_state(packet_queue::storage_type *storage, std::size_t capacity, bool native) noexcept
+			: native_payload(native)
 		{
+			if (native_payload) {
+				std::construct_at(&queue.slots, storage, capacity);
+			} else {
+				std::construct_at(&queue.records, storage, capacity);
+			}
 		}
-		packet_queue queue;   ///< Sole pointer-ring indices and element lifetimes.
-		bool claimed{false};  ///< Ready or being serviced; prevents duplicate ready publication.
+		/** @brief End the originally bound FIFO lifetime after the owner's emptiness preflight. */
+		~key_state()
+		{
+			if (native_payload) {
+				std::destroy_at(&queue.slots);
+			} else {
+				std::destroy_at(&queue.records);
+			}
+		}
+		/** @tparam payload Bound pointer type. @return The live FIFO, failing stop before a foreign-type access. */
+		template <typename payload>
+		[[nodiscard]] payload_queue<payload> &bound_queue() noexcept
+		{
+			static_assert(std::is_same_v<payload, native_packet_slot> ||
+				      std::is_same_v<payload, packet_record>);
+			if (native_payload != std::is_same_v<payload, native_packet_slot>) {
+				std::terminate();
+			}
+			if constexpr (std::is_same_v<payload, native_packet_slot>) {
+				return queue.slots;
+			} else {
+				return queue.records;
+			}
+		}
+		/** @return Whether the live FIFO has retired every pointer. */
+		[[nodiscard]] bool empty() const noexcept
+		{
+			return native_payload ? queue.slots.empty() : queue.records.empty();
+		}
+		queues queue;		    ///< One FIFO control block.
+		const bool native_payload;  ///< Immutable discriminator adjacent to ready membership.
+		bool claimed{false};	    ///< Ready or being serviced; prevents duplicate ready publication.
 	};
+	static_assert(sizeof(key_state) == sizeof(packet_queue) + alignof(packet_queue));
 
 	/** @brief One complete role whose capacity includes queued and outstanding records. */
 	struct alignas(algo::CACHE_LINE_SIZE) role_state {
@@ -183,7 +238,7 @@ class alignas(algo::CACHE_LINE_SIZE) packet_epoch_input_staging final {
 	 */
 	void commit_active(uint32_t key, packet_record *record) noexcept
 	{
-		commit_(*active_, key, record);
+		commit_(*active_, key, std::span<packet_record *const>(&record, 1u));
 	}
 	/**
 	 * @brief Publish future RX through an existing future reservation.
@@ -192,10 +247,30 @@ class alignas(algo::CACHE_LINE_SIZE) packet_epoch_input_staging final {
 	 */
 	void commit_future(uint32_t key, packet_record *record) noexcept
 	{
+		commit_future_prefix(key, std::span<packet_record *const>(&record, 1u));
+	}
+	/**
+	 * @brief Publish the complete typed prefix through previously acquired active reservations.
+	 * @param key Exact stage and continuation ordinal.
+	 * @param values Nonempty FIFO prefix of live pointers belonging to that key.
+	 */
+	template <typename payload>
+	void commit_active_prefix(uint32_t key, std::span<payload *const> values) noexcept
+	{
+		commit_(*active_, key, values);
+	}
+	/**
+	 * @brief Publish into a source's inert future RX role.
+	 * @param key Exact RX delivery ordinal.
+	 * @param values Nonempty prefix covered by future reservations.
+	 */
+	template <typename payload>
+	void commit_future_prefix(uint32_t key, std::span<payload *const> values) noexcept
+	{
 		if (future_ == nullptr || key >= keys_.size() || keys_[key].phase != packet_work_phase::RX_DELIVER) {
 			std::terminate();
 		}
-		commit_(*future_, key, record);
+		commit_(*future_, key, values);
 	}
 	/** @brief Retire outstanding active claims. @param count Exact transferred or unused population. */
 	void release_active_reservation(std::size_t count = 1u) noexcept
@@ -225,8 +300,31 @@ class alignas(algo::CACHE_LINE_SIZE) packet_epoch_input_staging final {
 	template <typename consume_type>
 	void service_active(std::span<packet_record *> scratch, consume_type &&consume) noexcept
 	{
-		static_assert(std::is_nothrow_invocable_v<consume_type &, const packet_work_key &,
-							  std::span<packet_record *const>>);
+		service_(scratch, consume);
+	}
+
+	/**
+	 * @brief Service native slots with the same ready-key and reservation rules as full records.
+	 * @param scratch Worker-owned space for one bounded prefix.
+	 * @param consume Callback retaining or resolving each typed slot's existing reservation.
+	 */
+	template <typename consume_type>
+	void service_native(std::span<native_packet_slot *> scratch, consume_type &&consume) noexcept
+	{
+		service_(scratch, consume);
+	}
+
+    private:
+	/**
+	 * @brief Visit each initially ready key at most once using its bound payload type.
+	 * @param scratch Initialized pointer destinations defining the total service budget.
+	 * @param consume Nonthrowing owner callback.
+	 */
+	template <typename payload, typename consume_type>
+	void service_(std::span<payload *> scratch, consume_type &consume) noexcept
+	{
+		static_assert(
+			std::is_nothrow_invocable_v<consume_type &, const packet_work_key &, std::span<payload *const>>);
 		auto &role = *active_;
 		if (role.servicing != NO_SERVICE || scratch.size() > common::runtime_sizing::PACKET_MAX_BURST_SIZE) {
 			std::terminate();
@@ -242,23 +340,24 @@ class alignas(algo::CACHE_LINE_SIZE) packet_epoch_input_staging final {
 				std::terminate();
 			}
 			auto &state = role.keys[key];
-			if (!state.claimed || state.queue.empty()) {
+			auto &queue = state.template bound_queue<payload>();
+			if (!state.claimed || queue.empty()) {
 				std::terminate();
 			}
-			const std::size_t count = state.queue.pop_batch(scratch.data(), remaining_records);
+			const std::size_t count = queue.pop_batch(scratch.data(), remaining_records);
 			if (role.reservations > role.occupied || count > role.occupied - role.reservations) {
 				std::terminate();
 			}
 			role.reservations += count;
-			const bool requeued = !state.queue.empty();
+			const bool requeued = !queue.empty();
 			if (requeued && !role.ready->try_push(key)) {
 				std::terminate();
 			}
 			role.servicing = key;
-			consume(keys_[key], std::span<packet_record *const>(scratch.data(), count));
+			consume(keys_[key], std::span<payload *const>(scratch.data(), count));
 			role.servicing = NO_SERVICE;
 			if (!requeued) {
-				if (state.queue.empty()) {
+				if (queue.empty()) {
 					state.claimed = false;
 				} else if (!role.ready->try_push(key)) {
 					std::terminate();
@@ -269,6 +368,7 @@ class alignas(algo::CACHE_LINE_SIZE) packet_epoch_input_staging final {
 		}
 	}
 
+    public:
 	/** @return True when the active role has no queued, outstanding or executing ownership. */
 	[[nodiscard]] bool active_empty() const noexcept
 	{
@@ -344,21 +444,25 @@ class alignas(algo::CACHE_LINE_SIZE) packet_epoch_input_staging final {
 	 * @brief Consume an existing claim and make its key ready exactly once.
 	 * @param role Exact selected role.
 	 * @param key Valid ordinal in that role's immutable key projection.
-	 * @param record Nonnull packet ownership covered by the reservation.
+	 * @param values Nonempty FIFO prefix of live pointers covered by reservations.
 	 */
-	static void commit_(role_state &role, uint32_t key, packet_record *record) noexcept
+	template <typename payload>
+	static void commit_(role_state &role, uint32_t key, std::span<payload *const> values) noexcept
 	{
-		if (key >= role.keys.size() || record == nullptr || role.reservations == 0u) {
+		if (key >= role.keys.size() || values.empty() || values.size() > role.reservations ||
+		    std::find(values.begin(), values.end(), nullptr) != values.end()) {
 			std::terminate();
 		}
 		auto &state = role.keys[key];
-		--role.reservations;
-		if (!state.queue.try_push(record)) {
+		auto &queue = state.template bound_queue<payload>();
+		if ((!state.claimed && (!role.ready || role.ready->full())) ||
+		    !queue.try_push_prefix(values.data(), values.size())) {
 			std::terminate();
 		}
+		role.reservations -= values.size();
 		if (!state.claimed) {
 			state.claimed = true;
-			if (!role.ready.has_value() || !role.ready->try_push(key)) {
+			if (!role.ready->try_push(key)) {
 				std::terminate();
 			}
 		}
@@ -409,10 +513,11 @@ class worker_packet_staging final {
 	 * @brief Construct one complete worker staging population before packet admission.
 	 * @param domains Sorted unique domains with exact capacities and sorted unique keys.
 	 * @param numa_node Exact nonnegative worker host-memory node.
+	 * @param native Whether the bound worker uses native slots for every staging key.
 	 * @return Complete owner, or shape/overflow/allocation failure with no live packet ownership.
 	 */
 	[[nodiscard]] static common::status_or<std::unique_ptr<worker_packet_staging>>
-	create(std::span<const worker_packet_staging_domain> domains, int32_t numa_node);
+	create(std::span<const worker_packet_staging_domain> domains, int32_t numa_node, bool native = false);
 	/** @brief A region and its roles have one reclamation owner. */
 	worker_packet_staging(const worker_packet_staging &) = delete;
 	/** @brief Reject duplicate region ownership. */

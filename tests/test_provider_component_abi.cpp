@@ -513,6 +513,9 @@ TEST(provider_component_abi, compiled_facts_and_factories_enforce_exact_role_par
 	EXPECT_EQ(kinetum_provider_factories_match_role(&factories, KINETUM_PROVIDER_ROLE_PACKET_STORAGE), 0u);
 	factories.packet_storage = abi_test_factory;
 	EXPECT_EQ(kinetum_provider_factories_match_role(&factories, KINETUM_PROVIDER_ROLE_EXECUTION), 0u);
+	factories.execution = nullptr;
+	ASSERT_EQ(kinetum_provider_factories_match_role(&factories, KINETUM_PROVIDER_ROLE_PACKET_STORAGE), 1u);
+	EXPECT_EQ(kinetum_provider_factories_match_role(&factories, KINETUM_PROVIDER_ROLE_IO_DRIVER), 0u);
 	EXPECT_EQ(kinetum_provider_factories_match_role(&factories, 0), 0u);
 }
 
@@ -808,9 +811,12 @@ TEST(provider_component_abi, dependencies_are_strictly_ordered_and_role_nullabil
 	dependencies[0].operations = nullptr;
 	EXPECT_EQ(kinetum_provider_dependencies_are_valid(dependencies, 2), 0u);
 	dependencies[0].operations = &facility_operations;
-	dependencies[1].instance_id = dependencies[0].instance_id;
-	dependencies[1].role = dependencies[0].role;
-	dependencies[1].operations = &storage_operations;
+	uint32_t other_facility_instance = 3;
+	const auto other_facility = abi_test_facility_operations(&other_facility_instance);
+	dependencies[1] = dependencies[0];
+	dependencies[1].instance = &other_facility_instance;
+	dependencies[1].operations = &other_facility;
+	ASSERT_EQ(kinetum_provider_dependency_is_valid(&dependencies[1]), 1u);
 	EXPECT_EQ(kinetum_provider_dependencies_are_valid(dependencies, 2), 0u);
 }
 
@@ -940,15 +946,17 @@ TEST(provider_component_abi, factory_result_nullability_is_status_and_role_exact
 	EXPECT_EQ(kinetum_provider_factory_result_matches_status(KINETUM_PROVIDER_ROLE_PROCESS_FACILITY,
 								 KINETUM_PROVIDER_STATUS_OK, &result),
 		  1u);
-	EXPECT_EQ(kinetum_provider_factory_result_matches_status(KINETUM_PROVIDER_ROLE_EXECUTION,
-								 KINETUM_PROVIDER_STATUS_OK, &result),
-		  0u);
+	EXPECT_EQ(kinetum_provider_factory_result_matches_status(0u, KINETUM_PROVIDER_STATUS_OK, &result), 0u);
 	result.operations = &execution_operations;
 	EXPECT_EQ(kinetum_provider_factory_result_matches_status(KINETUM_PROVIDER_ROLE_EXECUTION,
 								 KINETUM_PROVIDER_STATUS_OK, &result),
 		  1u);
 	EXPECT_EQ(kinetum_provider_factory_result_matches_status(KINETUM_PROVIDER_ROLE_EXECUTION,
 								 KINETUM_PROVIDER_STATUS_RESOURCE_EXHAUSTED, &result),
+		  0u);
+	execution_operations.required_access_agents = 0u;
+	EXPECT_EQ(kinetum_provider_factory_result_matches_status(KINETUM_PROVIDER_ROLE_EXECUTION,
+								 KINETUM_PROVIDER_STATUS_OK, &result),
 		  0u);
 	result = {};
 	EXPECT_EQ(kinetum_provider_factory_result_matches_status(KINETUM_PROVIDER_ROLE_EXECUTION,
@@ -971,6 +979,91 @@ TEST(provider_component_abi, process_facility_callbacks_have_one_exact_c_shape)
 	EXPECT_EQ(kinetum_provider_process_facility_operations_are_valid(&operations), 0u);
 }
 
+/** @brief A proved prefix still rejects every foreign identity, invalid length or unrecognized capability. */
+TEST(provider_component_abi, storage_prefix_proof_preserves_each_record_check)
+{
+	uint32_t state = 1u;
+	auto owner = abi_test_storage_operations(&state);
+	auto other = owner;
+	kinetum_packet_record record{};
+	record.storage.operations = &owner;
+	record.storage.generation = owner.generation;
+	record.storage.domain_index = owner.domain_index;
+	record.storage.length = owner.maximum_packet_length;
+	record.storage.segment_count = 1u;
+	record.storage.capabilities = owner.capabilities;
+	const auto matches = [&](const dp::packet_record *candidate) {
+		return dp::packet_record_matches_storage(candidate, &owner, owner.domain_index, owner.generation);
+	};
+	EXPECT_TRUE(matches(&record));
+	EXPECT_FALSE(matches(nullptr));
+	EXPECT_FALSE(dp::packet_storage_matches_domain(nullptr, owner.domain_index, owner.generation));
+	EXPECT_FALSE(dp::packet_storage_matches_domain(&owner, owner.domain_index + 1u, owner.generation));
+	EXPECT_FALSE(dp::packet_storage_matches_domain(&owner, owner.domain_index, owner.generation + 1u));
+	auto altered = record;
+	altered.storage.operations = &other;
+	EXPECT_FALSE(matches(&altered));
+	altered = record;
+	++altered.storage.generation;
+	EXPECT_FALSE(matches(&altered));
+	altered = record;
+	++altered.storage.domain_index;
+	EXPECT_FALSE(matches(&altered));
+	altered = record;
+	altered.storage.length = 0u;
+	EXPECT_FALSE(matches(&altered));
+	altered.storage.length = static_cast<uint32_t>(owner.maximum_packet_length) + 1u;
+	EXPECT_FALSE(matches(&altered));
+	altered = record;
+	altered.storage.segment_count = 0u;
+	EXPECT_FALSE(matches(&altered));
+	altered = record;
+	altered.storage.capabilities ^= KINETUM_PACKET_STORAGE_CPU_CONTIGUOUS_READ;
+	EXPECT_FALSE(matches(&altered));
+	owner.capabilities |= UINT32_C(0x80000000);
+	record.storage.capabilities = owner.capabilities;
+	EXPECT_FALSE(matches(&record));
+}
+
+/** @brief Optional native RX and TX each require a complete original storage and queue contract. */
+TEST(provider_component_abi, native_queues_require_complete_optional_storage_and_queue_operations)
+{
+	uint32_t state = 1u;
+	auto storage = abi_test_storage_operations(&state);
+	kinetum_packet_native_storage_operations native{};
+	native.owner = &storage;
+	kinetum_packet_rx_burst_operations rx{};
+	rx.state = &state;
+	rx.receive_burst = abi_test_receive;
+	rx.maximum_burst = 1u;
+	rx.logical_port = 0u;
+	ASSERT_EQ(kinetum_provider_rx_operations_are_valid(&rx), 1u);
+	rx.native_storage = &native;
+	EXPECT_EQ(kinetum_provider_rx_operations_are_valid(&rx), 0u);
+	rx.receive_native = [](void *, kinetum_packet_native_view *, uint16_t) noexcept {
+		return kinetum_packet_rx_burst_result{};
+	};
+	EXPECT_EQ(kinetum_provider_rx_operations_are_valid(&rx), 0u);
+	native.verify = [](void *, const kinetum_packet_native_view *, uint16_t) noexcept -> uint8_t { return 1u; };
+	EXPECT_EQ(kinetum_provider_rx_operations_are_valid(&rx), 0u);
+	native.release = [](void *, const kinetum_packet_native_view *, uint16_t) noexcept {};
+	EXPECT_EQ(kinetum_provider_rx_operations_are_valid(&rx), 1u);
+	kinetum_packet_tx_burst_operations tx{};
+	tx.state = &state;
+	tx.transmit_burst = abi_test_transmit;
+	tx.flush = abi_test_flush;
+	tx.maybe_flush = abi_test_maybe_flush;
+	tx.maximum_burst = 1u;
+	tx.transmit_native = [](void *, const kinetum_packet_native_view *, uint16_t count) noexcept { return count; };
+	EXPECT_EQ(kinetum_provider_tx_operations_are_valid(&tx), 0u);
+	tx.native_storage = &native;
+	EXPECT_EQ(kinetum_provider_tx_operations_are_valid(&tx), 1u);
+	tx.tail_padding[0] = 1u;
+	EXPECT_EQ(kinetum_provider_tx_operations_are_valid(&tx), 0u);
+	native.owner = nullptr;
+	EXPECT_EQ(kinetum_provider_rx_operations_are_valid(&rx), 0u);
+}
+
 /** @brief Reject every malformed role operation record before publication. */
 TEST(provider_component_abi, every_role_operation_record_is_validated_before_publication)
 {
@@ -982,6 +1075,9 @@ TEST(provider_component_abi, every_role_operation_record_is_validated_before_pub
 		.maximum_burst = 64,
 		.logical_port = 1,
 		.padding = {0},
+		.receive_native = nullptr,
+		.native_storage = nullptr,
+		.tail_padding = {0},
 	};
 	kinetum_packet_tx_burst_operations tx{
 		.state = &state,
@@ -991,6 +1087,9 @@ TEST(provider_component_abi, every_role_operation_record_is_validated_before_pub
 		.maximum_burst = 64,
 		.logical_port = 2,
 		.padding = {0},
+		.transmit_native = nullptr,
+		.native_storage = nullptr,
+		.tail_padding = {0},
 	};
 	kinetum_provider_io_driver_operations driver{
 		.state = &state,
@@ -1021,15 +1120,14 @@ TEST(provider_component_abi, every_role_operation_record_is_validated_before_pub
 		.padding = {0},
 	};
 
-	EXPECT_EQ(kinetum_provider_packet_storage_operations_are_valid(&storage), 1u);
-	EXPECT_EQ(kinetum_provider_io_driver_operations_are_valid(&driver), 1u);
-	EXPECT_EQ(kinetum_provider_execution_operations_are_valid(&execution), 1u);
-	EXPECT_EQ(kinetum_provider_storage_transition_operations_are_valid(&transition), 1u);
-	EXPECT_EQ(kinetum_provider_operations_match_role(KINETUM_PROVIDER_ROLE_PACKET_STORAGE, &storage), 1u);
-	EXPECT_EQ(kinetum_provider_operations_match_role(KINETUM_PROVIDER_ROLE_IO_DRIVER, &storage), 0u);
+	ASSERT_EQ(kinetum_provider_operations_match_role(KINETUM_PROVIDER_ROLE_PACKET_STORAGE, &storage), 1u);
+	ASSERT_EQ(kinetum_provider_operations_match_role(KINETUM_PROVIDER_ROLE_IO_DRIVER, &driver), 1u);
+	ASSERT_EQ(kinetum_provider_operations_match_role(KINETUM_PROVIDER_ROLE_EXECUTION, &execution), 1u);
+	ASSERT_EQ(kinetum_provider_operations_match_role(KINETUM_PROVIDER_ROLE_STORAGE_TRANSITION, &transition), 1u);
+	EXPECT_EQ(kinetum_provider_operations_match_role(0u, &driver), 0u);
 
 	rx.maximum_burst = 0;
-	EXPECT_EQ(kinetum_provider_io_driver_operations_are_valid(&driver), 0u);
+	EXPECT_EQ(kinetum_provider_operations_match_role(KINETUM_PROVIDER_ROLE_IO_DRIVER, &driver), 0u);
 	rx.maximum_burst = 64;
 	driver.activate_packet_io = nullptr;
 	EXPECT_EQ(kinetum_provider_io_driver_operations_are_valid(&driver), 0u);

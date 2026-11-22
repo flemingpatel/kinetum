@@ -62,7 +62,7 @@ struct domain_layout {
 }  // namespace
 
 common::status_or<std::unique_ptr<worker_packet_staging>>
-worker_packet_staging::create(std::span<const worker_packet_staging_domain> domains, int32_t numa_node)
+worker_packet_staging::create(std::span<const worker_packet_staging_domain> domains, int32_t numa_node, bool native)
 {
 	using domain_type = packet_epoch_input_staging;
 	using role_type = domain_type::role_state;
@@ -176,7 +176,7 @@ worker_packet_staging::create(std::span<const worker_packet_staging_domain> doma
 				auto pointers = numa_layout::row<pointer_storage>(owner->storage_, row.pointers,
 										  row.pointer_stride, key,
 										  domain.keys.size(), domain.capacity);
-				std::construct_at(&keys[key], pointers.data(), domain.capacity);
+				std::construct_at(&keys[key], pointers.data(), domain.capacity, native);
 			}
 			auto ready =
 				numa_layout::storage<ready_storage>(owner->storage_, row.ready, row.ready_capacity);
@@ -203,7 +203,7 @@ worker_packet_staging::~worker_packet_staging()
 				continue;
 			}
 			for (const auto &key : role->keys) {
-				if (key.claimed || !key.queue.empty()) {
+				if (key.claimed || !key.empty()) {
 					std::terminate();
 				}
 			}

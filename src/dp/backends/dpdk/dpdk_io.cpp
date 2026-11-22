@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <cstring>
 #include <exception>
+#include <functional>
 #include <iterator>
 #include <limits>
 #include <memory>
@@ -498,6 +499,22 @@ struct dpdk_io_driver::implementation {
 
 	/** @brief One stable hot-path TX queue state. */
 	struct tx_queue {
+		/**
+		 * @param buffers FIFO-ordered native buffers validated for this queue.
+		 * @param count Extent of the valid prefix; zero performs no native call.
+		 * @return Exactly the prefix accepted by the PMD.
+		 */
+		[[nodiscard]] uint16_t submit(rte_mbuf **buffers, uint16_t count) const noexcept
+		{
+			if (count == 0u) {
+				return 0u;
+			}
+			const auto accepted = rte_eth_tx_burst(physical_port, queue_id, buffers, count);
+			if (accepted > count) {
+				std::terminate();
+			}
+			return accepted;
+		}
 		uint16_t physical_port{0};   ///< Exact ethdev port.
 		uint16_t queue_id{0};	     ///< Exact dense TX queue.
 		uint16_t logical_port{0};    ///< Immutable logical egress identity.
@@ -505,6 +522,8 @@ struct dpdk_io_driver::implementation {
 		int32_t host_numa_node{-1};  ///< Common proven NUMA placement for queue and admitted pools.
 		std::vector<const dpdk_packet_storage *>
 			storage_by_domain;  ///< O(1) admitted native owners; holes reject.
+		const dpdk_packet_storage *sole_storage{
+			nullptr};  ///< Cold-resolved owner for a single admitted domain.
 	};
 
 	dpdk_ethdev_api api{};				 ///< Complete cold native ethdev API.
@@ -945,6 +964,7 @@ dpdk_packet_storage::dpdk_packet_storage(std::unique_ptr<implementation> state) 
 	operations_.copy_origins_burst = copy_origins_burst_;
 	operations_.release_burst = release_burst_;
 	operations_.observe_statistics = observe_statistics_;
+	native_operations_ = {&operations_, verify_native_, release_native_};
 }
 
 dpdk_packet_storage::~dpdk_packet_storage() noexcept
@@ -1088,12 +1108,28 @@ uint16_t dpdk_packet_storage::acquire_burst_(void *state, kinetum_packet_record 
 	return attempted;
 }
 
+namespace
+{
+/**
+ * @param record Live full record presented for byte access.
+ * @param storage Original pool and generation admitted for this operation.
+ * @return Its mbuf when identity, backing room and the domain length bound agree.
+ */
+rte_mbuf *record_buffer(const kinetum_packet_record *record, const dpdk_packet_storage &storage) noexcept
+{
+	if (!dp::dpdk_packet_record_matches_storage(record, storage.operations()) || record->storage.length == 0u ||
+	    record->storage.length > storage.operations().maximum_packet_length) {
+		return nullptr;
+	}
+	auto *mbuf = static_cast<rte_mbuf *>(record->storage.native_handle);
+	return mbuf->pool == storage.native_pool() && dp::dpdk_packet_range_is_valid(*mbuf) ? mbuf : nullptr;
+}
+}  // namespace
+
 kinetum_packet_record *dpdk_packet_storage::clone_writable_(void *state, const kinetum_packet_record *source) noexcept
 {
 	auto *storage = static_cast<dpdk_packet_storage *>(state);
-	if (storage == nullptr || source == nullptr || storage->state_->pool == nullptr ||
-	    !dp::dpdk_packet_record_matches_storage(source, storage->operations_) || source->storage.length == 0 ||
-	    source->storage.length > storage->operations_.maximum_packet_length) {
+	if (storage == nullptr || storage->state_->pool == nullptr || record_buffer(source, *storage) == nullptr) {
 		return nullptr;
 	}
 	rte_mbuf *native = rte_pktmbuf_alloc(storage->state_->pool);
@@ -1668,6 +1704,9 @@ kinetum_provider_status dpdk_io_driver::create(const kinetum_provider_factory_re
 					.maximum_burst = MAX_BURST,
 					.logical_port = queue.logical_port,
 					.padding = {0},
+					.receive_native = receive_native_,
+					.native_storage = &queue.storage->native_operations(),
+					.tail_padding = {0},
 				};
 				++rx_position;
 			} else {
@@ -1693,8 +1732,9 @@ kinetum_provider_status dpdk_io_driver::create(const kinetum_provider_factory_re
 					const uint32_t domain = stream.storage_domain_indices[domain_index];
 					queue.storage_by_domain[domain] = storage_dependency(request, domain);
 				}
-				native_port->native_tx_queues[queue.queue_id] = {
-					queue.descriptors, queue.storage_by_domain[stream.storage_domain_indices[0]]};
+				const auto *first_storage = queue.storage_by_domain[stream.storage_domain_indices[0]];
+				queue.sole_storage = stream.storage_domain_count == 1u ? first_storage : nullptr;
+				native_port->native_tx_queues[queue.queue_id] = {queue.descriptors, first_storage};
 				state->tx_operations[tx_position] = kinetum_packet_tx_burst_operations{
 					.state = &queue,
 					.transmit_burst = transmit_burst_,
@@ -1703,6 +1743,11 @@ kinetum_provider_status dpdk_io_driver::create(const kinetum_provider_factory_re
 					.maximum_burst = MAX_BURST,
 					.logical_port = queue.logical_port,
 					.padding = {0},
+					.transmit_native = queue.sole_storage != nullptr ? transmit_native_ : nullptr,
+					.native_storage = queue.sole_storage != nullptr ?
+								  &queue.sole_storage->native_operations() :
+								  nullptr,
+					.tail_padding = {0},
 				};
 				++tx_position;
 			}
@@ -1823,6 +1868,109 @@ kinetum_packet_rx_burst_result dpdk_io_driver::receive_burst_(void *state, kinet
 	return {.transferred_count = published, .rejected_count = static_cast<uint16_t>(received - published)};
 }
 
+namespace
+{
+/** @param mbuf Live native header. @param maximum Admitted domain length ceiling.
+ * @return Whether one complete nonempty range fits its actual backing room.
+ */
+bool valid_native_range(const rte_mbuf &mbuf, uint32_t maximum) noexcept
+{
+	return dp::dpdk_packet_is_contiguous(mbuf) && dp::dpdk_packet_range_is_valid(mbuf) && mbuf.data_len != 0u &&
+	       mbuf.data_len <= maximum;
+}
+/** @param storage Admitted original owner. @param view Saved handle and range. @return The exact live mbuf or null. */
+rte_mbuf *native_buffer(const dpdk_packet_storage &storage, const kinetum_packet_native_view &view) noexcept
+{
+	auto *mbuf = static_cast<rte_mbuf *>(view.handle);
+	if (mbuf == nullptr || view.data_start == nullptr || view.length == 0u || view.reserved != 0u ||
+	    mbuf->pool != storage.native_pool() ||
+	    !valid_native_range(*mbuf, storage.operations().maximum_packet_length) ||
+	    rte_pktmbuf_pkt_len(mbuf) != view.length || rte_pktmbuf_mtod(mbuf, const void *) != view.data_start) {
+		return nullptr;
+	}
+	return mbuf;
+}
+}  // namespace
+
+kinetum_packet_rx_burst_result dpdk_io_driver::receive_native_(void *state, kinetum_packet_native_view *views,
+							       uint16_t capacity) noexcept
+{
+	const auto *queue = static_cast<const implementation::rx_queue *>(state);
+	if (queue == nullptr || queue->storage == nullptr || views == nullptr || capacity > MAX_BURST) {
+		std::terminate();
+	}
+	std::array<rte_mbuf *, MAX_BURST> native;
+	const auto count = rte_eth_rx_burst(queue->physical_port, queue->queue_id, native.data(), capacity);
+	if (count > capacity) {
+		std::terminate();
+	}
+	uint16_t transferred = 0u;
+	for (uint16_t index = 0u; index < count; ++index) {
+		auto *mbuf = native[index];
+		if (mbuf == nullptr || mbuf->pool != queue->storage->native_pool()) {
+			std::terminate();
+		}
+		const auto length = rte_pktmbuf_pkt_len(mbuf);
+		if (!valid_native_range(*mbuf, queue->storage->operations().maximum_packet_length)) {
+			rte_pktmbuf_free(mbuf);
+			continue;
+		}
+		views[transferred++] = {mbuf, rte_pktmbuf_mtod(mbuf, const void *), length, 0u};
+	}
+	return {transferred, static_cast<uint16_t>(count - transferred)};
+}
+
+uint8_t dpdk_packet_storage::verify_native_(void *state, const kinetum_packet_native_view *views,
+					    uint16_t count) noexcept
+{
+	const auto *storage = static_cast<const dpdk_packet_storage *>(state);
+	if (storage == nullptr || views == nullptr || count > MAX_BURST) {
+		return 0u;
+	}
+	std::array<rte_mbuf *, MAX_BURST> buffers;
+	for (uint16_t index = 0u; index < count; ++index) {
+		buffers[index] = native_buffer(*storage, views[index]);
+		if (buffers[index] == nullptr) {
+			return 0u;
+		}
+	}
+	const auto end = buffers.begin() + count;
+	std::sort(buffers.begin(), end, std::less<rte_mbuf *>{});
+	return std::adjacent_find(buffers.begin(), end) == end ? 1u : 0u;
+}
+
+void dpdk_packet_storage::release_native_(void *state, const kinetum_packet_native_view *views, uint16_t count) noexcept
+{
+	const auto *storage = static_cast<const dpdk_packet_storage *>(state);
+	if (storage == nullptr || views == nullptr || count > MAX_BURST) {
+		std::terminate();
+	}
+	std::array<rte_mbuf *, MAX_BURST> buffers;
+	for (uint16_t index = 0u; index < count; ++index) {
+		// The synchronous owner has verified this exact suffix before any reclamation.
+		buffers[index] = static_cast<rte_mbuf *>(views[index].handle);
+	}
+	rte_pktmbuf_free_bulk(buffers.data(), count);
+}
+
+uint16_t dpdk_io_driver::transmit_native_(void *state, const kinetum_packet_native_view *views, uint16_t count) noexcept
+{
+	const auto *queue = static_cast<const implementation::tx_queue *>(state);
+	if (queue == nullptr || queue->sole_storage == nullptr || views == nullptr || count > MAX_BURST) {
+		std::terminate();
+	}
+	std::array<rte_mbuf *, MAX_BURST> buffers;
+	uint16_t valid = 0u;
+	while (valid < count) {
+		buffers[valid] = native_buffer(*queue->sole_storage, views[valid]);
+		if (buffers[valid] == nullptr) {
+			break;
+		}
+		++valid;
+	}
+	return queue->submit(buffers.data(), valid);
+}
+
 uint16_t dpdk_io_driver::transmit_burst_(void *state, kinetum_packet_record *const *records, uint16_t count) noexcept
 {
 	auto *queue = static_cast<implementation::tx_queue *>(state);
@@ -1835,31 +1983,46 @@ uint16_t dpdk_io_driver::transmit_burst_(void *state, kinetum_packet_record *con
 	const uint16_t attempted = count;
 	std::array<rte_mbuf *, common::runtime_sizing::PACKET_MAX_BURST_SIZE> native;
 	uint16_t valid_prefix = 0;
-	for (; valid_prefix < attempted; ++valid_prefix) {
-		const auto *record = records[valid_prefix];
-		if (record == nullptr || record->storage.domain_index >= queue->storage_by_domain.size()) {
-			break;
+	const auto collect = [&]<bool single_domain>() noexcept {
+		constexpr uint16_t LOOKAHEAD = 4u;
+		for (; valid_prefix < attempted; ++valid_prefix) {
+			if constexpr (single_domain) {
+				if (valid_prefix + LOOKAHEAD < attempted) {
+					const auto *ahead = records[valid_prefix + LOOKAHEAD];
+					if (ahead != nullptr &&
+					    ahead->storage.operations == &queue->sole_storage->operations()) {
+						auto *mbuf = static_cast<rte_mbuf *>(ahead->storage.native_handle);
+						if (mbuf != nullptr && dp::dpdk_packet_record(mbuf) == ahead) {
+							KINETUM_PREFETCH_L1(mbuf);
+							KINETUM_PREFETCH_L1(static_cast<const void *>(&mbuf->next));
+						}
+					}
+				}
+			}
+			const auto *record = records[valid_prefix];
+			if (record == nullptr) {
+				break;
+			}
+			const auto *storage = queue->sole_storage;
+			if constexpr (!single_domain) {
+				if (record->storage.domain_index >= queue->storage_by_domain.size()) {
+					break;
+				}
+				storage = queue->storage_by_domain[record->storage.domain_index];
+			}
+			auto *mbuf = storage != nullptr ? record_buffer(record, *storage) : nullptr;
+			if (mbuf == nullptr) {
+				break;
+			}
+			native[valid_prefix] = mbuf;
 		}
-		const auto *storage = queue->storage_by_domain[record->storage.domain_index];
-		if (storage == nullptr || !dp::dpdk_packet_record_matches_storage(record, storage->operations()) ||
-		    record->storage.length == 0 ||
-		    record->storage.length > storage->operations().maximum_packet_length) {
-			break;
-		}
-		auto *mbuf = static_cast<rte_mbuf *>(record->storage.native_handle);
-		if (mbuf->pool != storage->native_pool()) {
-			break;
-		}
-		native[valid_prefix] = mbuf;
+	};
+	if (queue->sole_storage != nullptr) {
+		collect.template operator()<true>();
+	} else {
+		collect.template operator()<false>();
 	}
-	if (valid_prefix == 0) {
-		return 0;
-	}
-	const uint16_t accepted = rte_eth_tx_burst(queue->physical_port, queue->queue_id, native.data(), valid_prefix);
-	if (accepted > valid_prefix) {
-		std::terminate();
-	}
-	return accepted;
+	return queue->submit(native.data(), valid_prefix);
 }
 
 void dpdk_io_driver::flush_(void *state) noexcept
