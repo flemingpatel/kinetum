@@ -37,16 +37,18 @@ Architecture
 Deployment Modes
 ----------------
 - **PASSTHROUGH**: Simple RX -> TX forwarding (baseline validation)
+- **PARSER_QOS**: One PCI worker forwarding through the IPv4 parser and QoS
 - **FAN_IN_EDGE_GATEWAY**: Two ingress RX/parse/ACL chains join at NAT, then QoS/TX (3 regions)
 
 Test Types
 ----------
 - **STANDARD**: Live fixed-epoch forwarding (loss, throughput, and
   profile-owned latency when available)
+- **MINIMUM_FRAME**: Two-port PCI forwarding with captured 64-byte wire frames
 - **EPOCH**: Ordered transition and boundary evidence
 - **COMMIT_CONFIRMED / ROLLBACK**: Exact live mutation workflows
 - **GUARDRAILS**: Telemetry-attributed durable automatic rollback
-- **FULL**: Composition of all implemented workflows
+- **FULL**: Gateway packet, NAT and configuration-transition workflows
 
 Usage
 -----

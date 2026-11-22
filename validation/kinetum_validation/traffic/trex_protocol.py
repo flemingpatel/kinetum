@@ -2,7 +2,15 @@
 
 import math
 
+from ..engine.json_contract import (
+    require_array, require_bool, require_exact_keys, require_int, require_number, require_object, require_trex_identity,
+)
+
 REMOTE_SUCCESS_KEYS = {
+    "minimum_frame": frozenset({
+        "ok", "action", "trex_identity", "pgid_demand", "links", "captured", "samples",
+        "tx_count", "rx_count", "errors", "port_counter_baseline", "port_counter_final",
+    }),
     "exchange_udp": frozenset({"ok", "action", "frames", "trex_identity", "pgid_demand"}),
     "probe": frozenset(
         {
@@ -66,6 +74,10 @@ REMOTE_GENERATION_RUN_KEYS = REMOTE_RUN_BASE_KEYS | {
     "overlap_window_ms",
 }
 REMOTE_REQUEST_KEYS = {
+    "minimum_frame": frozenset({
+        "action", "ports", "egress_ports", "trex_server", "trex_api_path", "work_dir", "trex_identity",
+        "ingress_port", "frames", "capture", "pps", "duration_s",
+    }),
     "exchange_udp": frozenset({
         "action", "ports", "egress_ports", "trex_server", "trex_api_path", "work_dir",
         "ingress_stream", "packets", "capture_marker", "trex_identity",
@@ -108,6 +120,106 @@ class TRexRemoteFailure(RuntimeError):
         """Preserve the endpoint's explicit before-effects rejection evidence."""
         super().__init__(message)
         self.mutation_attempted = mutation_attempted
+
+
+def source_mac_for_port(port_id: int) -> str:
+    """Return the deterministic locally administered MAC used for this tester ingress."""
+    value = require_int(port_id, "TRex source-MAC port", minimum=0, maximum=0xffffffff) + 1
+    return (b"\x02" + value.to_bytes(5, "big")).hex(":")
+
+
+def require_port_counters(value: object, name: str, ports: list[int]) -> dict:
+    """Admit all four absolute uint64 counters for every selected tester port."""
+    context = f"TRex port counter {name}"
+    rows = require_object(value, context)
+    require_exact_keys(rows, {str(port) for port in ports}, context)
+    for port, item in rows.items():
+        row = require_object(item, f"{context} port {port}")
+        require_exact_keys(row, {"opackets", "ipackets", "oerrors", "ierrors"}, f"{context} port {port}")
+        for field, count in row.items():
+            require_int(count, f"{context} port {port} {field}", minimum=0, maximum=(1 << 64) - 1)
+    return rows
+
+
+def port_counter_totals(payload: dict, ports: list[int], ingresses: list[int], egresses: list[int]) -> tuple[int, int]:
+    """Derive sent, received and error counts from native endpoints, including PGID agreement when present."""
+    before = require_port_counters(payload.get("port_counter_baseline"), "baseline", ports)
+    after = require_port_counters(payload.get("port_counter_final"), "final", ports)
+    for port, row in after.items():
+        for field, count in row.items():
+            if count < before[port][field]:
+                raise RuntimeError(f"trex port {port} {field} regressed")
+
+    def delta(selected: list[int], field: str) -> int:
+        """Sum the observed deltas only in the exercised direction."""
+        return sum(after[str(port)][field] - before[str(port)][field] for port in selected)
+
+    tx, rx = delta(ingresses, "opackets"), delta(egresses, "ipackets")
+    errors = delta(ingresses, "oerrors") + delta(egresses, "ierrors")
+    generation = payload["action"] == "generation_finish"
+    tx_field, rx_field = ("port_tx_count", "port_rx_count") if generation else ("tx_count", "rx_count")
+    for field, count in ((tx_field, tx), (rx_field, rx), ("errors", errors)):
+        if require_int(payload.get(field), f"TRex {field}", minimum=0, maximum=(1 << 64) - 1) != count:
+            raise RuntimeError(f"trex {field} disagrees with retained port snapshots")
+    if errors:
+        raise RuntimeError("trex remote result contains traffic errors")
+    if generation:
+        pgid_tx = require_int(payload.get("tx_count"), "TRex PGID TX", minimum=0, maximum=(1 << 64) - 1)
+        pgid_rx = require_int(payload.get("rx_count"), "TRex PGID RX", minimum=0, maximum=(1 << 64) - 1)
+        if (pgid_tx, pgid_rx) != (tx, rx):
+            raise RuntimeError(f"trex port and PGID aggregate counters disagree: port_tx={tx} pgid_tx={pgid_tx} "
+                               f"port_rx={rx} pgid_rx={pgid_rx}")
+    return tx, rx
+
+
+def require_minimum_observation(payload: dict, ingress: int, egress: int, identity: dict, *, capture: bool) -> None:
+    """Check live or retained tester identity, links, counts, monotonic sample brackets and capture extent."""
+    ports = [ingress, egress]
+    if (payload["action"] != "minimum_frame" or not require_bool(payload["ok"], "TRex success")
+            or require_trex_identity(payload["trex_identity"], "TRex admitted instrument identity") != identity
+            or [row["port_id"] for row in identity["ports"]] != sorted(ports)
+            or require_int(payload["pgid_demand"], "TRex PGID demand", minimum=0) != 0):
+        raise ValueError("minimum-frame action or tester identity differs from the admitted instrument")
+    sent, received = port_counter_totals(payload, ports, [ingress], [egress])
+    if sent == 0 or received > sent:
+        raise ValueError("minimum-frame port populations are contradictory")
+    links = require_array(payload["links"], "tester links")
+    observed = []
+    for item in links:
+        link = require_object(item, "tester link")
+        require_exact_keys(link, {"port", "link", "speed"}, "tester link")
+        observed.append(require_int(link["port"], "tester port", minimum=0, maximum=0xffffffff))
+        if link["link"] != "UP" or require_number(link["speed"], "tester link speed") <= 0:
+            raise ValueError("tester link is down or has no observed speed")
+    if sorted(observed) != sorted(ports):
+        raise ValueError("tester links differ from the exercised ports")
+    samples = require_array(payload["samples"], "minimum-frame counter samples")
+    if len(samples) != (2 if capture else 4):
+        raise ValueError("minimum-frame counter sample population is incomplete")
+    last_ns = 0
+    prior = {}
+    for item in samples:
+        sample = require_object(item, "minimum-frame sample")
+        require_exact_keys(sample, {"before_ns", "after_ns", "ports"}, "minimum-frame sample")
+        lower = require_int(sample["before_ns"], "sample opening", minimum=last_ns + 1, maximum=(1 << 64) - 1)
+        last_ns = require_int(sample["after_ns"], "sample closing", minimum=lower, maximum=(1 << 64) - 1)
+        counters = require_port_counters(sample["ports"], "sample", ports)
+        if prior and any(value < prior[port][key] for port, row in counters.items() for key, value in row.items()):
+            raise ValueError("minimum-frame tester counters regressed")
+        prior = counters
+    if samples[0]["ports"] != payload["port_counter_baseline"] or samples[-1]["ports"] != payload["port_counter_final"]:
+        raise ValueError("minimum-frame endpoints disagree with the retained samples")
+    frames = require_array(payload["captured"], "minimum-frame capture")
+    if len(frames) != (128 if capture else 0) or any(
+        not isinstance(frame, str) or len(frame) != 120 for frame in frames
+    ):
+        raise ValueError("minimum-frame capture has an incorrect frame count or length")
+
+
+def require_minimum_capture(payload: dict, expected: list[str]) -> None:
+    """Require two independent byte-exact returns for each flow, in any return order."""
+    if (payload["tx_count"], payload["rx_count"]) != (128, 128) or sorted(payload["captured"]) != sorted(expected * 2):
+        raise ValueError("minimum-frame return counts, headers or checksums differ from the expected frames")
 
 
 def generation_pgid_layout(ingress_count: int, num_flows: int) -> dict:

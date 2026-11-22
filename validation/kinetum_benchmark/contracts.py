@@ -7,9 +7,11 @@ from pathlib import Path
 from typing import Any, Dict, Iterable
 
 from kinetum_validation.config.types import (
-    StreamTopologyProfile, StorageProfile, TrafficEndpointConfig, epoch_window_has_capacity, timed_packet_count_fits,
+    BackendType, DEPLOYMENT_SPECS, DeploymentMode, StreamTopologyProfile, StorageProfile, TestType,
+    TrafficEndpointConfig, epoch_window_has_capacity, minimum_frame_shape_errors, timed_packet_count_fits,
 )
 from kinetum_validation.statistics import validate_percentile_population
+from kinetum_validation.minimum_frame import check_recorded_trial
 from kinetum_validation.process.epoch_load import require_epoch_load_artifact
 from kinetum_validation.engine.json_contract import (
     EXPECTED_SCENARIO_METRICS_BY_TEST,
@@ -72,11 +74,12 @@ def _validate_benchmark_scenario(value: object) -> Dict[str, Any]:
         scenario["traffic_driver"] in _TRAFFIC_DRIVERS,
         (scenario["backend"] == "dpdk_tap")
         == (scenario["traffic_driver"] == "native_tap"),
-        scenario["deployment"] != "passthrough"
-        or scenario["test_type"] == "standard",
     ))
     if not scenario_exact:
         raise JsonContractError("benchmark scenario identity is undeclared")
+    if DEPLOYMENT_SPECS[DeploymentMode(scenario["deployment"])].scenario_errors(
+            TestType(scenario["test_type"]), BackendType(scenario["backend"])):
+        raise JsonContractError("benchmark scenario is unavailable for its deployment")
     profile = _benchmark_profile(
         scenario["deployment"],
         scenario["backend"],
@@ -246,6 +249,11 @@ def validate_benchmark_manifest(value: Dict[str, Any], completed: bool) -> None:
         maximum=_UINT32_MAX,
     )
     require_bool(config["all_sizes"], "benchmark all-sizes selection")
+    errors = minimum_frame_shape_errors(
+        TestType(scenario["test_type"]), config["packet_size"], config["num_flows"], config["all_sizes"],
+    )
+    if errors:
+        raise JsonContractError(errors[0])
     for name in ("epoch_duration", "epoch_initial_duration"):
         require_number(config[name], f"benchmark {name}", minimum=0.0)
     window_fits = (
@@ -409,7 +417,6 @@ def validate_benchmark_run_artifacts(
         or metadata["bundle_root"] != f"{exact_run_root}/runtime_bundle"
     ):
         raise JsonContractError("benchmark run lifecycle identity is contradictory")
-
     endpoint = require_object(
         metadata["traffic_endpoint"], "run metadata traffic endpoint"
     )
@@ -425,6 +432,12 @@ def validate_benchmark_run_artifacts(
     if any(endpoint[name] != expected for name, expected in expected_endpoint.items()):
         raise JsonContractError("benchmark traffic endpoint identity disagrees")
     _validate_benchmark_profile_ports(metadata["ports"], profile.ports)
+    if scenario["test_type"] == "minimum_frame":
+        packets = result["packet_tests"]
+        if len(packets) > 1 or any(row["packet_size"] != 64 for row in packets):
+            raise JsonContractError("minimum-frame result contains a foreign packet population")
+        if packets and packets[0]["tx_count"] is not None:
+            check_recorded_trial(Path(exact_run_root), metadata, config, result)
 
 
 def validate_benchmark_result_identity(

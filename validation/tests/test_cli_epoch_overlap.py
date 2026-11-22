@@ -78,6 +78,7 @@ def _installed_roots(tmpdir):
     validation_bin.mkdir(parents=True)
     (runtime_root / "lib/modules").mkdir(parents=True)
     (validation_root / "examples").mkdir()
+    (validation_root / "fixtures").mkdir()
     for name in (
         "kinetum-info",
         "kinetum_cp",
@@ -411,7 +412,7 @@ class TestEpochOverlapCLI(unittest.TestCase):
             validation_orchestrator, "installed_root_errors", return_value=[]
         ), mock.patch.object(
             validation_orchestrator,
-            "installed_example_input_errors",
+            "installed_input_errors",
             return_value=[],
         ), mock.patch.object(
             validation_orchestrator,
@@ -470,9 +471,10 @@ class TestEpochOverlapCLI(unittest.TestCase):
                 ),
                 output_dir=Path(tmpdir) / "missing-input-output",
             )
-            missing = validation_orchestrator.installed_example_input_errors(
-                direct_config.process.validation_root,
-                direct_config.spec.example_dir,
+            missing = validation_orchestrator.installed_input_errors(
+                direct_config.process,
+                direct_config.spec,
+                direct_config.backend_profile,
                 direct_config.required_example_files,
             )
             self.assertTrue(missing)
@@ -484,9 +486,10 @@ class TestEpochOverlapCLI(unittest.TestCase):
             for name in direct_config.required_example_files:
                 (deployment_root / name).write_text("fixture\n", encoding="utf-8")
             self.assertEqual(
-                validation_orchestrator.installed_example_input_errors(
-                    direct_config.process.validation_root,
-                    direct_config.spec.example_dir,
+                validation_orchestrator.installed_input_errors(
+                    direct_config.process,
+                    direct_config.spec,
+                    direct_config.backend_profile,
                     direct_config.required_example_files,
                 ),
                 [],
@@ -715,7 +718,7 @@ class TestEpochOverlapCLI(unittest.TestCase):
                 benchmark_runner, "installed_root_errors", return_value=[]
             ), mock.patch.object(
                 benchmark_runner,
-                "installed_example_input_errors",
+                "installed_input_errors",
                 return_value=[],
             ), mock.patch.object(
                 benchmark_runner.ValidationRunOwner,
@@ -844,3 +847,21 @@ class TestEpochOverlapCLI(unittest.TestCase):
 
         with contextlib.redirect_stderr(io.StringIO()):
             self.assertTrue(benchmark_cli.validate_run_args(args))
+
+    def test_minimum_frame_defaults_are_the_same_for_validation_and_benchmark(self):
+        """Both entry points select the fixed 64-flow population and reject an explicit conflicting size or count."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            roots = _installed_roots(tmpdir)
+            select = ("--deployment", "passthrough", "--test-type", "minimum-frame")
+            valid = _validation_args(*roots, *select)
+            repeated = _benchmark_args(*select)
+            self.assertEqual((valid.packet_size, valid.num_flows, valid.all_sizes), (64, 64, False))
+            self.assertEqual((repeated.packet_size, repeated.num_flows, repeated.all_sizes), (64, 64, False))
+            self.assertTrue(validation_cli.validate_args(valid))
+            self.assertTrue(benchmark_cli.validate_run_args(repeated))
+            for option, value in (("--num-flows", "1"), ("--packet-size", "128")):
+                with self.subTest(option=option), contextlib.redirect_stderr(io.StringIO()):
+                    self.assertFalse(validation_cli.validate_args(_validation_args(*roots, *select, option, value)))
+                    self.assertFalse(benchmark_cli.validate_run_args(_benchmark_args(*select, option, value)))
+            standard = _benchmark_args("--test-type", "standard")
+            self.assertEqual((standard.num_flows, standard.all_sizes), (1, True))

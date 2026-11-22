@@ -40,6 +40,7 @@ class CONSTANTS:
 
     # Supplied Ethernet frame bytes, excluding FCS; 1514 fits a 1500-byte IP MTU.
     PACKET_SIZES: Tuple[int, ...] = (64, 128, 256, 512, 1024, 1514)
+    MINIMUM_FRAME_FLOWS: int = 64
 
     # Process management
     PROCESS_READY_TIMEOUT_S: int = 30
@@ -81,6 +82,8 @@ class DeploymentMode(Enum):
                  - Uses the mandatory explicit module-free bootstrap snapshot
                  - Does not admit module-configuration transition scenarios
 
+    PARSER_QOS: One PCI worker forwarding through the IPv4 parser and QoS module.
+
     FAN_IN_EDGE_GATEWAY: Multi-ingress edge pipeline with fan-in join
                     - Each ingress worker executes RX, parsing, and ACL
                     - NAT selects its session owner in region 2, followed by QoS and TX
@@ -89,6 +92,7 @@ class DeploymentMode(Enum):
                     - Uses built-in ACL, NAT44, and QoS modules
     """
     PASSTHROUGH = "passthrough"
+    PARSER_QOS = "parser_qos"
     FAN_IN_EDGE_GATEWAY = "fan_in_edge_gateway"
 
 
@@ -99,6 +103,8 @@ class TestType(Enum):
     STANDARD: Basic packet forwarding test
               - Send N packets, verify receipt
               - Measure loss and throughput, plus profile-owned latency when available
+
+    MINIMUM_FRAME: Two-port PCI forwarding of 64 untagged IPv4/UDP flows, 60 bytes before FCS.
 
     EPOCH: boundary-ordering validation for config transitions
            - Continuous traffic while config changes
@@ -122,14 +128,20 @@ class TestType(Enum):
                 - Generate traffic that triggers thresholds
                 - Verify auto-rollback occurs
 
-    FULL: Run every implemented scenario
+    FULL: Run the gateway forwarding, NAT and configuration-transition suite.
     """
     STANDARD = "standard"
+    MINIMUM_FRAME = "minimum_frame"
     EPOCH = "epoch"
     COMMIT_CONFIRMED = "commit_confirmed"
     ROLLBACK = "rollback"
     GUARDRAILS = "guardrails"
     FULL = "full"
+
+    @property
+    def default_num_flows(self) -> int:
+        """Return the flow count selected by this workload when the CLI omits an override."""
+        return CONSTANTS.MINIMUM_FRAME_FLOWS if self == TestType.MINIMUM_FRAME else 1
 
 
 class BackendType(Enum):
@@ -181,6 +193,14 @@ class TrafficDriverType(Enum):
     """
     NATIVE_TAP = "native_tap"
     TREX = "trex"
+
+
+def minimum_frame_shape_errors(test_type: TestType, packet_size: int, num_flows: int, all_sizes: bool) -> List[str]:
+    """Require the one physical population used for minimum-frame validation and its benchmark records."""
+    if test_type == TestType.MINIMUM_FRAME and (
+            packet_size != 64 or num_flows != CONSTANTS.MINIMUM_FRAME_FLOWS or all_sizes is not False):
+        return ["minimum-frame requires --packet-size 64 and --num-flows 64 without --all-sizes"]
+    return []
 
 
 class TransitionType(str, Enum):
@@ -246,6 +266,7 @@ class BackendProfile:
     timestamp_source: str
     rate_control_source: str
     latency_source: Optional[str]
+    input_locations: Dict[str, Tuple[str, str]] = field(default_factory=dict)
 
     def bindings_file_for(
         self,
@@ -275,7 +296,7 @@ class DeploymentSpec:
     Attributes
     ----------
     example_dir : str
-        Subdirectory under the installed examples root.
+        Deployment subdirectory under its registered source root.
     pipeline_file : str
         Axiom pipeline filename.
     config_snapshot : str
@@ -292,8 +313,12 @@ class DeploymentSpec:
         Whether bundle construction requires installed module images.
     backend_profiles : Dict[BackendType, BackendProfile]
         Exact physical validation profiles admitted for this deployment.
+    source_root : str
+        Default root for deployment files; the backend profile names any exceptions.
+    supported_tests : frozenset
+        Scenarios the deployment can exercise.
     """
-    example_dir: str                    # subdir under examples/
+    example_dir: str                    # subdirectory under the registered source root
     pipeline_file: str                  # .axiom.pbtxt filename
     config_snapshot: str                # mandatory bootstrap snapshot filename
     config_snapshot_v2: Optional[str]   # v2 snapshot for epoch/rollback, or None
@@ -301,6 +326,12 @@ class DeploymentSpec:
     regions: int                        # Gluon region count
     needs_modules: bool                 # bundle requires installed module images
     backend_profiles: Dict[BackendType, BackendProfile]
+    source_root: str = "examples"
+    supported_tests: frozenset[TestType] = frozenset(TestType) - {TestType.MINIMUM_FRAME}
+
+    def input_location(self, profile: BackendProfile, name: str) -> Tuple[str, str]:
+        """Return the registered kit root and directory for this deployment input."""
+        return profile.input_locations.get(name, (self.source_root, self.example_dir))
 
     def backend_profile(self, backend_type: BackendType) -> BackendProfile:
         """Return the backend profile or fail closed for unsupported mappings."""
@@ -311,9 +342,13 @@ class DeploymentSpec:
                 f"{self.example_dir} does not support backend {backend_type.value}"
             ) from exc
 
-    def scenario_errors(self, test_type: TestType) -> List[str]:
+    def scenario_errors(self, test_type: TestType, backend: BackendType) -> List[str]:
         """Return missing deployment facts for one requested scenario."""
         errors = []
+        if test_type not in self.supported_tests:
+            errors.append(f"the deployment does not support {test_type.value}")
+        if test_type == TestType.MINIMUM_FRAME and backend != BackendType.DPDK_PCI:
+            errors.append("minimum-frame requires the two-port PCI forwarding deployment")
         if test_type in {
             TestType.EPOCH,
             TestType.COMMIT_CONFIRMED,
@@ -391,6 +426,7 @@ def required_scenario_example_files(
     ]
     if (
         test_type in {
+            TestType.MINIMUM_FRAME,
             TestType.EPOCH,
             TestType.COMMIT_CONFIRMED,
             TestType.ROLLBACK,
@@ -409,9 +445,29 @@ def required_scenario_example_files(
 
 # Deployment Spec Registry - single source of truth for all deployment modes
 
+_D430_HARDWARE = "hardware_inventory_cloudlab_d430.pbtxt"
+
+
+def _forwarding_pci(binding: str) -> BackendProfile:
+    """Bind one d430 ingress/return pair using the gateway's hardware inventory."""
+    return BackendProfile(
+        backend_type=BackendType.DPDK_PCI,
+        bindings_files={(StreamTopologyProfile.DEFAULT, StorageProfile.SHARED): binding},
+        hw_file=_D430_HARDWARE,
+        ports=(PortSpec("wan0", "", "rx", peer_iface="enp6s0f0np0", peer_ip="10.10.1.1", traffic_port_id=0),
+               PortSpec("lan0", "", "tx", peer_iface="enp6s0f1np1", peer_ip="10.10.3.2", traffic_port_id=1)),
+        traffic_driver=TrafficDriverType.TREX,
+        timestamp_source="trex_port_stats",
+        rate_control_source="trex_stl_rate_control",
+        latency_source=None,
+        input_locations={_D430_HARDWARE: ("examples", "fan_in_edge_gateway")},
+    )
+
+
 DEPLOYMENT_SPECS: Dict[DeploymentMode, DeploymentSpec] = {
     DeploymentMode.PASSTHROUGH: DeploymentSpec(
         example_dir="passthrough",
+        supported_tests=frozenset({TestType.STANDARD, TestType.MINIMUM_FRAME}),
         pipeline_file="passthrough.axiom.pbtxt",
         config_snapshot="config_snapshot.pbtxt",
         config_snapshot_v2=None,
@@ -419,6 +475,7 @@ DEPLOYMENT_SPECS: Dict[DeploymentMode, DeploymentSpec] = {
         regions=1,
         needs_modules=False,
         backend_profiles={
+            BackendType.DPDK_PCI: _forwarding_pci("passthrough_pci_bindings.pbtxt"),
             BackendType.DPDK_TAP: BackendProfile(
                 backend_type=BackendType.DPDK_TAP,
                 bindings_files={
@@ -435,6 +492,13 @@ DEPLOYMENT_SPECS: Dict[DeploymentMode, DeploymentSpec] = {
                 latency_source="kernel_af_packet_pcap",
             ),
         },
+    ),
+    DeploymentMode.PARSER_QOS: DeploymentSpec(
+        example_dir="parser_qos", source_root="fixtures", supported_tests=frozenset({TestType.MINIMUM_FRAME}),
+        pipeline_file="parser_qos.axiom.pbtxt", config_snapshot="config_snapshot.pbtxt",
+        config_snapshot_v2="config_snapshot_v2.pbtxt", guardrails_degradation_snapshot=None,
+        regions=1, needs_modules=True,
+        backend_profiles={BackendType.DPDK_PCI: _forwarding_pci("parser_qos_pci_bindings.pbtxt")},
     ),
     DeploymentMode.FAN_IN_EDGE_GATEWAY: DeploymentSpec(
         example_dir="fan_in_edge_gateway",
@@ -570,7 +634,7 @@ class ProcessConfig:
     runtime_root : Path
         Exact installed runtime root containing bin/ and lib/modules/.
     validation_root : Path
-        Exact private kit root containing bin/ and examples/, outside the runtime.
+        Private kit root containing native helpers, examples and fixtures outside the runtime.
     dp_endpoint : str
         Data plane gRPC endpoint.
     cp_endpoint : str
@@ -600,6 +664,25 @@ class ProcessConfig:
     def examples_dir(self) -> Path:
         """Return the private kit's exact example-source directory."""
         return self.validation_root / "examples"
+
+    @property
+    def fixtures_dir(self) -> Path:
+        """Return the private kit's validation-only deployment sources."""
+        return self.validation_root / "fixtures"
+
+    def input_path(self, location: Tuple[str, str], name: str) -> Path:
+        """Resolve a registered input under one known root using exact ASCII path components."""
+        root, directory = location
+        for atom in (directory, name):
+            if not isinstance(atom, str) or not all((
+                atom not in {"", ".", ".."}, atom.isascii(), atom.isprintable(), len(atom) <= 255,
+                "/" not in atom, "\\" not in atom,
+            )):
+                raise ValueError("validation input name is not one exact path atom")
+        roots = {"examples": self.examples_dir, "fixtures": self.fixtures_dir}
+        if root not in roots:
+            raise ValueError("validation input names an unknown root")
+        return roots[root] / directory / name
 
 
 @dataclass(frozen=True)
@@ -885,6 +968,18 @@ class TestConfig:
     def bindings_file(self) -> str:
         """Bindings filename selected by backend, stream topology, and storage."""
         return self.backend_profile.bindings_file_for(self.stream_topology, self.storage_profile)
+
+    def workload_errors(self) -> List[str]:
+        """Check the physical population before opening a run or mutating the tester."""
+        errors = self.spec.scenario_errors(self.test_type, self.backend.backend_type)
+        errors.extend(minimum_frame_shape_errors(
+            self.test_type, self.packet.packet_size, self.packet.num_flows, self.packet.all_sizes,
+        ))
+        return errors
+
+    def input_path(self, name: str) -> Path:
+        """Resolve a selected source through its registered fixture owner."""
+        return self.process.input_path(self.spec.input_location(self.backend_profile, name), name)
 
     @property
     def required_example_files(self) -> Tuple[str, ...]:

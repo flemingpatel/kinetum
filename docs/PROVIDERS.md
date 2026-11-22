@@ -283,8 +283,10 @@ component code outlive every dependent.
 
 ### 7. Operation Tables and Packet Records
 
-Role operation records are immutable and cache-line aligned. Their opaque
-`state` can be mutable, subject to the role's calling contract.
+The factory role determines the C type used to read `operations`. The provider
+must supply a live table of that type for the instance's lifetime. These tables
+are immutable and cache-line aligned. Their opaque `state` can be mutable under
+the role's calling contract.
 
 Packet callbacks follow the [PEG hot-path rules](PLATFORM_ENGINEERING_GUIDE.md#pat-1-no-hot-path-allocation).
 Pool operations consume preallocated credits. A provider may use only system
@@ -304,7 +306,8 @@ Driver queue arrays preserve compiled order: the kth RX table corresponds to
 the kth RX row in the ascending stream-fact array, and likewise for TX.
 Components cannot reorder these arrays by native queue number.
 
-`kinetum_packet_record` is the sole packet representation: a 48-byte storage
+`kinetum_packet_record` is the representation for general routing, module
+execution and cross-worker handoff. It has a 48-byte storage
 descriptor followed by 80 bytes of metadata, in a 128-byte record aligned to
 64 bytes. Timestamp and epoch occupy offsets 48 and 56 in its first line.
 
@@ -316,6 +319,17 @@ descriptor followed by 80 bytes of metadata, in a 128-byte record aligned to
 Only the creating provider interprets `native_handle`. Modules receive a
 transient SoA projection through the Module SDK, never an mbuf or native
 storage handle. Byte mutations must update the parsed fields they invalidate.
+
+For a synchronous native handoff, the complete graph consists of one RX stage
+and one TX stage joined by an unconditional local edge. One worker owns the
+sole RX and TX streams, which share an I/O driver and storage domain. The RX
+queue's `receive_native` transfers a prefix of `kinetum_packet_native_view`
+entries. The TX queue's `transmit_native` consumes the accepted prefix. Both
+queues' `native_storage` pointers identify the same
+`kinetum_packet_native_storage_operations` table. Its `verify` and `release`
+callbacks operate on the refused suffix using the original storage owner's
+state. On a full-record-only queue, leave both its native callback and
+`native_storage` null.
 
 Current CPU execution requires one coherent contiguous segment, sufficient
 contiguous length, and proven CPU read/write access. Malformed native chains

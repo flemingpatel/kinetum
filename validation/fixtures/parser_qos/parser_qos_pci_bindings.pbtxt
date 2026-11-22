@@ -1,0 +1,98 @@
+# Copyright (c) 2026 Fleming Patel. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+process_facility_instances {
+  facility_instance_id: "facility_dpdk_0"
+  configuration {
+    [type.googleapis.com/kinetum.facility.dpdk.v1.DpdkFacilityConfig] {}
+  }
+}
+
+io_driver_instances {
+  io_driver_instance_id: "io_dpdk_0"
+  facility_instance_ids: "facility_dpdk_0"
+  configuration {
+    [type.googleapis.com/kinetum.io.dpdk.v1.DpdkDriverConfig] {
+      ports {
+        driver_port_id: "lan0"
+        pci { pci_address: "0000:06:00.1" }
+      }
+      ports {
+        driver_port_id: "wan0"
+        pci { pci_address: "0000:06:00.0" }
+      }
+    }
+  }
+}
+
+packet_storage_domains {
+  storage_domain_id: "storage_dpdk_0"
+  facility_instance_ids: "facility_dpdk_0"
+  configuration {
+    [type.googleapis.com/kinetum.storage.dpdk.v1.DpdkStorageConfig] {
+      cache_size: 256
+    }
+  }
+  buffer_count: 131071
+  data_room_bytes: 2048
+  headroom_bytes: 128
+  alignment_bytes: 64
+  host_numa_node: 0
+}
+
+execution_provider_instances {
+  execution_provider_instance_id: "execution_cpu_0"
+  configuration {
+    [type.googleapis.com/kinetum.execution.cpu.v1.CpuExecutionConfig] {}
+  }
+}
+
+logical_port_bindings {
+  logical_name: "wan0"
+  io_driver_instance_id: "io_dpdk_0"
+  driver_port_id: "wan0"
+  direction: PORT_DIRECTION_RX_ONLY
+  host_numa_node: 0
+  mtu: 1500
+}
+logical_port_bindings {
+  logical_name: "lan0"
+  io_driver_instance_id: "io_dpdk_0"
+  driver_port_id: "lan0"
+  direction: PORT_DIRECTION_TX_ONLY
+  host_numa_node: 0
+  mtu: 1500
+}
+
+io_stream_bindings {
+  logical_name: "wan0"
+  direction: IO_STREAM_DIRECTION_RX
+  queues { driver_queue_id: 0 descriptor_count: 2048 rx_storage_domain_id: "storage_dpdk_0" }
+  steering { kind: TRAFFIC_STEERING_KIND_NONE }
+}
+io_stream_bindings {
+  logical_name: "lan0"
+  direction: IO_STREAM_DIRECTION_TX
+  queues {
+    driver_queue_id: 0
+    descriptor_count: 2048
+    tx_storage { storage_domain_ids: "storage_dpdk_0" }
+  }
+  steering { kind: TRAFFIC_STEERING_KIND_NONE }
+}
+
+stage_execution_bindings {
+  logical_stage_id: "rx"
+  execution_provider_instance_id: "execution_cpu_0"
+}
+stage_execution_bindings {
+  logical_stage_id: "tx"
+  execution_provider_instance_id: "execution_cpu_0"
+}
+
+stage_execution_bindings { logical_stage_id: "parse" execution_provider_instance_id: "execution_cpu_0" }
+stage_execution_bindings { logical_stage_id: "qos" execution_provider_instance_id: "execution_cpu_0" }
+module_context_resource_bindings {
+  logical_stage_id: "qos" lane_id: "lane_0"
+  context_memory_capacity_bytes: 16777216 epoch_arena_capacity_bytes: 1048576
+}

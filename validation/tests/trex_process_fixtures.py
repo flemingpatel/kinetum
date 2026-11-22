@@ -36,6 +36,7 @@ class EndpointClient:
         self.acquired = []
         self.ingress = []
         self.started = False
+        self.active_reads = 0
         self.identity = complete_trex_identity()
 
     def record(self, name, ports=()):
@@ -57,7 +58,7 @@ class EndpointClient:
 
     def get_port_info(self, ports):
         """Project only the requested native capability rows."""
-        return [row for row in native_trex_port_info(self.identity) if row['index'] in ports]
+        return [dict(row, link='UP', speed=10) for row in native_trex_port_info(self.identity) if row['index'] in ports]
 
     def acquire(self, ports, force):
         """Acknowledge the complete requested claim before later mutations."""
@@ -86,10 +87,12 @@ class EndpointClient:
             raise AssertionError('stream creation without ownership')
         return list(range(1, len(streams) + 1))
 
-    def get_stats(self, ports):
+    def get_stats(self, ports, sync_now=True):
         """Refresh no hardware; absolute fixture rows are exposed separately."""
-        if not set(ports).issubset(self.acquired):
-            raise AssertionError('statistics without ownership')
+        if not sync_now or not set(ports).issubset(self.acquired):
+            raise AssertionError('unsynchronized statistics or ports without ownership')
+        if self.started:
+            self.active_reads += 1
         return {}
 
     def get_port(self, port_id):
@@ -114,6 +117,8 @@ class EndpointClient:
         """Keep the waiting run active until production cancellation handles it."""
         if ports != self.ingress:
             raise AssertionError('foreign active-port query')
+        if self.mode == 'ends-during-read' and self.active_reads >= 2:
+            return False
         return self.mode != 'complete' and self.started
 
     def wait_on_traffic(self, ports, timeout):

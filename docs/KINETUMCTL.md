@@ -852,8 +852,8 @@ kinetumctl stats [--format text|json] [--stage-stats]
 - `--storage-domain-stats`: also include compiled packet-storage-domain
   statistics.
 - `--port-stats`: also include exact logical-port/I/O-driver statistics.
-- `--topology-stats`: include admitted traffic-steering and module-context
-  membership rows.
+- `--topology-stats`: include traffic steering, module-context membership,
+  and the bound packet representation of each worker.
 
 Unknown `stats` flags or formats other than `text` and `json` exit 2.
 
@@ -899,9 +899,11 @@ On application success, both text and JSON modes contain:
    `AVAILABLE_EXACT`, `AVAILABLE_APPROXIMATE`,
    `UNSUPPORTED`, or `READ_FAILED`. Numeric values are present only for an
    available state; unsupported never means zero.
-5. **Admitted topology**: `--topology-stats` returns steering and module-context
-   membership using stable IDs. Provider-native lcores, physical port numbers,
-   pool scopes, and validation prose do not cross this generic boundary.
+5. **Admitted topology.** `--topology-stats` reports the plan's steering
+   profiles and module-context membership, and the packet representation bound
+   to each worker. Stream and storage-domain IDs refer to the compiled plan.
+   These rows omit DPDK lcore IDs, physical port numbers, native pool scopes
+   and validation-kit diagnostics.
 
 ### 16. `stats` Text Format
 
@@ -997,10 +999,11 @@ telemetry {
   `io_driver_instance_id` and `driver_port_id` identify its exact generic
   driver owner. `rx_missed`, `rx_errors`, `rx_no_buffer`, and `tx_errors` are
   provider-reported only in an available tuple.
-- `steering_profiles` and `module_context_domains`: selected together under
-  `--topology-stats`. Each context-domain row contains `module_id` and its
-  sorted `context_instance_ids`. These are admitted topology, not live provider
-  validation prose.
+- With `--topology-stats`, `steering_profiles` identifies the governed streams
+  and each `module_context_domains` row gives a `module_id` and its sorted
+  `context_instance_ids`. The same flag includes `packet_bindings.rows` in
+  worker-index order. A direct native binding names its RX stream, TX stream
+  and original storage domain.
 
 ### 17. `stats` JSON Format
 
@@ -1010,11 +1013,9 @@ are decimal strings. Application failure leaves stdout empty.
 
 #### Schema
 
-The abridged object below shows the permanent nesting. Optional row families
-appear only when selected, and optional scalar timestamps/counters appear only
-when their producer state makes them meaningful.
-Counters and digests are illustrative; the storage budget uses the shipped
-default d430 PCI profile.
+The abridged example shows a three-worker gateway with topology selected.
+The counters and digests are illustrative. The storage budget uses the
+shipped default d430 PCI profile.
 
 ```json
 {
@@ -1309,21 +1310,30 @@ default d430 PCI profile.
         "module_id": "kinetum.qos",
         "context_instance_ids": ["qos@lane_0"]
       }
-    ]
+    ],
+    "packet_bindings": {
+      "rows": [
+        {"worker_index": 0, "representation": "WORKER_PACKET_REPRESENTATION_FULL_RECORD"},
+        {"worker_index": 1, "representation": "WORKER_PACKET_REPRESENTATION_FULL_RECORD"},
+        {"worker_index": 2, "representation": "WORKER_PACKET_REPRESENTATION_FULL_RECORD"}
+      ]
+    }
   }
 }
 ```
 
 #### Conditional arrays
 
-Detailed arrays are **conditional** in the JSON output:
+Selection controls which detailed rows are populated. The JSON printer emits
+an empty array for an unselected repeated field.
 
 - `stages`, `module_counters`, `module_histograms`,
   `module_epoch_mismatches`, `module_health`, `workers`, `regions`,
   `boundaries`, `streams`, `storage_domains`, and `ports` follow their exact
   selection flags.
-- `steering_profiles` and `module_context_domains` are selected together under
-  `--topology-stats`.
+- `--topology-stats` selects `steering_profiles`, `module_context_domains` and
+  the `packet_bindings` object together. Without the flag, `packet_bindings`
+  is absent.
 - Optional transaction, certificate, grace, health, boundary-timing, and
   provider-value fields are emitted only with protobuf presence. Selected
   stream counters always have explicit presence, including zero. Numeric zero
@@ -1331,10 +1341,9 @@ Detailed arrays are **conditional** in the JSON output:
   non-optional primitive defaults, so a selected successful row has a stable
   scalar shape; optional evidence still appears only when present.
 
-A robust JSON consumer must first require exit code zero, then check key
-presence rather than assume the optional-array shape. Within a successful JSON
-object, `status`, `active_config`, and all four mandatory telemetry summaries
-are unconditional. String values are JSON-escaped by protobuf's printer.
+Read stdout after exit code zero. Each successful response contains `status`,
+`active_config` and the mandatory telemetry fields `runtime`, `engine`,
+`worker_counters`, `transition` and `protocol_faults`.
 
 #### Pretty-printing and field names
 

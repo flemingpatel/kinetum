@@ -15,20 +15,12 @@ from .engine.json_contract import parse_exact_json_object, require_array, requir
 from .process.kinetumctl import ActiveSnapshot
 from .process.system_tools import RECOVERABLE_EXCEPTIONS
 from .scenario_context import ScenarioContext
+from .traffic.udp import internet_checksum, ipv4_udp
 
 
 _FLOWS_PER_INGRESS = 16
 _REMOTE_IP = "198.51.100.9"
 _REMOTE_PORT = 49999
-
-
-def _checksum(data: bytes) -> int:
-    """Compute an independent complete Internet checksum, including an odd tail."""
-    padded = data + (b"\x00" if len(data) % 2 else b"")
-    total = sum(word[0] for word in struct.iter_unpack("!H", padded))
-    while total >> 16:
-        total = (total & 0xffff) + (total >> 16)
-    return total ^ 0xffff
 
 
 @dataclass(frozen=True)
@@ -43,16 +35,7 @@ class _Datagram:
 
     def encode(self) -> bytes:
         """Build one fixed-header IPv4/UDP datagram with valid complete checksums."""
-        source = ipaddress.IPv4Address(self.source_ip).packed
-        destination = ipaddress.IPv4Address(self.destination_ip).packed
-        udp_length = 8 + len(self.payload)
-        udp = struct.pack("!HHHH", self.source_port, self.destination_port, udp_length, 0) + self.payload
-        pseudo = source + destination + struct.pack("!BBH", 0, 17, udp_length)
-        checksum = _checksum(pseudo + udp)
-        udp = udp[:6] + struct.pack("!H", checksum if checksum else 0xffff) + udp[8:]
-        header = struct.pack("!BBHHHBBH4s4s", 0x45, 0, 20 + udp_length, 0, 0x4000, 64, 17, 0,
-                             source, destination)
-        return header[:10] + struct.pack("!H", _checksum(header)) + header[12:] + udp
+        return ipv4_udp(self.source_ip, self.destination_ip, self.source_port, self.destination_port, self.payload)
 
 
 def _decode_frame(frame: bytes) -> _Datagram:
@@ -63,14 +46,14 @@ def _decode_frame(frame: bytes) -> _Datagram:
     total_length = int.from_bytes(ip[2:4], "big")
     if (
         ip[0] != 0x45 or ip[9] != 17 or not 28 <= total_length <= len(ip)
-        or int.from_bytes(ip[6:8], "big") & 0x3fff or _checksum(ip[:20]) != 0
+        or int.from_bytes(ip[6:8], "big") & 0x3fff or internet_checksum(ip[:20]) != 0
     ):
         raise RuntimeError("NAT exchange captured malformed IPv4 header evidence")
     udp = ip[20:total_length]
     if int.from_bytes(udp[4:6], "big") != len(udp) or udp[6:8] == b"\x00\x00":
         raise RuntimeError("NAT exchange UDP length or checksum presence is incorrect")
     pseudo = ip[12:20] + struct.pack("!BBH", 0, 17, len(udp))
-    if _checksum(pseudo + udp) != 0:
+    if internet_checksum(pseudo + udp) != 0:
         raise RuntimeError("NAT exchange transport checksum is invalid")
     return _Datagram(
         str(ipaddress.IPv4Address(ip[12:16])), str(ipaddress.IPv4Address(ip[16:20])),

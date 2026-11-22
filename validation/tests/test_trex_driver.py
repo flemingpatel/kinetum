@@ -42,7 +42,8 @@ from kinetum_validation.process.kinetumctl import KinetumCtl
 from kinetum_validation.traffic import trex as trex_module
 from kinetum_validation.traffic.trex import TRexTrafficDriver
 from kinetum_validation.traffic.trex_protocol import (
-    TRexRemoteFailure, generation_flow_expected_tx, generation_pgid_layout, require_trex_capacity,
+    TRexRemoteFailure, generation_flow_expected_tx, generation_pgid_layout, require_port_counters,
+    require_trex_capacity,
 )
 from tests.epoch_load_fixtures import load_snapshot, load_topology
 from tests.traffic_fixtures import complete_trex_identity, native_trex_port_info
@@ -133,11 +134,12 @@ def _remote_action_execution(action: str) -> str:
     script = trex_module._REMOTE_TREX_SCRIPT  # pylint: disable=protected-access
     module = ast.parse(script)
     if action == "run":
+        admission = ast.parse('action not in {"run", "minimum_frame"}', mode="eval").body
         for node in module.body:
             if not isinstance(node, ast.Try):
                 continue
             for index, statement in enumerate(node.body):
-                if isinstance(statement, ast.If) and ast.unparse(statement.test) == "action != 'run'":
+                if isinstance(statement, ast.If) and ast.dump(statement.test) == ast.dump(admission):
                     return ast.unparse(ast.Module(body=node.body[index + 1:], type_ignores=[]))
         raise AssertionError("ordinary remote run has no execution owner")
     matches = []
@@ -967,12 +969,49 @@ class TestTRexTrafficDriver(unittest.TestCase):  # pylint: disable=too-many-publ
             with patch.object(driver, "cancel_remote_action", new=cancel), patch.object(
                 driver, "_await_remote_kill_task", new=await_kill,
             ):
-                with self.assertRaisesRegex(RuntimeError, "capture retirement is unproved"):
+                with self.assertRaisesRegex(RuntimeError, "remote traffic retirement is unproved"):
                     await driver.teardown()
 
         asyncio.run(exchange())
         cancel.assert_called_once_with()
         await_kill.assert_awaited_once_with()
+
+    def test_minimum_frame_reuses_port_reset_and_common_exit(self):
+        """Completion and interruption retire the same selected ports through the existing endpoint finally."""
+        endpoint = ast.parse(trex_module._REMOTE_TREX_SCRIPT)  # pylint: disable=protected-access
+        owner, = [node for node in endpoint.body if isinstance(node, ast.Try) and node.finalbody
+                  and "client.disconnect" in ast.unparse(node.finalbody[0])]
+        acquire, = [node for node in endpoint.body if isinstance(node, ast.FunctionDef)
+                    and node.name == "acquire_ports"]
+        operations = compile(ast.Module(body=[acquire, owner], type_ignores=[]), "<owned TRex action>", "exec")
+        for interrupted in (False, True):
+            with self.subTest(interrupted=interrupted):
+                client = MagicMock()
+                client.get_acquired_ports.return_value = [0, 1]
+
+                def fail(_message, code):
+                    """Use SystemExit so the real endpoint's shared finally runs."""
+                    raise SystemExit(code)
+
+                action = MagicMock(side_effect=InterruptedError() if interrupted else None, return_value={})
+                ns = {
+                    "client": None, "STLClient": MagicMock(return_value=client), "action": "minimum_frame",
+                    "spec": {"ports": [0, 1], "egress_ports": [1], "trex_server": "localhost",
+                             "pps": 1000, "duration_s": 7, "capture": True},
+                    "ingress": 0, "frames": [], "promisc_ports": [], "mutation_attempted": False,
+                    "release_ports_on_exit": True, "check_cancellation": MagicMock(), "connect_client": MagicMock(),
+                    "contextlib": contextlib, "sys": sys, "minimum_frame_run": action,
+                    "admit_instrument": MagicMock(return_value={}), "emit": partial(fail, code=0), "fail": fail,
+                }
+                with self.assertRaises(SystemExit) as completed:
+                    exec(operations, ns)  # pylint: disable=exec-used
+                self.assertEqual(completed.exception.code, 130 if interrupted else 0)
+                client.acquire.assert_called_once_with(ports=[0, 1], force=True)
+                client.reset.assert_called_once_with(ports=[0, 1])
+                self.assertEqual(client.mock_calls[-4:], [
+                    call.stop(ports=[0, 1]), call.set_port_attr(ports=[1], promiscuous=False),
+                    call.release(ports=[0, 1]), call.disconnect(stop_traffic=False, release_ports=False),
+                ])
 
     def test_udp_capture_retires_before_service_mode_on_success_and_failure(self):
         """Endpoint send failures and cancellation still retire the exact capture before service mode."""
@@ -1434,12 +1473,22 @@ class TestTRexTrafficDriver(unittest.TestCase):  # pylint: disable=too-many-publ
 
     def test_remote_cancellation_waits_for_port_retirement_and_rejects_unproved_cleanup(self):
         """Real endpoint pipes distinguish completion, cooperative cancellation and forced transport exit."""
-        async def exercise(root, mode):
+        async def exercise(root, mode, minimum):
             """Run the production transport and complete endpoint program without a live instrument."""
             config = _trex_config()
-            config = replace(config, traffic=replace(config.traffic, work_dir=str(root)))
+            if minimum:
+                profile = DEPLOYMENT_SPECS[DeploymentMode.PASSTHROUGH].backend_profile(BackendType.DPDK_PCI)
+                ports = tuple(replace(port, runtime_mac=f"02:00:00:00:00:0{index + 1}",
+                                      runtime_direction=port.traffic_role) for index, port in enumerate(profile.ports))
+                config = replace(
+                    config, deployment=DeploymentMode.PASSTHROUGH, test_type=ValidationTestType.MINIMUM_FRAME,
+                    backend=replace(config.backend, ports=ports),
+                    packet=PacketConfig(pps=1000, num_flows=64, duration_s=1),
+                )
+            selected = tuple(p.traffic_port_id for p in config.backend.ports)
+            config = replace(config, traffic=replace(config.traffic, work_dir=str(root), trex_ports=selected))
             driver = TRexTrafficDriver(config)
-            driver._trex_identity = copy.deepcopy(TREX_IDENTITY)  # pylint: disable=protected-access
+            driver._trex_identity = complete_trex_identity(selected)  # pylint: disable=protected-access
             create_process = asyncio.create_subprocess_exec
             processes = []
 
@@ -1453,11 +1502,16 @@ class TestTRexTrafficDriver(unittest.TestCase):  # pylint: disable=too-many-publ
                 patch.object(trex_module.asyncio, 'create_subprocess_exec', new=launch),
                 patch.object(trex_module, '_REMOTE_TERMINATE_GRACE_S', 1.0),
             ):
-                task = asyncio.create_task(driver.run_remote_traffic(PacketConfig(pps=10), 1.0, 'standard', 0))
+                traffic = (driver.minimum_frame(capture=False) if minimum else
+                           driver.run_remote_traffic(PacketConfig(pps=10), 1.0, 'standard', 0))
+                task = asyncio.create_task(traffic)
                 try:
                     if mode == 'complete':
                         result = await asyncio.wait_for(task, timeout=10.0)
                         self.assertEqual((result['tx_count'], result['rx_count']), (10, 10))
+                    elif mode == 'ends-during-read':
+                        with self.assertRaisesRegex(TRexRemoteFailure, "finished during an interior counter read"):
+                            await asyncio.wait_for(task, timeout=10.0)
                     else:
                         async with asyncio.timeout(10.0):
                             while not (root / 'endpoint-started').exists():
@@ -1469,6 +1523,12 @@ class TestTRexTrafficDriver(unittest.TestCase):  # pylint: disable=too-many-publ
                         expected = asyncio.CancelledError if mode == 'wait' else RuntimeError
                         with self.assertRaises(expected):
                             await task
+                        if minimum:
+                            if mode == 'wait':
+                                await driver.teardown()
+                            else:
+                                with self.assertRaisesRegex(RuntimeError, "retirement is unproved"):
+                                    await driver.teardown()
                     self.assertIsNone(driver._remote_proc)  # pylint: disable=protected-access
                 finally:
                     if not task.done():
@@ -1480,15 +1540,20 @@ class TestTRexTrafficDriver(unittest.TestCase):  # pylint: disable=too-many-publ
                         await process.wait()
                 return processes[0].returncode
 
-        for mode in ('complete', 'wait', 'cleanup-failure', 'hang'):
-            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+        cases = [(False, mode) for mode in ('complete', 'wait', 'cleanup-failure', 'hang')]
+        cases.extend((True, mode) for mode in ('wait', 'cleanup-failure', 'ends-during-read'))
+        for minimum, mode in cases:
+            with self.subTest(minimum=minimum, mode=mode), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory).resolve()
-                code = asyncio.run(exercise(root, mode))
+                code = asyncio.run(exercise(root, mode, minimum))
                 operations = [json.loads(line)[0] for line in (root / 'endpoint.jsonl').read_text().splitlines()]
                 if mode in ('complete', 'wait'):
                     self.assertEqual(code, 0 if mode == 'complete' else 130)
                     self.assertEqual(operations[-4:], ['stop', 'restore', 'release', 'disconnect'])
                     self.assertEqual('rx-drain' in operations, mode == 'complete')
+                elif mode == 'ends-during-read':
+                    self.assertEqual(code, 1)
+                    self.assertEqual(operations[-4:], ['stop', 'restore', 'release', 'disconnect'])
                 else:
                     self.assertEqual(code, 1 if mode == 'cleanup-failure' else -15)
                     self.assertNotIn('release', operations)
@@ -1708,11 +1773,10 @@ class TestTRexTrafficDriver(unittest.TestCase):  # pylint: disable=too-many-publ
 
     def test_port_counter_baseline_requires_exact_presence_and_uint64_values(self):
         """Both transport boundaries reject incomplete or fabricated baselines."""
-        driver = TRexTrafficDriver(_trex_config())
-        remote_validate = _remote_helper("exact_port_counters", "exact_int")
+        ports = [0, 1, 2]
         validators = (
-            driver._require_port_counters,  # pylint: disable=protected-access
-            remote_validate,
+            (require_port_counters, ("baseline", ports)),
+            (_remote_helper("exact_port_counters", "exact_int"), (ports,)),
         )
         invalid = [None, {}, {**PORT_COUNTER_BASELINE, "3": PORT_COUNTER_BASELINE["0"]}]
         for field in ("opackets", "ipackets", "oerrors", "ierrors"):
@@ -1723,8 +1787,7 @@ class TestTRexTrafficDriver(unittest.TestCase):  # pylint: disable=too-many-publ
                 malformed = copy.deepcopy(PORT_COUNTER_BASELINE)
                 malformed["0"][field] = value
                 invalid.append(malformed)
-        for validator in validators:
-            args = ([0, 1, 2],) if validator is remote_validate else ("baseline",)
+        for validator, args in validators:
             validator(PORT_COUNTER_BASELINE, *args)
             for bound in (0, (1 << 64) - 1):
                 validator({

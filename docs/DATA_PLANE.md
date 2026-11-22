@@ -131,7 +131,7 @@ asynchronous work, including across live transitions.
 | **Region**              | Logical partition slice in the deployment plan. Defined by `plan.regions[i]`.                              |
 | **Runtime worker**       | One busy-poll execution owner for a populated `(region,lane)` slice. Single-lane plans have one worker per region; RSS multi-lane plans may have more. |
 | **Boundary**            | An exact cross-worker handoff defined by `plan.boundaries[i]`, including endpoint stage instances, owner workers, capacities, and NUMA placement. |
-| **Dispatch core**       | The pre-resolved `packet_worker_kernel` dispatch methods route one owned `packet_record *` to its next stage, TX operation, boundary, fan-out branch, or burst retirement without a provider or string lookup. |
+| **Dispatch core**       | Pre-resolved `packet_worker_kernel` methods route full records to stages, TX, boundaries, fan-out or retirement without a provider or string lookup. A worker bound for a direct native handoff services the same RX and TX stage turns using typed local slots. |
 | **Snapshot epoch store** | Cold coordinator-owned two-slot owner of exact canonical `ConfigSnapshot` artifacts in EMPTY, PREPARED, PUBLISHED, or RETAINED state. It has no history map, nearby-epoch lookup, allocator, lock, shared ownership, or packet-path reader. |
 | **Module image**        | One canonical, link-closed `.so` loaded by exact path with local symbol scope; `kinetum_module_register` returns its exact descriptor. |
 | **Module context**      | One executable stage-instance state object with a sole owner worker and exact compiled placement.         |
@@ -140,11 +140,11 @@ asynchronous work, including across live transitions.
 | **Module epoch store**  | Per-context two-slot owner of exact PREPARED, PUBLISHED, and RETAINED artifacts plus the active executable view. It never maps an unknown epoch to a nearby slot. |
 | **Module executable view** | One cache-line owner-local callback/config authority pre-resolved before worker launch. Packet execution performs one exact packet/view epoch equality and no slot or manager lookup. |
 | **Worker ownership record** | Compiled runtime-worker record containing the RX sources, inbound/outbound boundaries, I/O streams, and stage instances that one worker owns. |
-| **Worker epoch ledger** | One owner-worker two-slot logical-work counter. `packet_private.epoch` selects the exact active/future slot; packet operations use plain arithmetic, while foreign readers consume only the coherent per-turn publication. Local queue-slot reservations and physical storage credits remain separate capacity/record authorities. |
+| **Worker epoch ledger** | One owner-worker two-slot logical-work counter. The full record's `packet_private.epoch` or the native receipt's epoch selects the active or future slot. Packet operations use plain arithmetic, while foreign readers consume the coherent per-turn publication. Local queue reservations and physical storage have separate lifetimes. |
 | **Worker epoch input staging** | One prefaulted worker-NUMA allocation containing all domain roles. Each role groups packet pointers by exact stage and continuation while sharing one capacity with outstanding reservations. Transition-enabled source domains also own equal-capacity future roles; complete roles exchange by pointer in O(1). |
 | **Boundary future-output hold** | One sender-NUMA, pointer-only queue per boundary. It is preallocated and empty until ordered commit allows local future execution while that boundary's exact ACK gate is closed. |
 | **`packet_private`**    | 80-byte sole metadata authority embedded in every provider-neutral packet record. |
-| **`packet_record`**     | Exact 128-byte, two-cache-line core packet representation physically declared by the provider C ABI: a 48-byte storage descriptor followed by `packet_private`. Every packet-path owner transfers only `packet_record *`. |
+| **`packet_record`**     | The provider C ABI's 128-byte full record spans two cache lines and contains a 48-byte storage descriptor followed by `packet_private`. General routing, modules and all cross-worker DATA transfers use this representation. |
 | **Provider contract**   | One exact typed configuration schema plus canonicalization and capability semantics, identified by its complete canonical type URL. |
 | **Provider component**  | One exact-release, signed-inventory ELF image that realizes one or more provider contracts behind the C provider ABI. |
 | **Compiled provider topology** | Sole semantic result containing compact facilities, drivers, storage, execution, transitions, worker schedules, access proofs, and required component contracts. |
@@ -880,14 +880,14 @@ The worker requests at most its current service allowance and free
 staging capacity. The allowance is bounded by the operation's maximum burst
 and the shared 64-record scratch ceiling. RX returns
 `transferred_count` and `rejected_count`; their widened sum must not exceed the
-request. Only the transferred prefix grants record ownership. Rejected native
+request. The worker takes ownership of the transferred packets. Rejected native
 inputs are already retired by the provider. Both counts zero means no input
 was consumed; violating the input bound fails stop.
 
-The I/O/storage implementation has already constructed every returned
-`packet_record`: DPDK recovers the record from the mbuf private area; UDP
-receives into records reserved from its declared storage domain. Core code then
-stamps only generic metadata authority:
+On the full-record path the provider has already constructed each returned
+`packet_record`. DPDK recovers the record from the mbuf private area. UDP
+receives into records reserved from its declared storage domain. The worker
+sets the following admission metadata.
 
 - `timestamp_ns = worker_now_ns`
 - `epoch = worker_epoch_ledger.source_epoch`
@@ -896,22 +896,30 @@ stamps only generic metadata authority:
 - exact logical and executable RX stage identities
 - `module_next_stage = INVALID_STAGE_ID`
 
-Once per provider burst, the worker compares its owner-local source and active
-epochs and selects exactly one queue role. Records enter that role of the exact
-storage-domain staging owner. The worker reserves a slot before asking the
-provider for a record and never requests more than available capacity slots,
-the provider's maximum burst, or `PACKET_MAX_BURST_SIZE`. A returned-prefix
-population receives its exact source-epoch credits in one counted operation
-before any local work publication. Rejected and unconsumed input creates no credit;
-every unused staging reservation is released, including a rejected-only burst.
-The role-local reservation remains a capacity rollback proof and is never read
-as epoch ownership or quiescence.
+When the complete graph consists of one RX stage connected directly to one
+TX stage, the worker can bind a synchronous native handoff. The edge must
+be unconditional and local. One worker owns both streams, and their queues
+share the same driver and original storage domain. Each local slot holds the
+opaque buffer handle, original data start and length, timestamp and epoch.
+TX accepts a prefix. The worker compares any refused views with its saved
+receipts, then asks the storage owner to verify their live ranges before
+releasing them. It counts accepted bytes from the saved lengths because TX
+may already have reclaimed those buffers. Both paths use the same epoch
+rotation, turn limits and stream counter units.
 
-RX, ACTIVE-origin result and transition-destination buffers start entirely null.
-After each call, the worker validates the untouched suffix and clears accepted
-pointers after their last use. This preserves the complete buffer across changing
-request sizes without clearing it before every call. Origin byte views are
-separately cleared after the copy callback returns.
+Once per provider burst, the worker compares its owner-local source and active
+epochs and selects one staging role for the storage domain. It reserves
+capacity for the requested burst before calling the provider. It then
+acquires the returned prefix's source-epoch credits in one operation,
+publishes that prefix and releases every unused reservation. A rejected-only
+burst releases the entire reservation. The epoch ledger tracks owned work
+independently of queue capacity.
+
+Full-record RX, ACTIVE-origin result and transition-destination buffers start
+entirely null. After each call, the worker validates the untouched suffix and
+clears accepted pointers after their last use. This preserves the complete
+buffer across changing request sizes without clearing it before every call.
+Origin byte views are separately cleared after the copy callback returns.
 
 At IDLE, source and active epochs are equal, so the predicted active branch is
 selected and every future role is empty. A committed TRANSITION command binds
@@ -1067,7 +1075,8 @@ including ordinary retirement points, see
 
 ### 11. TX and Egress
 
-Terminal TX dispatch is a grouped scatter pattern with no fallback:
+Full records use the following egress rules. The [direct native handoff](#9-rx-path)
+uses the TX stream bound at construction.
 
 - `KINETUM_PORT_DROP` makes the TX mechanism reject the packet and routes it to
   storage retirement.
@@ -1089,11 +1098,11 @@ Terminal TX dispatch is a grouped scatter pattern with no fallback:
 The worker accumulates records in order for each exact
 `packet_tx_burst_operations` table. A full accumulator or the iteration boundary
 invokes one `transmit_burst`; records are never sorted or split by pool.
-Before the foreign call, the worker saves every record's original domain,
-length, epoch, and executed TX stage. Accepted records may already be freed or
-reused when the call returns. The operation consumes every record in its
-returned accepted prefix, and only that exact prefix retires its
-worker credits after the provider reports acceptance. The worker retains the
+Before the provider call, the worker saves each record's length, metadata and
+original domain. A batch with a common metadata body and domain can share
+those values while retaining each timestamp and length. Accepted records may
+already be freed or reused when the call returns. The worker retires the
+accepted prefix's credits using only the saved facts. The worker retains the
 untouched suffix and appends it to the existing grouped storage-domain release
 path, where terminal disposition retires each remaining credit exactly once;
 each worker polls, conditionally flushes, and finally flushes only the TX
@@ -2129,14 +2138,14 @@ compiled provider-neutral identities:
 | `runtime_io_port_statistics` | Exact logical port, I/O-driver instance, driver-local port, typed availability, and complete optional native counter tuple. |
 | `runtime_traffic_steering_statistics` | Exact admitted steering profile, mechanism, symmetry, and stable stream membership. |
 | `runtime_module_context_domain` | Exact module identity and canonical context membership defining fixed ordinals. |
+| `runtime_worker_packet_binding` | Construction-time representation for one worker, with RX, TX and original storage identities for a direct native route. |
 | `engine_stats` | Plain component-test counters exposed by `dp_engine::stats()` under one serialized caller; not a live runtime source. |
 
 Tests can exercise RPC behavior without opening a listening socket by
 constructing a complete fixture runtime and `dataplane_control_service`, then
 calling handlers with `grpc::ServerContext` stubs. Provider mechanism tests may
-substitute exact operation tables inside their owned compile domain, but they
-do not get a second packet representation, partial runtime constructor, or
-provider-selection bypass.
+substitute exact operation tables inside their owned compile domain. The same
+representation, construction and provider selection rules apply to those tables.
 
 ### 21. Determinism
 

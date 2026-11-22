@@ -359,10 +359,7 @@ async def run_epoch_test(context: ScenarioContext) -> EpochTestResult:
             raise RuntimeError("epoch rate or packet count is outside the supported range")
         if context.config.spec.config_snapshot_v2 is None:
             raise RuntimeError("epoch requires a target configuration snapshot")
-        config_v2 = (
-            context.config.process.examples_dir / context.config.spec.example_dir
-            / context.config.spec.config_snapshot_v2
-        )
+        config_v2 = context.config.input_path(context.config.spec.config_snapshot_v2)
         if not is_symlink_free_regular_file(config_v2):
             raise RuntimeError("config_snapshot_v2 is not an exact regular file")
         old_load = context.epoch_load_phase(traffic_start_stats)
@@ -618,11 +615,7 @@ async def run_commit_confirmed_test(context: ScenarioContext) -> CommitConfirmed
             duration_s=time.monotonic() - start_time,
             message="Commit-confirmed test requires a second snapshot",
         )
-    config_file = (
-        context.config.process.examples_dir
-        / spec.example_dir
-        / spec.config_snapshot_v2
-    )
+    config_file = context.config.input_path(spec.config_snapshot_v2)
 
     if not is_symlink_free_regular_file(config_file):
         return CommitConfirmedTestResult(
@@ -648,11 +641,7 @@ async def run_commit_confirmed_test(context: ScenarioContext) -> CommitConfirmed
         # public transition surface before arming a v2 confirmation; a
         # same-content pending-confirm record would have no distinct
         # rollback target and must remain inadmissible.
-        baseline_file = (
-            context.config.process.examples_dir
-            / spec.example_dir
-            / spec.config_snapshot
-        )
+        baseline_file = context.config.input_path(spec.config_snapshot)
         if not is_symlink_free_regular_file(baseline_file):
             raise RuntimeError("commit-confirmed baseline is unavailable")
         current = await context.get_stats_snapshot(selection=replace(TRANSITION_STATS, include_stage_stats=False))
@@ -1035,16 +1024,8 @@ async def run_rollback_test(context: ScenarioContext) -> RollbackTestResult:
             duration_s=time.monotonic() - start_time,
             message="Rollback test requires a second snapshot",
         )
-    config_v1 = (
-        context.config.process.examples_dir
-        / spec.example_dir
-        / spec.config_snapshot
-    )
-    config_v2 = (
-        context.config.process.examples_dir
-        / spec.example_dir
-        / spec.config_snapshot_v2
-    )
+    config_v1 = context.config.input_path(spec.config_snapshot)
+    config_v2 = context.config.input_path(spec.config_snapshot_v2)
 
     if not is_symlink_free_regular_file(config_v1):
         return RollbackTestResult(
@@ -1440,11 +1421,7 @@ async def run_guardrails_test(context: ScenarioContext) -> GuardrailsTestResult:
                 "degradation snapshot"
             ),
         )
-    candidate_file = (
-        context.config.process.examples_dir
-        / context.config.spec.example_dir
-        / degradation_snapshot
-    )
+    candidate_file = context.config.input_path(degradation_snapshot)
     if not is_symlink_free_regular_file(candidate_file):
         return GuardrailsTestResult(
             passed=False,

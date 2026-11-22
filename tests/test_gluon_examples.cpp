@@ -43,7 +43,7 @@ namespace
 struct example_spec {
 	const char *directory;	    ///< Example directory and pipeline filename stem.
 	const char *bindings;	    ///< Exact deployment-binding filename.
-	const char *hardware;	    ///< Exact hardware-inventory filename.
+	const char *hardware;	    ///< Hardware inventory relative to the examples root.
 	int32_t regions;	    ///< Region count used by the deployment.
 	int expected_handoffs;	    ///< Exact number of cross-worker stage edges.
 	uint32_t rx_descriptors;    ///< Authored descriptor population for each RX stream.
@@ -51,13 +51,18 @@ struct example_spec {
 	uint64_t required_buffers;  ///< Independently derived complete per-domain ownership bound.
 };
 
+/** @brief Shared hardware inventory for the shipped d430 PCI examples. */
+constexpr char D430_HARDWARE[] = "fan_in_edge_gateway/hardware_inventory_cloudlab_d430.pbtxt";
+
 /** @brief Single-queue deployments selected by the validation profiles. */
-constexpr std::array<example_spec, 3> SINGLE_QUEUE_EXAMPLES{{
-	{"passthrough", "passthrough_tap_bindings.pbtxt", "hardware_inventory_tap.pbtxt", 1, 0, 1024u, 1024u, 4480u},
-	{"fan_in_edge_gateway", "fan_in_edge_gateway_tap_bindings.pbtxt", "hardware_inventory_tap.pbtxt", 3, 2, 1024u,
-	 1024u, 13312u},
-	{"fan_in_edge_gateway", "fan_in_edge_gateway_cloudlab_d430_bindings.pbtxt",
-	 "hardware_inventory_cloudlab_d430.pbtxt", 3, 2, 2048u, 2048u, 16384u},
+constexpr std::array<example_spec, 4> SINGLE_QUEUE_EXAMPLES{{
+	{"passthrough", "passthrough_tap_bindings.pbtxt", "passthrough/hardware_inventory_tap.pbtxt", 1, 0, 1024u,
+	 1024u, 4480u},
+	{"passthrough", "passthrough_pci_bindings.pbtxt", D430_HARDWARE, 1, 0, 2048u, 2048u, 6528u},
+	{"fan_in_edge_gateway", "fan_in_edge_gateway_tap_bindings.pbtxt",
+	 "fan_in_edge_gateway/hardware_inventory_tap.pbtxt", 3, 2, 1024u, 1024u, 13312u},
+	{"fan_in_edge_gateway", "fan_in_edge_gateway_cloudlab_d430_bindings.pbtxt", D430_HARDWARE, 3, 2, 2048u, 2048u,
+	 16384u},
 }};
 
 /** @brief Parsed inputs retained while planning or removing an authored handoff. */
@@ -74,7 +79,8 @@ struct example_inputs {
  */
 kinetum::common::status_or<example_inputs> load_example(const example_spec &spec)
 {
-	const auto directory = std::filesystem::path(KINETUM_TEST_SOURCE_ROOT) / "examples" / spec.directory;
+	const auto examples = std::filesystem::path(KINETUM_TEST_SOURCE_ROOT) / "examples";
+	const auto directory = examples / spec.directory;
 	auto pipeline_or = kinetum::axiom::load_pipeline_pbtxt(
 		(directory / (std::string(spec.directory) + ".axiom.pbtxt")).string(), {});
 	if (!pipeline_or.is_ok()) {
@@ -83,7 +89,7 @@ kinetum::common::status_or<example_inputs> load_example(const example_spec &spec
 	example_inputs inputs;
 	inputs.pipeline = std::move(pipeline_or).value();
 	const auto hardware_status = kinetum::common::read_pbtxt_file(
-		(directory / spec.hardware).string(), kinetum::common::DEFAULT_MAX_FILE_SIZE, &inputs.hardware);
+		(examples / spec.hardware).string(), kinetum::common::DEFAULT_MAX_FILE_SIZE, &inputs.hardware);
 	if (!hardware_status.is_ok()) {
 		return hardware_status;
 	}
@@ -264,7 +270,7 @@ TEST(gluon_examples, rss_bindings_plan_complete_context_selection_handoffs)
 {
 	constexpr example_spec RSS_EXAMPLE{"fan_in_edge_gateway",
 					   "fan_in_edge_gateway_cloudlab_d430_rx_rss_2_bindings.pbtxt",
-					   "hardware_inventory_cloudlab_d430.pbtxt",
+					   D430_HARDWARE,
 					   3,
 					   8,
 					   2048u,
@@ -310,13 +316,13 @@ TEST(gluon_examples, per_queue_storage_bindings_plan_original_domains)
 		uint32_t pool_buffers;	///< Exact per-domain physical buffer population.
 	};
 	constexpr std::array<storage_example, 2> EXAMPLES{{
-		{{"fan_in_edge_gateway", "fan_in_edge_gateway_cloudlab_d430_per_rx_queue_bindings.pbtxt",
-		  "hardware_inventory_cloudlab_d430.pbtxt", 3, 2, 2048u, 2048u, 9920u},
+		{{"fan_in_edge_gateway", "fan_in_edge_gateway_cloudlab_d430_per_rx_queue_bindings.pbtxt", D430_HARDWARE,
+		  3, 2, 2048u, 2048u, 9920u},
 		 2,
 		 1,
 		 65535u},
 		{{"fan_in_edge_gateway", "fan_in_edge_gateway_cloudlab_d430_rx_rss_2_per_rx_queue_bindings.pbtxt",
-		  "hardware_inventory_cloudlab_d430.pbtxt", 3, 8, 2048u, 2048u, 15360u},
+		  D430_HARDWARE, 3, 8, 2048u, 2048u, 15360u},
 		 4,
 		 2,
 		 32767u},

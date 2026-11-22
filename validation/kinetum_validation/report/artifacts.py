@@ -320,6 +320,8 @@ class RunArtifacts:
                     asdict(row) for row in stats.worker_epoch_stats
                 ],
                 "worker_counters": [asdict(row) for row in stats.worker_counters],
+                **({"packet_bindings": {"rows": [row.wire_row() for row in stats.packet_bindings]}}
+                   if stats.packet_bindings is not None else {}),
                 "stream_stats": [
                     asdict(row) for row in stats.stream_stats
                 ],

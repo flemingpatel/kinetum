@@ -72,6 +72,7 @@ from .config.types import (
     TestType,
     TrafficEndpointConfig,
     epoch_window_has_capacity,
+    minimum_frame_shape_errors,
     timed_packet_count_fits,
     traffic_endpoint_errors,
 )
@@ -95,8 +96,7 @@ def parse_args() -> argparse.Namespace:
         type=str,
         choices=[mode.value.replace("_", "-") for mode in DeploymentMode],
         default=DeploymentMode.FAN_IN_EDGE_GATEWAY.value.replace("_", "-"),
-        help="Deployment mode: fan-in-edge-gateway (multi-ingress, 3 regions), "
-             "passthrough (RX->TX)",
+        help="Deployment: fan-in-edge-gateway (three regions), passthrough (RX to TX), or parser-qos (one worker)",
     )
 
     # Test type
@@ -105,8 +105,8 @@ def parse_args() -> argparse.Namespace:
         type=str,
         choices=[test_type.value.replace("_", "-") for test_type in TestType],
         default=TestType.STANDARD.value,
-        help="Test type: standard (forwarding), epoch (boundary-ordering transition), "
-             "commit-confirmed, rollback, guardrails, full (implemented tests)",
+        help="Test type: standard (tagged forwarding), minimum-frame (64 bytes including FCS), "
+             "epoch, commit-confirmed, rollback, guardrails, or full",
     )
 
     # Physical validation-infrastructure profile
@@ -220,12 +220,12 @@ def parse_args() -> argparse.Namespace:
     packet_group.add_argument(
         "--num-flows",
         type=int,
-        default=1,
+        default=None,
         help=(
             "Number of traffic-generator flows per ingress port; "
             "rx-rss-2 requires at least "
             f"{CONSTANTS.RX_RSS_2_MIN_NUM_FLOWS}, and transition evidence "
-            "must fit the bounded JSON result (default: 1)"
+            "must fit the bounded JSON result (minimum-frame: 64; other tests: 1)"
         ),
     )
     packet_group.add_argument(
@@ -331,7 +331,10 @@ def parse_args() -> argparse.Namespace:
         ),
     )
 
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.num_flows is None:
+        args.num_flows = TestType(args.test_type.replace("-", "_")).default_num_flows
+    return args
 
 
 def _validate_installation_args(
@@ -348,9 +351,9 @@ def _validate_installation_args(
         )
     )
 
-    errors.extend(
-        spec.scenario_errors(TestType(args.test_type.replace("-", "_")))
-    )
+    test_type = TestType(args.test_type.replace("-", "_"))
+    errors.extend(spec.scenario_errors(test_type, BackendType(args.backend.replace("-", "_"))))
+    errors.extend(minimum_frame_shape_errors(test_type, args.packet_size, args.num_flows, args.all_sizes))
 
 
 def _validate_backend_args(

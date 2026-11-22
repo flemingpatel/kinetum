@@ -488,8 +488,13 @@ lets a cold storage owner check that extent before allocation. Scalar operations
 are O(1); `pop_batch()` consumes an available FIFO prefix across at most two
 contiguous ranges and advances the cursor once. It requires nonthrowing move
 assignment and destruction into initialized, nonoverlapping output storage.
-Batch consumption and `clear()` are O(n). The view allocates no storage, takes
-no lock, and keeps circular arithmetic out of its subsystem consumer.
+`try_push_prefix(values, count)` copies all `count` values and advances the
+producer cursor once, including when the copy wraps. The input must not
+overlap the queue storage, and copy construction must be nonthrowing. A zero
+count succeeds. The call returns false before construction if a nonempty
+prefix has a null source or exceeds the free capacity. Both batch operations and
+`clear()` are O(n). The view allocates no storage, takes no lock, and keeps
+circular arithmetic out of its subsystem consumer.
 
 DP composes these views into active/future role sets. Each role shares one
 packet-capacity bound across its keys and outstanding reservations; its

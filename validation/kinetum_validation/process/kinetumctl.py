@@ -754,7 +754,7 @@ class KinetumCtl:
             return StatsResult(success=False, diagnostic=stderr or stdout)
 
         # Parse JSON output from kinetumctl stats --format json
-        result = parse_stats_json(stdout)
+        result = parse_stats_json(stdout, selection)
         if result.success and selection.include_stream_stats and not stream_totals_are_exact(result):
             return StatsResult(success=False, diagnostic="engine and selected stream totals disagree")
         if result.success and selection.include_topology_stats and result.module_context_count != sum(

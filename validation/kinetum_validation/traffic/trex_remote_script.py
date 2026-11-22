@@ -355,6 +355,22 @@ if "egress_ports" in spec:
         fail("egress_ports are not members of ports", 2)
 if action == "exchange_udp":
     exchange_ingress, exchange_packets, exchange_marker = exchange_input()
+if action == "minimum_frame":
+    ingress = exact_int(spec["ingress_port"], "ingress port", 0, (1 << 32) - 1)
+    if (len(ports) != 2 or len(egress_ports) != 1 or ingress not in ports or ingress in egress_ports
+            or not isinstance(spec["capture"], bool) or not isinstance(spec["frames"], list)
+            or len(spec["frames"]) != 64):
+        fail("minimum-frame traffic requires one ingress, one return port and 64 flows", 2)
+    frames = [bytes.fromhex(exact_string(frame, "Ethernet frame")) for frame in spec["frames"]]
+    for flow, frame in enumerate(frames):
+        if (len(frame) != 60 or frame[12:16] != b"\x08\x00\x45\x00" or frame[16:18] != b"\x00\x2e"
+                or frame[23] != 17 or frame[38:40] != b"\x00\x1a"
+                or frame[42:] != b"KINETUM" + bytes([flow]) + bytes(range(10))):
+            fail("minimum-frame input differs from its untagged IPv4/UDP flow", 2)
+    rate = exact_int(spec["pps"], "offered packets per second", 1, 1000000000)
+    duration = exact_number(spec["duration_s"], "offering duration", positive=True)
+    if not 1 <= rate * duration <= (1 << 32) - 1:
+        fail("minimum-frame offered population exceeds the packet-count domain", 2)
 if action in {"run", "generation_start", "generation_finish"}:
     duration_s = exact_number(spec["duration_s"], "duration_s", positive=True)
     pps = exact_int(spec["pps"], "pps", 1, 1000000000)
@@ -749,6 +765,58 @@ def exchange_udp(client, ingress, packets, marker, egress_ports):
     return frames
 
 
+def minimum_frame_run(client, ports, ingress, egress, frames, capture, rate, seconds):
+    '''Verify the finite frame population or time independently sampled port counters.'''
+    links = [{"port": row["index"], "link": row["link"], "speed": row["speed"]}
+             for row in client.get_port_info(ports=ports)]
+    samples = []
+
+    def sample():
+        '''Bracket the native refresh on the tester's monotonic clock.'''
+        lower = time.monotonic_ns()
+        client.get_stats(ports=ports, sync_now=True)
+        counters = absolute_port_counters(client, ports)
+        samples.append({"before_ns": lower, "after_ns": time.monotonic_ns(), "ports": counters})
+
+    captured = []
+    if capture:
+        with client.service_mode(ports=ports):
+            capture_id = client.start_capture(rx_ports=egress, limit=129, mode="fixed",
+                                              bpf_filter="ip and udp")["id"]
+            try:
+                sample()
+                client.push_packets([Ether(frame) for frame in frames] * 2, ports=[ingress], ipg_usec=1000)
+                check_cancellation(EXCHANGE_TIMEOUT_S)
+                sample()
+            finally:
+                client.stop_capture(capture_id, output=captured)
+    else:
+        streams = [STLStream(packet=STLPktBuilder(pkt=Ether(frame)), mode=STLTXCont(pps=rate / len(frames)),
+                             mac_src_override_by_pkt=True, mac_dst_override_mode=1) for frame in frames]
+        client.add_streams(streams, ports=[ingress])
+        sample()
+        client.start(ports=[ingress], duration=seconds, force=True)
+        origin = time.monotonic()
+        for offset in (seconds / 7, seconds * 6 / 7):
+            check_cancellation(max(0.0, origin + offset - time.monotonic()))
+            if not client.is_traffic_active(ports=[ingress]):
+                raise RuntimeError("minimum-frame sampling window lost its active sender")
+            sample()
+        if not client.is_traffic_active(ports=[ingress]):
+            raise RuntimeError("minimum-frame sender finished during an interior counter read")
+        wait_for_traffic(client, [ingress], seconds + 30.0)
+        check_cancellation(EXCHANGE_TIMEOUT_S)
+        sample()
+    if any(row["origin"] != "RX" or row["port"] != egress[0] for row in captured):
+        raise RuntimeError("minimum-frame capture contains a foreign observation")
+    before, after = samples[0]["ports"], samples[-1]["ports"]
+    delta = port_counter_deltas(after, before)
+    return {"links": links, "captured": [row["binary"].hex() for row in captured], "samples": samples,
+            "port_counter_baseline": before, "port_counter_final": after,
+            "tx_count": stat_value(delta, ingress, "opackets"), "rx_count": stat_value(delta, egress[0], "ipackets"),
+            "errors": stat_value(delta, ingress, "oerrors") + stat_value(delta, egress[0], "ierrors")}
+
+
 client = None
 # Ports whose promiscuous setting must be retired, including an attempted
 # multi-port attribute call that can fail after changing a prefix.
@@ -763,7 +831,7 @@ try:
 
     if action in {
         "probe", "run", "generation_start", "generation_finish",
-        "generation_abort", "exchange_udp",
+        "generation_abort", "exchange_udp", "minimum_frame",
     }:
         egress_ports = [int(p) for p in spec["egress_ports"]]
     else:
@@ -1066,14 +1134,9 @@ try:
             "action": "generation_abort",
         })
 
-    if action != "run":
+    if action not in {"run", "minimum_frame"}:
         fail("unsupported TRex action: {}".format(action), 2)
-    ingress_ports = [stream["port_id"] for stream in ingress_streams]
     duration_s = float(spec["duration_s"])
-    mode = spec["mode"]
-
-    num_flows = spec["num_flows"]
-    per_stream_pps = float(spec["pps"]) / float(len(ingress_ports) * num_flows)
     admitted_identity = admit_instrument(client, ports, egress_ports, 0)
     for operation in ("is_traffic_active", "wait_on_traffic"):
         if not callable(getattr(client, operation, None)):
@@ -1086,6 +1149,16 @@ try:
             promisc_ports = list(egress_ports)
             client.set_port_attr(ports=egress_ports, promiscuous=True)
 
+        if action == "minimum_frame":
+            minimum_result = minimum_frame_run(client, ports, ingress, egress_ports, frames, spec["capture"],
+                                               spec["pps"], duration_s)
+    if action == "minimum_frame":
+        emit({"ok": True, "action": action, "trex_identity": admitted_identity, "pgid_demand": 0, **minimum_result})
+
+    ingress_ports = [stream["port_id"] for stream in ingress_streams]
+    num_flows = spec["num_flows"]
+    per_stream_pps = float(spec["pps"]) / float(len(ingress_ports) * num_flows)
+    with contextlib.redirect_stdout(sys.stderr):
         for stream in ingress_streams:
             port_id = int(stream["port_id"])
             client.add_streams(

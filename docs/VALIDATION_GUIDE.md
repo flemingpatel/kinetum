@@ -47,7 +47,7 @@ Section 22 summarizes validation capabilities and evidence boundaries.
 
 ### Part 3: Test Types
 
-- [Section 9: standard](#9-standard)
+- [Section 9: standard](#9-standard) and [minimum-frame on PCI](#minimum-ethernet-frames-on-pci)
 - [Section 10: epoch](#10-epoch)
 - [Section 11: commit-confirmed](#11-commit-confirmed)
 - [Section 12: rollback](#12-rollback)
@@ -149,9 +149,10 @@ host setup. See Ubuntu's [package contents](https://packages.ubuntu.com/en/noble
 and [DPDK configuration guide](https://ubuntu.com/server/docs/explanation/networking/about-dpdk/).
 
 The DPDK provider requires [exclusive i40e adapter ownership](PROVIDERS.md#native-construction-and-ownership):
-bind declared functions to `vfio-pci` and leave unused siblings unbound. For the
-shipped d430 bindings, `0000:06:00.3` is unused. Repeat NIC preparation after a
-reboot; the runtime checks ownership and never changes bindings itself.
+bind declared functions to `vfio-pci` and leave unused siblings unbound. The
+d430 fan-in gateway uses `0000:06:00.0` through `.2`. Passthrough and parser/QoS
+use `.0` and `.1`, so both `.2` and `.3` must be unbound on the DUT. Repeat NIC
+preparation after a reboot. The runtime checks these bindings during admission.
 
 Use the completed native build from [Getting Started](GETTING_STARTED.md#1-build)
 to produce the private wheel, then transfer it to the prepared lab host of the
@@ -326,8 +327,8 @@ short option is accepted.
 
 | Flag | Default | Notes |
 |------|---------|-------|
-| `--deployment`, `-d` | `fan-in-edge-gateway` | `fan-in-edge-gateway` or `passthrough`. |
-| `--test-type`, `-t` | `standard` | `standard`, `epoch`, `commit-confirmed`, `rollback`, `guardrails`, `full`. |
+| `--deployment`, `-d` | `fan-in-edge-gateway` | `fan-in-edge-gateway`, `passthrough` or `parser-qos`. |
+| `--test-type`, `-t` | `standard` | `standard`, `minimum-frame`, `epoch`, `commit-confirmed`, `rollback`, `guardrails`, `full`. |
 | `--backend`, `-b` | `dpdk-tap` | Selects `dpdk-tap` or `dpdk-pci` validation infrastructure. It is never propagated to Gluon or DP. |
 | `--stream-topology` | `default` | Deployment-binding topology selected before Gluon planning. `rx-rss-2` is available for the fan-in d430 PCI profile. |
 | `--storage-profile` | `shared` | Select `per-rx-queue` for separate ingress pools in either fan-in d430 PCI topology. Selects the authored bindings file before planning. |
@@ -339,16 +340,16 @@ short option is accepted.
 | `--trex-server` | `127.0.0.1` | TRex stateless server address as seen from the traffic endpoint. |
 | `--trex-api-path` | empty | Optional path prepended before importing `trex_stl_lib.api` on the traffic endpoint. |
 | `--trex-port` | profile default | Ordered TRex port override. Repeat once per selected deployment port. |
-| `--pps` | `1000` | Aggregate target PPS for standard and guardrails traffic, divided across ingress ports/flows. Bounded to `1..1000000000`. |
-| `--count` | `1000` | Standard-test packet target in the positive uint32 domain; converted to a duration using `count / pps`. |
-| `--duration` | `0.0` | Standard-test traffic duration in seconds. `0.0` uses `--count`; a positive duration must schedule at least one packet and keep `pps * duration` inside uint32. |
-| `--packet-size` | `64` | Bytes. Validated to `[64, 9000]`. |
-| `--all-sizes` | off | Run packet test for `(64, 128, 256, 512, 1024, 1514)`. |
-| `--num-flows` | `1` | TRex flows per ingress port, `1..55536`, varying UDP source port from 10000. `rx-rss-2` requires at least 64. Generation admission requires enough reported counters at every observation port and a result within the shared 16 MiB JSON limit. Native TAP remains single-flow. |
+| `--pps` | `1000` | Aggregate target PPS for standard, minimum-frame and guardrails traffic, divided across ingress ports and flows. Range `1..1000000000`. |
+| `--count` | `1000` | Packet target for standard and minimum-frame traffic, in the positive uint32 range. |
+| `--duration` | `0.0` | Traffic duration in seconds. Zero uses `count / pps`. A positive duration must schedule at least one packet and keep `pps * duration` inside uint32. |
+| `--packet-size` | `64` | Supplied bytes for tagged tests, in `[64, 9000]`. For `minimum-frame`, 64 is the wire size including FCS. |
+| `--all-sizes` | off | Sweep `(64, 128, 256, 512, 1024, 1514)` for standard packet tests. Leave off for `minimum-frame`. |
+| `--num-flows` | `64` for `minimum-frame`, otherwise `1` | TRex flows per ingress port, varying the UDP source port from 10000. Minimum-frame requires exactly 64. Tagged TRex traffic accepts `1..55536`, with at least 64 for `rx-rss-2`. Generation admission requires enough counters at every observation port and a result within the shared 16 MiB JSON limit. Native TAP uses one flow. |
 | `--src-ip` | `10.0.0.100` | Source IP of generated UDP flow. |
 | `--dst-ip` | `192.168.1.1` | Destination IP. |
 | `--runtime-root` | required | Explicit finalized installed runtime root. It and every consumed `bin/` or `lib/` path component must be absolute and symlink-free. Exact regular runtime executables and, for module deployments, `lib/modules/` are required. |
-| `--validation-root` | installed package's `data/` directory | Validation resources containing `VERSION`, `bin/`, and `examples/`. An explicit selection must be absolute, symlink-free, and disjoint from the runtime root in both containment directions. |
+| `--validation-root` | installed package's `data/` directory | Validation resources containing `VERSION`, `bin/`, `examples/` and `fixtures/`. An explicit selection must be absolute, symlink-free, and disjoint from the runtime root in both containment directions. |
 | `--dp-endpoint` | `127.0.0.1:50052` | DP gRPC listen address. |
 | `--cp-endpoint` | `127.0.0.1:50051` | CP gRPC listen address. |
 | `--epoch-duration` | `30.0` | Requested epoch traffic window in seconds, including load qualification but excluding setup, drain and analysis. |
@@ -358,12 +359,11 @@ short option is accepted.
 | `--output-dir` | `/tmp/kinetum_validation` | Absent absolute final path created once for CP state, logs, captures, and JSON artifacts. Existing output rejects. |
 | `--verbose`, `-v` | off | Starts Photon, CP, and DP at DEBUG instead of INFO; includes ordinary TRex stderr details and CLI error tracebacks. Process output is streamed unchanged in both modes. |
 | `--no-color` | off | Disables ANSI output in `ConsoleReporter`. |
-| `--max-loss` | `1.0` | Maximum loss percentage (`0..100`) for standard, epoch, commit-confirmed, and rollback. Epoch also requires at most 0.1%; `--max-loss 0` requires zero loss. Guardrails checks deliberate degradation and recovery. |
+| `--max-loss` | `1.0` | Maximum loss percentage (`0..100`) for standard, minimum-frame, epoch, commit-confirmed and rollback. Zero requires zero loss. Epoch also requires at most 0.1%. Guardrails checks deliberate degradation and recovery. |
 
-For standard traffic, `--duration 0.0` selects `count / pps` seconds of
-generation. `--count` is therefore a pacing target; successful sends are
-measured. A positive `--duration` overrides that calculation. Scenario-specific
-traffic windows are defined in Sections 10-13.
+For standard and minimum-frame traffic, the driver measures how many packets
+were actually sent during the requested interval. Sections 10-13 give the
+traffic windows for configuration tests.
 
 ### 5.2 Shell Wrapper Entry
 
@@ -507,16 +507,23 @@ simultaneous hardware snapshot.
 
 ## 7. Deployments
 
-`DEPLOYMENT_SPECS` in `config/types.py` defines deployments for the CLI,
-supervisor, backend, and orchestrator, avoiding separate per-deployment branches.
+The validation and benchmark CLIs and the orchestrator read deployment inputs
+and supported scenarios from `DEPLOYMENT_SPECS` in `config/types.py`.
 
 | Deployment | Regions | Ports | needs_modules | allow_dag | Snapshots |
 |------------|---------|-------|---------------|-----------|-----------|
-| `passthrough` | 1 | `wan0->neb_rx (rx)`, `lan0->neb_tx (tx)` | no | no | `config_snapshot.pbtxt` |
-| `fan-in-edge-gateway` | 3 | `wan0->neb_rx0 (rx)`, `wan1->neb_rx1 (rx)`, `lan0->neb_tx (tx)` | yes | yes | `config_snapshot.pbtxt`, `config_snapshot_v2.pbtxt`, `config_snapshot_guardrails_degradation.pbtxt` |
+| `passthrough` | 1 | `wan0` RX, `lan0` TX (PCI or TAP interfaces `neb_rx`, `neb_tx`, respectively) | no | no | `config_snapshot.pbtxt` |
+| `parser-qos` | 1 | `wan0` RX, `lan0` TX (PCI) | yes | no | QoS bootstrap and Apply snapshots |
+| `fan-in-edge-gateway` | 3 | `wan0` and `wan1` RX, `lan0` TX (PCI or TAP interfaces `neb_rx0`, `neb_rx1`, `neb_tx`, respectively) | yes | yes | `config_snapshot.pbtxt`, `config_snapshot_v2.pbtxt`, `config_snapshot_guardrails_degradation.pbtxt` |
 
-Each kebab-case CLI value maps through `DEPLOYMENT_SPECS` to its explicit
-underscore-named `examples/<example_dir>/` artifact directory, which contains:
+The registry resolves public sources under `examples/` and kit-only inputs
+under `fixtures/`. Passthrough's TAP and PCI bindings ship together in
+`examples/passthrough/`. Parser/QoS lives in `fixtures/parser_qos/`.
+All d430 profiles use the inventory in `examples/fan_in_edge_gateway/`.
+Before packing for another DUT, match its MAC addresses in the inventory
+and its PCI addresses in both the inventory and the selected bindings.
+
+The public examples also include these inputs.
 
 - `<deployment>.axiom.pbtxt` (the pipeline source).
 - TAP hardware inventory (`hardware_inventory_tap.pbtxt`).
@@ -665,7 +672,8 @@ The kit's defaults are:
 
 The unused traffic-peer function is `0000:06:00.3`. The operator configures TRex
 before validation; the kit does not reorder its interfaces. `--trex-port`
-overrides remain in deployment order (WAN0, WAN1, LAN0). When hosts change,
+overrides follow deployment order (WAN0, WAN1, LAN0 for the gateway and
+WAN0, LAN0 for the two-port deployments). When hosts change,
 update the runtime hardware inventory and both hosts' attachment/MAC facts
 before generating a bundle; the example records one assigned d430 host.
 
@@ -766,8 +774,8 @@ private source, an install service, a custom image, or runtime provider policy.
 The deployment bindings and hardware inventory remain the only runtime
 topology authorities after the lab nodes are instantiated.
 
-The d430 selectors choose one complete authored file under
-`examples/fan_in_edge_gateway/`; they never rewrite runtime bindings:
+For the d430 fan-in gateway, `--stream-topology` and `--storage-profile`
+select one of the following files in `examples/fan_in_edge_gateway/`.
 
 | Stream topology | Storage profile | Bindings file |
 |---|---|---|
@@ -829,7 +837,7 @@ to end with loss within threshold, while recording the achieved rate.
 
 **Inputs.**
 
-- Deployment: `passthrough` or `fan-in-edge-gateway`.
+- Deployment: `passthrough` or `fan-in-edge-gateway` for standard forwarding.
 - Packet config: PPS, count or duration, packet size, src/dst IP.
 - `--max-loss` (default `1.0`%).
 
@@ -865,22 +873,18 @@ Result JSON and CSVs retain measured rates, loss percentages, and latency values
 without decimal rounding. Human-readable output preserves small nonzero values rather than
 displaying them as zero.
 
-**What this proves.** That the runner, selected traffic driver, pipeline, and
-validated packet/counter evidence line up end to end. Native TAP exercises the
-DPDK TAP PMD, AF_PACKET injection, tcpdump capture, and pcap analyzer; physical
-PCI exercises the TRex endpoint and real NIC bindings. For `passthrough` it is
-a validation-profile and exact provider-graph bring-up test. For
-`fan-in-edge-gateway` it additionally
-exercises the full module chain (ACL, NAT44, QoS) under the v1
-snapshot. Native TAP records positive achieved throughput but does not turn
-the requested pacing rate into a performance pass threshold; physical
-throughput qualification belongs to the benchmark campaign.
+**Coverage.** Native TAP exercises the DPDK TAP PMD, AF_PACKET injection,
+tcpdump capture and pcap analyzer. Physical PCI exercises the TRex endpoint
+and the bound NIC ports. Passthrough forwards packets between its two ports.
+The fan-in gateway also exercises ACL, NAT44 and QoS under the bootstrap
+snapshot.
 
 **Pass criteria.** Exact evidence for the selected driver and
-`loss_pct <= max_loss`. Loss percentage alone can never hide a sender error or
-counter disagreement; native pcap evidence also rejects a foreign, duplicate,
-or within-input reordered frame. Independent fan-in inputs may interleave;
-the pipeline does not promise one global packet order across them.
+`loss_pct <= max_loss`. Standard TRex runs also require at least 95% of the
+expected packets to be sent. Native TAP reports the achieved sender rate.
+Both drivers reject sender errors and counter disagreement. Native pcap
+analysis also rejects a foreign, duplicate or within-input reordered frame.
+Independent fan-in inputs may interleave.
 
 The canonical fan-in `standard` and `full` runs also perform a bounded NAT
 exchange after the measured scenarios and their statistics are saved. Each
@@ -902,6 +906,35 @@ Its packets do not enter throughput, latency, or RSS-balance measurements.
 - `--num-flows`: TRex varies UDP source port per flow; the native sender
   remains single-flow. `rx-rss-2` requires at least 64 flows.
 
+### Minimum Ethernet frames on PCI
+
+Use `--test-type minimum-frame --backend dpdk-pci` with
+`--deployment passthrough` or `--deployment parser-qos` and the TRex endpoint
+options. Passthrough measures forwarding between two ports. Parser/QoS
+measures forwarding through the IPv4 parser and the QoS module on one worker.
+Set the offered rate with `--pps`. The validation CLI accepts `--duration`
+in seconds. For benchmark runs the duration is `count / pps`.
+
+TRex first sends two copies of each of 64 untagged Ethernet frames carrying
+IPv4/UDP. The kit checks the number and contents of the returned frames.
+Each contains 60 supplied bytes plus the four-byte Ethernet FCS on the wire.
+Parser/QoS also checks the IPv4 checksum and DSCP marking under the bootstrap
+policy (10) and after Apply completes (20). The timed trial sends the same
+input frames with capture disabled.
+
+`minimum_frame.json` reports the offered and returned rates separately under
+`rates.offered` and `rates.returned`. Each has `lower_pps`, `midpoint_pps`
+and `upper_pps` from two counter reads during transmission. The packet
+result's `throughput_pps` is the offered midpoint. Loss uses the total sent
+and returned counts after drain. Passing requires at least one returned
+frame, reconciled tester, NIC and worker counters, and loss within the limit.
+
+The file also retains the frames, captures and worker binding. CPU placement
+and descriptor counts come from the packed plan, link information from TRex,
+and PCI driver bindings and the default route from the DUT. The benchmark
+rechecks the plan, frame bytes, configuration identities and counter intervals
+for every measured result, including one that exceeded the loss limit.
+
 ## 10. epoch
 
 The epoch test establishes the intended ingress load before applying one
@@ -918,8 +951,10 @@ and zero new typed protocol faults.
 
 **Inputs.**
 
-- Deployment: must satisfy `spec.needs_modules`; `passthrough` rejects before
-  run ownership or process effects for every transition-oriented test type.
+- Use `--deployment fan-in-edge-gateway` for the epoch test. The runner
+  rejects transition test types on `passthrough` and `parser-qos` before
+  acquiring the run lock, creating the output directory, starting Photon
+  or sending traffic.
 - `--epoch-duration` (default `30.0` s), `--epoch-pps` (default `1000`),
   `--epoch-initial-duration` (default `5.0` s) and `--epoch-overlap-ms`
   (default `500` ms).
@@ -1534,6 +1569,7 @@ possible artifact.
 | `logs/` | non-dry-run startup | Platform-owned Photon/CP/DP files, role locks, and bounded rotations. See [Logging](LOGGING.md). |
 | `cp_store/` | non-dry-run startup | Fresh durable CP authority retained as run evidence after shutdown. |
 | `capture_<size>.pcap` or `capture_<size>.trex_stats.json` | per `standard` size | Native-TAP pcap or exact TRex counter sidecar. |
+| `minimum_frame.json` | `minimum-frame` finalization | Frame preflight, forwarding measurements and host checks, or the observations gathered before failure. |
 | `epoch_capture.pcap` or `epoch_capture.trex_stats.json` | `epoch` test | Native-TAP pcap or generation/PGID TRex sidecar. |
 | `epoch_load.json` | epoch finalization after initial runtime identity is admitted, including failed qualification | Bounded old/target source observations, barriers, policy, Apply result and failure diagnostic. |
 | `commit_confirmed_capture.pcap` or matching TRex sidecar | `commit_confirmed` test | Traffic-window evidence. |
@@ -1573,6 +1609,9 @@ unknown/missing fields, indirect paths,
 foreign capabilities, conflicting port identities, and scalar coercion reject.
 Recorded TRex IDs and explicit overrides define that run's port mapping;
 the observed capability membership must agree with the effective IDs.
+After live setup reads the worker bindings, `run_metadata.json` records
+their runtime generation, worker count and ordered rows under `worker_topology`.
+Dry runs omit this field.
 
 Release metadata comes from the successful held `kinetum-info --check --json`
 response admitted in [Section 6](#6-test-lifecycle). Its `build_features` must
@@ -1589,8 +1628,8 @@ An interrupted or failed cleanup can leave only partial run evidence. Top-level 
 | Field | Type | Notes |
 |-------|------|-------|
 | `timestamp` | string (canonical ISO 8601 UTC) | `datetime.now(timezone.utc).isoformat()`. |
-| `deployment` | string | `passthrough` or `fan_in_edge_gateway`. |
-| `test_type` | string | `standard`, `epoch`, `commit_confirmed`, `rollback`, `guardrails`, `full`. |
+| `deployment` | string | `passthrough`, `parser_qos` or `fan_in_edge_gateway`. |
+| `test_type` | string | `standard`, `minimum_frame`, `epoch`, `commit_confirmed`, `rollback`, `guardrails`, `full`. |
 | `backend` | string | Physical validation profile (`dpdk_tap` or `dpdk_pci`), not runtime provider authority. |
 | `traffic_driver` | string | Selected traffic mechanism. |
 | `timestamp_source` | string | Evidence timestamp authority supplied by the selected profile. |
@@ -1721,9 +1760,9 @@ as measurement frequency.
 Written after the [final-observation checks](#61-final-statistics) succeed,
 before the optional NAT exchange and runtime shutdown.
 The harness requests stage, module metric/health, worker, region, boundary,
-stream, storage, port, steering, and module-context rows in one call and records
-the validated result. Both final projections retain the mandatory worker-counter
-rows. Required topology checks are reported separately in `stats_validation`;
+stream, storage, port, steering, module-context and worker binding rows in one
+call and records the validated result. Both final projections retain the mandatory
+worker-counter rows. Required topology checks are reported separately in `stats_validation`;
 the presence of `dp_stats.json` alone does not establish their verdict.
 
 The artifact is a dataclass projection of the validated protobuf JSON, not a
@@ -1744,7 +1783,7 @@ Top-level fields:
 | `success` | bool | Always true; file existence itself follows successful exact collection. |
 | `error` | string | Empty on the only writable success path. |
 | `rx_packets` | uint64 | DP total RX from the data path. |
-| `tx_packets` | uint64 | Records whose ownership the TX provider accepted; not wire delivery. |
+| `tx_packets` | uint64 | Packets accepted by the TX provider. Wire delivery is measured at the receiving port. |
 | `dropped_packets` | uint64 | Packets retired as drops, counted once. |
 | `rx_bytes`, `tx_bytes`, `fanout_overflow` | uint64 | Exact engine byte totals and refused fan-out branches. |
 | `runtime_generation`, `status_publication_generation` | uint64 | Exact counter/status namespace. |
@@ -1765,6 +1804,7 @@ Top-level fields:
 | `port_stats` | array | Exact logical/driver identity plus typed optional native counter tuple. |
 | `traffic_steering_stats` | array | One entry per compiled traffic-steering profile. |
 | `module_context_domains` | array | Exact module ID and ordered context IDs for each compiled population. |
+| `packet_bindings` | object when selected | One row per worker in index order. A direct native row identifies its RX stream, TX stream and original storage domain. |
 
 The following excerpts show selected row fields.
 
@@ -2033,7 +2073,7 @@ Benchmark-specific options:
 | `--runs`, `-n` | `30` | Number of iterations in `1..999`. |
 | `--variant` | `default` | Required printable UTF-8 manifest label, at most 128 bytes. |
 | `--inclusion-policy` | `passed-only` | `passed-only` or `all-runs`. Drives which runs are included in the aggregated distributions. |
-| `--no-all-sizes` | off | The benchmark default is **all sizes on**. Pass `--no-all-sizes` to limit to a single size. |
+| `--no-all-sizes` | off | Standard benchmarks sweep all sizes by default. Pass this flag to use only `--packet-size`. Minimum-frame always uses 64 bytes on the wire. |
 | `--output-dir` | `/tmp/kinetum_benchmark` | Must be an absent absolute final path. |
 
 These options use the defaults and meanings from
@@ -2391,7 +2431,7 @@ This section summarizes the exact validation-profile and evidence boundaries.
 | Dry run | Bundle construction, verification, and metadata only; no live packet or transition evidence. |
 | Standard and transition scenarios | The recipes in Sections 9-13 define each verdict. `full` composes them under the shared lifecycle; a successful run qualifies only its recorded workload and environment. |
 | Local TAP | Packet identity, loss, per-input ordering, and local sender-to-capture latency. Native generation is single-flow. |
-| Physical PCI/TRex | Port counters and, for epoch traffic, generation-separated PGIDs. Multiple flows vary UDP source ports. No per-packet ordering or packet-latency measurement is produced. |
+| Physical PCI/TRex | Port counters, generation-separated PGIDs for epoch traffic, and a finite byte-checked capture for minimum frames. Flows vary UDP source ports. Timed runs report aggregate delivery and rate. Per-packet ordering and latency are unavailable. |
 | Unavailable latency | TRex artifacts carry null latency, aggregation omits its distributions, tables show `n/a`, and no latency figure is emitted. |
 | RSS and per-queue storage | [Section 8.3](#83-dpdkpcibackend) requires exact topology and final stream/pool/port evidence. This does not establish a throughput ceiling. |
 | Runtime wiring and launch | The verified plan owns runtime resources; installed Photon owns DP/CP. [Section 20](#20-process-lifecycle) defines the harness's process ownership. |

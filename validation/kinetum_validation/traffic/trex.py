@@ -53,6 +53,7 @@ from ..config.types import (
     TestConfig,
 )
 from .base import EXCHANGE_PACKET_BYTES, TrafficDriver, TrafficSender, validate_udp_exchange
+from .udp import minimum_frames
 from .trex_remote_script import REMOTE_TREX_SCRIPT as _REMOTE_TREX_SCRIPT
 from .trex_protocol import (
     REMOTE_REQUEST_KEYS as _REMOTE_REQUEST_KEYS,
@@ -61,6 +62,11 @@ from .trex_protocol import (
     generation_flow_expected_tx,
     generation_pgid_layout,
     require_generation_flow_plan,
+    port_counter_totals,
+    require_minimum_capture,
+    require_minimum_observation,
+    require_port_counters,
+    source_mac_for_port,
     require_trex_capacity,
 )
 
@@ -311,7 +317,7 @@ class TRexTrafficDriver(TrafficDriver):
         self._remote_kill_task: Optional[asyncio.Task[None]] = None
         self._active_generation_session: Optional[Dict[str, Any]] = None
         self._trex_identity: Optional[Dict[str, Any]] = None
-        self._udp_exchange_incomplete = False
+        self._unresolved_action = False
 
     @property
     def requires_sustained_generation_overlap(self) -> bool:
@@ -380,9 +386,9 @@ class TRexTrafficDriver(TrafficDriver):
                 )
             else:
                 failure = exc
-        if self._udp_exchange_incomplete:
+        if self._unresolved_action:
             raise RuntimeError(
-                "trex UDP capture retirement is unproved"
+                "trex remote traffic retirement is unproved"
                 + (f"; other cleanup failure: {failure}" if failure is not None else "")
             ) from failure
         if failure is not None:
@@ -400,7 +406,7 @@ class TRexTrafficDriver(TrafficDriver):
         TRex port counters are used as capture evidence; no PCAP file is
         produced by this driver.
         """
-        if self._capture_file is not None or self._completed_capture_file is not None or self._udp_exchange_incomplete:
+        if self._capture_file is not None or self._completed_capture_file is not None or self._unresolved_action:
             raise RuntimeError("trex capture ownership already active")
         try:
             exact_parent = pcap_file.parent.resolve(strict=True)
@@ -932,7 +938,7 @@ class TRexTrafficDriver(TrafficDriver):
         """Use TRex's bounded packet capture after the measurement window retires."""
         validate_udp_exchange(packets, marker)
         if (self._capture_file is not None or self._remote_proc is not None
-                or self._active_generation_session is not None or self._udp_exchange_incomplete):
+                or self._active_generation_session is not None or self._unresolved_action):
             raise RuntimeError("UDP exchange cannot overlap a measurement capture")
         streams = [stream for stream in self._ingress_streams if stream["logical_name"] == logical_ingress]
         if len(streams) != 1:
@@ -950,6 +956,31 @@ class TRexTrafficDriver(TrafficDriver):
             "trex_identity": self.traffic_generator_identity,
         })
         return tuple(bytes.fromhex(frame) for frame in result["frames"])
+
+    def _minimum_frames(self, dscp: int = 0) -> list[str]:
+        """Serialize the 64 untagged Ethernet templates, including both protocol checksums."""
+        ingress, = self._ingress_streams
+        return minimum_frames(self.config.packet, ingress["src_mac"], ingress["dst_mac"], dscp)
+
+    async def minimum_frame(self, *, capture: bool, expected_dscp: int = 0) -> dict:
+        """Run a bounded minimum-frame capture or a timed trial on the resolved two-port circuit."""
+        if (self._active_generation_session is not None or self._capture_file is not None
+                or self._unresolved_action):
+            raise RuntimeError("minimum-frame traffic requires a retired preceding action")
+        ingress, = self._ingress_port_ids
+        templates = self._minimum_frames()
+        raw = await self._invoke_remote({
+            "action": "minimum_frame", "capture": capture, "ingress_port": ingress, "frames": templates,
+            "ports": self._all_port_ids, "egress_ports": self._egress_port_ids,
+            "pps": self.config.packet.pps, "duration_s": self.config.packet.duration_s or
+            self.config.packet.count / self.config.packet.pps, "trex_identity": self.traffic_generator_identity,
+            "trex_server": self.config.traffic.trex_server, "trex_api_path": self.config.traffic.trex_api_path,
+            "work_dir": self.config.traffic.work_dir,
+        })
+        if capture:
+            require_minimum_capture(raw, self._minimum_frames(expected_dscp))
+        evidence = {"expected_dscp": expected_dscp} if capture else {"templates": templates}
+        return {**raw, **evidence, "ingress_port": ingress, "egress_port": self._egress_port_ids[0]}
 
     def _validate_udp_exchange_request(self, spec: Dict[str, Any]) -> None:
         """Admit exact endpoint ownership and canonical datagram bytes before SSH."""
@@ -1020,6 +1051,13 @@ class TRexTrafficDriver(TrafficDriver):
             )
         if action == "exchange_udp":
             self._validate_udp_exchange_request(spec)
+        if action == "minimum_frame":
+            require_bool(spec["capture"], "minimum-frame capture")
+            if (self._ingress_port_ids != [require_int(spec["ingress_port"], "minimum-frame ingress", minimum=0)]
+                    or len(self._egress_port_ids) != 1 or spec["frames"] != self._minimum_frames()
+                    or require_int(spec["pps"], "minimum-frame rate", minimum=1) != self.config.packet.pps
+                    or not 1 <= spec["pps"] * require_number(spec["duration_s"], "frame duration") <= _UINT32_MAX):
+                raise RuntimeError("minimum-frame request differs from the selected circuit or workload")
         pgid_demand = 0
         if action in {"run", "generation_start", "generation_finish"}:
             duration = require_number(
@@ -1125,7 +1163,7 @@ class TRexTrafficDriver(TrafficDriver):
                 raise RuntimeError(
                     "trex generation evidence exceeds the bounded JSON result"
                 )
-        if action in {"run", "generation_start", "generation_finish", "exchange_udp"}:
+        if action in {"run", "generation_start", "generation_finish", "exchange_udp", "minimum_frame"}:
             identity = require_trex_identity(spec["trex_identity"], "TRex requested instrument identity")
             if identity != self._trex_identity:
                 raise RuntimeError("trex run request has foreign instrument identity")
@@ -1144,7 +1182,7 @@ class TRexTrafficDriver(TrafficDriver):
                 "TRex request ingress ports",
             )
         if action == "generation_finish":
-            self._require_port_counters(spec["port_counter_baseline"], "baseline")
+            require_port_counters(spec["port_counter_baseline"], "baseline", self._all_port_ids)
             self._validate_generation_flow_plan(spec["generation_flow_plan"], spec)
             next_start = require_number(
                 spec["next_start_monotonic"], "TRex next monotonic start",
@@ -1207,8 +1245,8 @@ class TRexTrafficDriver(TrafficDriver):
                 self._active_generation_session = None
             raise
         self._remote_proc = proc
-        if action == "exchange_udp":
-            self._udp_exchange_incomplete = True
+        if action in {"exchange_udp", "minimum_frame"}:
+            self._unresolved_action = True
         try:
             stdout, stderr, interruption = await communicate_cooperative_subprocess(
                 proc,
@@ -1222,8 +1260,8 @@ class TRexTrafficDriver(TrafficDriver):
             if proc.returncode == 0:
                 # These actions exit zero only after endpoint cleanup. Retire
                 # ownership before local decoding or evidence checks can fail.
-                if action == "exchange_udp":
-                    self._udp_exchange_incomplete = False
+                if action in {"exchange_udp", "minimum_frame"}:
+                    self._unresolved_action = False
                 elif action in {"generation_finish", "generation_abort"}:
                     self._active_generation_session = None
             if proc.returncode is not None:
@@ -1257,11 +1295,10 @@ class TRexTrafficDriver(TrafficDriver):
                 proc.returncode != 130 and mutated
             ):
                 raise RuntimeError("trex interrupted action did not prove remote cleanup") from interruption
-            if not mutated:
-                if action == "generation_start":
-                    self._active_generation_session = None
-                elif action == "exchange_udp":
-                    self._udp_exchange_incomplete = False
+            if action in {"exchange_udp", "minimum_frame"}:
+                self._unresolved_action = False
+            elif not mutated and action == "generation_start":
+                self._active_generation_session = None
         else:
             if "ok" not in payload:
                 raise RuntimeError("trex remote action omitted its result classification")
@@ -1273,8 +1310,8 @@ class TRexTrafficDriver(TrafficDriver):
             if not ok:
                 require_exact_keys(payload, {"ok", "error", "mutation_attempted"}, "TRex remote failure")
                 mutation_attempted = require_bool(payload["mutation_attempted"], "TRex mutation attempt")
-                if action == "exchange_udp" and not mutation_attempted:
-                    self._udp_exchange_incomplete = False
+                if action in {"exchange_udp", "minimum_frame"} and not mutation_attempted:
+                    self._unresolved_action = False
                 error = self._safe_remote_text(
                     require_string(payload["error"], "TRex remote error"), 2000
                 )
@@ -1303,7 +1340,7 @@ class TRexTrafficDriver(TrafficDriver):
         identity = require_trex_identity(payload["trex_identity"], "TRex admitted instrument identity")
         if identity != request["trex_identity"]:
             raise RuntimeError("trex admitted instrument identity differs from the request")
-        demand = 0 if request["action"] in {"run", "exchange_udp"} else generation_pgid_layout(
+        demand = 0 if request["action"] in {"run", "exchange_udp", "minimum_frame"} else generation_pgid_layout(
             len(self._ingress_port_ids), request["num_flows"],
         )["demand"]
         observed_demand = require_int(
@@ -1317,6 +1354,10 @@ class TRexTrafficDriver(TrafficDriver):
         self, payload: Dict[str, Any], action: str, request: Dict[str, Any]
     ) -> None:
         """Validate one response against its exact local request."""
+        if action == "minimum_frame":
+            require_minimum_observation(payload, self._ingress_port_ids[0], self._egress_port_ids[0],
+                                        request["trex_identity"], capture=request["capture"])
+            return
         if action == "exchange_udp":
             self._validate_instrument_admission(payload, request)
             frames = require_array(payload["frames"], "UDP exchange captured frames")
@@ -1387,7 +1428,7 @@ class TRexTrafficDriver(TrafficDriver):
                 "TRex promiscuous ports",
             )
         if action == "generation_start":
-            self._require_port_counters(payload["port_counter_baseline"], "baseline")
+            require_port_counters(payload["port_counter_baseline"], "baseline", self._all_port_ids)
             initial = require_int(
                 payload["initial_generation_tag"],
                 "TRex initial generation tag",
@@ -1481,78 +1522,9 @@ class TRexTrafficDriver(TrafficDriver):
             )
             self._validate_generation_finish(payload, request)
 
-    def _require_port_counters(
-        self, value: object, name: str,
-    ) -> Dict[str, Dict[str, int]]:
-        """Admit exact uint64 packet/error observations for every owned port."""
-        context = f"TRex port counter {name}"
-        rows = require_object(value, context)
-        require_exact_keys(
-            rows, {str(port) for port in self._all_port_ids}, context,
-        )
-        result = {}
-        for port_text, item in rows.items():
-            row = require_object(item, f"{context} port {port_text}")
-            require_exact_keys(
-                row, {"opackets", "ipackets", "oerrors", "ierrors"},
-                f"{context} port {port_text}",
-            )
-            result[port_text] = {
-                field: require_int(
-                    count, f"{context} port {port_text} {field}",
-                    minimum=0, maximum=_UINT64_MAX,
-                )
-                for field, count in row.items()
-            }
-        return result
-
     def _validated_port_totals(self, payload: Dict[str, Any]) -> tuple[int, int]:
-        """Recompute reported TX/RX from retained snapshots before accepting evidence.
-
-        Reject missing observations, per-counter regression, inconsistent totals,
-        and new traffic errors. Historical errors remain outside this interval.
-        """
-        baseline = self._require_port_counters(payload.get("port_counter_baseline"), "baseline")
-        final = self._require_port_counters(payload.get("port_counter_final"), "final")
-        for port_text, row in final.items():
-            for field, count in row.items():
-                if count < baseline[port_text][field]:
-                    raise RuntimeError(f"trex port {port_text} {field} regressed")
-        tx_count = sum(
-            final[str(port)]["opackets"] - baseline[str(port)]["opackets"]
-            for port in self._ingress_port_ids
-        )
-        rx_count = sum(
-            final[str(port)]["ipackets"] - baseline[str(port)]["ipackets"]
-            for port in self._egress_port_ids
-        )
-        errors = sum(
-            final[str(port)]["oerrors"] - baseline[str(port)]["oerrors"]
-            for port in self._ingress_port_ids
-        ) + sum(
-            final[str(port)]["ierrors"] - baseline[str(port)]["ierrors"]
-            for port in self._egress_port_ids
-        )
-        tx_field, rx_field = (
-            ("port_tx_count", "port_rx_count")
-            if payload["action"] == "generation_finish"
-            else ("tx_count", "rx_count")
-        )
-        for field, count in ((tx_field, tx_count), (rx_field, rx_count), ("errors", errors)):
-            if require_int(payload.get(field), f"TRex {field}", minimum=0, maximum=_UINT64_MAX) != count:
-                raise RuntimeError(f"trex {field} disagrees with retained port snapshots")
-        if errors != 0:
-            raise RuntimeError("trex remote result contains traffic errors")
-        if payload["action"] == "generation_finish":
-            pgid_tx = require_int(payload.get("tx_count"), "TRex PGID TX", minimum=0, maximum=_UINT64_MAX)
-            pgid_rx = require_int(payload.get("rx_count"), "TRex PGID RX", minimum=0, maximum=_UINT64_MAX)
-            if tx_count != pgid_tx or rx_count != pgid_rx:
-                raise RuntimeError(
-                    "trex port and PGID aggregate counters disagree: "
-                    f"port_tx={tx_count} pgid_tx={pgid_tx} "
-                    f"port_rx={rx_count} pgid_rx={pgid_rx}"
-                )
-        return tx_count, rx_count
+        """Reconcile native port counters for this deployment and its generation PGIDs when present."""
+        return port_counter_totals(payload, self._all_port_ids, self._ingress_port_ids, self._egress_port_ids)
 
     @staticmethod
     def _require_int_array(value: object, context: str) -> List[int]:
@@ -1830,7 +1802,7 @@ class TRexTrafficDriver(TrafficDriver):
     @staticmethod
     def _remote_timeout_s(spec: Dict[str, Any]) -> float:
         """Return an outer timeout for one remote TRex action."""
-        if spec["action"] not in {"run", "generation_finish"}:
+        if spec["action"] not in {"run", "generation_finish", "minimum_frame"}:
             return _REMOTE_PROBE_TIMEOUT_S
         duration_s = require_number(
             spec["duration_s"], "TRex remote duration", minimum=0.0
@@ -2045,22 +2017,10 @@ class TRexTrafficDriver(TrafficDriver):
             streams.append({
                 "logical_name": port.logical_name,
                 "port_id": port_id,
-                "src_mac": self._source_mac_for_port(port_id),
+                "src_mac": source_mac_for_port(port_id),
                 "dst_mac": port.runtime_mac,
             })
         return streams
-
-    @staticmethod
-    def _source_mac_for_port(port_id: int) -> str:
-        """Return a deterministic locally-administered source MAC for TRex."""
-        value = require_int(
-            port_id, "TRex source-MAC port", minimum=0, maximum=_UINT32_MAX
-        ) + 1
-        return (
-            f"02:{(value >> 32) & 0xFF:02x}:{(value >> 24) & 0xFF:02x}:"
-            f"{(value >> 16) & 0xFF:02x}:{(value >> 8) & 0xFF:02x}:"
-            f"{value & 0xFF:02x}"
-        )
 
     @property
     def _egress_port_ids(self) -> List[int]:

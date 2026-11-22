@@ -411,8 +411,8 @@ Section 6 (hot-path rules listed).
 
 **Rule.** A module packet callback operates over a transient SoA
 (struct-of-arrays) projection (`kinetum_batch_t`), not over a
-packet-at-a-time AoS stream or a provider-native handle. The runtime remains
-the owner of one exact `packet_record` per packet and projects its bounded
+packet-at-a-time AoS stream or a provider-native handle. The runtime owns one
+`packet_record` per packet admitted to a module stage and projects each bounded
 prefix into worker-local SoA scratch. Each callback-visible attribute (data
 pointer, length, parsed addresses/ports, output port, next stage, persistent
 user word) is a separate array indexed by packet lane.
@@ -1254,6 +1254,15 @@ compiler validates the graph; providers reserve and construct native resources.
   carry one `packet_record*`; provider-native handles stay inside its opaque
   storage descriptor. One component may implement several roles, but the plan
   and hot contracts remain separate.
+  The full-record rule applies to general routing and every cross-worker DATA
+  boundary. The local exception requires a complete graph with one RX stage,
+  one TX stage and no other stage. The RX stage has one unconditional local
+  edge to the TX stage. One worker owns the sole RX and TX streams, and both
+  queues share the proved storage domain. That worker may stage a provider-bound
+  native view locally. The bound RX queue transfers the view to the worker.
+  The bound TX queue consumes the accepted prefix. The original storage-domain
+  owner verifies and releases the retained suffix. The worker keeps the native
+  handle and data-range identity opaque.
 - An I/O-driver factory reserves and configures one cold complete driver; it
   cannot make ingress live. The exact ABI supplies mandatory whole-driver
   activation and deactivation. After every module owner activates and every

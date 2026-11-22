@@ -242,19 +242,26 @@ async def communicate_cooperative_subprocess(
     ))
     completion = asyncio.gather(*readers)
     interruption: Optional[BaseException] = None
+
+    async def wait_for_reply():
+        """Observe the pipe owners without cancelling them when the caller's deadline expires."""
+        await asyncio.wait((completion,))
+        return completion.result()
+
     try:
         try:
-            # Like communicate(), retain an early child's result even when it
-            # closes input before the parent's final drain completes.
-            with contextlib.suppress(BrokenPipeError, ConnectionResetError):
-                process.stdin.write(input_data)
-                await process.stdin.drain()
-            output, diagnostic, _status = await asyncio.wait_for(asyncio.shield(completion), timeout_s)
+            async with asyncio.timeout(timeout_s):
+                # Keep an early child's reply even if it already closed its input.
+                with contextlib.suppress(BrokenPipeError, ConnectionResetError):
+                    process.stdin.write(input_data)
+                    await process.stdin.drain()
+                output, diagnostic, _status = await wait_for_reply()
         except BaseException as error:  # pylint: disable=broad-exception-caught
             interruption = error
             process.stdin.close()
             try:
-                output, diagnostic, _status = await asyncio.wait_for(asyncio.shield(completion), grace_s)
+                async with asyncio.timeout(grace_s):
+                    output, diagnostic, _status = await wait_for_reply()
             except BaseException as retirement_error:
                 for task in readers:
                     if not task.done():
