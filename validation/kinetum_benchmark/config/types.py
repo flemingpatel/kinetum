@@ -27,10 +27,9 @@ class BenchmarkScenarioConfig:
     Attributes
     ----------
     deployment : str
-        Deployment mode (passthrough or fan_in_edge_gateway).
+        Registered validation deployment for each repetition.
     test_type : str
-        Test type (standard, epoch, commit_confirmed, rollback, guardrails,
-        full).
+        Validation workload supported by the selected deployment and backend.
     backend : str
         Physical I/O validation profile selected for each run. This chooses
         harness resources, not the runtime provider graph.

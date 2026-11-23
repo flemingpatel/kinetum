@@ -910,6 +910,23 @@ common::status populate_runtime_telemetry_wire(const runtime_telemetry_snapshot 
 				target->add_io_stream_ids(stream);
 			}
 		}
+		if (!snapshot.packet_bindings.empty()) {
+			auto *bindings = output->mutable_packet_bindings();
+			for (const auto &route : snapshot.packet_bindings) {
+				const auto index = static_cast<uint32_t>(bindings->rows_size());
+				auto *row = bindings->add_rows();
+				row->set_worker_index(index);
+				row->set_representation(
+					route ? kinetum::telemetry::v1::WORKER_PACKET_REPRESENTATION_DIRECT_NATIVE :
+						kinetum::telemetry::v1::WORKER_PACKET_REPRESENTATION_FULL_RECORD);
+				if (route) {
+					auto *native = row->mutable_native_route();
+					native->set_rx_stream_id(route->rx_stream_id);
+					native->set_tx_stream_id(route->tx_stream_id);
+					native->set_storage_domain_id(route->storage_domain_id);
+				}
+			}
+		}
 		for (const auto &row : snapshot.module_context_domains) {
 			auto *target = output->add_module_context_domains();
 			target->set_module_id(row.module_id);

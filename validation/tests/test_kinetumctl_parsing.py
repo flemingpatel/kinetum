@@ -73,6 +73,12 @@ class TestKinetumctlMutationIdentity(unittest.IsolatedAsyncioTestCase):
                 payload = _full_stats_object()
                 if not included:
                     payload["telemetry"].pop("module_context_domains")
+                if selected:
+                    count = payload["telemetry"]["runtime"]["expected_workers"]
+                    payload["telemetry"]["packet_bindings"] = {"rows": [
+                        {"worker_index": index, "representation": "WORKER_PACKET_REPRESENTATION_FULL_RECORD"}
+                        for index in range(count)
+                    ]}
                 client = KinetumCtl(Path("/opt/kinetum"))
                 client._run = AsyncMock(return_value=(0, json.dumps(payload), ""))  # pylint: disable=protected-access
                 result = await client.get_stats(StatsSelection(include_topology_stats=selected))
@@ -683,6 +689,47 @@ def _full_stats_json() -> str:
 
 class TestKinetumctlStatsParsing(unittest.TestCase):
     """Regression tests for exact validation-side stats parsing."""
+
+    def test_direct_native_binding_agrees_with_selected_and_mandatory_topology(self):
+        """A one-worker direct route has two stages, both named streams and its original storage domain."""
+        payload = _full_stats_object()
+        telemetry = payload["telemetry"]
+        for key, value in telemetry.items():
+            if isinstance(value, list) and key not in {"stages", "streams", "storage_domains", "worker_counters"}:
+                value.clear()
+        telemetry["runtime"].update(active_workers=1, expected_workers=1)
+        worker, _ = telemetry["worker_counters"]
+        worker["counters"] = telemetry["engine"].copy()
+        telemetry["worker_counters"] = [worker]
+        transition = telemetry["transition"]
+        transition.update(execution_participant_count=1, quiescence_reader_count=1, region_count=1,
+                          module_context_count=0, boundary_count=0, terminal_history_size=0)
+        for key in ("latest_terminal", "certificate", "grace"):
+            del transition[key]
+        rx, tx = telemetry["streams"]
+        tx.update(owning_region_id=0, worker_index=0)
+        telemetry["stages"][1]["stage_id"] = "tx"
+        route = {"rx_stream_id": rx["io_stream_id"], "tx_stream_id": tx["io_stream_id"],
+                 "storage_domain_id": telemetry["storage_domains"][0]["storage_domain_id"]}
+        telemetry["packet_bindings"] = {"rows": [
+            {"worker_index": 0, "representation": "WORKER_PACKET_REPRESENTATION_DIRECT_NATIVE", "native_route": route},
+        ]}
+        selected = StatsSelection(include_topology_stats=True, include_stream_stats=True,
+                                  include_storage_domain_stats=True, include_stage_stats=True)
+        self.assertTrue(parse_stats_json(json.dumps(payload), selected).success)
+        self.assertFalse(parse_stats_json(json.dumps(payload), StatsSelection()).success)
+        for field in ("stages", "streams", "storage_domains", "packet_bindings"):
+            altered = copy.deepcopy(payload)
+            del altered["telemetry"][field]
+            with self.subTest(field=field):
+                self.assertFalse(parse_stats_json(json.dumps(altered), selected).success)
+        for field in ("boundary_count", "module_context_count"):
+            altered = copy.deepcopy(payload)
+            altered["telemetry"]["transition"][field] = 1
+            with self.subTest(field=field):
+                self.assertFalse(parse_stats_json(json.dumps(altered), selected).success)
+        route["rx_stream_id"], route["tx_stream_id"] = route["tx_stream_id"], route["rx_stream_id"]
+        self.assertFalse(parse_stats_json(json.dumps(payload), selected).success)
 
     def test_full_stats_success(self):
         """The complete canonical response parses successfully."""

@@ -532,6 +532,30 @@ message TrafficSteeringStats {
   repeated string io_stream_ids = 4;
 }
 
+// Representation selected once when the worker's queues and storage are bound.
+enum WorkerPacketRepresentation {
+  WORKER_PACKET_REPRESENTATION_UNSPECIFIED = 0;
+  WORKER_PACKET_REPRESENTATION_FULL_RECORD = 1;
+  WORKER_PACKET_REPRESENTATION_DIRECT_NATIVE = 2;
+}
+
+message NativePacketRoute {
+  string rx_stream_id = 1;
+  string tx_stream_id = 2;
+  string storage_domain_id = 3;
+}
+
+message WorkerPacketBinding {
+  uint32 worker_index = 1;
+  WorkerPacketRepresentation representation = 2;
+  NativePacketRoute native_route = 3;
+}
+
+// Present only for selected topology. Rows follow compact worker-index order.
+message WorkerPacketBindings {
+  repeated WorkerPacketBinding rows = 1;
+}
+
 // One complete generation-scoped runtime observation.
 message RuntimeTelemetry {
   RuntimeObservation runtime = 1;
@@ -553,4 +577,5 @@ message RuntimeTelemetry {
   repeated kinetum.gluon.v1.ModuleContextDomain module_context_domains = 18;
   // Mandatory compact worker-index order, including workers without I/O.
   repeated WorkerCounterStats worker_counters = 19;
+  WorkerPacketBindings packet_bindings = 20;
 }

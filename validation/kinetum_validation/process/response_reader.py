@@ -9,6 +9,7 @@ from typing import List, Optional
 
 from ..engine.json_contract import (
     JsonContractError,
+    packet_binding_rows,
     parse_exact_json_object,
     require_exact_keys,
     require_key_contract,
@@ -46,6 +47,8 @@ from .telemetry import (
     RegionEpochStatsResult,
     WorkerEpochStatsResult,
     WorkerCounterStatsResult,
+    WorkerPacketBinding,
+    StatsSelection,
     StreamStatsResult,
     StorageDomainStatsResult,
     PortStatsResult,
@@ -75,6 +78,12 @@ def wire_uint(value: object, bits: int = 64) -> int:
     if value < 0 or value > (1 << bits) - 1:
         raise ValueError("telemetry integer is outside its exact wire domain")
     return value
+
+
+def _packet_bindings(value: object, workers: int) -> list[WorkerPacketBinding]:
+    """Project the validated wire rows into the operator client's typed result."""
+    return [WorkerPacketBinding(row["worker_index"], row["representation"], **row.get("native_route", {}))
+            for row in packet_binding_rows(value, workers)]
 
 
 def wire_int32(value: object) -> int:
@@ -349,17 +358,17 @@ def parse_worker_counter(row: object) -> WorkerCounterStatsResult:
     )
 
 
-def parse_stats_json(raw_json: str) -> StatsResult:
+def parse_stats_json(raw_json: str, selection: Optional[StatsSelection] = None) -> StatsResult:
     """
     Parse kinetumctl stats --format json output into a StatsResult.
-
-    Extracted as a standalone function so it can be tested independently
-    of subprocess execution.
 
     Parameters
     ----------
     raw_json : str
         Raw JSON string from kinetumctl stats --format json.
+    selection : StatsSelection, optional
+        The live request identifies empty selected families. Archived replies without a request
+        are checked against the observations they contain.
 
     Returns
     -------
@@ -1234,8 +1243,9 @@ def parse_stats_json(raw_json: str) -> StatsResult:
                 module_id=wire_string(domain["module_id"]),
                 context_instance_ids=_wire_string_list(domain["context_instance_ids"]),
             ))
-
-        if not stats_are_exact(result):
+        if "packet_bindings" in telemetry:
+            result.packet_bindings = _packet_bindings(telemetry["packet_bindings"], result.expected_workers)
+        if not stats_are_exact(result, selection):
             raise ValueError("statistics response lacks exact required identity")
 
     except (JsonContractError, KeyError, AttributeError, TypeError, ValueError):

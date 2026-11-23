@@ -187,12 +187,15 @@ class TestBackendProfiles(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "storage profile per_rx_queue"):
             profile.bindings_file_for(StreamTopologyProfile.DEFAULT, StorageProfile.PER_RX_QUEUE)
 
-    def test_unsupported_pci_profile_fails_closed(self):
-        """Deployments without a PCI profile should reject dpdk_pci."""
+    def test_passthrough_uses_public_pci_example_and_shared_inventory(self):
+        """The two-port profile resolves both the graph and PCI binding from the public example."""
         spec = DEPLOYMENT_SPECS[DeploymentMode.PASSTHROUGH]
-
-        with self.assertRaises(ValueError):
-            spec.backend_profile(BackendType.DPDK_PCI)
+        profile = spec.backend_profile(BackendType.DPDK_PCI)
+        binding = profile.bindings_file_for(StreamTopologyProfile.DEFAULT, StorageProfile.SHARED)
+        self.assertEqual(spec.input_location(profile, binding), ("examples", "passthrough"))
+        self.assertEqual(spec.input_location(profile, profile.hw_file), ("examples", "fan_in_edge_gateway"))
+        self.assertEqual(spec.input_location(profile, spec.pipeline_file), ("examples", "passthrough"))
+        self.assertEqual(tuple(port.traffic_port_id for port in profile.ports), (0, 1))
 
 
 class TestTrafficDrivers(unittest.TestCase):

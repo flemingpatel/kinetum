@@ -92,6 +92,7 @@ void poison_aggregate_stats(kinetum::control::v1::StatsResponse *response)
 	response->mutable_telemetry()->add_storage_domains();
 	response->mutable_telemetry()->add_steering_profiles();
 	response->mutable_telemetry()->add_module_context_domains();
+	response->mutable_telemetry()->mutable_packet_bindings()->add_rows();
 	response->mutable_telemetry()->add_ports();
 }
 
@@ -326,7 +327,7 @@ class CpStatsForwardingTest : public ::testing::Test {
 	 * @param include_stream_stats Whether to request compiled stream stats.
 	 * @param include_storage_domain_stats Whether to request storage-domain stats.
 	 * @param include_port_stats Whether to request logical-port driver stats.
-	 * @param include_topology_stats Whether to request steering and flow-domain rows.
+	 * @param include_topology_stats Whether to request steering, context domains and worker packet bindings.
 	 * @param include_boundary_epoch_stats Whether to request exact boundary progress.
 	 */
 	void call_get_stats(bool include_stage_stats, bool include_region_epoch_stats,
@@ -569,6 +570,14 @@ TEST_F(CpStatsForwardingTest, forwards_topology_stats_when_requested)
 	EXPECT_EQ(telemetry.module_context_domains(0).module_id(), "kinetum.acl");
 	ASSERT_EQ(telemetry.module_context_domains(0).context_instance_ids_size(), 1);
 	EXPECT_EQ(telemetry.module_context_domains(0).context_instance_ids(0), "acl@lane_0");
+	ASSERT_TRUE(telemetry.has_packet_bindings());
+	ASSERT_EQ(telemetry.packet_bindings().rows_size(), telemetry.worker_counters_size());
+	for (int index = 0; index < telemetry.worker_counters_size(); ++index) {
+		const auto &row = telemetry.packet_bindings().rows(index);
+		EXPECT_EQ(row.worker_index(), telemetry.worker_counters(index).worker_index());
+		EXPECT_EQ(row.representation(), kinetum::telemetry::v1::WORKER_PACKET_REPRESENTATION_FULL_RECORD);
+		EXPECT_FALSE(row.has_native_route());
+	}
 }
 
 /**
@@ -675,6 +684,7 @@ TEST_F(CpStatsForwardingTest, topology_stats_absent_when_not_requested)
 	EXPECT_EQ(resp.telemetry().ports_size(), 0);
 	EXPECT_EQ(resp.telemetry().steering_profiles_size(), 0);
 	EXPECT_EQ(resp.telemetry().module_context_domains_size(), 0);
+	EXPECT_FALSE(resp.telemetry().has_packet_bindings());
 }
 
 // ---------------------------------------------------------------------------

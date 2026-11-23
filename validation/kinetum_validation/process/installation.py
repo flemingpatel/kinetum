@@ -6,6 +6,8 @@ import os
 from pathlib import Path
 from typing import Iterable, List
 
+from ..config.types import BackendProfile, DeploymentSpec, ProcessConfig
+
 
 RUNTIME_EXECUTABLES = (
     "kinetum-info",
@@ -94,6 +96,7 @@ def installed_root_errors(
         "validation examples directory",
         errors,
     )
+    _require_directory(validation_root / "fixtures", "validation fixtures directory", errors)
 
     if require_modules:
         _require_directory(
@@ -105,28 +108,20 @@ def installed_root_errors(
     return errors
 
 
-def installed_example_input_errors(
-    validation_root: Path,
-    example_dir: str,
+def installed_input_errors(
+    process: ProcessConfig,
+    spec: DeploymentSpec,
+    profile: BackendProfile,
     filenames: Iterable[str],
 ) -> List[str]:
-    """Return every exact-path error in one selected scenario input set."""
+    """Admit every selected input through the same registry used by packing and Apply."""
     errors: List[str] = []
-    if not _is_path_atom(example_dir):
-        return ["validation example directory name is not one exact atom"]
-    deployment_root = validation_root / "examples" / example_dir
-    _require_directory(
-        deployment_root,
-        "selected validation example directory",
-        errors,
-    )
     for filename in filenames:
-        if not _is_path_atom(filename):
-            errors.append(
-                f"validation example input name is not one exact atom: {filename}"
-            )
+        try:
+            path = process.input_path(spec.input_location(profile, filename), filename)
+        except ValueError as exc:
+            errors.append(str(exc))
             continue
-        path = deployment_root / filename
         if path.is_absolute() and _path_has_symlink(path):
             errors.append(
                 f"validation example input must not contain symlink indirection: {path}"
@@ -146,19 +141,6 @@ def _path_has_symlink(path: Path) -> bool:
         if current.is_symlink():
             return True
     return False
-
-
-def _is_path_atom(value: object) -> bool:
-    """Return whether one value is a bounded printable ASCII path component."""
-    return (
-        isinstance(value, str)
-        and value not in {"", ".", ".."}
-        and value.isascii()
-        and len(value.encode("ascii")) <= 255
-        and value.isprintable()
-        and "/" not in value
-        and "\\" not in value
-    )
 
 
 def _require_directory(path: Path, label: str, errors: List[str]) -> None:

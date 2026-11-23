@@ -58,7 +58,8 @@ struct runtime_telemetry_request {
 	bool include_stream_stats{false};	   ///< Include I/O-stream rows.
 	bool include_storage_domain_stats{false};  ///< Include storage-domain rows.
 	bool include_port_stats{false};		   ///< Include logical/driver-port rows.
-	bool include_topology_stats{false};	   ///< Include steering and module-context membership.
+	bool include_topology_stats{
+		false};	 ///< Include steering, module-context membership and worker packet bindings.
 };
 
 /** @brief One stage's current packet counters. */
@@ -259,6 +260,16 @@ struct runtime_module_context_domain {
 	std::vector<std::string> context_instance_ids{};  ///< Canonical order defining context ordinals.
 };
 
+/** @brief The original stream and storage identities of a bound direct handoff. */
+struct runtime_native_packet_route {
+	std::string rx_stream_id;	///< Bound receiver.
+	std::string tx_stream_id;	///< Bound transmitter.
+	std::string storage_domain_id;	///< Original owner.
+};
+
+/** A worker with no direct route stages full records. */
+using runtime_worker_packet_binding = std::optional<runtime_native_packet_route>;
+
 /** @brief One coherent generation-scoped runtime observation. */
 struct runtime_telemetry_snapshot {
 	runtime_engine_statistics engine{};				///< Complete aggregate engine counters.
@@ -266,6 +277,7 @@ struct runtime_telemetry_snapshot {
 	epoch_transition_progress_snapshot transition_progress{};	///< Coherent coordinator progress.
 	epoch_transition_telemetry_snapshot transition_transactions{};	///< Active/latest transaction truth.
 	std::string plan_content_hash{};				///< Exact lowercase compiled plan-content hash.
+	std::vector<runtime_worker_packet_binding> packet_bindings;	///< Selected compact worker order.
 	std::optional<epoch_transition_completion_progress_snapshot> completion_progress{};  ///< Certificate/grace truth.
 	std::array<uint64_t, EPOCH_PROTOCOL_FAULT_COUNT> protocol_fault_counts{};  ///< Cumulative typed faults.
 	std::optional<epoch_protocol_first_fault> first_protocol_fault{};	   ///< Immutable first fault.

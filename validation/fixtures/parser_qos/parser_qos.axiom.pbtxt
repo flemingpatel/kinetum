@@ -1,0 +1,30 @@
+# Copyright (c) 2026 Fleming Patel. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+pipeline_id: "parser_qos"
+stages {
+  stage_id: "rx"
+  kind: STAGE_KIND_RX
+  execution_mode: EXECUTION_MODE_PASSIVE
+  io { interface: "wan0" }
+}
+stages {
+  stage_id: "parse"
+  kind: STAGE_KIND_PARSE_IPV4
+  execution_mode: EXECUTION_MODE_PASSIVE
+}
+stages {
+  stage_id: "qos"
+  kind: STAGE_KIND_MODULE
+  execution_mode: EXECUTION_MODE_PASSIVE
+  module { module_id: "kinetum.qos" context_selection: MODULE_CONTEXT_SELECTION_SAME_LANE }
+}
+stages {
+  stage_id: "tx"
+  kind: STAGE_KIND_TX
+  execution_mode: EXECUTION_MODE_PASSIVE
+  io { interface: "lan0" }
+}
+edges { from_stage_id: "rx" to_stage_id: "parse" mode: EDGE_MODE_PUSH }
+edges { from_stage_id: "parse" to_stage_id: "qos" mode: EDGE_MODE_PUSH }
+edges { from_stage_id: "qos" to_stage_id: "tx" mode: EDGE_MODE_PUSH }

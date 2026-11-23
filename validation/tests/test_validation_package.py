@@ -86,6 +86,50 @@ class ValidationPackageTest(unittest.TestCase):
     wheel: Path
     installed: Path
     working_directory: Path
+    build_directory: Path
+
+    def test_installed_forwarding_fixtures_produce_verified_bundles(self) -> None:
+        """Pack the public passthrough and private parser/QoS deployments from the installed kit."""
+        with tempfile.TemporaryDirectory(dir=self.working_directory) as temporary:
+            root = Path(temporary)
+            _run_tool(["/usr/bin/cmake", "--install", os.fspath(self.build_directory), "--config", "Release",
+                       "--component", "KinetumRuntimePayload", "--prefix", os.fspath(root)], root)
+            program = """
+import json, sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from kinetum_validation import VALIDATION_ROOT
+from kinetum_validation.config.types import (
+    BackendConfig, BackendType, DeploymentMode, PacketConfig, ProcessConfig, TestConfig, TestType,
+)
+from kinetum_validation.process.installation import installed_input_errors
+workload = TestType.MINIMUM_FRAME
+config = TestConfig(process=ProcessConfig(Path(sys.argv[2]), VALIDATION_ROOT), deployment=DeploymentMode(sys.argv[3]),
+                    backend=BackendConfig(backend_type=BackendType.DPDK_PCI), test_type=workload,
+                    packet=PacketConfig(num_flows=workload.default_num_flows))
+errors = config.workload_errors()
+errors.extend(installed_input_errors(
+    config.process, config.spec, config.backend_profile, config.required_example_files,
+))
+if errors:
+    raise RuntimeError(errors)
+print(json.dumps([str(config.input_path(name)) for name in
+                  (config.spec.pipeline_file, config.backend_profile.hw_file, config.bindings_file,
+                   config.spec.config_snapshot)]))
+"""
+            runtime = root / "runtime"
+            for name in ("passthrough", "parser_qos"):
+                selected = _run_tool([sys.executable, "-I", "-B", "-c", program, os.fspath(self.installed),
+                                      os.fspath(runtime), name], root)
+                pipeline, hardware, binding, snapshot = json.loads(selected.stdout)
+                bundle = root / name
+                arguments = [os.fspath(runtime / "bin/kinetum_pack"), "--axiom", pipeline, "--hw", hardware,
+                             "--bindings", binding, "--bootstrap-snapshot", snapshot, "--regions", "1",
+                             "--out", os.fspath(bundle)]
+                if name == "parser_qos":
+                    arguments.extend(["--modules-dir", os.fspath(runtime / "lib/modules")])
+                _run_tool(arguments, root)
+                self.assertTrue((bundle / "configs/plan.pbtxt").is_file())
 
     def test_wheel_contains_exact_staged_files_and_matching_native_tag(self) -> None:
         """Every staged member survives packaging and the wheel tag matches both ELF images."""
@@ -251,6 +295,7 @@ def installed_validation_package(package_build_directory: Path) -> Iterator[None
                 importlib.metadata.PackageNotFoundError) as exc:
             pytest.exit(f"validation package fixture failed: {exc}", returncode=pytest.ExitCode.TESTS_FAILED)
         ValidationPackageTest.stage = stage
+        ValidationPackageTest.build_directory = package_build_directory
         ValidationPackageTest.wheel = wheel
         ValidationPackageTest.installed = installed
         ValidationPackageTest.working_directory = root

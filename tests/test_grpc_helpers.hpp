@@ -552,6 +552,13 @@ class fake_dp_service : public kinetum::dataplane::v1::DataplaneService::Service
 		}
 
 		if (req != nullptr && req->selection().include_topology_stats()) {
+			auto *bindings = telemetry->mutable_packet_bindings();
+			for (const auto &worker : telemetry->worker_counters()) {
+				auto *row = bindings->add_rows();
+				row->set_worker_index(worker.worker_index());
+				row->set_representation(
+					kinetum::telemetry::v1::WORKER_PACKET_REPRESENTATION_FULL_RECORD);
+			}
 			for (const auto &ts : traffic_steering_stats) {
 				auto *out = telemetry->add_steering_profiles();
 				out->set_steering_profile_id(ts.steering_profile_id);

@@ -86,7 +86,12 @@ class work_queue_indices final {
 	/** @brief Commit one already-constructed publication. */
 	KINETUM_ALWAYS_INLINE void commit_push() noexcept
 	{
-		++head_;
+		commit_push_prefix(1u);
+	}
+	/** @param count Number of consecutive values constructed in previously free slots. */
+	KINETUM_ALWAYS_INLINE void commit_push_prefix(std::size_t count) noexcept
+	{
+		head_ += count;
 	}
 	/**
 	 * @brief Commit an already-consumed FIFO prefix.

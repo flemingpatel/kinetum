@@ -38,9 +38,10 @@ from .config.types import (
 )
 from .backend import DPDKPCIBackend, DPDKTapBackend
 from .engine.runtime_release import collect_runtime_release_metadata
+from .minimum_frame import run_minimum_frame
 from .engine.json_contract import validate_run_metadata
 from .process.installation import (
-    installed_example_input_errors,
+    installed_input_errors,
     installed_root_errors,
     is_symlink_free_directory,
     is_symlink_free_regular_file,
@@ -63,7 +64,7 @@ from .engine.plan_metadata import (
 )
 from .process.supervisor import AsyncProcessSupervisor
 from .process.kinetumctl import KinetumCtl
-from .process.telemetry import StatsResult
+from .process.telemetry import StatsResult, StatsSelection
 from .report.console import ConsoleReporter
 from .traffic import TrafficDriver, make_traffic_driver
 from .scenario_context import ScenarioContext
@@ -184,8 +185,11 @@ class TestOrchestrator:
                 self.artifacts.save_test_results(suite_result, self.config.backend_profile)
                 return suite_result
 
-            # Run standard tests
             context = self.scenario_context()
+            if self.config.test_type == TestType.MINIMUM_FRAME:
+                result = await run_minimum_frame(context)
+                results.append(result)
+                self.reporter.print_test_result(result)
             if self.config.test_type in (TestType.STANDARD, TestType.FULL):
                 for size in self.config.packet.sizes_to_test:
                     result = await run_packet_test(context, size)
@@ -306,10 +310,14 @@ class TestOrchestrator:
             self._traffic = make_traffic_driver(self.config)
             await self._traffic.setup()
 
+            observed = await self._kinetumctl.get_stats(StatsSelection(include_topology_stats=True))
+            if not observed.success or observed.packet_bindings is None:
+                raise RuntimeError("packet-ready runtime did not report its worker bindings")
             self._save_run_metadata(
                 plan_file,
                 bundle_root,
                 self._traffic.traffic_generator_identity,
+                observed,
             )
 
             self.reporter.print_progress("Environment ready")
@@ -328,17 +336,12 @@ class TestOrchestrator:
         regular module images in one operation. No detached-plan compiler path,
         build-tree executable lookup, or module symlink participates.
         """
-        examples_dir = self.config.process.examples_dir
-        # Determine source files and bindings from deployment spec
         spec = self.config.spec
         profile = self.config.backend_profile
-        bindings_file = self.config.bindings_file
-        src = examples_dir / spec.example_dir / spec.pipeline_file
-        hw = examples_dir / spec.example_dir / profile.hw_file
-        bindings = examples_dir / spec.example_dir / bindings_file
-        bootstrap_snapshot = (
-            examples_dir / spec.example_dir / spec.config_snapshot
-        )
+        src = self.config.input_path(spec.pipeline_file)
+        hw = self.config.input_path(profile.hw_file)
+        bindings = self.config.input_path(self.config.bindings_file)
+        bootstrap_snapshot = self.config.input_path(spec.config_snapshot)
         regions = spec.regions
 
         required_inputs = (
@@ -1068,6 +1071,7 @@ class TestOrchestrator:
         plan_file: Path,
         bundle_root: Path,
         trex_identity: Optional[dict[str, Any]],
+        observed: Optional[StatsResult] = None,
     ) -> None:
         """Persist backend, topology, and observed generator provenance."""
         if self._release_metadata is None:
@@ -1113,6 +1117,12 @@ class TestOrchestrator:
                 "trex_identity": trex_identity,
             },
         }
+        if observed is not None:
+            metadata["worker_topology"] = {
+                "runtime_generation": observed.runtime_generation,
+                "worker_count": observed.expected_workers,
+                "bindings": {"rows": [row.wire_row() for row in observed.packet_bindings]},
+            }
         validate_run_metadata(metadata)
         metadata_file = self.config.output_dir / "run_metadata.json"
         with open(metadata_file, "x", encoding="utf-8") as f:
@@ -1226,7 +1236,7 @@ async def run_test_suite(
     TestSuiteResult
         Combined results from all tests.
     """
-    scenario_errors = config.spec.scenario_errors(config.test_type)
+    scenario_errors = config.workload_errors()
     if scenario_errors:
         raise RuntimeError(
             "validation scenario admission rejected: "
@@ -1242,9 +1252,10 @@ async def run_test_suite(
             "installed validation layout rejected: "
             + "; ".join(installation_errors)
         )
-    example_errors = installed_example_input_errors(
-        config.process.validation_root,
-        config.spec.example_dir,
+    example_errors = installed_input_errors(
+        config.process,
+        config.spec,
+        config.backend_profile,
         config.required_example_files,
     )
     if example_errors:

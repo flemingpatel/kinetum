@@ -1125,6 +1125,13 @@ materialized_provider_runtime::create(admitted_provider_runtime admitted, const 
 						"provider RX operation order disagrees with compiled stream order");
 				}
 				const auto *queue = &operations->rx_queues[rx_position++];
+				if (queue->native_storage != nullptr &&
+				    (stream.rx_storage_domain_index >= runtime->storage_operations_.size() ||
+				     queue->native_storage->owner !=
+					     runtime->storage_operations_[stream.rx_storage_domain_index])) {
+					return status::internal_error(
+						"native RX binding names a foreign storage owner");
+				}
 				if (queue->logical_port != logical_port ||
 				    queue->maximum_burst > common::runtime_sizing::PACKET_MAX_BURST_SIZE) {
 					return status::internal_error(
@@ -1139,6 +1146,14 @@ materialized_provider_runtime::create(admitted_provider_runtime admitted, const 
 						"provider TX operation order disagrees with compiled stream order");
 				}
 				const auto *queue = &operations->tx_queues[tx_position++];
+				if (queue->native_storage != nullptr &&
+				    (stream.tx_storage_domain_indices.size() != 1u ||
+				     stream.tx_storage_domain_indices.front() >= runtime->storage_operations_.size() ||
+				     queue->native_storage->owner !=
+					     runtime->storage_operations_[stream.tx_storage_domain_indices.front()])) {
+					return status::internal_error(
+						"native TX binding lacks one exact storage owner");
+				}
 				if (queue->logical_port != logical_port ||
 				    queue->maximum_burst > common::runtime_sizing::PACKET_MAX_BURST_SIZE) {
 					return status::internal_error(

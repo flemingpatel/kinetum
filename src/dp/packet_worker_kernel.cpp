@@ -53,6 +53,7 @@
 #include "src/dp/packet_mechanism.hpp"
 #include "src/dp/packet_work_key.hpp"
 #include "src/dp/worker_packet_staging.hpp"
+#include "src/dp/worker_native_handoff.hpp"
 #include "src/dp/worker_input_scheduler.hpp"
 #include "src/dp/worker_lifecycle.hpp"
 #include "src/dp/worker_runtime_command.hpp"
@@ -170,6 +171,11 @@ class packet_worker_kernel::implementation final {
 		return worker_index_;
 	}
 
+	/** @copydoc packet_worker_kernel::native_binding */
+	[[nodiscard]] const native_packet_binding *native_binding() const noexcept
+	{
+		return native_ == nullptr ? nullptr : &native_->binding();
+	}
 	/** @copydoc packet_worker_kernel::try_read_epoch_ownership */
 	[[nodiscard]] publication_read_result try_read_epoch_ownership(worker_epoch_ledger_snapshot &out) const noexcept
 	{
@@ -305,10 +311,12 @@ class packet_worker_kernel::implementation final {
 	/** @brief One exact worker-owned RX queue and stream-to-stage edge. */
 	struct rx_stream_runtime {
 		uint32_t telemetry_ordinal{UINT32_MAX};	 ///< Pre-resolved owner-local stream counter row.
-		bool owned{false};			 ///< Whether this compact stream is polled here.
+		uint32_t local_target{
+			INVALID_RUNTIME_ORDINAL};  ///< Conversion-free single local successor, when proved.
 
-		const provider::compiled_provider_io_stream *facts{nullptr};  ///< Immutable stream facts.
-		const packet_rx_burst_operations *operations{nullptr};	      ///< Direct provider burst target.
+		const provider::compiled_provider_io_stream *facts{
+			nullptr};					///< Immutable facts for an owned RX stream.
+		const packet_rx_burst_operations *operations{nullptr};	///< Direct provider burst target.
 
 		uint32_t stage_instance_index{provider::INVALID_COMPILED_PROVIDER_INDEX};  ///< RX stage.
 		uint32_t storage_domain_index{provider::INVALID_COMPILED_PROVIDER_INDEX};  ///< Native RX storage.
@@ -390,13 +398,37 @@ class packet_worker_kernel::implementation final {
 	 */
 	template <typename stream_type>
 	struct tx_batch_record {
-		std::array<packet_private, MAX_BURST> metadata{};   ///< Epoch/stage and suffix-integrity snapshots.
+		std::array<packet_private, MAX_BURST> metadata{};  ///< Epoch/stage and suffix-integrity snapshots.
+		/** @param a Original receipt. @param b Candidate. @return Whether every byte after the timestamp agrees. */
+		[[nodiscard]] static bool equal_body(const packet_private &a, const packet_private &b) noexcept
+		{
+			static_assert(offsetof(packet_private, timestamp_ns) == 0u);
+			constexpr auto offset = sizeof(a.timestamp_ns);
+			return std::memcmp(reinterpret_cast<const std::byte *>(&a) + offset,
+					   reinterpret_cast<const std::byte *>(&b) + offset, sizeof(a) - offset) == 0;
+		}
+		/** @brief Materialize saved receipts before appending a nonmatching lane. */
+		void expand() noexcept
+		{
+			if (common_metadata) {
+				for (uint16_t index = 1u; index < count; ++index) {
+					const auto timestamp = metadata[index].timestamp_ns;
+					metadata[index] = metadata[0];
+					metadata[index].timestamp_ns = timestamp;
+					storage_domains[index] = storage_domains[0];
+				}
+				common_metadata = false;
+			}
+		}
 		bool owned{false};				    ///< Stream belongs to this worker.
 		const stream_type *stream{nullptr};		    ///< Stable pre-resolved stream.
 		std::array<packet_record *, MAX_BURST> records{};   ///< Exact caller-owned records.
 		std::array<uint32_t, MAX_BURST> lengths{};	    ///< Pre-call byte counts for accepted ownership.
 		std::array<uint16_t, MAX_BURST> storage_domains{};  ///< Pre-call original domains.
 		uint16_t count{0};				    ///< Current bounded group size.
+		bool common_metadata{false};  ///< Lane zero owns the shared metadata body and domain.
+		uint32_t common_bytes{0u};    ///< At most MAX_BURST admitted uint16-sized packets.
+		static_assert(MAX_BURST <= UINT32_MAX / UINT16_MAX);
 	};
 	using tx_batch = tx_batch_record<tx_stream_runtime>;  ///< Live TX batch bound to a published stream.
 
@@ -731,6 +763,16 @@ class packet_worker_kernel::implementation final {
 	 */
 	void queue_tx_(tx_stream_runtime &stream, packet_record *record, uint32_t reserved_domain) noexcept;
 	/**
+	 * @tparam ingress Select RX delivery or terminal TX execution.
+	 * @param records Nonempty FIFO prefix already admitted to this domain and epoch.
+	 * @param stage Current executable stage.
+	 * @param domain Original storage and reservation domain.
+	 * @return True after completing the entire prefix. Refusal precedes stage accounting or ownership transfer.
+	 */
+	template <bool ingress>
+	[[nodiscard]] bool process_io_prefix_(std::span<packet_record *const> records, stage_runtime &stage,
+					      uint32_t domain) noexcept;
+	/**
 	 * @brief Submit one grouped TX batch and retire the untouched suffix exactly once.
 	 *
 	 * @param batch Exact grouped TX invocation.
@@ -855,8 +897,9 @@ class packet_worker_kernel::implementation final {
 	numa_owner<worker_active_stage_scheduler> active_scheduler_;  ///< Exact active/async stage owner.
 	numa_owner<module::worker_module_health> module_health_;      ///< Exact module-health claim owner.
 	numa_owner<worker_epoch_activation> epoch_activation_;	      ///< Exact local activation order.
-	worker_lifecycle_context lifecycle_;			      ///< Sole worker-local launch and exit record.
-	kinetum::algo::quiescence_reader quiescence_reader_;	      ///< Worker-owned exact config reader.
+	worker_native_handoff *native_{nullptr};  ///< Same-node service bound only for direct native forwarding.
+	worker_lifecycle_context lifecycle_;	  ///< Sole worker-local launch and exit record.
+	kinetum::algo::quiescence_reader quiescence_reader_;		    ///< Worker-owned exact config reader.
 	source_kernel_kind source_kernel_{source_kernel_kind::NO_SOURCES};  ///< Once-selected source loop.
 	receive_burst_function homogeneous_receive_burst_{nullptr};	    ///< Sole homogeneous callback target.
 	bool outbound_closed_{false};					    ///< Exact-once shutdown publication.
@@ -934,6 +977,8 @@ class packet_worker_kernel::implementation::construction final {
 	[[nodiscard]] common::status initialize_storage_();
 	/** @return OK after resolving every producer key and allocating all roles in one worker region. */
 	[[nodiscard]] common::status initialize_work_staging_();
+	/** @return OK with the proved native or full-record route, or an inconsistent provider-binding error. */
+	[[nodiscard]] common::status resolve_native_binding_();
 	/**
 	 * @brief Derive and construct the sole worker epoch ledger.
 	 * @return OK after adopting the exact compiled physical-record ceiling.
@@ -1053,6 +1098,7 @@ class packet_worker_kernel::implementation::construction final {
 	numa_owner<worker_boundary_sender> boundary_sender_;	     ///< Ledger-borrowing sender-policy owner.
 	numa_owner<worker_boundary_receiver> boundary_receiver_;     ///< Ledger-borrowing receiver policy.
 
+	std::optional<native_packet_binding> native_binding_;  ///< Single cold selection consumed by both allocations.
 	source_kernel_kind source_kernel_{source_kernel_kind::NO_SOURCES};  ///< Validated polling specialization.
 	receive_burst_function homogeneous_receive_burst_{nullptr};	    ///< Validated common burst callback.
 };
@@ -1231,6 +1277,19 @@ common::status_or<numa_owner<packet_worker_kernel>> packet_worker_kernel::implem
 						     stream.accepted_storage_domains.value_limit()),
 					     placement.domains) ||
 		    !layout.append<uint32_t>(stream.transition_by_storage_domain.size(), placement.transitions)) {
+			return overflow();
+		}
+	}
+	std::size_t native_offset = 0u, slots_offset = 0u, free_offset = 0u, slot_count = 0u;
+	if (native_binding_) {
+		const auto *staging = local_staging_(native_binding_->domain);
+		if (staging->active_capacity() > std::numeric_limits<std::size_t>::max() - staging->future_capacity()) {
+			return overflow();
+		}
+		slot_count = staging->active_capacity() + staging->future_capacity();
+		if (!layout.append<worker_native_handoff>(1u, native_offset, algo::CACHE_LINE_SIZE) ||
+		    !layout.append<native_packet_slot>(slot_count, slots_offset, algo::CACHE_LINE_SIZE) ||
+		    !layout.append<native_packet_slot *>(slot_count, free_offset, algo::CACHE_LINE_SIZE)) {
 			return overflow();
 		}
 	}
@@ -1413,6 +1472,15 @@ common::status_or<numa_owner<packet_worker_kernel>> packet_worker_kernel::implem
 	}
 	auto *placed = new (numa_layout::storage<implementation>(region, root_offset).data())
 		implementation(*this, views);
+	if (native_binding_) {
+		const auto &binding = *native_binding_;
+		const auto key = views.stages[binding.tx_stage].execution_keys[binding.domain];
+		placed->native_ = std::construct_at(
+			numa_layout::storage<worker_native_handoff>(region, native_offset).data(), binding, key,
+			*views.local_staging_by_domain[binding.domain], *placed->epoch_ledger_, *placed->telemetry_,
+			numa_layout::storage<native_packet_slot>(region, slots_offset, slot_count),
+			numa_layout::storage<native_packet_slot *>(region, free_offset, slot_count));
+	}
 	// Construct here to retain access to the facade's private constructor.
 	auto *facade = new (numa_layout::storage<packet_worker_kernel>(region, facade_offset).data())
 		packet_worker_kernel(placed);
@@ -1516,6 +1584,30 @@ packet_worker_kernel::implementation::construction::initialize(const std::vector
 	if (!result.is_ok()) {
 		return result;
 	}
+	for (auto *stream : rx_inputs_) {
+		const auto &stage = stages_[stream->stage_instance_index];
+		if (stage.mechanism != packet_mechanism_kind::RX ||
+		    stream->transition_index != INVALID_RUNTIME_ORDINAL ||
+		    stage.facts->dispatch_mode != provider::compiled_stage_dispatch_mode::UNCONDITIONAL_FANOUT ||
+		    stage.fanout_group_ordinals.size() != 1u) {
+			continue;
+		}
+		const auto &group = stage.groups[stage.fanout_group_ordinals.front()];
+		if (group.select_contexts != nullptr || group.direct_target_ordinal >= stage.targets.size()) {
+			continue;
+		}
+		const auto &target = stage.targets[group.direct_target_ordinal];
+		const auto domain = stream->storage_domain_index;
+		if (target.sender_ordinal == INVALID_RUNTIME_ORDINAL &&
+		    domain < target.transition_by_storage_domain.size() &&
+		    target.transition_by_storage_domain[domain] == INVALID_RUNTIME_ORDINAL) {
+			stream->local_target = group.direct_target_ordinal;
+		}
+	}
+	result = resolve_native_binding_();
+	if (!result.is_ok()) {
+		return result;
+	}
 	result = initialize_work_staging_();
 	if (!result.is_ok()) {
 		return result;
@@ -1577,6 +1669,59 @@ common::status packet_worker_kernel::implementation::construction::initialize_st
 		previous = storage_domain_index;
 		have_previous = true;
 	}
+	return common::status::ok();
+}
+
+common::status packet_worker_kernel::implementation::construction::resolve_native_binding_()
+{
+	if (topology_.worker_schedules.size() != 1u || topology_.logical_stages.size() != 2u || stages_.size() != 2u ||
+	    topology_.io_streams.size() != 2u || rx_inputs_.size() != 1u || tx_flush_schedule_.size() != 1u ||
+	    !topology_.control_edges.empty() || !topology_.module_contexts.empty() ||
+	    !schedule_->active_stage_instance_indices.empty() || !schedule_->async_stage_instance_indices.empty() ||
+	    !inbound_boundaries_.empty() || !worker_->outbound_boundary_indices.empty() ||
+	    !transition_flush_schedule_.empty() || schedule_->storage_domain_indices.size() != 1u) {
+		return common::status::ok();
+	}
+	const auto &rx = *rx_inputs_.front();
+	const auto &tx = *tx_flush_schedule_.front();
+	const auto &source = stages_[rx.stage_instance_index];
+	const auto &sink = stages_[tx.stage_instance_index];
+	const auto domain = rx.storage_domain_index;
+	if (rx.local_target != 0u || sink.mechanism != packet_mechanism_kind::TX ||
+	    sink.facts->dispatch_mode != provider::compiled_stage_dispatch_mode::TERMINAL ||
+	    source.groups.size() != 1u || source.targets.size() != 1u ||
+	    source.targets.front().stage_instance_index != tx.stage_instance_index ||
+	    domain >= tx.transition_by_storage_domain.size() ||
+	    tx.transition_by_storage_domain[domain] != INVALID_RUNTIME_ORDINAL ||
+	    !tx.accepted_storage_domains.contains(domain) || tx.facts->tx_storage_domain_indices.size() != 1u ||
+	    topology_.ports[rx.facts->port_index].io_driver_index !=
+		    topology_.ports[tx.facts->port_index].io_driver_index ||
+	    rx.operations->logical_port >= MAX_LOGICAL_PORTS) {
+		return common::status::ok();
+	}
+	const auto *storage = rx.operations->native_storage;
+	if (storage == nullptr || tx.operations->native_storage == nullptr) {
+		return common::status::ok();
+	}
+	if (storage != tx.operations->native_storage || storage->owner != release_batches_[domain].operations ||
+	    !packet_storage_matches_domain(storage->owner, domain, providers_.runtime_generation()) ||
+	    (storage->owner->capabilities & packet_storage_capabilities::CURRENT_CPU_RECORD_REQUIRED) !=
+		    packet_storage_capabilities::CURRENT_CPU_RECORD_REQUIRED) {
+		return common::status::failed_precondition("native queues do not share their admitted storage owner");
+	}
+	native_binding_ = native_packet_binding{
+		.rx = rx.operations,
+		.tx = tx.operations,
+		.storage = storage,
+		.rx_stream = rx.facts->io_stream_index,
+		.tx_stream = tx.facts->io_stream_index,
+		.domain = domain,
+		.rx_stage = rx.stage_instance_index,
+		.tx_stage = tx.stage_instance_index,
+		.rx_stage_counter = source.telemetry_ordinal,
+		.tx_stage_counter = sink.telemetry_ordinal,
+		.tx_stream_counter = tx.telemetry_ordinal,
+	};
 	return common::status::ok();
 }
 
@@ -1669,7 +1814,7 @@ common::status packet_worker_kernel::implementation::construction::initialize_wo
 		domains.push_back(
 			{domain, capacity, future ? std::optional<std::size_t>(capacity) : std::nullopt, rows});
 	}
-	auto staging_or = worker_packet_staging::create(domains, worker_->numa_node);
+	auto staging_or = worker_packet_staging::create(domains, worker_->numa_node, native_binding_.has_value());
 	if (!staging_or.is_ok()) {
 		return staging_or.error();
 	}
@@ -2315,7 +2460,6 @@ common::status packet_worker_kernel::implementation::construction::initialize_st
 				"worker RX stream operation does not equal compiled stream truth");
 		}
 		auto &stream = rx_streams_[stream_index];
-		stream.owned = true;
 		stream.facts = &facts;
 		stream.operations = operations;
 		stream.stage_instance_index = facts.stage_instance_index;
@@ -2440,7 +2584,7 @@ common::status packet_worker_kernel::implementation::construction::initialize_st
 		case provider::compiled_stage_kind::RX:
 			stage.mechanism = packet_mechanism_kind::RX;
 			if (!facts.io_stream_index.has_value() || *facts.io_stream_index >= rx_streams_.size() ||
-			    !rx_streams_[*facts.io_stream_index].owned ||
+			    rx_streams_[*facts.io_stream_index].facts == nullptr ||
 			    rx_streams_[*facts.io_stream_index].stage_instance_index != stage_index) {
 				return common::status::failed_precondition(
 					"RX stage lacks its exact worker-owned stream");
@@ -3056,46 +3200,66 @@ algo::service_result packet_worker_kernel::implementation::poll_one_rx_(rx_strea
 		if (!reserved) {
 			std::terminate();
 		}
-		const auto result = receive_burst(stream.operations->state, scratch_->rx_records.data(),
-						  static_cast<uint16_t>(requested));
-		const uint16_t received = result.transferred_count;
-		if (kinetum_packet_rx_burst_result_is_valid(result, static_cast<uint16_t>(requested)) == 0u) {
-			std::terminate();
-		}
-		if (!std::all_of(scratch_->rx_records.data() + received, scratch_->rx_records.data() + requested,
-				 [](const auto *record) noexcept { return record == nullptr; })) {
-			// Only the returned prefix can carry ownership across this call.
-			std::terminate();
-		}
-		const auto &stage = stages_[stream.stage_instance_index];
-		if (received != 0u) {
-			if (!stage.owned || stage.facts == nullptr || stage.logical == nullptr ||
-			    stage.facts->stage_instance_index > std::numeric_limits<uint16_t>::max()) {
-				std::terminate();
-			}
-			epoch_ledger_->acquire(source_epoch, received);
-		}
+		packet_rx_burst_result result{};
 		uint64_t received_bytes = 0u;
-		for (uint16_t index = 0; index < received; ++index) {
-			auto *record = scratch_->rx_records[index];
-			if (!validate_record_(record, stream.storage_domain_index)) {
+		if (native_ != nullptr) {
+			result = native_->receive({.epoch = source_epoch,
+						   .timestamp = cached_time,
+						   .key = stream.delivery_key,
+						   .capacity = static_cast<uint16_t>(requested),
+						   .future = future},
+						  received_bytes);
+		} else {
+			result = receive_burst(stream.operations->state, scratch_->rx_records.data(),
+					       static_cast<uint16_t>(requested));
+			const uint16_t received = result.transferred_count;
+			if (kinetum_packet_rx_burst_result_is_valid(result, static_cast<uint16_t>(requested)) == 0u) {
 				std::terminate();
 			}
-			initialize_packet_record(*record);
-			record->metadata.timestamp_ns = cached_time;
-			record->metadata.epoch = source_epoch;
-			record->metadata.ingress_port = stream.operations->logical_port;
-			record->metadata.current_stage = stage.logical->logical_stage_index;
-			record->metadata.current_stage_instance =
-				static_cast<uint16_t>(stage.facts->stage_instance_index);
-			received_bytes += record->storage.length;
-			if constexpr (future) {
-				staging->commit_future(stream.delivery_key, record);
-			} else {
-				staging->commit_active(stream.delivery_key, record);
+			if (!std::all_of(scratch_->rx_records.data() + received,
+					 scratch_->rx_records.data() + requested,
+					 [](const auto *record) noexcept { return record == nullptr; })) {
+				// Only the returned prefix can carry ownership across this call.
+				std::terminate();
 			}
-			scratch_->rx_records[index] = nullptr;
+			if (received != 0u) {
+				const auto &stage = stages_[stream.stage_instance_index];
+				if (!stage.owned || stage.facts == nullptr || stage.logical == nullptr ||
+				    stage.facts->stage_instance_index > std::numeric_limits<uint16_t>::max()) {
+					std::terminate();
+				}
+				const auto domain = stream.storage_domain_index;
+				const auto *operations = release_batches_[domain].operations;
+				if (!packet_storage_matches_domain(operations, domain,
+								   providers_.runtime_generation())) {
+					std::terminate();
+				}
+				packet_private incoming;
+				reset_packet_private(incoming);
+				incoming.timestamp_ns = cached_time;
+				incoming.epoch = source_epoch;
+				incoming.ingress_port = stream.operations->logical_port;
+				incoming.current_stage = stage.logical->logical_stage_index;
+				incoming.current_stage_instance =
+					static_cast<uint16_t>(stage.facts->stage_instance_index);
+				const std::span<packet_record *const> records(scratch_->rx_records.data(), received);
+				for (auto *record : records) {
+					if (!packet_record_matches_operations(record, *operations)) {
+						std::terminate();
+					}
+					record->metadata = incoming;
+					received_bytes += record->storage.length;
+				}
+				epoch_ledger_->acquire(source_epoch, received);
+				if constexpr (future) {
+					staging->commit_future_prefix(stream.delivery_key, records);
+				} else {
+					staging->commit_active_prefix(stream.delivery_key, records);
+				}
+				std::fill_n(scratch_->rx_records.begin(), received, nullptr);
+			}
 		}
+		const uint16_t received = result.transferred_count;
 		if constexpr (future) {
 			staging->release_future_reservation(requested - received);
 		} else {
@@ -3201,6 +3365,10 @@ template <bool has_active_scheduler, bool has_async_scheduler>
 void packet_worker_kernel::implementation::process_local_queues_() noexcept
 {
 	static_assert(has_active_scheduler || !has_async_scheduler);
+	if (native_ != nullptr) {
+		native_->service(epoch_ledger_->active_epoch());
+		return;
+	}
 	flush_stage_outputs_();
 	for (const auto &entry : local_queue_schedule_) {
 		const uint32_t domain = entry.storage_domain_index;
@@ -3221,7 +3389,8 @@ void packet_worker_kernel::implementation::process_local_queues_() noexcept
 				std::terminate();
 			}
 			auto &stage = stages_[key.stage_instance_index];
-			if (!stage.owned || stage.facts == nullptr || stage.logical == nullptr) {
+			if (!stage.owned || stage.facts == nullptr || stage.logical == nullptr ||
+			    !packet_storage_matches_domain(operations, domain, generation)) {
 				std::terminate();
 			}
 			constexpr std::size_t RECORD_PREFETCH_DISTANCE = 4u;
@@ -3237,7 +3406,7 @@ void packet_worker_kernel::implementation::process_local_queues_() noexcept
 					packet_prefetch_record(records[index + RECORD_PREFETCH_DISTANCE]);
 				}
 				const auto *record = records[index];
-				if (!packet_record_matches_storage(record, operations, domain, generation) ||
+				if (!packet_record_matches_operations(record, *operations) ||
 				    record->metadata.current_stage_instance != key.stage_instance_index ||
 				    record->metadata.current_stage != stage.logical->logical_stage_index ||
 				    record->metadata.epoch != active_epoch) {
@@ -3262,11 +3431,18 @@ void packet_worker_kernel::implementation::process_work_batch_(packet_work_phase
 {
 	switch (phase) {
 	case packet_work_phase::RX_DELIVER:
+		if (process_io_prefix_<true>(records, stage, reserved_domain)) {
+			return;
+		}
 		for (auto *record : records) {
 			deliver_rx_(record, stage, reserved_domain);
 		}
 		return;
 	case packet_work_phase::EXECUTE:
+		if (stage.mechanism == packet_mechanism_kind::TX &&
+		    process_io_prefix_<false>(records, stage, reserved_domain)) {
+			return;
+		}
 		for (auto *record : records) {
 			execute_stage_(record, stage, reserved_domain);
 		}
@@ -3286,6 +3462,93 @@ void packet_worker_kernel::implementation::process_work_batch_(packet_work_phase
 		return;
 	}
 	std::terminate();
+}
+
+template <bool ingress>
+bool packet_worker_kernel::implementation::process_io_prefix_(std::span<packet_record *const> records,
+							      stage_runtime &stage, uint32_t domain) noexcept
+{
+	if (records.empty() || scratch_->pending_count != 0u || !stage.reachable_storage_domains.contains(domain)) {
+		return false;
+	}
+	uint32_t destination = INVALID_RUNTIME_ORDINAL;
+	tx_batch *batch = nullptr;
+	uint16_t capacity = 0u;
+	if constexpr (ingress) {
+		if (stage.rx_stream_index >= rx_streams_.size()) {
+			return false;
+		}
+		const auto &stream = rx_streams_[stage.rx_stream_index];
+		if (stream.storage_domain_index != domain || stream.local_target == INVALID_RUNTIME_ORDINAL) {
+			return false;
+		}
+		destination = stream.local_target;
+	} else {
+		if (stage.stage_bound_tx_stream_index >= tx_streams_.size()) {
+			return false;
+		}
+		const auto &stream = tx_streams_[stage.stage_bound_tx_stream_index];
+		if (!stream.owned || stream.stage_instance_index != stage.facts->stage_instance_index ||
+		    !stream.accepted_storage_domains.contains(domain) ||
+		    domain >= stream.transition_by_storage_domain.size() ||
+		    stream.transition_by_storage_domain[domain] != INVALID_RUNTIME_ORDINAL) {
+			return false;
+		}
+		batch = &tx_batches_[stream.facts->io_stream_index];
+		capacity = std::min<uint16_t>(stream.operations->maximum_burst, MAX_BURST);
+		if (!batch->owned || batch->stream != &stream || batch->count > capacity ||
+		    records.size() > static_cast<std::size_t>(capacity - batch->count)) {
+			return false;
+		}
+	}
+	uint64_t bytes = 0u;
+	for (auto *record : records) {
+		if (!packet_record_has_current_cpu_shape(record) ||
+		    record->metadata.module_next_stage != KINETUM_NEXT_STAGE_UNSET ||
+		    (!ingress && record->metadata.egress_port != KINETUM_PORT_UNSET) ||
+		    execute_packet_mechanism(ingress ? packet_mechanism_kind::RX : packet_mechanism_kind::TX, record) !=
+			    (ingress ? packet_mechanism_outcome::FORWARDED_RX :
+				       packet_mechanism_outcome::FORWARDED_TX)) {
+			return false;
+		}
+		bytes += record->storage.length;
+	}
+	telemetry_->record_stage_input(stage.telemetry_ordinal, static_cast<uint16_t>(records.size()), bytes);
+	if constexpr (ingress) {
+		dispatch_target_prefix_(records, stage, destination, domain);
+		return true;
+	}
+	const auto &model = batch->count == 0u ? records.front()->metadata : batch->metadata[0];
+	const bool shared = (batch->count == 0u || (batch->common_metadata && batch->storage_domains[0] == domain)) &&
+			    std::all_of(records.begin(), records.end(), [&](const auto *record) {
+				    return tx_batch::equal_body(model, record->metadata);
+			    });
+	if (shared && batch->count == 0u) {
+		batch->metadata[0] = model;
+		batch->storage_domains[0] = static_cast<uint16_t>(domain);
+		batch->common_metadata = true;
+		batch->common_bytes = 0u;
+	} else if (!shared) {
+		batch->expand();
+	}
+	for (auto *record : records) {
+		const auto index = batch->count++;
+		batch->records[index] = record;
+		batch->lengths[index] = record->storage.length;
+		if (shared) {
+			batch->metadata[index].timestamp_ns = record->metadata.timestamp_ns;
+		} else {
+			batch->metadata[index] = record->metadata;
+			batch->storage_domains[index] = static_cast<uint16_t>(domain);
+		}
+	}
+	if (shared) {
+		batch->common_bytes += static_cast<uint32_t>(bytes);
+	}
+	if (batch->count == capacity) {
+		flush_tx_(*batch);
+	}
+	return true;
 }
 
 void packet_worker_kernel::implementation::execute_stage_(packet_record *record, stage_runtime &stage,
@@ -3562,9 +3825,27 @@ void packet_worker_kernel::implementation::dispatch_target_prefix_(std::span<pac
 		stamp_route_(*record, target);
 	}
 	telemetry_->record_stage_output(stage.telemetry_ordinal, bytes, static_cast<uint16_t>(records.size()));
-	if (target.transition_by_storage_domain[reserved_domain] == provider::INVALID_COMPILED_PROVIDER_INDEX &&
-	    target.sender_ordinal != INVALID_RUNTIME_ORDINAL) {
-		send_boundary_(records, stage, reserved_domain);
+	if (target.transition_by_storage_domain[reserved_domain] == provider::INVALID_COMPILED_PROVIDER_INDEX) {
+		if (target.sender_ordinal != INVALID_RUNTIME_ORDINAL) {
+			send_boundary_(records, stage, reserved_domain);
+			return;
+		}
+		const auto index = target.stage_instance_index;
+		if (index >= stages_.size() || !stages_[index].owned ||
+		    index >= stage.target_by_stage_instance.size() ||
+		    stage.target_by_stage_instance[index] != target_ordinal ||
+		    !stages_[index].reachable_storage_domains.contains(reserved_domain) ||
+		    reserved_domain >= stages_[index].execution_keys.size()) {
+			std::terminate();
+		}
+		auto *staging = local_staging_(reserved_domain);
+		if (staging == nullptr) {
+			std::terminate();
+		}
+		for (auto *record : records) {
+			promote_next_stage_(*record);
+		}
+		staging->commit_active_prefix(stages_[index].execution_keys[reserved_domain], records);
 		return;
 	}
 	for (auto *record : records) {
@@ -3626,6 +3907,9 @@ packet_worker_kernel::implementation::~implementation() noexcept
 	if (scratch_ != nullptr) {
 		std::destroy_at(scratch_);
 	}
+	if (native_ != nullptr) {
+		std::destroy_at(native_);
+	}
 }
 
 void packet_worker_kernel::implementation::deliver_rx_(packet_record *record, stage_runtime &stage,
@@ -3635,7 +3919,7 @@ void packet_worker_kernel::implementation::deliver_rx_(packet_record *record, st
 		std::terminate();
 	}
 	const auto &stream = rx_streams_[stage.rx_stream_index];
-	if (!stream.owned || stream.stage_instance_index != stage.facts->stage_instance_index ||
+	if (stream.facts == nullptr || stream.stage_instance_index != stage.facts->stage_instance_index ||
 	    stream.storage_domain_index != reserved_domain) {
 		std::terminate();
 	}
@@ -3833,7 +4117,6 @@ void packet_worker_kernel::implementation::flush_transition_(transition_batch &b
 	if (accepted > attempted) {
 		std::terminate();
 	}
-
 	for (uint16_t index = 0; index < accepted; ++index) {
 		auto *destination = batch.destinations[index];
 		if (!validate_record_(destination, destination_domain) ||
@@ -3920,6 +4203,7 @@ void packet_worker_kernel::implementation::queue_tx_(tx_stream_runtime &stream, 
 	if (batch.count >= stream.operations->maximum_burst || batch.count >= MAX_BURST) {
 		std::terminate();
 	}
+	batch.expand();
 	const uint16_t index = batch.count;
 	batch.records[index] = record;
 	batch.metadata[index] = record->metadata;
@@ -3949,6 +4233,10 @@ void packet_worker_kernel::implementation::flush_tx_(tx_batch &batch) noexcept
 	if (accepted > attempted) {
 		std::terminate();
 	}
+	// A partial submission needs independent suffix receipts. Expand only the pre-call samples.
+	if (accepted != attempted) {
+		batch.expand();
+	}
 	for (uint16_t index = accepted; index < attempted; ++index) {
 		if (!validate_record_(batch.records[index], batch.storage_domains[index]) ||
 		    batch.records[index]->storage.length != batch.lengths[index] ||
@@ -3959,22 +4247,31 @@ void packet_worker_kernel::implementation::flush_tx_(tx_batch &batch) noexcept
 	// TX may already have reclaimed accepted records. All accepted accounting
 	// below uses the pre-call snapshots, never those record pointers.
 	uint64_t accepted_bytes = 0u;
-	for (uint16_t first = 0; first < accepted;) {
-		const uint64_t epoch = batch.metadata[first].epoch;
-		const uint32_t domain = batch.storage_domains[first];
-		const uint16_t stage = batch.metadata[first].current_stage_instance;
-		uint16_t end = first;
-		uint64_t bytes = 0u;
-		do {
-			bytes += batch.lengths[end++];
-		} while (end < accepted && batch.metadata[end].epoch == epoch && batch.storage_domains[end] == domain &&
-			 batch.metadata[end].current_stage_instance == stage);
-		const uint16_t count = static_cast<uint16_t>(end - first);
-		epoch_ledger_->retire(epoch, count);
-		release_local_reservation_(domain, count);
-		telemetry_->record_stage_output(stages_[stage].telemetry_ordinal, bytes, count);
-		accepted_bytes += bytes;
-		first = end;
+	if (batch.common_metadata) {
+		accepted_bytes = batch.common_bytes;
+		epoch_ledger_->retire(batch.metadata[0].epoch, accepted);
+		release_local_reservation_(batch.storage_domains[0], accepted);
+		telemetry_->record_stage_output(stages_[batch.metadata[0].current_stage_instance].telemetry_ordinal,
+						accepted_bytes, accepted);
+	} else {
+		for (uint16_t first = 0; first < accepted;) {
+			const uint64_t epoch = batch.metadata[first].epoch;
+			const uint32_t domain = batch.storage_domains[first];
+			const uint16_t stage = batch.metadata[first].current_stage_instance;
+			uint16_t end = first;
+			uint64_t bytes = 0u;
+			do {
+				bytes += batch.lengths[end++];
+			} while (end < accepted && batch.metadata[end].epoch == epoch &&
+				 batch.storage_domains[end] == domain &&
+				 batch.metadata[end].current_stage_instance == stage);
+			const uint16_t count = static_cast<uint16_t>(end - first);
+			epoch_ledger_->retire(epoch, count);
+			release_local_reservation_(domain, count);
+			telemetry_->record_stage_output(stages_[stage].telemetry_ordinal, bytes, count);
+			accepted_bytes += bytes;
+			first = end;
+		}
 	}
 	for (uint16_t index = accepted; index < attempted; ++index) {
 		const uint32_t stage_ordinal = stages_[batch.metadata[index].current_stage_instance].telemetry_ordinal;
@@ -3983,11 +4280,16 @@ void packet_worker_kernel::implementation::flush_tx_(tx_batch &batch) noexcept
 	}
 	telemetry_->record_stream(batch.stream->telemetry_ordinal, accepted, accepted_bytes,
 				  static_cast<uint16_t>(attempted - accepted));
+	batch.common_metadata = false;
 	batch.count = 0;
 }
 
 void packet_worker_kernel::implementation::flush_tx_batches_() noexcept
 {
+	if (native_ != nullptr) {
+		native_->flush();
+		return;
+	}
 	for (auto *stream : tx_flush_schedule_) {
 		if (stream == nullptr || stream->facts == nullptr ||
 		    stream->facts->io_stream_index >= tx_batches_.size()) {
@@ -4111,6 +4413,9 @@ void packet_worker_kernel::implementation::stamp_route_(packet_record &record,
 
 bool packet_worker_kernel::implementation::local_work_empty_() const noexcept
 {
+	if (native_ != nullptr && !native_->empty()) {
+		return false;
+	}
 	if (scratch_ != nullptr && scratch_->pending_count != 0u) {
 		return false;
 	}
@@ -4831,6 +5136,11 @@ void packet_worker_kernel::bind_bootstrap_epoch(uint64_t bootstrap_epoch, uint64
 void packet_worker_kernel::run() noexcept
 {
 	implementation_->run();
+}
+
+const native_packet_binding *packet_worker_kernel::native_binding() const noexcept
+{
+	return implementation_->native_binding();
 }
 
 uint32_t packet_worker_kernel::worker_index() const noexcept

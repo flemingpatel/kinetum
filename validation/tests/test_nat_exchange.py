@@ -25,6 +25,7 @@ from kinetum_validation.process.kinetumctl import ActiveSnapshot, SnapshotModule
 from kinetum_validation.scenario_context import ScenarioContext
 from kinetum_validation.traffic.base import validate_udp_exchange
 from kinetum_validation.traffic import native_tap
+from kinetum_validation.traffic.udp import internet_checksum
 
 
 _ETHERNET = bytes.fromhex("001122334455024b4e4154000800")
@@ -147,7 +148,7 @@ class NatExchangeTest(unittest.IsolatedAsyncioTestCase):
 
     def test_checksum_and_capture_bounds(self):
         """Pin an independent checksum vector and reject bytes outside the exchange contract."""
-        checksum = nat_exchange._checksum(  # pylint: disable=protected-access
+        checksum = internet_checksum(
             bytes.fromhex("0001f203f4f5f6f7"),
         )
         self.assertEqual(checksum, 0x220d)

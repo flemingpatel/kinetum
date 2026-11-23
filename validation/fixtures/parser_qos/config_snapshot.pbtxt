@@ -1,0 +1,11 @@
+# Copyright (c) 2026 Fleming Patel. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+snapshot_id: "parser_qos_v1"
+revision: 1
+modules {
+  module_id: "kinetum.qos"
+  revision: 1
+  content_type: "application/json"
+  config_blob: "{ \"default_profile\": \"default\", \"profiles\": [ { \"name\": \"default\", \"cir_kbps\": 10000000, \"cbs_kb\": 4096, \"conform_dscp\": 10 } ] }"
+}

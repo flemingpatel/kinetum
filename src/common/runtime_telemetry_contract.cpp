@@ -1299,6 +1299,10 @@ static status validate_runtime_telemetry_impl(const telemetry::RuntimeTelemetry 
 	if (!selection_shape) {
 		return status::invalid_argument("RuntimeTelemetry contains an unrequested row family");
 	}
+	if (selection.include_topology_stats() != value.has_packet_bindings()) {
+		return status::invalid_argument(
+			"RuntimeTelemetry packet binding presence disagrees with topology selection");
+	}
 	if ((selection.include_module_health() &&
 	     static_cast<uint32_t>(value.module_health_size()) != transition.module_context_count()) ||
 	    (selection.include_module_metrics() &&
@@ -1676,6 +1680,55 @@ static status validate_runtime_telemetry_impl(const telemetry::RuntimeTelemetry 
 					return status::invalid_argument(
 						"RuntimeTelemetry steering profile references an unknown selected stream");
 				}
+			}
+		}
+	}
+	if (value.has_packet_bindings()) {
+		const auto &bindings = value.packet_bindings();
+		if (static_cast<uint32_t>(bindings.rows_size()) != runtime.expected_workers()) {
+			return status::invalid_argument(
+				"RuntimeTelemetry worker packet binding membership is incomplete");
+		}
+		for (int index = 0; index < bindings.rows_size(); ++index) {
+			const auto &row = bindings.rows(index);
+			if (row.worker_index() != static_cast<uint32_t>(index)) {
+				return status::invalid_argument(
+					"RuntimeTelemetry packet bindings are out of worker order");
+			}
+			if (row.representation() == telemetry::WORKER_PACKET_REPRESENTATION_FULL_RECORD &&
+			    !row.has_native_route()) {
+				continue;
+			}
+			const auto &route = row.native_route();
+			if (row.representation() != telemetry::WORKER_PACKET_REPRESENTATION_DIRECT_NATIVE ||
+			    bindings.rows_size() != 1 || transition.boundary_count() != 0u ||
+			    transition.module_context_count() != 0u ||
+			    (selection.include_stage_stats() && value.stages_size() != 2) || !row.has_native_route() ||
+			    !identity_present(route.rx_stream_id()) || !identity_present(route.tx_stream_id()) ||
+			    route.rx_stream_id() == route.tx_stream_id() ||
+			    !identity_present(route.storage_domain_id())) {
+				return status::invalid_argument(
+					"RuntimeTelemetry worker packet binding has an invalid representation or route");
+			}
+			if (selection.include_stream_stats()) {
+				const auto rx = find_stream(route.rx_stream_id());
+				const auto tx = find_stream(route.tx_stream_id());
+				if (value.streams_size() != 2 || rx == stream_identities.end() ||
+				    rx->first != route.rx_stream_id() ||
+				    rx->second != kinetum::gluon::v1::IO_STREAM_DIRECTION_RX ||
+				    tx == stream_identities.end() || tx->first != route.tx_stream_id() ||
+				    tx->second != kinetum::gluon::v1::IO_STREAM_DIRECTION_TX) {
+					return status::invalid_argument(
+						"RuntimeTelemetry native binding contradicts the selected streams");
+				}
+			}
+			if (selection.include_storage_domain_stats() &&
+			    std::none_of(value.storage_domains().begin(), value.storage_domains().end(),
+					 [&](const auto &domain) {
+						 return domain.storage_domain_id() == route.storage_domain_id();
+					 })) {
+				return status::invalid_argument(
+					"RuntimeTelemetry native binding references an unknown selected domain");
 			}
 		}
 	}

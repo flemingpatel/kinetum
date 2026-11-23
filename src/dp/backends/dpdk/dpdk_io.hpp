@@ -125,6 +125,11 @@ class dpdk_packet_storage final {
 
 	/** @return Borrowed immutable storage table, valid for this owner's lifetime. */
 	[[nodiscard]] const kinetum_packet_storage_domain_operations &operations() const noexcept;
+	/** @return Verification and reclamation for synchronous native views from this exact pool. */
+	[[nodiscard]] const kinetum_packet_native_storage_operations &native_operations() const noexcept
+	{
+		return native_operations_;
+	}
 	/** @return Native pool borrowed by dependent RX queues while this storage owner remains alive. */
 	[[nodiscard]] rte_mempool *native_pool() const noexcept;
 	/** @return Exact host NUMA node required for native queue memory. */
@@ -177,6 +182,12 @@ class dpdk_packet_storage final {
 	 * @param count Positive count within the platform burst bound; invalid or duplicate ownership fails stop.
 	 */
 	static void release_burst_(void *state, kinetum_packet_record *const *records, uint16_t count) noexcept;
+	/** @param state Original storage owner. @param views Retained receipts. @param count Suffix length.
+	 * @return One when every retained native buffer still has its admitted pool and byte range.
+	 */
+	static uint8_t verify_native_(void *state, const kinetum_packet_native_view *views, uint16_t count) noexcept;
+	/** @param state Original storage owner. @param views Verified views to retire. @param count Exact batch size. */
+	static void release_native_(void *state, const kinetum_packet_native_view *views, uint16_t count) noexcept;
 	/**
 	 * @brief Publish one cold approximate native-pool occupancy observation.
 	 * @param state Borrowed storage owner.
@@ -188,8 +199,9 @@ class dpdk_packet_storage final {
 	observe_statistics_(void *state, kinetum_provider_storage_observation *observation,
 			    kinetum_provider_diagnostic *diagnostic) noexcept;
 
-	std::unique_ptr<implementation> state_;			 ///< Exact native storage ownership.
-	kinetum_packet_storage_domain_operations operations_{};	 ///< Published storage table.
+	std::unique_ptr<implementation> state_;				///< Exact native storage ownership.
+	kinetum_packet_native_storage_operations native_operations_{};	///< Original native storage authority.
+	kinetum_packet_storage_domain_operations operations_{};		///< Published cache-line-aligned storage table.
 };
 
 /**
@@ -297,6 +309,15 @@ class dpdk_io_driver final {
 	 */
 	static kinetum_packet_rx_burst_result receive_burst_(void *state, kinetum_packet_record **records,
 							     uint16_t capacity) noexcept;
+	/** @param state Bound RX queue. @param[out] views Zeroed output slots. @param capacity Reserved input capacity.
+	 * @return Compact ownership transfers and provider-retired rejections.
+	 */
+	static kinetum_packet_rx_burst_result receive_native_(void *state, kinetum_packet_native_view *views,
+							      uint16_t capacity) noexcept;
+	/** @param state Bound TX queue. @param views Borrowed submitted receipts. @param count Offered population.
+	 * @return Exact accepted native prefix from one submission.
+	 */
+	static uint16_t transmit_native_(void *state, const kinetum_packet_native_view *views, uint16_t count) noexcept;
 	/**
 	 * @brief Transfer exactly the accepted prefix to one native TX queue.
 	 * @param state Borrowed materialized TX queue.

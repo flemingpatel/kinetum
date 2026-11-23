@@ -971,6 +971,7 @@ add_library(kinetum_packet_runtime STATIC
   src/dp/epoch/epoch_transition_preparation.cpp
   src/dp/epoch/epoch_transition_staging.cpp
   src/dp/worker_packet_staging.cpp
+  src/dp/worker_native_handoff.cpp
   src/dp/epoch/frozen_transition_participants.cpp
   src/dp/epoch/worker_boundary_receiver.cpp
   src/dp/epoch/worker_boundary_sender.cpp
@@ -1624,6 +1625,7 @@ if(KINETUM_ENABLE_TESTS)
     tests/test_worker_runtime_telemetry.cpp
     tests/test_epoch_transition_staging.cpp
     tests/test_worker_packet_staging.cpp
+    tests/test_worker_native_handoff.cpp
     tests/test_numa_layout.cpp
     tests/test_numa_memory.cpp
     tests/test_worker_numa_placement.cpp

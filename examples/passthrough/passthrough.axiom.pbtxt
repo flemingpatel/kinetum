@@ -2,11 +2,11 @@
 # Passthrough Pipeline - Simple RX to TX Forwarding
 # =============================================================================
 #
-# Minimal pipeline for baseline validation and TAP PMD testing.
+# Minimal pipeline for TAP or PCI forwarding.
 # Receives and forwards packets without a module stage.
 #
 # Use Case:
-#   - TAP PMD integration testing
+#   - TAP and physical port integration testing
 #   - Baseline throughput measurement
 #   - DPDK initialization validation
 #

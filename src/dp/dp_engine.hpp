@@ -8,7 +8,7 @@
  * @brief Provider-neutral owner-worker packet mechanism execution.
  * @author Fleming Patel
  *
- * The engine consumes the dataplane's sole packet_record representation. It
+ * The engine exercises the full-record stage and module contracts. It
  * never includes a provider header, branches on a provider kind, discovers a
  * module, or resolves mutable configuration on the packet path.
  *

@@ -69,6 +69,7 @@ _BACKENDS = frozenset(backend.value for backend in BackendType)
 _TRAFFIC_DRIVERS = frozenset(driver.value for driver in TrafficDriverType)
 EXPECTED_TRANSITION_TYPES_BY_TEST = {
     "standard": (),
+    "minimum_frame": (),
     "epoch": ("epoch",),
     "commit_confirmed": (
         "commit_confirmed", "commit_confirmed_timeout_rollback",
@@ -86,6 +87,7 @@ EXPECTED_TRANSITION_TYPES_BY_TEST = {
 }
 EXPECTED_SCENARIO_METRICS_BY_TEST = {
     "standard": ("packet_tests",),
+    "minimum_frame": ("packet_tests",),
     "epoch": ("epoch_test",),
     "commit_confirmed": ("commit_confirmed_test",),
     "rollback": ("rollback_test",),
@@ -974,7 +976,7 @@ def validate_test_suite_result(
         raise JsonContractError("test-results scenario identity is undeclared")
     if (
         (backend == "dpdk_tap") != (traffic_driver == "native_tap")
-        or (deployment == "passthrough" and test_type != "standard")
+        or DEPLOYMENT_SPECS[DeploymentMode(deployment)].scenario_errors(TestType(test_type), BackendType(backend))
     ):
         raise JsonContractError("test-results scenario identity is undeclared")
     timestamp_source = require_string(
@@ -1126,7 +1128,7 @@ def validate_test_suite_result(
         "rollback": test_type in {"rollback", "full"},
         "guardrails": test_type in {"guardrails", "full"},
     }
-    packet_family_expected = test_type in {"standard", "full"}
+    packet_family_expected = test_type in {"standard", "minimum_frame", "full"}
     if any(
         present and not expected_presence[name]
         for name, present in optional_presence.items()
@@ -1223,9 +1225,36 @@ def _require_canonical_mac(
     return text
 
 
+def packet_binding_rows(value: object, worker_count: int) -> list[dict]:
+    """Validate ordered, presence-qualified bindings from the wire or a retained run manifest."""
+    bindings = require_object(value, "worker packet bindings")
+    require_exact_keys(bindings, {"rows"}, "worker packet bindings")
+    rows = require_array(bindings["rows"], "worker packet bindings")
+    if not rows or len(rows) != worker_count:
+        raise JsonContractError("packet binding count differs from runtime worker count")
+    for index, item in enumerate(rows):
+        row = require_object(item, "worker packet binding")
+        require_key_contract(row, {"worker_index", "representation"}, {"native_route"}, "worker packet binding")
+        mode = require_string(row["representation"], "worker packet representation")
+        if require_int(row["worker_index"], "binding index", minimum=0, maximum=_UINT32_MAX) != index:
+            raise JsonContractError("packet bindings are out of worker order")
+        if mode == "WORKER_PACKET_REPRESENTATION_FULL_RECORD" and "native_route" not in row:
+            continue
+        if mode != "WORKER_PACKET_REPRESENTATION_DIRECT_NATIVE" or "native_route" not in row or worker_count != 1:
+            raise JsonContractError("worker packet representation has an invalid route")
+        route = require_object(row["native_route"], "native packet route")
+        fields = {"rx_stream_id", "tx_stream_id", "storage_domain_id"}
+        require_exact_keys(route, fields, "native packet route")
+        for key in fields:
+            require_string(route[key], key)
+        if route["rx_stream_id"] == route["tx_stream_id"]:
+            raise JsonContractError("native packet route repeats a stream")
+    return rows
+
+
 def validate_run_metadata(value: Dict[str, Any]) -> None:
     """Validate one complete physical-run identity record before publication."""
-    require_exact_keys(
+    require_key_contract(
         value,
         {
             "backend", "traffic_driver", "stream_topology", "storage_profile", "timestamp_source",
@@ -1233,8 +1262,17 @@ def validate_run_metadata(value: Dict[str, Any]) -> None:
             "runtime_release", "runtime_root", "validation_root", "bundle_root",
             "plan_file", "dry_run", "ports", "traffic_endpoint",
         },
+        {"worker_topology"},
         "run metadata",
     )
+    if "worker_topology" in value:
+        topology = require_object(value["worker_topology"], "run worker topology")
+        require_exact_keys(topology, {"runtime_generation", "worker_count", "bindings"}, "run worker topology")
+        require_int(topology["runtime_generation"], "binding generation", minimum=1, maximum=_UINT64_MAX)
+        count = require_int(topology["worker_count"], "worker count", minimum=1, maximum=_UINT32_MAX)
+        packet_binding_rows(topology["bindings"], count)
+        if value["dry_run"]:
+            raise JsonContractError("dry run reports a live worker binding")
     backend = require_string(value["backend"], "run metadata backend")
     traffic_driver = require_string(
         value["traffic_driver"], "run metadata traffic driver"

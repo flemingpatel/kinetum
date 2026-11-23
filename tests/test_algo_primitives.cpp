@@ -971,6 +971,26 @@ TEST(algo_compact_index_set, borrowed_extent_must_equal_the_complete_universe)
 	EXPECT_FALSE(view.contains(127u));
 }
 
+/** @brief An oversized prefix publishes nothing and an admitted wrapped prefix keeps FIFO order. */
+TEST(algo_queue, whole_prefix_refusal_and_wrap_preserve_fifo)
+{
+	constexpr std::array<uint32_t, 3> FIRST{1u, 2u, 3u}, SECOND{4u, 5u, 6u};
+	std::array<work_queue_view<uint32_t>::storage_type, 4> storage{};
+	work_queue_view<uint32_t> queue(storage.data(), storage.size());
+	EXPECT_TRUE(queue.try_push_prefix(nullptr, 0u));
+	EXPECT_FALSE(queue.try_push_prefix(nullptr, 1u));
+	ASSERT_TRUE(queue.try_push_prefix(FIRST.data(), FIRST.size()));
+	EXPECT_FALSE(queue.try_push_prefix(SECOND.data(), SECOND.size()));
+	EXPECT_EQ(queue.size(), 3u);
+	std::array<uint32_t, 4> out{};
+	ASSERT_EQ(queue.pop_batch(out.data(), 2u), 2u);
+	EXPECT_EQ(out[0], 1u);
+	EXPECT_EQ(out[1], 2u);
+	ASSERT_TRUE(queue.try_push_prefix(SECOND.data(), SECOND.size()));
+	ASSERT_EQ(queue.pop_batch(out.data(), out.size()), 4u);
+	EXPECT_EQ(out, (std::array<uint32_t, 4>{3u, 4u, 5u, 6u}));
+}
+
 /** @brief Verify caller-storage owner queues retain exact runtime FIFO capacity. */
 TEST(algo_queue, borrowed_work_queue_uses_exact_single_owner_arithmetic)
 {

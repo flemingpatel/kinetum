@@ -68,6 +68,46 @@ telemetry::RuntimeTelemetry valid_telemetry()
 
 }  // namespace
 
+/** @brief Require field presence, ordered membership and exact representation-specific route fields. */
+TEST(runtime_telemetry_contract, packet_binding_is_present_only_for_selected_topology)
+{
+	auto value = valid_telemetry();
+	telemetry::TelemetrySelection selected;
+	selected.set_include_topology_stats(true);
+	EXPECT_FALSE(validate_runtime_telemetry(value, selected).is_ok());
+	auto *row = value.mutable_packet_bindings()->add_rows();
+	EXPECT_FALSE(validate_runtime_telemetry(value, selected).is_ok());
+	row->set_representation(telemetry::WORKER_PACKET_REPRESENTATION_FULL_RECORD);
+	ASSERT_TRUE(validate_runtime_telemetry(value, selected).is_ok());
+	EXPECT_FALSE(validate_runtime_telemetry(value, telemetry::TelemetrySelection{}).is_ok());
+	row->set_worker_index(1u);
+	EXPECT_FALSE(validate_runtime_telemetry(value, selected).is_ok());
+	row->set_worker_index(0u);
+	auto *route = row->mutable_native_route();
+	route->set_rx_stream_id("rx");
+	route->set_tx_stream_id("tx");
+	route->set_storage_domain_id("pool");
+	EXPECT_FALSE(validate_runtime_telemetry(value, selected).is_ok());
+	row->set_representation(telemetry::WORKER_PACKET_REPRESENTATION_DIRECT_NATIVE);
+	EXPECT_TRUE(validate_runtime_telemetry(value, selected).is_ok());
+	selected.set_include_stage_stats(true);
+	EXPECT_FALSE(validate_runtime_telemetry(value, selected).is_ok());
+	selected.set_include_stage_stats(false);
+	value.mutable_transition()->set_module_context_count(1u);
+	auto *domain = value.add_module_context_domains();
+	domain->set_module_id("kinetum.qos");
+	domain->add_context_instance_ids("qos@0");
+	EXPECT_FALSE(validate_runtime_telemetry(value, selected).is_ok());
+	value.clear_module_context_domains();
+	value.mutable_transition()->set_module_context_count(0u);
+	value.mutable_transition()->set_boundary_count(1u);
+	EXPECT_FALSE(validate_runtime_telemetry(value, selected).is_ok());
+	value.mutable_transition()->set_boundary_count(0u);
+	ASSERT_TRUE(validate_runtime_telemetry(value, selected).is_ok());
+	route->set_tx_stream_id("rx");
+	EXPECT_FALSE(validate_runtime_telemetry(value, selected).is_ok());
+}
+
 /** @brief Accept one exact mandatory observation and canonical wrappers. */
 TEST(runtime_telemetry_contract, mandatory_families_and_service_wrappers_are_exact)
 {
@@ -278,6 +318,8 @@ TEST(runtime_telemetry_contract, optional_row_membership_is_selection_exact)
 	auto topology = valid_telemetry();
 	telemetry::TelemetrySelection topology_selection;
 	topology_selection.set_include_topology_stats(true);
+	topology.mutable_packet_bindings()->add_rows()->set_representation(
+		telemetry::WORKER_PACKET_REPRESENTATION_FULL_RECORD);
 	auto *profile = topology.add_steering_profiles();
 	profile->set_steering_profile_id("steering.0");
 	profile->set_kind(kinetum::gluon::v1::TRAFFIC_STEERING_KIND_RSS);

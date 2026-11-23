@@ -26,7 +26,7 @@ from kinetum_validation.config.types import (
 from kinetum_validation.engine.runtime_release import collect_runtime_release_metadata
 from kinetum_validation.engine.json_contract import parse_exact_json_object
 from kinetum_validation.orchestrator import run_test_suite
-from kinetum_validation.process.installation import installed_example_input_errors, installed_root_errors
+from kinetum_validation.process.installation import installed_input_errors, installed_root_errors
 from kinetum_validation.process.run_owner import ValidationRunOwner
 
 from .contracts import validate_benchmark_manifest
@@ -159,7 +159,7 @@ def admit_benchmark_inputs(config: BenchmarkConfig) -> None:
         )
     except (KeyError, ValueError) as exc:
         raise RuntimeError("benchmark scenario identity is undeclared") from exc
-    scenario_errors = deployment.scenario_errors(test_type)
+    scenario_errors = _build_test_config(config, config.output_dir).workload_errors()
     if scenario_errors:
         raise RuntimeError(
             "benchmark scenario admission rejected: "
@@ -175,9 +175,10 @@ def admit_benchmark_inputs(config: BenchmarkConfig) -> None:
             "installed benchmark layout rejected: "
             + "; ".join(installation_errors)
         )
-    example_errors = installed_example_input_errors(
-        config.validation_root,
-        deployment.example_dir,
+    example_errors = installed_input_errors(
+        ProcessConfig(config.runtime_root, config.validation_root),
+        deployment,
+        backend_profile,
         required_files,
     )
     if example_errors:

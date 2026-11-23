@@ -53,6 +53,7 @@ from kinetum_validation.config.types import (
     TestType,
     TrafficEndpointConfig,
     epoch_window_has_capacity,
+    minimum_frame_shape_errors,
     timed_packet_count_fits,
     traffic_endpoint_errors,
 )
@@ -183,12 +184,12 @@ def _add_run_args(parser: argparse.ArgumentParser) -> None:
                         help="Packet count (default: 1000)")
     parser.add_argument("--packet-size", type=int, default=64,
                         help="Packet size in bytes (default: 64)")
-    parser.add_argument("--no-all-sizes", action="store_true",
-                        help="Test single packet size only (default: all sizes 64-1514)")
+    parser.add_argument("--no-all-sizes", dest="all_sizes", action="store_false",
+                        help="Test one size (minimum-frame always uses the 64-byte wire size)")
     parser.add_argument(
         "--num-flows",
         type=int,
-        default=1,
+        default=None,
         help=(
             "Number of traffic-generator flows per ingress port; "
             "rx-rss-2 requires at least "
@@ -313,7 +314,14 @@ def parse_args() -> argparse.Namespace:
     )
     _add_report_args(report_parser)
 
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.command == "run":
+        test_type = TestType(args.test_type.replace("-", "_"))
+        if args.num_flows is None:
+            args.num_flows = test_type.default_num_flows
+        if test_type == TestType.MINIMUM_FRAME:
+            args.all_sizes = False
+    return args
 
 
 def validate_run_args(
@@ -381,11 +389,9 @@ def validate_run_args(
             BackendType(args.backend.replace("-", "_"))
         )
         selected_profile.bindings_file_for(stream_topology, storage_profile)
-        errors.extend(
-            deployment.scenario_errors(
-                TestType(args.test_type.replace("-", "_"))
-            )
-        )
+        test_type = TestType(args.test_type.replace("-", "_"))
+        errors.extend(deployment.scenario_errors(test_type, selected_profile.backend_type))
+        errors.extend(minimum_frame_shape_errors(test_type, args.packet_size, args.num_flows, args.all_sizes))
         if (
             stream_topology == StreamTopologyProfile.RX_RSS_2
             and args.num_flows < CONSTANTS.RX_RSS_2_MIN_NUM_FLOWS
@@ -462,7 +468,7 @@ async def cmd_run(args: argparse.Namespace) -> int:
         pps=args.pps,
         count=args.count,
         packet_size=args.packet_size,
-        all_sizes=not args.no_all_sizes,
+        all_sizes=args.all_sizes,
         num_flows=args.num_flows,
         epoch_duration=args.epoch_duration,
         epoch_pps=args.epoch_pps,

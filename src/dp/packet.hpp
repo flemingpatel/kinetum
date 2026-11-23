@@ -8,10 +8,10 @@
  * @brief Exact provider-neutral packet record and packet operation contracts.
  * @author Fleming Patel
  *
- * Every packet-path owner carries exactly one packet_record pointer. Native
- * provider handles remain opaque inside packet_storage_descriptor; core
- * routing, modules, boundaries, and epoch logic never include or branch on a
- * provider type.
+ * A full-record owner holds one packet_record pointer. Its native handle
+ * remains opaque inside packet_storage_descriptor. The exact local RX-to-TX
+ * handoff can instead retain a native view in a worker slot. Core routing,
+ * modules, boundaries and epoch logic consume no provider-specific type.
  *
  * The record separates three roles deliberately:
  *
@@ -172,6 +172,41 @@ inline void initialize_packet_record(packet_record &record) noexcept
 }
 
 /**
+ * @brief Check the immutable facts shared by a storage-domain prefix.
+ * @param operations Materialized table, or null for an unscheduled domain.
+ * @param expected_domain Compiled domain of the prefix.
+ * @param runtime_generation Generation that owns the table.
+ * @return Whether the table supplies the exact expected identity and known capabilities.
+ */
+[[nodiscard]] KINETUM_ALWAYS_INLINE bool
+packet_storage_matches_domain(const packet_storage_domain_operations *operations, uint32_t expected_domain,
+			      uint64_t runtime_generation) noexcept
+{
+	return operations != nullptr && operations->domain_index == expected_domain &&
+	       operations->generation == runtime_generation &&
+	       (operations->capabilities & ~packet_storage_capabilities::KNOWN_MASK) == 0u;
+}
+
+/**
+ * @param record Candidate in a prefix with an admitted operation table.
+ * @param operations Table already checked against the compiled domain and runtime generation.
+ * @return Whether this record has the exact table, identity, capabilities and valid intrinsic shape.
+ */
+[[nodiscard]] KINETUM_ALWAYS_INLINE bool
+packet_record_matches_operations(const packet_record *record,
+				 const packet_storage_domain_operations &operations) noexcept
+{
+	if (record == nullptr) {
+		return false;
+	}
+	const auto &storage = record->storage;
+	return storage.operations == &operations && storage.generation == operations.generation &&
+	       storage.domain_index == operations.domain_index && storage.length != 0u &&
+	       storage.length <= operations.maximum_packet_length && storage.segment_count != 0u &&
+	       storage.capabilities == operations.capabilities;
+}
+
+/**
  * @brief Match one record against the already admitted storage expectation.
  * @param record Live candidate record, or null.
  * @param operations Immutable materialized operation table, or null when unscheduled.
@@ -183,16 +218,8 @@ inline void initialize_packet_record(packet_record &record) noexcept
 packet_record_matches_storage(const packet_record *record, const packet_storage_domain_operations *operations,
 			      uint32_t expected_domain, uint64_t runtime_generation) noexcept
 {
-	if (record == nullptr || operations == nullptr) {
-		return false;
-	}
-	const auto &storage = record->storage;
-	return storage.operations == operations && storage.generation == runtime_generation &&
-	       storage.generation == operations->generation && storage.domain_index == expected_domain &&
-	       storage.domain_index == operations->domain_index && storage.length != 0 &&
-	       storage.length <= operations->maximum_packet_length && storage.segment_count != 0 &&
-	       storage.capabilities == operations->capabilities &&
-	       (storage.capabilities & ~packet_storage_capabilities::KNOWN_MASK) == 0;
+	return packet_storage_matches_domain(operations, expected_domain, runtime_generation) &&
+	       packet_record_matches_operations(record, *operations);
 }
 
 /**

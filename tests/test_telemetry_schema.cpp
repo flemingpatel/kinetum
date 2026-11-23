@@ -223,6 +223,12 @@ TEST(telemetry_schema, enum_values_are_compact_and_exact)
 	expect_enum(file->FindEnumTypeByName("EpochProtocolFaultCode"), PROTOCOL_FAULTS);
 	expect_enum(file->FindEnumTypeByName("EpochProtocolFaultDisposition"), FAULT_DISPOSITIONS);
 	expect_enum(file->FindEnumTypeByName("ModuleHealthState"), HEALTH_STATES);
+	constexpr std::array<expected_enum_value, 3> REPRESENTATIONS{{
+		{"WORKER_PACKET_REPRESENTATION_UNSPECIFIED", 0},
+		{"WORKER_PACKET_REPRESENTATION_FULL_RECORD", 1},
+		{"WORKER_PACKET_REPRESENTATION_DIRECT_NATIVE", 2},
+	}};
+	expect_enum(file->FindEnumTypeByName("WorkerPacketRepresentation"), REPRESENTATIONS);
 }
 
 /** @brief Pin the mandatory summaries and exact optional-row selector. */
@@ -267,7 +273,7 @@ TEST(telemetry_schema, core_message_fields_are_compact_and_exact)
 		{"published_monotonic_ns", 4, field_descriptor::TYPE_UINT64, false, false, nullptr},
 		{"counters", 5, field_descriptor::TYPE_MESSAGE, false, true, "kinetum.telemetry.v1.EngineStats"},
 	}};
-	constexpr std::array<expected_field, 18> COMPLETE{{
+	constexpr std::array<expected_field, 19> COMPLETE{{
 		{"runtime", 1, field_descriptor::TYPE_MESSAGE, false, true, "kinetum.telemetry.v1.RuntimeObservation"},
 		{"engine", 2, field_descriptor::TYPE_MESSAGE, false, true, "kinetum.telemetry.v1.EngineStats"},
 		{"transition", 3, field_descriptor::TYPE_MESSAGE, false, true,
@@ -297,11 +303,31 @@ TEST(telemetry_schema, core_message_fields_are_compact_and_exact)
 		 "kinetum.gluon.v1.ModuleContextDomain"},
 		{"worker_counters", 19, field_descriptor::TYPE_MESSAGE, true, false,
 		 "kinetum.telemetry.v1.WorkerCounterStats"},
+		{"packet_bindings", 20, field_descriptor::TYPE_MESSAGE, false, true,
+		 "kinetum.telemetry.v1.WorkerPacketBindings"},
 	}};
 	expect_message(v1::TelemetrySelection::descriptor(), SELECTION);
 	expect_message(v1::RuntimeObservation::descriptor(), RUNTIME);
 	expect_message(v1::EngineStats::descriptor(), ENGINE);
 	expect_message(v1::WorkerCounterStats::descriptor(), WORKER_COUNTERS);
+	constexpr std::array<expected_field, 3> NATIVE_ROUTE{{
+		{"rx_stream_id", 1, field_descriptor::TYPE_STRING, false, false, nullptr},
+		{"tx_stream_id", 2, field_descriptor::TYPE_STRING, false, false, nullptr},
+		{"storage_domain_id", 3, field_descriptor::TYPE_STRING, false, false, nullptr},
+	}};
+	constexpr std::array<expected_field, 3> BINDING{{
+		{"worker_index", 1, field_descriptor::TYPE_UINT32, false, false, nullptr},
+		{"representation", 2, field_descriptor::TYPE_ENUM, false, false,
+		 "kinetum.telemetry.v1.WorkerPacketRepresentation"},
+		{"native_route", 3, field_descriptor::TYPE_MESSAGE, false, true,
+		 "kinetum.telemetry.v1.NativePacketRoute"},
+	}};
+	constexpr std::array<expected_field, 1> BINDINGS{{
+		{"rows", 1, field_descriptor::TYPE_MESSAGE, true, false, "kinetum.telemetry.v1.WorkerPacketBinding"},
+	}};
+	expect_message(v1::NativePacketRoute::descriptor(), NATIVE_ROUTE);
+	expect_message(v1::WorkerPacketBinding::descriptor(), BINDING);
+	expect_message(v1::WorkerPacketBindings::descriptor(), BINDINGS);
 	expect_message(v1::RuntimeTelemetry::descriptor(), COMPLETE);
 	EXPECT_EQ(v1::RuntimeTelemetry::descriptor()->FindFieldByNumber(17), nullptr);
 }

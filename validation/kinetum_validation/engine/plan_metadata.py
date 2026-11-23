@@ -60,6 +60,8 @@ class PlanIoStreamMetadata:
     driver_queue_id: int
     rx_storage_domain_id: Optional[str]
     tx_storage_domain_ids: Tuple[str, ...]
+    owning_worker_id: str = ""
+    descriptor_count: int = 0
 
     @property
     def storage_domain_ids(self) -> Tuple[str, ...]:
@@ -121,6 +123,16 @@ class PlanStorageTransitionMetadata:
 
 
 @dataclass(frozen=True)
+class PlanWorkerPlacement:
+    """One authored CPU and region assignment, indexed by compact worker identity."""
+
+    worker_id: str
+    worker_index: int
+    region_id: int
+    cpu: int
+
+
+@dataclass(frozen=True)
 class PlanTopologyMetadata:
     """Immutable plan-derived identities consumed by physical validation."""
 
@@ -131,6 +143,8 @@ class PlanTopologyMetadata:
     module_context_domains: Tuple[PlanModuleContextDomainMetadata, ...]
     module_contexts: Tuple[PlanModuleContextMetadata, ...]
     storage_transitions: Tuple[PlanStorageTransitionMetadata, ...]
+    workers: Tuple[PlanWorkerPlacement, ...] = ()
+    content_hash: str = ""
 
 
 def resolve_runtime_ports(
@@ -198,6 +212,13 @@ def parse_plan_topology(plan_file: Path) -> PlanTopologyMetadata:
     then compares runtime telemetry with those emitted facts.
     """
     lines = plan_file.read_text(encoding="utf-8").splitlines()
+    hashes = [line for line in lines if line.startswith("content_hash:")]
+    content_hash = ""
+    if hashes:
+        match = re.fullmatch(r'content_hash: "([0-9a-f]{64})"', hashes[0])
+        if len(hashes) != 1 or match is None:
+            raise RuntimeError("generated plan has an invalid content hash")
+        content_hash = match.group(1)
     ports = tuple(
         PlanPortMetadata(
             logical_port_id=_uint32_scalar(record, "logical_port_id", "ports"),
@@ -297,6 +318,13 @@ def parse_plan_topology(plan_file: Path) -> PlanTopologyMetadata:
         contexts.update(identities)
     return PlanTopologyMetadata(
         ports=ports,
+        content_hash=content_hash,
+        workers=tuple(PlanWorkerPlacement(
+            _required_scalar(row, "worker_id", "worker_placements"),
+            _uint32_scalar(row, "worker_index", "worker_placements"),
+            _uint32_scalar(row, "region_id", "worker_placements"),
+            int(_required_scalar(row, "cpu_core_ids", "worker_placements")),
+        ) for row in _parse_top_level_records(lines, "worker_placements")),
         io_streams=io_streams,
         storage_domains=storage_domains,
         steering_profiles=steering_profiles,
@@ -364,6 +392,8 @@ def _read_io_stream(record: _GeneratedMessage) -> PlanIoStreamMetadata:
         lane_id=_required_scalar(record, "lane_id", "io_streams"),
         steering_profile_id=_optional_scalar(record, "steering_profile_id", "io_streams"),
         driver_queue_id=_uint32_scalar(record, "driver_queue_id", "io_streams"),
+        owning_worker_id=_optional_scalar(record, "owning_worker_id", "io_streams"),
+        descriptor_count=_uint32_scalar(record, "descriptor_count", "io_streams"),
         rx_storage_domain_id=rx_domain,
         tx_storage_domain_ids=tx_domains,
     )

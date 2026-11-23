@@ -158,8 +158,27 @@ _TELEMETRY_ROW_FIELDS = frozenset({
     "stages", "module_counters", "module_histograms",
     "module_epoch_mismatches", "module_health", "workers", "regions",
     "boundaries", "streams", "storage_domains", "ports",
-    "steering_profiles", "module_context_domains",
+    "steering_profiles", "module_context_domains", "packet_bindings",
 })
+
+
+@dataclass(frozen=True)
+class WorkerPacketBinding:
+    """One worker's construction-time representation and its direct-route identities."""
+
+    worker_index: int
+    representation: str
+    rx_stream_id: Optional[str] = None
+    tx_stream_id: Optional[str] = None
+    storage_domain_id: Optional[str] = None
+
+    def wire_row(self) -> dict:
+        """Return the exact presence-bearing row for offline membership validation."""
+        row = {"worker_index": self.worker_index, "representation": self.representation}
+        if self.rx_stream_id is not None:
+            row["native_route"] = {"rx_stream_id": self.rx_stream_id, "tx_stream_id": self.tx_stream_id,
+                                   "storage_domain_id": self.storage_domain_id}
+        return row
 
 
 @dataclass(frozen=True)
@@ -187,7 +206,7 @@ class StatsSelection:
     include_port_stats : bool
         Request native logical-port observations.
     include_topology_stats : bool
-        Request compiled steering and module-context populations.
+        Request steering, module-context populations and the worker packet bindings.
     """
 
     include_stage_stats: bool = False
@@ -704,6 +723,8 @@ class StatsResult:  # pylint: disable=too-many-instance-attributes
         Per-traffic-steering-profile statistics.
     module_context_domains : list
         Canonical module-context populations defining generation-fixed ordinals.
+    packet_bindings : list or None
+        Ordered worker representations when topology was selected and reported.
     diagnostic : str
         Failure diagnostic; empty on success.
     """
@@ -765,6 +786,7 @@ class StatsResult:  # pylint: disable=too-many-instance-attributes
     port_stats: List[PortStatsResult] = field(default_factory=list)
     traffic_steering_stats: List[TrafficSteeringStatsResult] = field(default_factory=list)
     module_context_domains: List[ModuleContextDomainResult] = field(default_factory=list)
+    packet_bindings: Optional[List[WorkerPacketBinding]] = None
     diagnostic: str = ""
 
 

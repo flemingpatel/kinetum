@@ -852,7 +852,7 @@ Both `StatsRequest` wrappers contain exactly one field:
 | `include_stream_stats` | 7 | `streams[]` |
 | `include_storage_domain_stats` | 8 | `storage_domains[]` |
 | `include_port_stats` | 9 | `ports[]` |
-| `include_topology_stats` | 10 | `steering_profiles[]` and `module_context_domains[]` |
+| `include_topology_stats` | 10 | `steering_profiles[]`, `module_context_domains[]`, and `packet_bindings` |
 
 The DP `StatsResponse` is `{status=1, telemetry=2}`. The CP response is
 `{status=1, active_config=2, telemetry=3}`; `active_config` contains
@@ -875,7 +875,7 @@ readiness, all expected workers, and causal timestamps.
 | --- | --- |
 | `rx_packets`, `rx_bytes` | Physical provider ingress prefix admitted into runtime ownership. |
 | `tx_packets`, `tx_bytes` | Provider-accepted transmit prefix only; retries cannot double-count. |
-| `dropped_packets` | Exactly-once terminal record retirement. |
+| `dropped_packets` | Packets retired as drops by workers, counted once. |
 | `fanout_overflow` | Refused additional fan-out branches for which no record was created. |
 
 All are cumulative within `runtime_generation`. A generation change resets a
@@ -1096,6 +1096,14 @@ These counts do not guarantee a later acquisition's accepted prefix.
 | ------------------------- | -------- | -------------------------------------------- |
 | `module_id` | `string` | Exact module configuration identity. |
 | `context_instance_ids` | `repeated string` | Sorted complete population; position defines its generation-fixed ordinal. |
+
+`RuntimeTelemetry.packet_bindings` (field 20) is present when topology is
+selected. Its `rows` contain one binding per worker in compact index order.
+Each row identifies full-record or direct-native processing. Only a
+direct-native row carries `native_route`, with `rx_stream_id`, `tx_stream_id`
+and `storage_domain_id`. That graph has one worker, two stages (RX and TX),
+and no module contexts or boundaries. The binding is fixed for the runtime
+generation.
 
 `PortStats` carries `logical_port_id`, `logical_name`,
 `io_driver_instance_id`, `driver_port_id`, `observation_state`, and the

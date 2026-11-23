@@ -2115,24 +2115,25 @@ and [`PLATFORM_ENGINEERING_GUIDE.md`](../PLATFORM_ENGINEERING_GUIDE.md).
 
 ## 13. Packet Lifecycle
 
-One `packet_record` owns physical packet storage. Metadata carries epoch, stage,
-route, and port; the storage descriptor identifies the owner and carries a
-provider-private native handle. Each worker-owned branch holds one ledger credit
-until retirement or transfer. Storage, queue capacity, and work credits have
-separate lifetimes.
+On the general route, `packet_record` holds the epoch, stage, route and port.
+Its storage descriptor identifies the owner and carries the provider's native
+handle. A direct local RX-to-TX handoff carries the original buffer view in
+a worker-owned slot. Each worker-owned branch holds one ledger credit until
+retirement or transfer. Storage, queue capacity and work credits have separate
+lifetimes.
 
 ### Packet lifecycle flow
 
-**Admission and execution.** Only transferred records acquire packet credits.
-Rejected native input and unused receive capacity do not become worker-owned
-packets.
+**Admission and execution.** The worker acquires one epoch credit per admitted
+packet and returns unused receive capacity to local staging.
 
 ```{uml}
 @startuml
 participant "RX provider / origin module" as P
 participant "Owner worker / scheduler" as W
 collections "Local staging + epoch ledger" as L
-participant "Parser / module stage" as M
+participant "Platform / module stage" as M
+participant "Bound TX queue" as TX
 participant "Original storage domain" as S
 
 alt Physical RX
@@ -2140,8 +2141,12 @@ alt Physical RX
     W->P: receive burst, limited by free capacity and burst bound
     P-->W: transferred prefix + rejected count
     note over P,W: Provider already reclaimed rejected native inputs; they acquire no worker credit
+    alt Full records
+        W->W: stamp source epoch, time, ingress, and stage
+    else Bound local RX-to-TX handoff
+        W->W: retain original native view, timestamp and source epoch in a typed slot
+    end
     W->L: acquire exact source-epoch credits for the accepted count
-    W->W: stamp source epoch, time, ingress, and stage on transferred records
     W->L: publish active / future input
     W->L: release every unused reservation
     W->W: account transferred packets/bytes and native rejections once per burst
@@ -2156,26 +2161,38 @@ else Active origin
     W-->P: accepted prefix; remaining origin work stays module-owned
 end
 W->L: take staged work only at the exact active epoch
-alt Platform stage
-    W->M: execute the exact RX, parser, or TX mechanism
-    M-->W: outcome and parsed fields
-else Module stage
-    W->W: take one ready key's FIFO prefix for its exact context\nadmit and project occupied SoA lanes in one traversal
-    W->M: invoke one pre-resolved callback with its exact view
-    M-->W: occupied-prefix forward mask and mutable fields
-    W->W: validate callback authority, bounds, and field coherence
-end
-alt Drop
-    W->L: retire credit once
-    W->W: append to the original domain's release batch
-    ... grouped release ...
-    W->S: release the owned burst
-    S-->W: release completed
-    W->L: release local capacity
-else Forward
-    W->W: resolve compiled routing
-else Retained by ACTIVE ingest
-    W->L: release local capacity; preserve the existing credit\nunder an opaque retained handle
+alt Direct local RX-to-TX binding
+    W->L: service RX, then stage its prefix at the TX key
+    W->W: queue TX slots in FIFO order
+    W->TX: submit pending native views at the burst limit or turn flush
+    TX-->W: accepted prefix length
+    opt TX refused a suffix
+        W->W: compare refused views with the saved receipts
+        W->S: verify live ranges and release refused buffers
+    end
+    W->L: retire credits and release reservations for the whole submission
+else Full records
+    alt Platform stage
+        W->M: execute the exact RX, parser, or TX mechanism
+        M-->W: stage outcome
+    else Module stage
+        W->W: take one ready key's FIFO prefix for its exact context\nadmit and project occupied SoA lanes in one traversal
+        W->M: invoke one pre-resolved callback with its exact view
+        M-->W: occupied-prefix forward mask and mutable fields
+        W->W: validate callback authority, bounds, and field coherence
+    end
+    alt Drop
+        W->L: retire credit once
+        W->W: append to the original domain's release batch
+        ... grouped release ...
+        W->S: release the owned burst
+        S-->W: release completed
+        W->L: release local capacity
+    else Forward
+        W->W: resolve compiled routing
+    else Retained by ACTIVE ingest
+        W->L: release local capacity; preserve the existing credit\nunder an opaque retained handle
+    end
 end
 @enduml
 ```
@@ -2293,7 +2310,7 @@ publication and completed dequeue are separate transfer edges.
 @enduml
 ```
 
-**Egress and storage return.** The worker preserves pre-call metadata because
+**Full-record egress and storage return.** The worker preserves pre-call metadata because
 accepted records may already be freed when the provider returns.
 
 ```{uml}
@@ -2331,8 +2348,8 @@ partition "Transfer one bounded burst" {
     :Validate the complete unaccepted suffix;
     split
         :Accepted prefix;
-        :Group saved facts by contiguous
-        epoch, domain and stage in one pass;
+        :Use saved totals for a fully accepted common-metadata batch,
+        or group consecutive receipts by epoch, domain and stage;
         :Count stage output, retire credits
         and release reservations per group;
         note right

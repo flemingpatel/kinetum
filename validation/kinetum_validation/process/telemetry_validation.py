@@ -33,6 +33,7 @@ from .telemetry import (
     EpochGraceStatsResult,
     ProtocolFirstFaultResult,
     StatsResult,
+    StatsSelection,
 )
 
 
@@ -1557,7 +1558,29 @@ def require_stream_observation(
     )
 
 
-def stats_are_exact(result: StatsResult) -> bool:
+def _worker_bindings_are_exact(result: StatsResult, selection: Optional[StatsSelection]) -> bool:
+    """Match the bound representation to mandatory topology and each available selected family."""
+    bindings = result.packet_bindings
+    if selection is not None and (bindings is not None) != selection.include_topology_stats:
+        return False
+    if not bindings or bindings[0].rx_stream_id is None:
+        return True
+    route = bindings[0]
+    if result.boundary_count or result.module_context_count:
+        return False
+    if (result.stage_stats or (selection and selection.include_stage_stats)) and len(result.stage_stats) != 2:
+        return False
+    if result.stream_stats or (selection and selection.include_stream_stats):
+        if {row.io_stream_id: row.direction for row in result.stream_stats} != {
+            route.rx_stream_id: "rx", route.tx_stream_id: "tx",
+        }:
+            return False
+    return (not result.storage_domain_stats and not (selection and selection.include_storage_domain_stats)) or any(
+        row.storage_domain_id == route.storage_domain_id for row in result.storage_domain_stats
+    )
+
+
+def stats_are_exact(result: StatsResult, selection: Optional[StatsSelection] = None) -> bool:
     """Admit scalar authorities before dependent telemetry-family checks."""
     if (
         not _runtime_frame_is_exact(result)
@@ -1574,6 +1597,7 @@ def stats_are_exact(result: StatsResult) -> bool:
         and _module_rows_are_exact(result)
         and _worker_region_boundary_rows_are_exact(result)
         and _provider_topology_rows_are_exact(result)
+        and _worker_bindings_are_exact(result, selection)
     )
 
 
